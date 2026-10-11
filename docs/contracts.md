@@ -1,0 +1,11 @@
+# Native contract invariants
+
+Catalogue entity keys are native `series_ticker`, `event_ticker` and `market_ticker`; relationships use declared parents. Settlement status and results are copied without conflating native states. Raw response bytes are authoritative acquisition evidence. JSON payloads preserve exact numeric values as strings when parsing JSON decimals; financial projections use exact decimals, and definitions include rules, strikes, price grids, settlement sources and native combo legs.
+
+Catalogue current tables include `payload_json` for the complete observed object plus normalized identity/provenance. Unresolved parents remain visible through left joins. `combo_legs` has one row per native selected leg, keyed by combo market and leg index, and retains native side and settlement value. Observation history has one row per capture page and JSON pointer, deduplicated by observation identity on replay.
+
+Event-embedded markets are observation references only. Direct live and historical market endpoints determine current market inventory; a nested event summary cannot override a direct market definition. A catalogue release covers completed requested traversals over an observation interval, not an atomic exchange snapshot or a proof of permanent absence.
+
+Targeted bundles contain only found usable selected markets and their authoritative event/series parents. Every requested ticker appears exactly once in coverage; absent, malformed, unresolved and failed are distinct states. A malformed or failed response prevents completion, while honest absence/unresolved parent results may complete with non-found coverage. No producer warehouse is needed to verify or consume a copied bundle.
+
+Release identity is the SHA-256 of compact sorted JSON (`separators=(",", ":")`, no trailing newline) of literal filename inventories. Inventory entry fields are `sha256` and integer `size`; filenames and digests are ASCII. File SHA-256 includes every byte, including JSON files' final newline. Catalogue/metadata manifests have separate versioned contract identifiers.

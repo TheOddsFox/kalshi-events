@@ -1,0 +1,8 @@
+name: kalshi_events
+version: '1.0.0'
+config-version: 2
+profile: kalshi_events
+model-paths: [models]
+models:
+  kalshi_events:
+    +materialized: table

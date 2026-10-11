@@ -1,0 +1,16 @@
+name: offline verification
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: scripts/verify
+        env:
+          KALSHI_EVENTS_API_URL: http://127.0.0.1:9/trade-api/v2
+          KALSHI_EVENTS_ALLOW_LOOPBACK: '1'
+      - run: uv run --locked python scripts/check-distributions.py
+      - run: uv run --locked python scripts/check-installed.py

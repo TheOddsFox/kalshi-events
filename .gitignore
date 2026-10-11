@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Operator evidence and warehouse are deliberately absent from distributions.
+data/
+.state/
+*.duckdb
+*.duckdb.wal

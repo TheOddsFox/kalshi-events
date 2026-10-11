@@ -1,0 +1,34 @@
+version: 2
+models:
+  - name: observation_history
+    columns:
+      - name: observation_id
+        data_tests: [not_null, unique]
+      - name: entity_ticker
+        data_tests: [not_null]
+      - name: entity_kind
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['series', 'events', 'markets']
+  - name: current_series
+    columns:
+      - name: series_ticker
+        data_tests: [not_null, unique]
+  - name: current_events
+    columns:
+      - name: event_ticker
+        data_tests: [not_null, unique]
+  - name: current_markets
+    columns:
+      - name: market_ticker
+        data_tests: [not_null, unique]
+      - name: event_ticker
+        data_tests: [not_null]
+  - name: combo_legs
+    columns:
+      - name: side
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['yes', 'no']

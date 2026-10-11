@@ -1,0 +1,12 @@
+{
+  "files": {
+    ".agents/skills/pad-engineering/SKILL.md": "3cb5185116663c2f8ee58764a4180784ff2604b05e2e75b2b6f13cc1ccfd0071",
+    "AGENTS.md": "8e0e7df28f0df8d847f4981da0978c28c2c9615b0382c3bfc62c6af90a52f6b1",
+    "PROJECT_AGENT.md": "c526c7db20b7e853900d85f199fa00d05ef4b8a5cc0152a20a8da4a7b63fd0b9",
+    "scripts/verify": "2fdbe73b83807ffbbb748e2195ab57c5ca40e177ddb8af6cce5f33a48a347f6e",
+    "scripts/verify-fast": "1053c856109905e5b060601c5eff9a25e11613e79c0c04cf3b2ef739897ca940"
+  },
+  "repository": "oddsfox-kalshi-events",
+  "version": "1.1.0",
+  "workspace": "oddsfox-kalshi-events-engineering"
+}
