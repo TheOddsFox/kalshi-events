@@ -162,6 +162,7 @@ def _land_rows(store: Store, state: dict[str, Any], directory: Path) -> int:
 
 def load(store: Store, capture_id: str) -> dict[str, Any]:
     """Land a catalogue capture into a throwaway warehouse; reports the landing without publishing."""
+    store.require_writable()
     state = catalogue_capture(store, capture_id)
     relative = f"tmp/load-{uuid.uuid4().hex}"
     directory = store.path(relative)
@@ -188,6 +189,7 @@ def dbt(
     artifacts: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run the packaged dbt project against `database` (root-relative)."""
+    store.require_writable()
     runtime_relative = f"tmp/dbt-{uuid.uuid4().hex}"
     runtime = store.path(runtime_relative)
     runtime.mkdir(parents=True)
@@ -259,6 +261,7 @@ def dbt(
 
 def build(store: Store, capture_id: str) -> dict[str, Any]:
     """Build a fresh, certified warehouse for one complete catalogue capture."""
+    store.require_writable()
     state = catalogue_capture(store, capture_id)
     store.check_deadline()
     staging_relative = f"tmp/build-{uuid.uuid4().hex}"

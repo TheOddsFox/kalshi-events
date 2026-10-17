@@ -51,12 +51,14 @@ def parser() -> argparse.ArgumentParser:
         "current",
         "verify",
         "dbt",
+        "upgrade-root",
     ):
         command = commands.add_parser(name)
         if name in {"capture", "load", "build", "publish", "replay"}:
             command.add_argument("--capture-id")
         if name == "capture":
             command.add_argument("--market-ticker", action="append")
+            command.add_argument("--compression", choices=("identity", "gzip"), default=None)
         if name == "verify":
             command.add_argument("--release", type=Path, required=True)
         if name == "dbt":
@@ -82,7 +84,7 @@ def _limits(command: argparse.ArgumentParser) -> None:
         command.add_argument(
             "--" + field.replace("_", "-"),
             type=float if field in FLOAT_LIMITS else int,
-            default=getattr(defaults, field),
+            default=(None if field == "max_decoded_response_bytes" else getattr(defaults, field)),
         )
 
 
@@ -112,11 +114,18 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
         return publish.current(store)
     if args.command == "status":
         return _status(store)
+    if args.command == "upgrade-root":
+        with store.lock(allow_legacy=True) as writer_lock:
+            store.upgrade_root(writer_lock)
+        return {"storage_version": store.storage_version, "upgraded": True}
     with store.lock():
         if args.command == "capture":
             with metrics.phase("capture"):
                 state = acquisition.capture(
-                    store, selected=args.market_ticker, resume=args.capture_id
+                    store,
+                    selected=args.market_ticker,
+                    resume=args.capture_id,
+                    compression=args.compression,
                 )
             return {
                 key: state[key]

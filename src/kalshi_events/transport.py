@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import email.utils
+import hashlib
 import math
 import os
 import random
 import threading
 import time
 import uuid
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -53,21 +55,121 @@ def source_url() -> str:
     return value
 
 
-def read_page(store: Store, relative: str, limit: int | None = None) -> tuple[dict[str, Any], Any]:
-    """Verify one raw receipt and its body. `limit` is the capture's sealed response ceiling."""
+def _decode_gzip(body: bytes, limit: int, check_deadline: Any = None) -> tuple[bytes, str]:
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    output = bytearray()
+    checksum = hashlib.sha256()
+    metrics.add("hashes")
+    try:
+        with metrics.phase("decompression"):
+            for offset in range(0, len(body), 64 * 1024):
+                pending = body[offset : offset + 64 * 1024]
+                while pending:
+                    if check_deadline is not None:
+                        check_deadline()
+                    remaining = limit - len(output)
+                    decoded = decoder.decompress(pending, remaining + 1)
+                    if check_deadline is not None:
+                        check_deadline()
+                    if len(decoded) > remaining:
+                        raise CatalogueError("decoded response exceeds byte ceiling")
+                    output.extend(decoded)
+                    with metrics.phase("decoded_hashing"):
+                        checksum.update(decoded)
+                    metrics.add("hash_bytes", len(decoded))
+                    if decoder.unused_data:
+                        raise CatalogueError("gzip response has trailing data or multiple members")
+                    pending = decoder.unconsumed_tail
+                    if not pending:
+                        break
+            if not decoder.eof:
+                raise CatalogueError("truncated gzip response")
+    except zlib.error as exc:
+        raise CatalogueError("invalid gzip response") from exc
+    return bytes(output), checksum.hexdigest()
+
+
+def _checked_size(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CatalogueError(f"invalid raw evidence {name}")
+    return value
+
+
+def _checked_digest(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(c not in "0123456789abcdef" for c in value)
+    ):
+        raise CatalogueError(f"invalid raw evidence {name}")
+    return value
+
+
+def _encoded_digest(body: bytes) -> str:
+    with metrics.phase("encoded_hashing"):
+        return digest(body)
+
+
+def read_page(
+    store: Store,
+    relative: str,
+    limit: int | None = None,
+    decoded_limit: int | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """Verify one raw receipt. Limits may be the capture's sealed response ceilings."""
     limit = store.limits.max_response_bytes if limit is None else limit
+    decoded_limit = (
+        store.limits.max_decoded_response_bytes if decoded_limit is None else decoded_limit
+    )
     manifest = decode(regular_bytes(store.path(relative), 1024**2))
-    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+    store.check_deadline()
+    if (
+        not isinstance(manifest, dict)
+        or isinstance(manifest.get("version"), bool)
+        or manifest.get("version") not in {1, 2}
+    ):
         raise CatalogueError("unsupported raw evidence manifest")
+    status = manifest.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        raise CatalogueError("invalid raw evidence status")
     body_path = store.path(str(Path(relative).parent / "body.bin"))
     body = regular_bytes(body_path, limit)
     metrics.add("raw_body_reads")
     metrics.add("raw_body_read_bytes", len(body))
-    if len(body) != manifest.get("size") or digest(body) != manifest.get("sha256"):
-        raise CatalogueError("raw response evidence integrity mismatch")
-    if manifest["status"] == 200:
+    version = manifest["version"]
+    if version == 1:
+        if len(body) != _checked_size(manifest.get("size"), "size") or _encoded_digest(
+            body
+        ) != _checked_digest(manifest.get("sha256"), "sha256"):
+            raise CatalogueError("raw response evidence integrity mismatch")
+        decoded = body
+    else:
+        if manifest.get("content_encoding") != "gzip":
+            raise CatalogueError("unsupported raw evidence content encoding")
+        encoded_size = _checked_size(manifest.get("encoded_size"), "encoded size")
+        decoded_size = _checked_size(manifest.get("decoded_size"), "decoded size")
+        encoded_sha = _checked_digest(manifest.get("encoded_sha256"), "encoded checksum")
+        decoded_sha = _checked_digest(manifest.get("decoded_sha256"), "decoded checksum")
+        if (
+            len(body) != encoded_size
+            or len(body) != _checked_size(manifest.get("size"), "size")
+            or _encoded_digest(body) != encoded_sha
+            or manifest.get("sha256") != encoded_sha
+        ):
+            raise CatalogueError("raw response evidence integrity mismatch")
+        decoded, actual_decoded_sha = _decode_gzip(body, decoded_limit, store.check_deadline)
+        if len(decoded) != decoded_size or actual_decoded_sha != decoded_sha:
+            raise CatalogueError("decoded response evidence integrity mismatch")
+    if len(decoded) > decoded_limit:
+        raise CatalogueError("decoded response exceeds byte ceiling")
+    if version == 1 and len(body) > decoded_limit:
+        raise CatalogueError("decoded response exceeds byte ceiling")
+    if status == 200:
         metrics.add("raw_body_json_decodes")
-    return manifest, decode(body) if manifest["status"] == 200 else None
+    store.check_deadline()
+    payload = decode(decoded) if status == 200 else None
+    store.check_deadline()
+    return manifest, payload
 
 
 class RateLimiter:
@@ -124,15 +226,18 @@ def backoff_seconds(attempt: int, retry_after: float | None) -> float:
 
 
 class PublicClient:
-    def __init__(self, store: Store, budget: Budget):
+    def __init__(self, store: Store, budget: Budget, *, compression: str = "identity"):
+        if compression not in {"identity", "gzip"}:
+            raise CatalogueError("compression must be identity or gzip")
         self.store = store
         self.budget = budget
+        self.compression = compression
         self.base_url = source_url()
         self.limiter = RateLimiter(store.limits.max_rate)
         self.client = httpx.Client(
             trust_env=False,
             follow_redirects=False,
-            headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+            headers={"Accept": "application/json", "Accept-Encoding": compression},
             limits=httpx.Limits(
                 max_connections=MAX_CONCURRENT_REQUESTS,
                 max_keepalive_connections=MAX_CONCURRENT_REQUESTS,
@@ -176,14 +281,19 @@ class PublicClient:
                 "reserved_bytes": allowance,
                 "accounting_complete": False,
             }
-            body = bytearray()
+            spool = None
             streamed = 0
+            decoded_size = 0
+            encoded_hash = hashlib.sha256()
+            decoded_hash = hashlib.sha256()
+            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
             status: int | None = None
             retry_after: str | None = None
             committed: dict[str, Any] | None = None
             try:
                 self.store.write(relative, reservation)
                 metrics.add("requests")
+                spool = self.store.spool(f"raw/{attempt_id}/body.bin")
                 with (
                     metrics.phase("request"),
                     self.client.stream(
@@ -195,37 +305,72 @@ class PublicClient:
                 ):
                     status = response.status_code
                     retry_after = response.headers.get("retry-after")
-                    if response.headers.get("content-encoding", "identity") not in {
-                        "identity",
-                        "",
-                    }:
-                        raise CatalogueError("compressed response is not permitted")
+                    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+                    if encoding not in {"identity", "gzip"}:
+                        raise CatalogueError("unsupported response content encoding")
+                    if encoding == "gzip" and self.compression != "gzip":
+                        raise CatalogueError("source returned unrequested gzip compression")
                     declared = response.headers.get("content-length")
-                    if declared and int(declared) > allowance:
-                        raise self._ceiling_error(allowance)
+                    if declared is not None:
+                        if not declared.isdigit():
+                            raise CatalogueError("invalid response content length")
+                        if int(declared) > allowance:
+                            raise self._ceiling_error(allowance)
                     for chunk in response.iter_raw():
-                        _ = self.budget.remaining
                         streamed += len(chunk)
                         downloaded = self.budget.add_download(len(chunk))
                         metrics.add("encoded_bytes", len(chunk))
+                        _ = self.budget.remaining
                         if downloaded > self.budget.limits.max_download_bytes:
                             raise BudgetExceeded("download allowance exhausted")
-                        if len(body) + len(chunk) > allowance:
+                        if streamed > allowance:
                             raise self._ceiling_error(allowance)
-                        body.extend(chunk)
-                payload = bytes(body)
-                metrics.add("decoded_bytes", len(payload))
-                self.store.write_bytes(f"raw/{attempt_id}/body.bin", payload)
+                        spool.write(chunk, self.budget.consume_storage)
+                        with metrics.phase("encoded_hashing"):
+                            encoded_hash.update(chunk)
+                        metrics.add("hash_bytes", len(chunk))
+                        if encoding == "gzip":
+                            decoded_size += self._consume_gzip(
+                                decoder,
+                                chunk,
+                                decoded_hash,
+                                decoded_size,
+                            )
+                            _ = self.budget.remaining
+                        else:
+                            decoded_size += len(chunk)
+                            if decoded_size > self.budget.max_decoded_response_bytes:
+                                raise CatalogueError("decoded response exceeds byte ceiling")
+                if encoding == "gzip" and not decoder.eof:
+                    raise CatalogueError("truncated gzip response")
+                _ = self.budget.remaining
+                spool.commit()
+                payload_size = streamed
+                metrics.add("hashes", 1 if encoding == "identity" else 2)
+                encoded_checksum = encoded_hash.hexdigest()
+                decoded_checksum = (
+                    encoded_checksum if encoding == "identity" else decoded_hash.hexdigest()
+                )
                 receipt = {
                     **reservation,
                     "status": status,
-                    "size": len(payload),
-                    "sha256": digest(payload),
+                    "size": payload_size,
+                    "sha256": encoded_checksum,
                     "received_at": now(),
                     "downloaded_bytes": streamed,
                     "retry_after": retry_after,
                     "accounting_complete": True,
                 }
+                if encoding == "gzip":
+                    receipt.update(
+                        version=2,
+                        content_encoding="gzip",
+                        encoded_size=payload_size,
+                        encoded_sha256=encoded_checksum,
+                        decoded_size=decoded_size,
+                        decoded_sha256=decoded_checksum,
+                    )
+                metrics.add("decoded_bytes", decoded_size)
                 if status in RETRYABLE_STATUSES and not last:
                     delay = backoff_seconds(attempt, retry_after_seconds(retry_after))
                     receipt["retry_delay_seconds"] = round(delay, 3)
@@ -244,7 +389,7 @@ class PublicClient:
                     relative,
                     reservation,
                     status=status,
-                    size=len(body),
+                    size=streamed,
                     downloaded=streamed,
                     extra={"error": type(exc).__name__},
                     delay=delay,
@@ -264,15 +409,43 @@ class PublicClient:
                         relative,
                         reservation,
                         status=status,
-                        size=len(body),
+                        size=streamed,
                         downloaded=streamed,
                         extra={"error": label},
                         delay=None,
                     )
                 raise
             finally:
+                if spool is not None:
+                    spool.abort()
                 self.budget.settle(allowance)
-        raise CatalogueError("source retries exhausted")
+
+    def _consume_gzip(
+        self,
+        decoder: Any,
+        chunk: bytes,
+        checksum: Any,
+        current_size: int,
+    ) -> int:
+        pending = chunk
+        emitted = 0
+        while pending:
+            remaining = self.budget.max_decoded_response_bytes - current_size - emitted
+            try:
+                with metrics.phase("decompression"):
+                    decoded = decoder.decompress(pending, remaining + 1)
+            except zlib.error as exc:
+                raise CatalogueError("invalid gzip response") from exc
+            emitted += len(decoded)
+            if emitted > self.budget.max_decoded_response_bytes - current_size:
+                raise CatalogueError("decoded response exceeds byte ceiling")
+            with metrics.phase("decoded_hashing"):
+                checksum.update(decoded)
+            metrics.add("hash_bytes", len(decoded))
+            if decoder.unused_data:
+                raise CatalogueError("gzip response has trailing data or multiple members")
+            pending = decoder.unconsumed_tail
+        return emitted
 
     def _record_failure(
         self,

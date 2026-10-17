@@ -79,6 +79,16 @@ def read_capture(store: Store, capture_id: str) -> dict[str, Any]:
     ceiling = state.get("max_response_bytes")
     if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
         raise CatalogueError("invalid sealed response ceiling")
+    decoded_ceiling = state.get("max_decoded_response_bytes", ceiling)
+    if (
+        isinstance(decoded_ceiling, bool)
+        or not isinstance(decoded_ceiling, int)
+        or decoded_ceiling <= 0
+    ):
+        raise CatalogueError("invalid sealed decoded response ceiling")
+    encoding = state.get("compression", "identity")
+    if encoding not in {"identity", "gzip"}:
+        raise CatalogueError("invalid sealed response compression")
     return state
 
 
@@ -113,13 +123,22 @@ def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
 def capture_pages(store: Store, state: dict[str, Any]) -> Iterator[tuple[dict[str, Any], Any]]:
     for row in page_receipts(store, state):
         store.check_deadline()
-        manifest, payload = read_page(store, row["relative"], state["max_response_bytes"])
+        manifest, payload = read_page(
+            store,
+            row["relative"],
+            state["max_response_bytes"],
+            state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+        )
         if manifest.get("capture_id") != state["capture_id"]:
             raise CatalogueError("raw evidence belongs to another capture")
         yield manifest, payload
 
 
-def new_capture(store: Store, selected: list[str] | None) -> dict[str, Any]:
+def new_capture(
+    store: Store, selected: list[str] | None, compression: str = "identity"
+) -> dict[str, Any]:
+    if compression not in {"identity", "gzip"}:
+        raise CatalogueError("compression must be identity or gzip")
     work = [task("/historical/cutoff", None, singular=True)]
     if selected is None:
         work += [
@@ -151,6 +170,8 @@ def new_capture(store: Store, selected: list[str] | None) -> dict[str, Any]:
         "complete": False,
         # Sealed at creation: every later read of this capture uses this ceiling.
         "max_response_bytes": store.limits.max_response_bytes,
+        "max_decoded_response_bytes": store.limits.max_decoded_response_bytes,
+        "compression": compression,
         "tasks": work,
         "cutoff": None,
         "coverage": {},
@@ -295,7 +316,12 @@ def _consume(
     seen: dict[int, set[str]],
 ) -> None:
     work = state["tasks"][index]
-    manifest, payload = read_page(store, relative, state["max_response_bytes"])
+    manifest, payload = read_page(
+        store,
+        relative,
+        state["max_response_bytes"],
+        state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+    )
     if manifest.get("request_id") != _request_context(state, index)["request_id"]:
         raise CatalogueError("raw receipt does not match its traversal")
     if _phase(work) == "cutoff":
@@ -402,7 +428,12 @@ def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
             or manifest.get("singular") != singular
         ):
             raise CatalogueError("uncommitted raw receipt contradicts request identity")
-        read_page(store, relative, state["max_response_bytes"])
+        read_page(
+            store,
+            relative,
+            state["max_response_bytes"],
+            state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+        )
         if context["request_id"] in recovered:
             raise CatalogueError("multiple completed raw receipts claim the same request identity")
         recovered[context["request_id"]] = relative
@@ -482,12 +513,26 @@ def capture(
     selected: list[str] | None = None,
     resume: str | None = None,
     client_factory: Any = None,
+    compression: str | None = None,
 ) -> dict[str, Any]:
+    store.require_writable()
     factory = client_factory or PublicClient
-    state = read_capture(store, resume) if resume else new_capture(store, selected)
+    state = (
+        read_capture(store, resume)
+        if resume
+        else new_capture(store, selected, compression or "identity")
+    )
     if resume and selected is not None and selected != state["selected"]:
         raise CatalogueError("resume selection differs from capture")
-    budget = Budget(store, max_response_bytes=state["max_response_bytes"])
+    sealed_compression = state.get("compression", "identity")
+    if compression is not None and compression != sealed_compression:
+        raise CatalogueError("resume compression differs from capture")
+    decoded_ceiling = state.get("max_decoded_response_bytes", state["max_response_bytes"])
+    budget = Budget(
+        store,
+        max_response_bytes=state["max_response_bytes"],
+        max_decoded_response_bytes=decoded_ceiling,
+    )
     if state["complete"]:
         return {**state, **budget.result(), "budget_exhausted": False}
     state["error"] = None
@@ -495,7 +540,11 @@ def capture(
     budget_exhausted = False
     try:
         with (
-            factory(store, budget) as client,
+            (
+                factory(store, budget, compression=sealed_compression)
+                if sealed_compression != "identity"
+                else factory(store, budget)
+            ) as client,
             ThreadPoolExecutor(
                 max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="kalshi-traversal"
             ) as pool,

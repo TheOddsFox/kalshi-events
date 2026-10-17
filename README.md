@@ -19,6 +19,8 @@ uv run kalshi-events --root /absolute/operator/kalshi-events current
 
 The operator root is the persistent directory passed with `--root`, or `KALSHI_EVENTS_ROOT`, or `data`. It holds raw evidence, captures, builds, releases and `current.json`. Only one writer may hold the canonical root at a time. Symlinked roots, files and destinations are refused.
 
+New roots use storage version 2. Existing roots remain readable; stop writers and explicitly run `kalshi-events --root /absolute/operator/kalshi-events upgrade-root` before further writes. Upgrade changes only the marker under the writer lock. Existing incomplete captures retain their original checkpoint protocol. Older binaries refuse an upgraded root; binary rollback requires a separate legacy root and retained verified v1 publication. Never downgrade the marker.
+
 ## Capture
 
 The public transport uses only `https://external-api.kalshi.com/trade-api/v2`. Requests are paced by one shared limiter at 10 requests per second by default. Set `--max-rate` to a positive number to change that rate; zero or negative values are rejected. All five traversals (series, ordinary events, multivariate events, live markets and historical markets) run concurrently under that one limiter. Events and multivariate events use pages of 200; live and historical markets use pages of 1000.
@@ -28,6 +30,23 @@ Each attempt writes its raw HTTP response bytes and per-attempt accounting befor
 Capture stops at its request, download, response, duration or storage allowance and reports `complete: false` with exit code 3. Completed raw evidence is kept, and the capture resumes from there. Invalidated cursors restart their traversal. Each historical read is preceded by a cutoff read that is recorded as its own receipt. Missing parents are retained as unresolved relationships and are never derived from ticker prefixes.
 
 Every capture seals its response ceiling at creation, so later reads with different flags still verify the bytes it recorded.
+
+Identity encoding remains the default. `capture --compression gzip` requests gzip while accepting an identity fallback. Raw evidence retains exact encoded bytes; gzip receipts also certify decoded size and checksum. Both representations have independent ceilings: `--max-decoded-response-bytes` defaults to the chosen `--max-response-bytes`. Resume retains the original compression and ceilings. Truncated or corrupt gzip, additional members, trailing bytes and excessive expansion fail closed.
+
+### Optional transport diagnostics
+
+Capability and rate checks are manual, bounded operations. Use a new disposable root and a known market ticker with a new metrics report path:
+
+```sh
+uv run kalshi-events --root /absolute/new/probe-root \
+  --metrics-file /absolute/new/probe-metrics.json capture \
+  --market-ticker KNOWN_MARKET_TICKER --compression gzip --max-rate 10 \
+  --max-requests 12 --max-download-bytes 8388608 \
+  --max-response-bytes 4194304 --max-decoded-response-bytes 4194304 \
+  --max-duration-seconds 30 --max-root-bytes 67108864 --max-temp-bytes 33554432
+```
+
+Inspect the probe's raw receipts: version 2 with `content_encoding: "gzip"` proves compressed evidence was served; version 1 means identity fallback. Compare encoded bytes, request time, rate waits and retry waits in the external metrics report. To investigate a different rate, explicitly repeat with another new root/report and a chosen positive `--max-rate`, keeping other limits fixed. A small probe can expose throttling but cannot establish sustained catalogue throughput. Normal commands and CI never probe or tune automatically; the default remains 10 requests per second. No live compression or higher-rate capability is assumed.
 
 ## Build and publish
 

@@ -82,6 +82,7 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
 
 
 def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
+    store.require_writable()
     capture_id = capture_id or latest_catalogue_capture(store)
     state = complete_capture(store, capture_id)
     if state["selected"] is not None:
@@ -176,6 +177,7 @@ def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
 def prune_superseded(store: Store, state: dict[str, Any], release_id: str) -> list[str]:
     """Delete catalogue captures older than the published one, with their raw evidence, builds
     and superseded releases. Runs only after the release is verified and promoted."""
+    store.require_writable()
     keep = state["capture_id"]
     removed = []
     captures = store.path("captures")

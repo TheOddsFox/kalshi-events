@@ -26,6 +26,7 @@ from kalshi_events import metrics
 MAX_BUNDLE_BYTES = 128 * 1024**2
 TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
+CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
 
 
 class CatalogueError(RuntimeError):
@@ -61,10 +62,11 @@ def _reject(value: Any) -> Any:
 def decode(body: bytes) -> Any:
     metrics.add("json_decodes")
     metrics.add("json_decoded_bytes", len(body))
-    try:
-        return json.loads(body, parse_float=Decimal, parse_constant=lambda _: _reject(None))
-    except (ValueError, TypeError, UnicodeError) as exc:
-        raise CatalogueError("invalid JSON response or evidence") from exc
+    with metrics.phase("json_parsing"):
+        try:
+            return json.loads(body, parse_float=Decimal, parse_constant=lambda _: _reject(None))
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise CatalogueError("invalid JSON response or evidence") from exc
 
 
 def digest(body: bytes) -> str:
@@ -156,12 +158,15 @@ class Limits:
     max_requests: int = 25_000
     max_download_bytes: int = 4 * 1024**3
     max_response_bytes: int = 384 * 1024**2
+    max_decoded_response_bytes: int | None = None
     max_duration_seconds: float = 4 * 3600
     max_root_bytes: int = 64 * 1024**3
     max_temp_bytes: int = 8 * 1024**3
     max_database_bytes: int = 2 * 1024**3
 
     def __post_init__(self) -> None:
+        if self.max_decoded_response_bytes is None:
+            object.__setattr__(self, "max_decoded_response_bytes", self.max_response_bytes)
         for key in self.__dataclass_fields__:
             value = getattr(self, key)
             if (
@@ -190,6 +195,7 @@ class Store:
         self.limits = limits or Limits()
         self.started = time.monotonic()
         self._lock = threading.RLock()
+        self._storage_reservations = 0
         self._sizes: dict[str, int] = {}
         self._usage = {"retained_bytes": 0, "temporary_bytes": 0, "database_bytes": 0}
         self.root.mkdir(parents=True, exist_ok=True)
@@ -197,9 +203,11 @@ class Store:
         if not marker.exists():
             if any(self.root.iterdir()):
                 raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
-            atomic_json(marker, OWNER_MARKER)
-        if decode(regular_bytes(marker)) != OWNER_MARKER:
+            atomic_json(marker, CURRENT_ROOT_MARKER)
+        marker_value = decode(regular_bytes(marker))
+        if marker_value not in (OWNER_MARKER, CURRENT_ROOT_MARKER):
             raise CatalogueError("operator root belongs to another application")
+        self.storage_version = 1 if marker_value == OWNER_MARKER else 2
         self.reconcile()
 
     @property
@@ -224,10 +232,12 @@ class Store:
 
     def check_storage(self, additional: int = 0) -> dict[str, int]:
         usage = self.usage()
-        metrics.peak("reserved", additional)
-        if usage["retained_bytes"] + additional > self.limits.max_root_bytes:
+        with self._lock:
+            reserved = self._storage_reservations
+        metrics.peak("reserved", reserved + additional)
+        if usage["retained_bytes"] + reserved + additional > self.limits.max_root_bytes:
             raise BudgetExceeded("operator root storage exhausted")
-        if usage["temporary_bytes"] + additional > self.limits.max_temp_bytes:
+        if usage["temporary_bytes"] + reserved + additional > self.limits.max_temp_bytes:
             raise BudgetExceeded("temporary storage exhausted")
         if usage["database_bytes"] > self.limits.max_database_bytes:
             raise BudgetExceeded("database storage exhausted")
@@ -249,6 +259,7 @@ class Store:
         self.write_bytes(relative, json_bytes(value))
 
     def write_bytes(self, relative: str, body: bytes) -> None:
+        self._require_writable()
         path = self.path(relative)
         with self._lock:
             previous = self._sizes.get(str(path), 0)
@@ -262,6 +273,7 @@ class Store:
             self._record(path, len(body))
 
     def append(self, relative: str, body: bytes) -> None:
+        self._require_writable()
         path = self.path(relative)
         with self._lock:
             previous = self._sizes.get(str(path), 0)
@@ -284,6 +296,7 @@ class Store:
             self._record(path, previous + len(body))
 
     def remove(self, relative: str) -> None:
+        self._require_writable()
         path = self.path(relative)
         if path.is_dir():
             shutil.rmtree(path)
@@ -291,13 +304,52 @@ class Store:
             path.unlink()
         self.sync(relative)
 
-    def lock(self) -> FileLock:
+    def lock(self, *, allow_legacy: bool = False) -> FileLock:
+        if not allow_legacy:
+            self._require_writable()
         lock = FileLock(str(self.path("writer.lock")), timeout=0)
         try:
             lock.acquire()
         except Timeout as exc:
             raise CatalogueError("another writer holds the canonical operator root lock") from exc
         return lock
+
+    def upgrade_root(self, lock: FileLock) -> None:
+        """Upgrade a legacy root marker while holding the writer lock; evidence is untouched."""
+        expected_lock = str(self.path("writer.lock"))
+        if not lock.is_locked or str(lock.lock_file) != expected_lock:
+            raise CatalogueError("root upgrade requires the writer lock")
+        current = decode(regular_bytes(self.path("root.json"), 1024**2))
+        if current == CURRENT_ROOT_MARKER:
+            self.storage_version = 2
+            return
+        if current != OWNER_MARKER:
+            raise CatalogueError("operator root belongs to another application")
+        atomic_json(self.path("root.json"), CURRENT_ROOT_MARKER)
+        self.storage_version = 2
+
+    def reserve_storage(self, amount: int) -> None:
+        with self._lock:
+            self.check_storage(amount)
+            self._storage_reservations += amount
+
+    def release_storage(self, amount: int) -> None:
+        with self._lock:
+            self._storage_reservations -= amount
+            if self._storage_reservations < 0:
+                self._storage_reservations = 0
+                raise CatalogueError("storage reservation accounting underflow")
+
+    def spool(self, relative: str) -> EvidenceSpool:
+        self._require_writable()
+        return EvidenceSpool(self, relative)
+
+    def require_writable(self) -> None:
+        if self.storage_version != 2:
+            raise CatalogueError("operator root requires explicit upgrade-root before writing")
+
+    def _require_writable(self) -> None:
+        self.require_writable()
 
     def _sync_prefix(self, path: Path) -> None:
         prefix = str(path)
@@ -341,6 +393,67 @@ class Store:
         metrics.peak("temporary", self._usage["temporary_bytes"])
 
 
+class EvidenceSpool:
+    """Incremental same-directory file that becomes evidence only after fsync and rename."""
+
+    def __init__(self, store: Store, relative: str):
+        self.store = store
+        self.destination = store.path(relative)
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".write-body-", dir=self.destination.parent)
+        self.path = Path(name)
+        self.stream = os.fdopen(fd, "wb")
+        self.size = 0
+        self.closed = False
+
+    def write(self, chunk: bytes, consume_reservation: Callable[[int], None] | None = None) -> None:
+        if self.closed:
+            raise CatalogueError("evidence spool is already closed")
+        with self.store._lock:
+            if consume_reservation is not None:
+                consume_reservation(len(chunk))
+            self.store.check_storage(len(chunk))
+            with metrics.phase("raw_write"):
+                self.stream.write(chunk)
+            self.size += len(chunk)
+            self.store._record(self.path, self.size)
+        metrics.add("raw_write_bytes", len(chunk))
+
+    def commit(self) -> None:
+        if self.closed:
+            raise CatalogueError("evidence spool is already closed")
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+        metrics.add("fsync_calls")
+        self.stream.close()
+        self.closed = True
+        with self.store._lock:
+            os.replace(self.path, self.destination)
+            self.store._record(self.path, None)
+            self.store._record(self.destination, self.size)
+            directory = os.open(self.destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+                metrics.add("fsync_calls")
+
+    def abort(self) -> None:
+        if not self.closed:
+            self.stream.close()
+            self.closed = True
+        self.path.unlink(missing_ok=True)
+        with self.store._lock:
+            self.store._record(self.path, None)
+
+    def __enter__(self) -> EvidenceSpool:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type is not None or not self.closed:
+            self.abort()
+
+
 @contextmanager
 def interrupt_at_deadline(store: Store, interrupt: Callable[[], None]) -> Iterator[None]:
     """Run `interrupt` once the operation deadline passes, while the block is executing."""
@@ -356,13 +469,23 @@ def interrupt_at_deadline(store: Store, interrupt: Callable[[], None]) -> Iterat
 class Budget:
     """Request, download and deadline allowance for one invocation. Safe across worker threads."""
 
-    def __init__(self, store: Store, *, max_response_bytes: int | None = None):
+    def __init__(
+        self,
+        store: Store,
+        *,
+        max_response_bytes: int | None = None,
+        max_decoded_response_bytes: int | None = None,
+    ):
         self.store = store
         self.limits = store.limits
         self.max_response_bytes = max_response_bytes or store.limits.max_response_bytes
+        self.max_decoded_response_bytes = (
+            max_decoded_response_bytes or store.limits.max_decoded_response_bytes
+        )
         self.requests = 0
         self.downloaded_bytes = 0
         self._inflight = 0
+        self._storage_by_thread: dict[int, int] = {}
         self._lock = threading.Lock()
 
     @property
@@ -380,14 +503,35 @@ class Budget:
             if remaining_bytes <= 0:
                 raise BudgetExceeded("download allowance exhausted")
             allowance = min(self.max_response_bytes, remaining_bytes)
-            self.store.check_storage(allowance * 2)
+            storage_reservation = allowance + self.max_decoded_response_bytes
             self.requests += 1
             self._inflight += allowance
-            return allowance
+        try:
+            self.store.reserve_storage(storage_reservation)
+        except BaseException:
+            with self._lock:
+                self.requests -= 1
+                self._inflight -= allowance
+            raise
+        with self._lock:
+            self._storage_by_thread[threading.get_ident()] = storage_reservation
+        return allowance
+
+    def consume_storage(self, amount: int) -> None:
+        ident = threading.get_ident()
+        with self._lock:
+            remaining = self._storage_by_thread.get(ident, 0)
+            consumed = min(amount, remaining)
+            self._storage_by_thread[ident] = remaining - consumed
+        if consumed:
+            self.store.release_storage(consumed)
 
     def settle(self, allowance: int) -> None:
+        ident = threading.get_ident()
         with self._lock:
             self._inflight -= allowance
+            storage_reservation = self._storage_by_thread.pop(ident, 0)
+        self.store.release_storage(storage_reservation)
 
     def add_download(self, size: int) -> int:
         with self._lock:
