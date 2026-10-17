@@ -75,9 +75,9 @@ Run `scripts/verify-fast` during development and `scripts/verify` before complet
 
 No capture has completed. The 2026-10-17 probe is not acceptance.
 
-A new capture ran for 20.1 minutes and stored 7.41 GiB across 7,802 pages. Series finished at 15,187. The other traversals were still returning full pages: 484,600 events, 590,400 multivariate events, 903,000 live markets, and 761,000 historical markets. Sharing 10 requests per second, those four moved at about 42, 34, 22, and 26 minutes per extra million. Disk use was about 22 GiB per hour. The cursors do not report a remainder, so this probe has no end time.
+A new capture ran for 20.1 minutes and stored 6.90 GiB (7,409,637,631 bytes) across 7,802 pages. Series finished at 15,187. The other traversals were still returning full pages: 484,600 events, 590,400 multivariate events, 903,000 live markets, and 761,000 historical markets. Sharing 10 requests per second, those four moved at about 42, 34, 22, and 26 minutes per extra million. Disk use was about 21 GiB per hour. The cursors do not report a remainder, so this probe has no end time.
 
-One page exceeded the old 16 MiB response default. The probe sealed a 256 MiB ceiling and kept receiving pages. The default is now 384 MiB, 1.5 times that ceiling. `max_root_bytes` stays 64 GiB because 1.5 times the 7.41 GiB probe is 11 GiB. A finished capture can pass 64 GiB; this probe never reached the end.
+One page exceeded the old 16 MiB response default. The probe sealed a 256 MiB ceiling and kept receiving pages. The default is now 384 MiB, 1.5 times that ceiling. `max_root_bytes` stays 64 GiB because 1.5 times the 6.90 GiB probe is 10.4 GiB. A finished capture can pass 64 GiB; this probe never reached the end.
 
 A targeted refresh of `KXNHLGOAL-26OCT17DALCHI-CHIRGREENE20-2` returned 4 requests and a bundle. `kalshi-market-data run` accepted that producer for candles from 2026-10-17T00:00:00Z through 2026-10-18T00:00:00Z. The consumer run completed with release `e2777881be74a464b301f04894a7574154a90f4f119b5f17fee490815f851e34`.
 
