@@ -21,6 +21,8 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
+from kalshi_events import metrics
+
 MAX_BUNDLE_BYTES = 128 * 1024**2
 TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
@@ -57,6 +59,8 @@ def _reject(value: Any) -> Any:
 
 
 def decode(body: bytes) -> Any:
+    metrics.add("json_decodes")
+    metrics.add("json_decoded_bytes", len(body))
     try:
         return json.loads(body, parse_float=Decimal, parse_constant=lambda _: _reject(None))
     except (ValueError, TypeError, UnicodeError) as exc:
@@ -64,7 +68,10 @@ def decode(body: bytes) -> Any:
 
 
 def digest(body: bytes) -> str:
-    return hashlib.sha256(body).hexdigest()
+    metrics.add("hashes")
+    metrics.add("hash_bytes", len(body))
+    with metrics.phase("hashing"):
+        return hashlib.sha256(body).hexdigest()
 
 
 def file_digest(path: Path, limit: int = MAX_BUNDLE_BYTES) -> tuple[str, int]:
@@ -72,13 +79,16 @@ def file_digest(path: Path, limit: int = MAX_BUNDLE_BYTES) -> tuple[str, int]:
     if not path.is_file() or path.stat().st_size > limit:
         raise CatalogueError("missing, nonregular or oversized evidence file")
     checksum = hashlib.sha256()
+    metrics.add("hashes")
+    metrics.add("file_reads")
     size = 0
-    with path.open("rb") as stream:
+    with metrics.phase("hashing"), path.open("rb") as stream:
         while chunk := stream.read(1024**2):
             size += len(chunk)
             if size > limit:
                 raise CatalogueError("evidence file grew beyond byte ceiling")
             checksum.update(chunk)
+            metrics.add("hash_bytes", len(chunk))
     return checksum.hexdigest(), size
 
 
@@ -108,6 +118,8 @@ def regular_bytes(path: Path, limit: int = MAX_BUNDLE_BYTES) -> bytes:
         raise CatalogueError(f"missing, nonregular or oversized file: {path}")
     with path.open("rb") as stream:
         body = stream.read()
+    metrics.add("file_reads")
+    metrics.add("file_read_bytes", len(body))
     if len(body) > limit:
         raise CatalogueError("file grew beyond limit")
     return body
@@ -122,12 +134,14 @@ def atomic_bytes(path: Path, body: bytes) -> None:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
+            metrics.add("fsync_calls")
         os.replace(name, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
+            metrics.add("fsync_calls")
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -210,6 +224,7 @@ class Store:
 
     def check_storage(self, additional: int = 0) -> dict[str, int]:
         usage = self.usage()
+        metrics.peak("reserved", additional)
         if usage["retained_bytes"] + additional > self.limits.max_root_bytes:
             raise BudgetExceeded("operator root storage exhausted")
         if usage["temporary_bytes"] + additional > self.limits.max_temp_bytes:
@@ -238,7 +253,11 @@ class Store:
         with self._lock:
             previous = self._sizes.get(str(path), 0)
         self.check_storage(max(0, len(body) - previous))
-        atomic_bytes(path, body)
+        if relative.startswith("raw/"):
+            with metrics.phase("raw_write"):
+                atomic_bytes(path, body)
+        else:
+            atomic_bytes(path, body)
         with self._lock:
             self._record(path, len(body))
 
@@ -253,12 +272,14 @@ class Store:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
+            metrics.add("fsync_calls")
         if created:
             directory = os.open(path.parent, os.O_RDONLY)
             try:
                 os.fsync(directory)
             finally:
                 os.close(directory)
+            metrics.add("fsync_calls")
         with self._lock:
             self._record(path, previous + len(body))
 
@@ -316,6 +337,8 @@ class Store:
             self._usage["temporary_bytes"] += delta
         if path.name.endswith((".duckdb", ".wal")):
             self._usage["database_bytes"] += delta
+        metrics.peak("retained", self._usage["retained_bytes"])
+        metrics.peak("temporary", self._usage["temporary_bytes"])
 
 
 @contextmanager

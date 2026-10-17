@@ -9,9 +9,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from datetime import datetime, timedelta
 from typing import Any
 
+from kalshi_events import metrics
 from kalshi_events.common import (
     Budget,
     BudgetExceeded,
@@ -322,6 +324,11 @@ def _settle(store: Store, state: dict[str, Any], seen: dict[int, set[str]]) -> N
 
 
 def _hydrate(store: Store, state: dict[str, Any]) -> bool:
+    with metrics.phase("hydration"):
+        return _hydrate_pages(store, state)
+
+
+def _hydrate_pages(store: Store, state: dict[str, Any]) -> bool:
     events = {}
     series = set()
     markets = {}
@@ -432,7 +439,15 @@ def _run(
                         continue
                     endpoint, params, _, _ = _plan(work, _phase(work))
                     busy.add(index)
-                    running[pool.submit(client.get, endpoint, params, context=context)] = index
+                    running[
+                        pool.submit(
+                            copy_context().run,
+                            client.get,
+                            endpoint,
+                            params,
+                            context=context,
+                        )
+                    ] = index
                     index += 1
             except (CatalogueError, OSError) as exc:
                 failure = exc

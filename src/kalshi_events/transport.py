@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from kalshi_events import metrics
 from kalshi_events.common import (
     Budget,
     BudgetExceeded,
@@ -60,8 +61,12 @@ def read_page(store: Store, relative: str, limit: int | None = None) -> tuple[di
         raise CatalogueError("unsupported raw evidence manifest")
     body_path = store.path(str(Path(relative).parent / "body.bin"))
     body = regular_bytes(body_path, limit)
+    metrics.add("raw_body_reads")
+    metrics.add("raw_body_read_bytes", len(body))
     if len(body) != manifest.get("size") or digest(body) != manifest.get("sha256"):
         raise CatalogueError("raw response evidence integrity mismatch")
+    if manifest["status"] == 200:
+        metrics.add("raw_body_json_decodes")
     return manifest, decode(body) if manifest["status"] == 200 else None
 
 
@@ -82,7 +87,8 @@ class RateLimiter:
         if wait > 0:
             if wait >= budget.remaining:
                 raise BudgetExceeded("deadline cannot accommodate request spacing")
-            time.sleep(wait)
+            with metrics.phase("rate_wait"):
+                time.sleep(wait)
 
     def defer(self, seconds: float) -> None:
         """Hold every traversal back, for example after a Retry-After from the source."""
@@ -177,12 +183,16 @@ class PublicClient:
             committed: dict[str, Any] | None = None
             try:
                 self.store.write(relative, reservation)
-                with self.client.stream(
-                    "GET",
-                    self.base_url + endpoint,
-                    params=params,
-                    timeout=min(30, self.budget.remaining),
-                ) as response:
+                metrics.add("requests")
+                with (
+                    metrics.phase("request"),
+                    self.client.stream(
+                        "GET",
+                        self.base_url + endpoint,
+                        params=params,
+                        timeout=min(30, self.budget.remaining),
+                    ) as response,
+                ):
                     status = response.status_code
                     retry_after = response.headers.get("retry-after")
                     if response.headers.get("content-encoding", "identity") not in {
@@ -197,12 +207,14 @@ class PublicClient:
                         _ = self.budget.remaining
                         streamed += len(chunk)
                         downloaded = self.budget.add_download(len(chunk))
+                        metrics.add("encoded_bytes", len(chunk))
                         if downloaded > self.budget.limits.max_download_bytes:
                             raise BudgetExceeded("download allowance exhausted")
                         if len(body) + len(chunk) > allowance:
                             raise self._ceiling_error(allowance)
                         body.extend(chunk)
                 payload = bytes(body)
+                metrics.add("decoded_bytes", len(payload))
                 self.store.write_bytes(f"raw/{attempt_id}/body.bin", payload)
                 receipt = {
                     **reservation,
@@ -295,7 +307,8 @@ class PublicClient:
         if delay >= self.budget.remaining:
             raise BudgetExceeded("deadline cannot accommodate retry")
         self.limiter.defer(delay)
-        time.sleep(delay)
+        with metrics.phase("retry_wait"):
+            time.sleep(delay)
 
 
 def accounting(store: Store) -> dict[str, Any]:

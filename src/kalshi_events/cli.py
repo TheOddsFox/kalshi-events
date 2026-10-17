@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from kalshi_events import capture as acquisition
-from kalshi_events import metadata, publish, recovery, warehouse
+from kalshi_events import metadata, metrics, publish, recovery, warehouse
 from kalshi_events.common import (
     MAX_BUNDLE_BYTES,
     BudgetExceeded,
@@ -23,6 +23,7 @@ from kalshi_events.common import (
     Limits,
     Store,
     json_bytes,
+    safe_path,
 )
 from kalshi_events.transport import accounting
 
@@ -34,6 +35,9 @@ def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(prog="kalshi-events")
     cli.add_argument(
         "--root", type=Path, default=None, help="persistent producer-owned operator root"
+    )
+    cli.add_argument(
+        "--metrics-file", type=Path, help="write opt-in phase metrics outside command JSON"
     )
     commands = cli.add_subparsers(dest="command", required=True)
     for name in (
@@ -110,7 +114,10 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
         return _status(store)
     with store.lock():
         if args.command == "capture":
-            state = acquisition.capture(store, selected=args.market_ticker, resume=args.capture_id)
+            with metrics.phase("capture"):
+                state = acquisition.capture(
+                    store, selected=args.market_ticker, resume=args.capture_id
+                )
             return {
                 key: state[key]
                 for key in (
@@ -183,7 +190,31 @@ def _status(store: Store) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        result = execute(args)
+        if args.metrics_file is None:
+            result = execute(args)
+        else:
+            root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
+            metrics_path = safe_path(args.metrics_file)
+            if metrics_path.is_relative_to(root):
+                raise CatalogueError("metrics report must be outside the operator root")
+            if metrics_path.exists():
+                raise CatalogueError("metrics report path already exists")
+            report_stream = metrics.reserve_report(metrics_path)
+            operation_error: BaseException | None = None
+            with metrics.collect() as measured:
+                try:
+                    result = execute(args)
+                except BaseException as exc:
+                    operation_error = exc
+                    raise
+                finally:
+                    try:
+                        metrics.write_report(metrics_path, measured, report_stream)
+                    except OSError:
+                        if operation_error is None:
+                            raise
+                    finally:
+                        report_stream.close()
     except BudgetExceeded as exc:
         print(json_bytes({"complete": False, "error": str(exc)}).decode().strip())
         return EXIT_INCOMPLETE

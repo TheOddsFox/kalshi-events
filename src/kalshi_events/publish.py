@@ -17,6 +17,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from kalshi_events import metrics
 from kalshi_events.capture import (
     capture_pages,
     complete_capture,
@@ -52,6 +53,11 @@ def inventory(directory: Path, names: set[str], limit: int) -> dict[str, dict[st
 
 
 def verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any]:
+    with metrics.phase("verification"):
+        return _verify_release(directory, limit)
+
+
+def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any]:
     directory = safe_path(directory)
     manifest = decode(regular_bytes(directory / "manifest.json", 1024**2))
     if (
@@ -92,6 +98,7 @@ def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
         with (
             duckdb.connect(str(warehouse), read_only=True) as connection,
             interrupt_at_deadline(store, connection.interrupt),
+            metrics.phase("export"),
         ):
             for name, table in RELATIONS.items():
                 store.check_deadline()
@@ -145,18 +152,20 @@ def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
         store.sync(temporary_relative)
         store.sync(f"releases/{release_id}")
         store.check_deadline()
-        store.write(
-            "current.json",
-            {
-                "source_release_id": release_id,
-                "manifest_sha256": digest(regular_bytes(destination / "manifest.json")),
-            },
-        )
+        with metrics.phase("promotion"):
+            store.write(
+                "current.json",
+                {
+                    "source_release_id": release_id,
+                    "manifest_sha256": digest(regular_bytes(destination / "manifest.json")),
+                },
+            )
         # Pruning runs only after the promoted pointer re-verifies end to end.
         promoted = current(store)
         if promoted["capture_id"] != capture_id:
             raise CatalogueError("promoted release does not belong to the published capture")
-        pruned = prune_superseded(store, state, release_id)
+        with metrics.phase("pruning"):
+            pruned = prune_superseded(store, state, release_id)
         return {"output": str(destination), **manifest, "pruned_captures": pruned}
     finally:
         if temporary.exists():

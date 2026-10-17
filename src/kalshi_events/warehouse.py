@@ -20,6 +20,7 @@ from typing import Any
 import dlt
 import duckdb
 
+from kalshi_events import metrics
 from kalshi_events.capture import capture_pages, complete_capture, page_receipts
 from kalshi_events.common import (
     BudgetExceeded,
@@ -86,6 +87,11 @@ def _as_budget(exc: BaseException) -> BudgetExceeded | None:
 
 def _land(store: Store, state: dict[str, Any], directory: Path) -> int:
     """Land one capture into a fresh warehouse under `directory`. Returns observation count."""
+    with metrics.phase("landing"):
+        return _land_rows(store, state, directory)
+
+
+def _land_rows(store: Store, state: dict[str, Any], directory: Path) -> int:
     capture_id = state["capture_id"]
     observation_count = 0
     store.check_storage()
@@ -213,24 +219,25 @@ def dbt(
             key: value for key, value in os.environ.items() if not key.startswith(("DBT_", "DLT_"))
         }
         environment["DBT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
-        result = subprocess.run(
-            [
-                executable,
-                *args,
-                "--project-dir",
-                str(project),
-                "--profiles-dir",
-                str(runtime),
-                "--target-path",
-                str(runtime / "target"),
-                "--log-path",
-                str(runtime / "logs"),
-            ],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=min(timeout or store.limits.max_duration_seconds, store.remaining),
-        )
+        with metrics.phase("dbt"):
+            result = subprocess.run(
+                [
+                    executable,
+                    *args,
+                    "--project-dir",
+                    str(project),
+                    "--profiles-dir",
+                    str(runtime),
+                    "--target-path",
+                    str(runtime / "target"),
+                    "--log-path",
+                    str(runtime / "logs"),
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=min(timeout or store.limits.max_duration_seconds, store.remaining),
+            )
         if result.returncode:
             raise CatalogueError(
                 "dbt certification failed:\n" + result.stdout[-8000:] + result.stderr[-2000:]
