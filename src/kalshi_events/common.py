@@ -107,7 +107,7 @@ def regular_bytes(path: Path, limit: int = MAX_BUNDLE_BYTES) -> bytes:
     if not path.is_file() or path.stat().st_size > limit:
         raise CatalogueError(f"missing, nonregular or oversized file: {path}")
     with path.open("rb") as stream:
-        body = stream.read(limit + 1)
+        body = stream.read()
     if len(body) > limit:
         raise CatalogueError("file grew beyond limit")
     return body

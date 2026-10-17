@@ -13,8 +13,15 @@ from kalshi_events.common import (
     Limits,
     Store,
     atomic_json,
+    regular_bytes,
 )
 from kalshi_events.transport import PublicClient, read_page, source_url
+
+
+def test_regular_bytes_does_not_allocate_the_ceiling(tmp_path):
+    path = tmp_path / "page.json"
+    path.write_bytes(b"{}")
+    assert regular_bytes(path, 64 * 1024**3) == b"{}"
 
 
 def test_small_download_allowance_covers_several_responses_and_stops_at_zero(store, monkeypatch):
