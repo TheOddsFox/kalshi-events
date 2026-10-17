@@ -65,6 +65,22 @@ def catalogue_capture(store: Store, capture_id: str) -> dict[str, Any]:
     return state
 
 
+def _checkpoint_inventory(store: Store, state: dict[str, Any]) -> dict[str, str]:
+    base = f"captures/{state['capture_id']}"
+    result = {}
+    for filename, attribute in (
+        ("state.json", "verified_snapshot_sha256"),
+        ("pages.jsonl", "verified_journal_sha256"),
+    ):
+        store.check_deadline()
+        relative = f"{base}/{filename}"
+        checksum = file_digest(store.path(relative), store.limits.max_root_bytes)[0]
+        if state.get("journal_version") == 2 and checksum != getattr(state, attribute, None):
+            raise CatalogueError("capture checkpoint changed after journal verification")
+        result[relative] = checksum
+    return result
+
+
 def evidence_inventory(
     store: Store, capture_id: str, *, verified_pages: dict[str, str] | None = None
 ) -> dict[str, str]:
@@ -73,11 +89,7 @@ def evidence_inventory(
         if verified_pages is None
         else _complete_capture(store, capture_id)
     )
-    base = f"captures/{capture_id}"
-    result = {
-        f"{base}/state.json": digest(regular_bytes(store.path(f"{base}/state.json"))),
-        f"{base}/pages.jsonl": digest(regular_bytes(store.path(f"{base}/pages.jsonl"))),
-    }
+    result = _checkpoint_inventory(store, state)
     if verified_pages is not None:
         expected = set()
         for row in page_receipts(store, state):
@@ -368,10 +380,7 @@ def certified(
     expected_files = receipt.get("evidence")
     if not isinstance(expected_files, dict) or set(expected_files) != required:
         raise CatalogueError("build evidence inventory does not match the capture journal")
-    actual_files: dict[str, str] = {}
-    for relative in (f"{base}/state.json", f"{base}/pages.jsonl"):
-        store.check_deadline()
-        actual_files[relative] = file_digest(store.path(relative), store.limits.max_root_bytes)[0]
+    actual_files = _checkpoint_inventory(store, state)
     for row in rows:
         store.check_deadline()
         relative = row["relative"]

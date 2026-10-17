@@ -6,11 +6,15 @@ checkpoint writes; worker threads only perform HTTP through the shared client.
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import os
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from datetime import datetime, timedelta
+from itertools import chain
 from typing import Any
 
 from kalshi_events import metrics
@@ -34,6 +38,35 @@ EVENT_PAGE_LIMIT = 200
 MARKET_PAGE_LIMIT = 1000
 CUTOFF_ENDPOINT = "/historical/cutoff"
 HISTORICAL_PREFIX = "/historical/markets"
+JOURNAL_VERSION = 2
+MAX_JOURNAL_RECORD_BYTES = 16 * 1024**2
+_GENESIS = "0" * 64
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+class _CaptureState(dict[str, Any]):
+    """Logical capture state with non-serialized, operation-local recovery metadata."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.journal_head: dict[str, Any] | None = None
+        self.seen_cursors: dict[int, set[str]] = {}
+        self.page_rows: list[dict[str, Any]] = []
+        self.processed: set[str] = set()
+        self.request_ids: set[str] = set()
+        self.journal_uncertain = False
+        self.snapshot_seq: int | None = None
+        self.journal_anchor_state_sha256: str | None = None
+        self.recent_page: tuple[str, dict[str, Any], Any] | None = None
+        self.verified_journal_sha256: str | None = None
+        self.verified_snapshot_sha256: str | None = None
 
 
 def task(
@@ -64,14 +97,45 @@ def _historical(endpoint: str) -> bool:
     return endpoint.startswith(HISTORICAL_PREFIX)
 
 
-def read_capture(store: Store, capture_id: str) -> dict[str, Any]:
+def read_capture(
+    store: Store,
+    capture_id: str,
+    *,
+    _writer_resume: bool = False,
+    _parent_index: ParentIndex | None = None,
+) -> dict[str, Any]:
     if (
         not isinstance(capture_id, str)
         or len(capture_id) != 32
         or any(c not in "0123456789abcdef" for c in capture_id)
     ):
         raise CatalogueError("invalid capture identity")
-    state = decode(regular_bytes(store.path(f"captures/{capture_id}/state.json")))
+    state_path = store.path(f"captures/{capture_id}/state.json")
+    if not state_path.exists():
+        # A durable genesis record is authoritative if the process died before its first snapshot.
+        if _parent_index is not None and not _writer_resume:
+            raise CatalogueError("operation-local parent index requires writer resume")
+        return _read_v2(
+            store,
+            capture_id,
+            missing_snapshot=True,
+            repair_tail=_writer_resume,
+            parent_index=_parent_index,
+        )
+    snapshot_bytes = regular_bytes(state_path, store.limits.max_root_bytes)
+    state = decode(snapshot_bytes)
+    if isinstance(state, dict) and state.get("version") == JOURNAL_VERSION:
+        if _parent_index is not None and not _writer_resume:
+            raise CatalogueError("operation-local parent index requires writer resume")
+        recovered = _read_v2(
+            store,
+            capture_id,
+            envelope=state,
+            repair_tail=_writer_resume,
+            parent_index=_parent_index,
+        )
+        recovered.verified_snapshot_sha256 = digest(snapshot_bytes)
+        return recovered
     if state.get("capture_id") != capture_id or state.get("version") != 1:
         raise CatalogueError("invalid capture state")
     if "max_response_bytes" not in state:
@@ -94,6 +158,9 @@ def read_capture(store: Store, capture_id: str) -> dict[str, Any]:
 
 def save(store: Store, state: dict[str, Any]) -> None:
     """Rewrite the small checkpoint only; page receipts live in the append-only journal."""
+    if state.get("journal_version") == JOURNAL_VERSION:
+        _save_v2(store, state)
+        return
     store.write(f"captures/{state['capture_id']}/state.json", state)
 
 
@@ -102,6 +169,10 @@ def _journal(state: dict[str, Any]) -> str:
 
 
 def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
+    if state.get("journal_version") == JOURNAL_VERSION:
+        if isinstance(state, _CaptureState):
+            return [dict(row) for row in state.page_rows]
+        return _read_v2(store, state["capture_id"]).page_rows
     path = store.path(_journal(state))
     if not path.exists():
         return []
@@ -118,6 +189,825 @@ def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
             raise CatalogueError("invalid page journal")
         rows.append(row)
     return rows
+
+
+def _seen_value(seen: dict[int, set[str]]) -> dict[str, list[str]]:
+    return {str(index): sorted(values) for index, values in sorted(seen.items())}
+
+
+def _seen_parse(value: Any) -> dict[int, set[str]]:
+    if not isinstance(value, dict):
+        raise CatalogueError("invalid journal cursor checkpoint")
+    result: dict[int, set[str]] = {}
+    for key, rows in value.items():
+        if not isinstance(key, str) or not key.isdigit() or not isinstance(rows, list):
+            raise CatalogueError("invalid journal cursor checkpoint")
+        index = int(key)
+        if any(not isinstance(row, str) for row in rows) or len(rows) != len(set(rows)):
+            raise CatalogueError("invalid journal cursor checkpoint")
+        result[index] = set(rows)
+    return result
+
+
+def _state_digest(state: dict[str, Any], seen: dict[int, set[str]]) -> str:
+    return digest(json_bytes({"state": dict(state), "seen_cursors": _seen_value(seen)}))
+
+
+def _journal_checksum(record: dict[str, Any]) -> str:
+    return digest(json_bytes({key: value for key, value in record.items() if key != "sha256"}))
+
+
+def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != 1
+        or state.get("journal_version") != JOURNAL_VERSION
+        or state.get("capture_id") != capture_id
+        or not isinstance(state.get("tasks"), list)
+        or not isinstance(state.get("coverage"), dict)
+    ):
+        raise CatalogueError("invalid journal capture state")
+    endpoints: set[str] = set()
+    for work in state["tasks"]:
+        if not isinstance(work, dict) or set(work) != {
+            "endpoint",
+            "kind",
+            "singular",
+            "params",
+            "requested",
+            "cursor",
+            "restarts",
+            "done",
+            "pending",
+            "cutoff_due",
+        }:
+            raise CatalogueError("invalid journal traversal state")
+        if (
+            not isinstance(work.get("endpoint"), str)
+            or not work["endpoint"].startswith("/")
+            or work["endpoint"] in endpoints
+            or work.get("kind") not in {"events", "series", "markets", None}
+            or not isinstance(work.get("singular"), bool)
+            or not isinstance(work.get("params"), dict)
+            or (work.get("requested") is not None and not isinstance(work["requested"], str))
+            or not isinstance(work.get("cursor"), str)
+            or len(work["cursor"]) > 8192
+            or isinstance(work.get("restarts"), bool)
+            or not isinstance(work.get("restarts"), int)
+            or work["restarts"] < 0
+            or not isinstance(work.get("done"), bool)
+            or work.get("pending") is not None
+            or not isinstance(work.get("cutoff_due"), bool)
+        ):
+            raise CatalogueError("invalid journal traversal state")
+        endpoints.add(work["endpoint"])
+    # Reuse legacy sealed-limit validation without serializing runtime metadata.
+    if "max_response_bytes" not in state:
+        raise CatalogueError("invalid sealed response ceiling")
+    ceiling = state["max_response_bytes"]
+    decoded_ceiling = state.get("max_decoded_response_bytes", ceiling)
+    if (
+        isinstance(ceiling, bool)
+        or not isinstance(ceiling, int)
+        or ceiling <= 0
+        or isinstance(decoded_ceiling, bool)
+        or not isinstance(decoded_ceiling, int)
+        or decoded_ceiling <= 0
+        or state.get("compression", "identity") not in {"identity", "gzip"}
+    ):
+        raise CatalogueError("invalid sealed response settings")
+    return state
+
+
+def _validate_control_transition(
+    genesis: dict[str, Any],
+    candidate: dict[str, Any],
+    kind: str,
+    known_tasks: dict[str, dict[str, Any]],
+) -> None:
+    immutable = (
+        "capture_id",
+        "selected",
+        "started_at",
+        "max_response_bytes",
+        "max_decoded_response_bytes",
+        "compression",
+        "journal_version",
+    )
+    if any(candidate.get(key) != genesis.get(key) for key in immutable):
+        raise CatalogueError("journal control altered sealed capture settings")
+    task_map = {work.get("endpoint"): work for work in candidate["tasks"] if isinstance(work, dict)}
+    if len(task_map) != len(candidate["tasks"]) or not set(known_tasks).issubset(task_map):
+        raise CatalogueError("journal control removed or duplicated a traversal")
+    for endpoint, old in known_tasks.items():
+        new = task_map[endpoint]
+        for key in ("endpoint", "kind", "singular", "params", "requested"):
+            if new.get(key) != old.get(key):
+                raise CatalogueError("journal control altered traversal identity")
+    if kind == "hydrate":
+        if candidate.get("complete") is not False:
+            raise CatalogueError("hydration control cannot complete a capture")
+        for endpoint, work in task_map.items():
+            known_tasks.setdefault(endpoint, copy.deepcopy(work))
+        return
+    if kind == "complete":
+        if candidate.get("complete") is not True or not isinstance(
+            candidate.get("completed_at"), str
+        ):
+            raise CatalogueError("invalid completion control")
+        if any(
+            not work.get("done") or work.get("pending") is not None for work in candidate["tasks"]
+        ):
+            raise CatalogueError("completion control has unfinished traversals")
+        return
+    if kind == "stop":
+        if candidate.get("complete") is not False or not isinstance(candidate.get("error"), str):
+            raise CatalogueError("invalid stop control")
+        return
+    if kind == "clear_error":
+        if candidate.get("complete") is not False or candidate.get("error") is not None:
+            raise CatalogueError("invalid error-clear control")
+        return
+    raise CatalogueError("unknown journal control transition")
+
+
+def _apply_control_record(
+    state: dict[str, Any],
+    seen: dict[int, set[str]],
+    genesis: dict[str, Any],
+    payload: dict[str, Any],
+    known_tasks: dict[str, dict[str, Any]],
+    *,
+    replay: bool,
+) -> None:
+    kind = payload.get("kind")
+    if kind == "hydrate":
+        if set(payload) != {"kind", "tasks", "coverage", "state_sha256"}:
+            raise CatalogueError("invalid hydration control fields")
+        additions = payload["tasks"]
+        coverage = payload["coverage"]
+        if (
+            not isinstance(additions, list)
+            or len(additions) > 128
+            or not isinstance(coverage, dict)
+            or len(coverage) > 128
+        ):
+            raise CatalogueError("hydration control exceeds its bounded delta")
+        endpoints: set[str] = set()
+        for work in additions:
+            if (
+                not isinstance(work, dict)
+                or set(work)
+                != {
+                    "endpoint",
+                    "kind",
+                    "singular",
+                    "params",
+                    "requested",
+                    "cursor",
+                    "restarts",
+                    "done",
+                    "pending",
+                    "cutoff_due",
+                }
+                or not isinstance(work.get("endpoint"), str)
+                or not isinstance(work.get("params"), dict)
+                or not isinstance(work.get("singular"), bool)
+                or work.get("cursor") != ""
+                or work.get("restarts") != 0
+                or work.get("done") is not False
+                or work.get("pending") is not None
+            ):
+                raise CatalogueError("invalid hydration task")
+            endpoint = work["endpoint"]
+            expected_prefix = "/events/" if work.get("kind") == "events" else "/series/"
+            if (
+                work.get("kind") not in {"events", "series"}
+                or not endpoint.startswith(expected_prefix)
+                or not work["singular"]
+                or work["params"] != {}
+                or work["requested"] is not None
+                or not isinstance(work.get("cutoff_due"), bool)
+                or work["cutoff_due"]
+            ):
+                raise CatalogueError("invalid hydration task state")
+            ticker(endpoint[len(expected_prefix) :])
+            if endpoint in known_tasks or endpoint in endpoints:
+                raise CatalogueError("hydration control duplicates a traversal")
+            endpoints.add(endpoint)
+        if not _is_sha256(payload.get("state_sha256")):
+            raise CatalogueError("invalid hydration state checksum")
+        for key, item in coverage.items():
+            if (
+                not isinstance(key, str)
+                or not isinstance(item, dict)
+                or item.get("market_ticker") != key
+                or item.get("status") not in {"found", "absent", "unresolved"}
+            ):
+                raise CatalogueError("invalid hydration coverage entry")
+        if replay:
+            candidate = copy.deepcopy(state)
+            candidate["tasks"].extend(copy.deepcopy(additions))
+            candidate["coverage"].update(copy.deepcopy(coverage))
+            _validate_control_transition(genesis, candidate, kind, known_tasks)
+            if payload.get("state_sha256") != _state_digest(candidate, seen):
+                raise CatalogueError("hydration control state checksum mismatch")
+            state.clear()
+            state.update(candidate)
+        else:
+            for work in additions:
+                known_tasks[work["endpoint"]] = copy.deepcopy(work)
+        return
+    if kind == "complete":
+        if set(payload) != {"kind", "completed_at", "state_sha256"}:
+            raise CatalogueError("invalid completion control fields")
+        if not isinstance(payload.get("completed_at"), str):
+            raise CatalogueError("invalid completion timestamp")
+        if not _is_sha256(payload.get("state_sha256")):
+            raise CatalogueError("invalid completion state checksum")
+        if replay:
+            candidate = copy.deepcopy(state)
+            candidate.update(complete=True, completed_at=payload["completed_at"], error=None)
+            _validate_control_transition(genesis, candidate, kind, known_tasks)
+            if payload.get("state_sha256") != _state_digest(candidate, seen):
+                raise CatalogueError("completion control state checksum mismatch")
+            state.clear()
+            state.update(candidate)
+        elif not isinstance(payload.get("state_sha256"), str):
+            raise CatalogueError("invalid completion state checksum")
+        return
+    if kind in {"stop", "clear_error"}:
+        expected = (
+            {"kind", "reason", "state_sha256"} if kind == "stop" else {"kind", "state_sha256"}
+        )
+        if set(payload) != expected:
+            raise CatalogueError("invalid stop control fields")
+        if kind == "stop" and (
+            not isinstance(payload.get("reason"), str) or len(payload["reason"]) > 4096
+        ):
+            raise CatalogueError("invalid stop reason")
+        if replay:
+            candidate = copy.deepcopy(state)
+            candidate["error"] = payload["reason"] if kind == "stop" else None
+            _validate_control_transition(genesis, candidate, kind, known_tasks)
+            if payload.get("state_sha256") != _state_digest(candidate, seen):
+                raise CatalogueError("stop control state checksum mismatch")
+            state.clear()
+            state.update(candidate)
+        elif not _is_sha256(payload.get("state_sha256")):
+            raise CatalogueError("invalid stop control checksum")
+        return
+    raise CatalogueError("unknown journal control transition")
+
+
+def _journal_records(
+    store: Store, capture_id: str, *, repair_tail: bool = False
+) -> tuple[Iterator[tuple[dict[str, Any], int]], dict[str, Any]]:
+    if repair_tail and not store.writer_locked_by_current_thread:
+        raise CatalogueError("journal repair requires the canonical writer lock")
+    path = store.path(f"captures/{capture_id}/pages.jsonl")
+    if not path.exists():
+        return iter(()), {"valid_end": 0, "torn": False}
+    if path.is_symlink() or not path.is_file():
+        raise CatalogueError("journal is not a regular file")
+    total = path.stat().st_size
+    if total > store.limits.max_root_bytes:
+        raise CatalogueError("journal exceeds operator root limit")
+    scan: dict[str, Any] = {"valid_end": 0, "torn": False, "sha256": None}
+
+    def iterate() -> Iterator[tuple[dict[str, Any], int]]:
+        valid_end = 0
+        expected_seq = 1
+        previous = _GENESIS
+        committed_hash = hashlib.sha256()
+        with path.open("rb") as stream:
+            while True:
+                store.check_deadline()
+                start = valid_end
+                raw = stream.readline(MAX_JOURNAL_RECORD_BYTES + 1)
+                if not raw:
+                    break
+                store.check_deadline()
+                if start + len(raw) > store.limits.max_root_bytes:
+                    raise CatalogueError("journal grew beyond operator root limit")
+                if len(raw) > MAX_JOURNAL_RECORD_BYTES:
+                    raise CatalogueError("journal record exceeds the record limit")
+                if not raw.endswith(b"\n"):
+                    scan["torn"] = True
+                    break
+                record = decode(raw)
+                if not isinstance(record, dict):
+                    raise CatalogueError("invalid journal record")
+                if json_bytes(record) != raw:
+                    raise CatalogueError("journal record is not canonical JSON")
+                checksum = record.get("sha256")
+                seq = record.get("seq")
+                if (
+                    record.get("version") != JOURNAL_VERSION
+                    or set(record)
+                    != {"version", "capture_id", "seq", "prev", "op", "payload", "sha256"}
+                    or record.get("capture_id") != capture_id
+                    or isinstance(seq, bool)
+                    or not isinstance(seq, int)
+                    or seq != expected_seq
+                    or record.get("prev") != previous
+                    or not _is_sha256(checksum)
+                    or checksum != _journal_checksum(record)
+                    or record.get("op") not in {"start", "page", "control", "checkpoint"}
+                    or not isinstance(record.get("payload"), dict)
+                ):
+                    raise CatalogueError("journal sequence, identity or checksum is invalid")
+                previous = checksum
+                expected_seq += 1
+                valid_end = start + len(raw)
+                with metrics.phase("journal_hashing"):
+                    committed_hash.update(raw)
+                metrics.add("hash_bytes", len(raw))
+                scan["sha256"] = committed_hash.hexdigest()
+                scan["valid_end"] = valid_end
+                yield record, valid_end
+        if scan["torn"] and repair_tail:
+            with path.open("r+b") as stream:
+                stream.truncate(valid_end)
+                stream.flush()
+                os.fsync(stream.fileno())
+            metrics.add("fsync_calls")
+            store.sync(f"captures/{capture_id}/pages.jsonl")
+
+    return iterate(), scan
+
+
+def _read_v2(
+    store: Store,
+    capture_id: str,
+    *,
+    envelope: dict[str, Any] | None = None,
+    missing_snapshot: bool = False,
+    repair_tail: bool = False,
+    parent_index: ParentIndex | None = None,
+) -> _CaptureState:
+    records, scan = _journal_records(store, capture_id, repair_tail=repair_tail)
+    first_item = next(records, None)
+    if first_item is None or first_item[0].get("op") != "start":
+        raise CatalogueError("version 2 capture has no durable journal genesis")
+    first, first_end = first_item
+    start_payload = first["payload"]
+    if set(start_payload) != {"state", "seen_cursors", "state_sha256"}:
+        raise CatalogueError("invalid journal genesis fields")
+    base = _validate_logical_state(start_payload.get("state"), capture_id)
+    initial_seen = _seen_parse(start_payload.get("seen_cursors"))
+    initial_digest = _state_digest(base, initial_seen)
+    if start_payload.get("state_sha256") != initial_digest:
+        raise CatalogueError("journal genesis state checksum mismatch")
+    state = _CaptureState(copy.deepcopy(base))
+    seen = copy.deepcopy(initial_seen)
+    page_rows: list[dict[str, Any]] = []
+    processed: set[str] = set()
+    transition_count = 0
+    seen_request_ids: set[str] = set()
+    seen_relatives: set[str] = set()
+    known_tasks = {work["endpoint"]: work for work in base["tasks"]}
+    complete_seen = False
+    anchor_key = (1, first_end, first["sha256"], 0)
+    if envelope is not None:
+        expected_fields = {
+            "version",
+            "capture_id",
+            "state",
+            "state_sha256",
+            "snapshot_sha256",
+            "_journal",
+            "seen_cursors",
+        }
+        if set(envelope) != expected_fields or envelope.get("capture_id") != capture_id:
+            raise CatalogueError("invalid version 2 capture snapshot")
+        snapshot_checksum = envelope.get("snapshot_sha256")
+        snapshot_base = {key: value for key, value in envelope.items() if key != "snapshot_sha256"}
+        if (
+            not _is_sha256(snapshot_checksum)
+            or digest(json_bytes(snapshot_base)) != snapshot_checksum
+        ):
+            raise CatalogueError("capture snapshot checksum mismatch")
+        snapshot_state = _validate_logical_state(envelope.get("state"), capture_id)
+        snapshot_seen = _seen_parse(envelope.get("seen_cursors"))
+        if envelope.get("state_sha256") != _state_digest(snapshot_state, snapshot_seen):
+            raise CatalogueError("capture snapshot state checksum mismatch")
+        for key in (
+            "max_response_bytes",
+            "max_decoded_response_bytes",
+            "compression",
+            "started_at",
+            "selected",
+        ):
+            if snapshot_state.get(key) != base.get(key):
+                raise CatalogueError("capture snapshot settings differ from journal genesis")
+        journal_anchor = envelope.get("_journal")
+        if not isinstance(journal_anchor, dict) or set(journal_anchor) != {
+            "seq",
+            "offset",
+            "sha256",
+            "transition_count",
+        }:
+            raise CatalogueError("invalid capture snapshot journal anchor")
+        anchor_key = (
+            journal_anchor.get("seq"),
+            journal_anchor.get("offset"),
+            journal_anchor.get("sha256"),
+            journal_anchor.get("transition_count"),
+        )
+        if (
+            isinstance(anchor_key[0], bool)
+            or not isinstance(anchor_key[0], int)
+            or isinstance(anchor_key[1], bool)
+            or not isinstance(anchor_key[1], int)
+            or anchor_key[1] <= 0
+            or not isinstance(anchor_key[2], str)
+            or not _is_sha256(anchor_key[2])
+            or isinstance(anchor_key[3], bool)
+            or not isinstance(anchor_key[3], int)
+            or anchor_key[3] < 0
+        ):
+            raise CatalogueError("invalid capture snapshot journal anchor")
+        if snapshot_state.get("journal_version") != JOURNAL_VERSION:
+            raise CatalogueError("invalid capture snapshot version")
+        state = _CaptureState(copy.deepcopy(snapshot_state))
+        seen = copy.deepcopy(snapshot_seen)
+    else:
+        envelope = None
+
+    matched_anchor = envelope is None
+    chain_seq = 0
+    chain_hash = _GENESIS
+    offset = 0
+    anchor_transition = 0
+    tail_record = first
+    for record, end_offset in chain((first_item,), records):
+        tail_record = record
+        chain_seq = record["seq"]
+        chain_hash = record["sha256"]
+        offset = end_offset
+        op = record["op"]
+        payload = record["payload"]
+        if op == "start":
+            if record["seq"] != 1:
+                raise CatalogueError("journal genesis is not the first record")
+        elif op == "checkpoint":
+            if set(payload) != {"transition_count", "state_sha256"}:
+                raise CatalogueError("invalid checkpoint fields")
+            count = payload.get("transition_count")
+            digest_value = payload.get("state_sha256")
+            check_state = envelope is None or record["seq"] >= anchor_key[0]
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count != transition_count
+                or not _is_sha256(digest_value)
+            ):
+                raise CatalogueError("journal checkpoint state does not match replay")
+            if check_state and digest_value != _state_digest(state, seen):
+                raise CatalogueError("journal checkpoint state does not match replay")
+        elif op == "page":
+            if complete_seen:
+                raise CatalogueError("journal contains a page after capture completion")
+            if set(payload) != {"index", "relative", "request_id"}:
+                raise CatalogueError("invalid journal page fields")
+            index = payload.get("index")
+            relative = payload.get("relative")
+            request_id = payload.get("request_id")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or not isinstance(relative, str)
+                or not relative.startswith("raw/")
+                or not _is_sha256(request_id)
+            ):
+                raise CatalogueError("invalid journal page reference")
+            store.path(relative)
+            if request_id in seen_request_ids or relative in seen_relatives:
+                raise CatalogueError("journal contains a duplicate page receipt")
+            seen_request_ids.add(request_id)
+            seen_relatives.add(relative)
+            row = {"index": index, "relative": relative}
+            page_rows.append(row)
+            if envelope is None or record["seq"] > anchor_key[0]:
+                manifest, page_payload = _replay_page(
+                    store, state, seen, index, relative, request_id
+                )
+                if parent_index is not None:
+                    parent_index.add_page(manifest, page_payload)
+                    parent_index.processed.add(relative)
+            processed.add(relative)
+            transition_count += 1
+        elif op == "control":
+            if complete_seen:
+                raise CatalogueError("journal contains a control after capture completion")
+            _apply_control_record(
+                state,
+                seen,
+                base,
+                payload,
+                known_tasks,
+                replay=envelope is None or record["seq"] > anchor_key[0],
+            )
+            transition_count += 1
+            if payload["kind"] == "complete":
+                complete_seen = True
+        elif op != "checkpoint":
+            raise CatalogueError("unknown journal operation")
+        if envelope is not None and (chain_seq, offset, chain_hash, transition_count) == anchor_key:
+            if op not in {"start", "checkpoint"}:
+                raise CatalogueError("snapshot anchor is not a start or checkpoint")
+            if _state_digest(state, seen) != envelope["state_sha256"]:
+                raise CatalogueError("snapshot differs from its journal anchor")
+            matched_anchor = True
+            anchor_transition = transition_count
+            # Snapshot state is trusted only after full chain validation below; suffix replay starts after it.
+        if envelope is not None and chain_seq < anchor_key[0]:
+            # Page rows are indexed from the full prefix; logical state is replaced by the snapshot at anchor.
+            continue
+    if envelope is not None and not matched_anchor:
+        raise CatalogueError("capture snapshot journal anchor is missing")
+    if envelope is not None and anchor_key[1] > scan["valid_end"]:
+        raise CatalogueError("capture snapshot points beyond the committed journal")
+    if envelope is not None and chain_seq < anchor_key[0]:
+        raise CatalogueError("capture snapshot is ahead of the durable journal")
+    if envelope is not None and anchor_transition != anchor_key[3]:
+        raise CatalogueError("capture snapshot transition count differs from anchor")
+    if scan.get("sha256") is not None:
+        metrics.add("hashes")
+    # When the snapshot anchored at a checkpoint, state/seen already represent that boundary.
+    # The loop above replayed suffix records only; ensure checkpoints in that suffix validate against them.
+    state = _CaptureState(state)
+    state.seen_cursors = seen
+    state.page_rows = page_rows
+    state.processed = processed
+    state.request_ids = seen_request_ids
+    state.journal_head = {
+        "seq": chain_seq,
+        "offset": offset,
+        "sha256": chain_hash,
+        "transition_count": transition_count,
+    }
+    state.journal_uncertain = False
+    state.snapshot_seq = anchor_key[0] if envelope is not None else None
+    state.journal_anchor_state_sha256 = None
+    state.verified_journal_sha256 = scan.get("sha256")
+    # The tail itself is a save point only when it is genesis or a checkpoint.
+    if chain_seq and tail_record["op"] in {"start", "checkpoint"}:
+        state.journal_anchor_state_sha256 = tail_record["payload"]["state_sha256"]
+    return state
+
+
+def _replay_page(
+    store: Store,
+    state: dict[str, Any],
+    seen: dict[int, set[str]],
+    index: int,
+    relative: str,
+    request_id: str,
+) -> tuple[dict[str, Any], Any]:
+    if state.get("complete"):
+        raise CatalogueError("journal contains a page after capture completion")
+    if not 0 <= index < len(state["tasks"]):
+        raise CatalogueError("journal page task index is invalid")
+    manifest, payload = read_page(
+        store,
+        relative,
+        state["max_response_bytes"],
+        state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+    )
+    if manifest.get("capture_id") != state["capture_id"]:
+        raise CatalogueError("raw evidence belongs to another capture")
+    if (
+        manifest.get("request_id") != request_id
+        or request_id != _request_context(state, index)["request_id"]
+    ):
+        raise CatalogueError("journal receipt does not match its traversal")
+    work = state["tasks"][index]
+    if _phase(work) == "cutoff":
+        if manifest.get("status") != 200:
+            raise CatalogueError("historical cutoff receipt is invalid")
+        _record_cutoff(state, payload)
+        work["cutoff_due"] = False
+    else:
+        _apply(state, index, manifest, payload, seen)
+    return manifest, payload
+
+
+def _save_v2(store: Store, state: dict[str, Any]) -> None:
+    if not isinstance(state, _CaptureState) or state.journal_head is None:
+        raise CatalogueError("version 2 capture has no applied journal head")
+    seen = state.seen_cursors
+    digest_value = _state_digest(state, seen)
+    head = state.journal_head
+    anchor_digest = state.journal_anchor_state_sha256
+    if anchor_digest != digest_value:
+        raise CatalogueError("refusing to save a snapshot ahead of its journal")
+    envelope = {
+        "version": JOURNAL_VERSION,
+        "capture_id": state["capture_id"],
+        "state": dict(state),
+        "state_sha256": digest_value,
+        "_journal": dict(head),
+        "seen_cursors": _seen_value(seen),
+    }
+    envelope["snapshot_sha256"] = digest(json_bytes(envelope))
+    store.write(f"captures/{state['capture_id']}/state.json", envelope)
+    state.snapshot_seq = head["seq"]
+    state.journal_anchor_state_sha256 = anchor_digest
+
+
+def _append_v2_record(store: Store, state: _CaptureState, op: str, payload: dict[str, Any]) -> None:
+    head = state.journal_head
+    seq = 1 if head is None else head["seq"] + 1
+    previous = _GENESIS if head is None else head["sha256"]
+    record = {
+        "version": JOURNAL_VERSION,
+        "capture_id": state["capture_id"],
+        "seq": seq,
+        "prev": previous,
+        "op": op,
+        "payload": payload,
+    }
+    record["sha256"] = _journal_checksum(record)
+    encoded = json_bytes(record)
+    if len(encoded) > MAX_JOURNAL_RECORD_BYTES:
+        raise CatalogueError("journal record exceeds the record limit")
+    try:
+        store.append(_journal(state), encoded)
+    except BaseException:
+        state.journal_uncertain = True
+        raise
+    offset = len(encoded) if head is None else head["offset"] + len(encoded)
+    if head is not None:
+        head.update(seq=seq, offset=offset, sha256=record["sha256"])
+    else:
+        state.journal_head = {
+            "seq": seq,
+            "offset": offset,
+            "sha256": record["sha256"],
+            "transition_count": 0,
+        }
+    if op in {"start", "checkpoint"}:
+        state.journal_anchor_state_sha256 = payload["state_sha256"]
+    else:
+        state.journal_anchor_state_sha256 = None
+    state.journal_uncertain = False
+
+
+def _initialize_v2(store: Store, raw_state: dict[str, Any]) -> _CaptureState:
+    state = _CaptureState(raw_state)
+    state.seen_cursors = {}
+    initial_digest = _state_digest(state, state.seen_cursors)
+    _append_v2_record(
+        store,
+        state,
+        "start",
+        {"state": dict(state), "seen_cursors": {}, "state_sha256": initial_digest},
+    )
+    # The initial genesis record is itself the sequence-zero-transition snapshot anchor.
+    _save_v2(store, state)
+    return state
+
+
+def _checkpoint_v2(store: Store, state: _CaptureState) -> None:
+    if state.journal_uncertain:
+        raise CatalogueError("cannot checkpoint an uncertain journal append")
+    count = state.journal_head["transition_count"]
+    state_hash = _state_digest(state, state.seen_cursors)
+    _append_v2_record(
+        store,
+        state,
+        "checkpoint",
+        {"transition_count": count, "state_sha256": state_hash},
+    )
+    state.journal_head["transition_count"] = count
+    _save_v2(store, state)
+
+
+def _after_transition(store: Store, state: _CaptureState) -> None:
+    state.journal_head["transition_count"] += 1
+    if state.journal_head["transition_count"] % 100 == 0:
+        _checkpoint_v2(store, state)
+
+
+def _commit_control(
+    store: Store, state: _CaptureState, kind: str, candidate: dict[str, Any]
+) -> None:
+    if kind == "hydrate":
+        known = {work["endpoint"]: work for work in state["tasks"]}
+        _validate_control_transition(state, candidate, kind, known)
+        current_endpoints = {work["endpoint"] for work in state["tasks"]}
+        additions = [
+            work for work in candidate["tasks"] if work["endpoint"] not in current_endpoints
+        ]
+        coverage = {
+            key: value
+            for key, value in candidate["coverage"].items()
+            if state["coverage"].get(key) != value
+        }
+        for start in range(0, max(len(additions), len(coverage)), 128):
+            tasks_part = additions[start : start + 128]
+            coverage_items = list(coverage.items())[start : start + 128]
+            _commit_control_delta(
+                store,
+                state,
+                {
+                    "kind": "hydrate",
+                    "tasks": tasks_part,
+                    "coverage": dict(coverage_items),
+                },
+            )
+        return
+    if kind == "complete":
+        _commit_control_delta(
+            store,
+            state,
+            {"kind": "complete", "completed_at": candidate["completed_at"]},
+        )
+        return
+    if kind == "stop":
+        _commit_control_delta(store, state, {"kind": "stop", "reason": candidate["error"]})
+        return
+    if kind == "clear_error":
+        _commit_control_delta(store, state, {"kind": "clear_error"})
+        return
+    raise CatalogueError("unsupported journal control")
+
+
+def _commit_control_delta(store: Store, state: _CaptureState, delta: dict[str, Any]) -> None:
+    if state.get("complete"):
+        raise CatalogueError("capture cannot transition after completion")
+    candidate = copy.deepcopy(dict(state))
+    kind = delta["kind"]
+    if kind == "hydrate":
+        candidate["tasks"].extend(copy.deepcopy(delta["tasks"]))
+        candidate["coverage"].update(copy.deepcopy(delta["coverage"]))
+    elif kind == "complete":
+        candidate.update(complete=True, completed_at=delta["completed_at"], error=None)
+    elif kind == "stop":
+        reason = delta.get("reason")
+        if not isinstance(reason, str) or not reason or len(reason) > 4096:
+            raise CatalogueError("invalid stop reason")
+        candidate["error"] = reason
+    elif kind == "clear_error":
+        if not candidate.get("error"):
+            raise CatalogueError("cannot clear a capture without a recorded error")
+        candidate["error"] = None
+    else:
+        raise CatalogueError("unsupported journal control")
+    known = {work["endpoint"]: work for work in state["tasks"]}
+    _validate_control_transition(state, candidate, kind, known)
+    payload = {
+        **delta,
+        "state_sha256": _state_digest(candidate, state.seen_cursors),
+    }
+    _append_v2_record(store, state, "control", payload)
+    state.clear()
+    state.update(candidate)
+    _after_transition(store, state)
+
+
+def _commit_page_v2(
+    store: Store,
+    state: _CaptureState,
+    index: int,
+    relative: str,
+    request_id: str,
+    identities: ParentIndex,
+) -> tuple[dict[str, Any], Any]:
+    if state.get("complete"):
+        raise CatalogueError("capture cannot accept pages after completion")
+    if relative in state.processed or request_id in state.request_ids:
+        raise CatalogueError("page receipt is already committed")
+    candidate = copy.deepcopy(dict(state))
+    candidate_seen = copy.deepcopy(state.seen_cursors)
+    manifest, payload = _replay_page(store, candidate, candidate_seen, index, relative, request_id)
+    # Validate native identities before making the receipt durable in the journal.
+    # A failed append aborts this operation, so its operation-local index is discarded.
+    identities.add_page(manifest, payload)
+    _append_v2_record(
+        store,
+        state,
+        "page",
+        {"index": index, "relative": relative, "request_id": request_id},
+    )
+    _install_page_state(state, candidate, candidate_seen)
+    state.page_rows.append({"index": index, "relative": relative})
+    state.processed.add(relative)
+    state.request_ids.add(request_id)
+    identities.processed.add(relative)
+    _after_transition(store, state)
+    return manifest, payload
+
+
+def _install_page_state(
+    state: _CaptureState, candidate: dict[str, Any], seen: dict[int, set[str]]
+) -> None:
+    """Apply a validated page candidate after its journal append is durable."""
+    state.clear()
+    state.update(candidate)
+    state.seen_cursors = seen
 
 
 def capture_pages(
@@ -169,6 +1059,7 @@ def new_capture(
         ]
     state = {
         "version": 1,
+        "journal_version": JOURNAL_VERSION,
         "capture_id": uuid.uuid4().hex,
         "selected": selected,
         "started_at": now(),
@@ -183,8 +1074,7 @@ def new_capture(
         "coverage": {},
         "error": None,
     }
-    save(store, state)
-    return state
+    return _initialize_v2(store, state)
 
 
 def _phase(work: dict[str, Any]) -> str:
@@ -304,8 +1194,17 @@ def _apply(
     work["cutoff_due"] = _historical(work["endpoint"]) and not work["done"]
 
 
-def _stage(store: Store, state: dict[str, Any], index: int, relative: str) -> None:
+def _stage(
+    store: Store, state: dict[str, Any], index: int, relative: str, identities: ParentIndex
+) -> None:
     """Commit a raw receipt to its traversal before it is applied: checkpoint, then journal."""
+    if state.get("journal_version") == JOURNAL_VERSION:
+        context = _request_context(state, index)
+        manifest, payload = _commit_page_v2(
+            store, state, index, relative, context["request_id"], identities
+        )
+        state.recent_page = (relative, manifest, payload)
+        return
     work = state["tasks"][index]
     if work["pending"] is not None:
         raise CatalogueError("traversal already has an unapplied page")
@@ -322,6 +1221,21 @@ def _consume(
     seen: dict[int, set[str]],
     identities: ParentIndex,
 ) -> None:
+    if state.get("journal_version") == JOURNAL_VERSION:
+        if relative not in state.processed:
+            context = _request_context(state, index)
+            manifest, payload = _commit_page_v2(
+                store, state, index, relative, context["request_id"], identities
+            )
+            state.recent_page = (relative, manifest, payload)
+        recent = state.recent_page
+        if recent is not None and recent[0] == relative:
+            _, manifest, payload = recent
+            if relative not in identities.processed:
+                identities.add_page(manifest, payload)
+                identities.processed.add(relative)
+            state.recent_page = None
+        return
     work = state["tasks"][index]
     manifest, payload = read_page(
         store,
@@ -351,6 +1265,8 @@ def _settle(
     identities: ParentIndex,
 ) -> None:
     """Apply pages whose raw receipts were committed before a previous process stopped."""
+    if state.get("journal_version") == JOURNAL_VERSION:
+        return
     logged = {row["relative"] for row in page_receipts(store, state)}
     index = 0
     while index < len(state["tasks"]):
@@ -365,6 +1281,12 @@ def _settle(
 
 def _hydrate(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
     with metrics.phase("hydration"):
+        if state.get("journal_version") == JOURNAL_VERSION:
+            candidate = copy.deepcopy(dict(state))
+            more = _hydrate_pages(store, candidate, identities)
+            if json_bytes(dict(candidate)) != json_bytes(dict(state)):
+                _commit_control(store, state, "hydrate", candidate)
+            return more
         return _hydrate_pages(store, state, identities)
 
 
@@ -384,7 +1306,8 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
             if path not in existing:
                 state["tasks"].append(task(path, kind, singular=True))
     if any(not work["done"] for work in state["tasks"]):
-        save(store, state)
+        if state.get("journal_version") != JOURNAL_VERSION:
+            save(store, state)
         return True
     if state["selected"] is not None:
         for selected in state["selected"]:
@@ -467,7 +1390,7 @@ def _run(
                     context = _request_context(state, index)
                     relative = recovered.pop(context["request_id"], None)
                     if relative is not None:
-                        _stage(store, state, index, relative)
+                        _stage(store, state, index, relative, identities)
                         _consume(store, state, index, relative, seen, identities)
                         continue
                     endpoint, params, _, _ = _plan(work, _phase(work))
@@ -489,8 +1412,14 @@ def _run(
                 raise failure
             if _hydrate(store, state, identities):
                 continue
-            state.update(complete=True, completed_at=now(), error=None)
-            save(store, state)
+            if state.get("journal_version") == JOURNAL_VERSION:
+                candidate = copy.deepcopy(dict(state))
+                candidate.update(complete=True, completed_at=now(), error=None)
+                _commit_control(store, state, "complete", candidate)
+                _checkpoint_v2(store, state)
+            else:
+                state.update(complete=True, completed_at=now(), error=None)
+                save(store, state)
             return
         finished, _ = wait(running, return_when=FIRST_COMPLETED)
         for future in finished:
@@ -501,15 +1430,19 @@ def _run(
             except (CatalogueError, OSError) as exc:
                 failure = failure or exc
                 continue
+            if isinstance(state, _CaptureState) and state.journal_uncertain:
+                # The durable journal may include a record this process did not apply. Leave
+                # completed receipts orphaned; the next locked resume reconciles them.
+                continue
             try:
-                _stage(store, state, index, relative)
+                _stage(store, state, index, relative, identities)
                 if failure is None:
                     _consume(store, state, index, relative, seen, identities)
             except (CatalogueError, OSError) as exc:
                 failure = failure or exc
 
 
-def capture(
+def _capture_locked(
     store: Store,
     *,
     selected: list[str] | None = None,
@@ -517,13 +1450,25 @@ def capture(
     client_factory: Any = None,
     compression: str | None = None,
 ) -> dict[str, Any]:
-    store.require_writable()
     factory = client_factory or PublicClient
+    identities = ParentIndex()
     state = (
-        read_capture(store, resume)
+        read_capture(
+            store,
+            resume,
+            _writer_resume=True,
+            _parent_index=identities,
+        )
         if resume
         else new_capture(store, selected, compression or "identity")
     )
+    if isinstance(state, _CaptureState) and resume:
+        current_hash = _state_digest(state, state.seen_cursors)
+        if state.snapshot_seq != state.journal_head["seq"]:
+            if state.journal_anchor_state_sha256 == current_hash:
+                _save_v2(store, state)
+            else:
+                _checkpoint_v2(store, state)
     if resume and selected is not None and selected != state["selected"]:
         raise CatalogueError("resume selection differs from capture")
     sealed_compression = state.get("compression", "identity")
@@ -537,9 +1482,14 @@ def capture(
     )
     if state["complete"]:
         return {**state, **budget.result(), "budget_exhausted": False}
-    state["error"] = None
+    if state.get("error"):
+        if state.get("journal_version") == JOURNAL_VERSION:
+            _commit_control_delta(store, state, {"kind": "clear_error"})
+            _checkpoint_v2(store, state)
+        else:
+            state["error"] = None
+            save(store, state)
     seen: dict[int, set[str]] = {}
-    identities = ParentIndex()
     budget_exhausted = False
     try:
         with (
@@ -570,12 +1520,39 @@ def capture(
             recovered = _recover_receipts(store, state) if resume else {}
             _run(store, state, client, pool, recovered, seen, budget, identities)
     except (CatalogueError, OSError) as exc:
+        if state.get("journal_version") != JOURNAL_VERSION:
+            state["error"] = str(exc)
+            save(store, state)
+        elif not state.journal_uncertain and not state.get("complete"):
+            try:
+                _commit_control_delta(store, state, {"kind": "stop", "reason": str(exc)[:4096]})
+                _checkpoint_v2(store, state)
+            except (CatalogueError, OSError):
+                # Preserve the original operation failure; resume will replay any durable suffix.
+                state.journal_uncertain = True
         state["error"] = str(exc)
-        save(store, state)
         if not isinstance(exc, BudgetExceeded):
             raise
         budget_exhausted = True
     return {**state, **budget.result(), "budget_exhausted": budget_exhausted}
+
+
+def capture(
+    store: Store,
+    *,
+    selected: list[str] | None = None,
+    resume: str | None = None,
+    client_factory: Any = None,
+    compression: str | None = None,
+) -> dict[str, Any]:
+    with store.writer_guard():
+        return _capture_locked(
+            store,
+            selected=selected,
+            resume=resume,
+            client_factory=client_factory,
+            compression=compression,
+        )
 
 
 def _complete_capture(store: Store, capture_id: str) -> dict[str, Any]:

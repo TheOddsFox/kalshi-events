@@ -40,6 +40,12 @@ The journal covers all recovery-relevant state: sealed settings, pagination curs
 
 Only an incomplete trailing record lacking its commit delimiter may be discarded. Interior corruption, invalid checksums, missing sequences and contradictory transitions fail closed. Legacy captures retain their original checkpoint and page-journal protocol, including after a root upgrade.
 
+The v2 snapshot remains `captures/<capture_id>/state.json`. Its envelope contains `version`, `capture_id`, logical `state`, `seen_cursors`, `state_sha256`, `snapshot_sha256` and `_journal` (`seq`, `offset`, `sha256`, `transition_count`). The journal checkpoint binds a digest of both logical state and cursor history; recomputing a snapshot's own checksum cannot replace that anchored state. The offset is the byte position after the anchored record's newline.
+
+`pages.jsonl` records contain `version`, `capture_id`, `seq`, `prev`, `op`, `payload` and `sha256`. Each checksum covers canonical JSON excluding its own `sha256` field. The first `start` record has sequence 1 and a previous checksum of 64 zeroes. Page and bounded control transitions increment the transition count; checkpoint records do not. Readers validate the complete chain and snapshot anchor before accepting recovered state, then apply only the suffix after the snapshot. A valid genesis permits recovery when the first snapshot was never written. An existing invalid snapshot is rejected.
+
+Read-only inspection never repairs evidence. Resume takes the canonical writer lock before truncating an undelimited trailing record and syncs the truncation. Never edit a journal or snapshot by hand; preserve the root and investigate a committed-record integrity error instead of discarding it.
+
 ### Catalogue versions and selection
 
 Catalogue v1 remains `oddsfox.kalshi.catalogue.v1`, published through `current.json`. Full capture remains the default. Default `load`, `build`, `publish` and metadata capture selection excludes incremental captures, even if a delta is newer. Targeted captures remain separate from catalogue captures.

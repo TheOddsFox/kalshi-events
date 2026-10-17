@@ -11,6 +11,15 @@ from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store
 from kalshi_events.normalize import project_pages
 
 
+def _legacy_checkpoint(store, state):
+    """Convert a pristine v2 genesis into a v1 fixture for legacy resume tests."""
+    logical = dict(state)
+    logical.pop("journal_version")
+    store.remove(f"captures/{state['capture_id']}/pages.jsonl")
+    store.write(f"captures/{state['capture_id']}/state.json", logical)
+    return logical
+
+
 def test_native_full_catalogue_keeps_history_and_relationships(store, factory):
     state = acquisition.capture(store, client_factory=factory)
     assert state["complete"]
@@ -32,13 +41,28 @@ def test_native_full_catalogue_keeps_history_and_relationships(store, factory):
     assert archived["result"] == "no"
 
 
+def test_journal_control_size_does_not_scale_with_cursor_history(store):
+    state = acquisition.new_capture(store, None)
+    state.seen_cursors = {0: {f"{index:064x}" for index in range(10_000)}}
+
+    acquisition._commit_control_delta(
+        store, state, {"kind": "stop", "reason": "request allowance exhausted"}
+    )
+
+    journal = store.path(f"captures/{state['capture_id']}/pages.jsonl")
+    record = json.loads(journal.read_bytes().splitlines()[-1])
+    assert record["op"] == "control"
+    assert "seen_cursors" not in record["payload"]
+    assert len(json.dumps(record).encode()) < 2048
+
+
 def test_checkpoint_stays_small_while_pages_go_to_journal(store, factory):
     state = acquisition.capture(store, client_factory=factory)
     checkpoint = json.loads(store.path(f"captures/{state['capture_id']}/state.json").read_text())
     assert "pages" not in checkpoint
-    assert "seen_cursors" not in json.dumps(checkpoint["tasks"])
+    assert "seen_cursors" not in json.dumps(checkpoint["state"]["tasks"])
     journal = store.path(f"captures/{state['capture_id']}/pages.jsonl").read_text().splitlines()
-    assert len(journal) == state["requests"]
+    assert sum(json.loads(record)["op"] == "page" for record in journal) == state["requests"]
 
 
 def test_each_historical_read_records_its_own_cutoff(store):
@@ -102,7 +126,8 @@ def test_evidence_walk_checks_deadline_on_every_page(store, factory):
 def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
     state = acquisition.capture(store, client_factory=factory)
     relative = f"captures/{state['capture_id']}/state.json"
-    legacy = json.loads(store.path(relative).read_text())
+    legacy = dict(state)
+    legacy.pop("journal_version")
     del legacy["max_response_bytes"]
     store.write(relative, legacy)
     with pytest.raises(CatalogueError, match="pre-1.0 captures are not readable"):
@@ -110,6 +135,8 @@ def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
 
 
 def test_raw_commit_crash_is_recoverable_without_reissuing_request(store, factory, monkeypatch):
+    initial = acquisition.new_capture(store, None)
+    _legacy_checkpoint(store, initial)
     original = acquisition._consume
 
     def crash(*args):
@@ -117,8 +144,8 @@ def test_raw_commit_crash_is_recoverable_without_reissuing_request(store, factor
 
     monkeypatch.setattr(acquisition, "_consume", crash)
     with pytest.raises(RuntimeError):
-        acquisition.capture(store, client_factory=factory)
-    capture_id = next(store.path("captures").iterdir()).name
+        acquisition.capture(store, resume=initial["capture_id"], client_factory=factory)
+    capture_id = initial["capture_id"]
     state = acquisition.read_capture(store, capture_id)
     assert [work for work in state["tasks"] if work["pending"]]
     assert len(list(acquisition.capture_pages(store, state))) == 1

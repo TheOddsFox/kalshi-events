@@ -195,6 +195,8 @@ class Store:
         self.limits = limits or Limits()
         self.started = time.monotonic()
         self._lock = threading.RLock()
+        self._writer_lock: FileLock | None = None
+        self._writer_owner: int | None = None
         self._storage_reservations = 0
         self._sizes: dict[str, int] = {}
         self._usage = {"retained_bytes": 0, "temporary_bytes": 0, "database_bytes": 0}
@@ -304,15 +306,65 @@ class Store:
             path.unlink()
         self.sync(relative)
 
-    def lock(self, *, allow_legacy: bool = False) -> FileLock:
+    def lock(self, *, allow_legacy: bool = False) -> Any:
         if not allow_legacy:
             self._require_writable()
         lock = FileLock(str(self.path("writer.lock")), timeout=0)
         try:
-            lock.acquire()
+            acquisition = lock.acquire()
         except Timeout as exc:
             raise CatalogueError("another writer holds the canonical operator root lock") from exc
-        return lock
+        try:
+            self._refresh_storage_version(allow_legacy=allow_legacy)
+        except BaseException:
+            lock.release()
+            raise
+        with self._lock:
+            self._writer_lock = lock
+            self._writer_owner = threading.get_ident()
+        # FileLock.acquire() returns its context proxy so `with store.lock()` releases the
+        # acquisition already made above instead of acquiring it a second time.
+        return acquisition
+
+    @property
+    def writer_locked_by_current_thread(self) -> bool:
+        with self._lock:
+            lock = self._writer_lock
+            return (
+                lock is not None
+                and lock.is_locked
+                and str(lock.lock_file) == str(self.path("writer.lock"))
+                and self._writer_owner == threading.get_ident()
+            )
+
+    @contextmanager
+    def writer_guard(self) -> Iterator[None]:
+        """Hold this root's canonical writer lock, reusing it only on its owner thread."""
+        with self._lock:
+            held = self._writer_lock
+            owned_here = (
+                held is not None
+                and held.is_locked
+                and str(held.lock_file) == str(self.path("writer.lock"))
+                and self._writer_owner == threading.get_ident()
+            )
+        if owned_here:
+            self._refresh_storage_version()
+            yield
+            return
+        self.lock()
+        with self._lock:
+            lock = self._writer_lock
+        if lock is None:
+            raise CatalogueError("writer lock tracking was lost")
+        try:
+            yield
+        finally:
+            with self._lock:
+                if self._writer_lock is lock:
+                    self._writer_lock = None
+                    self._writer_owner = None
+            lock.release()
 
     def upgrade_root(self, lock: FileLock) -> None:
         """Upgrade a legacy root marker while holding the writer lock; evidence is untouched."""
@@ -347,6 +399,18 @@ class Store:
     def require_writable(self) -> None:
         if self.storage_version != 2:
             raise CatalogueError("operator root requires explicit upgrade-root before writing")
+
+    def _refresh_storage_version(self, *, allow_legacy: bool = False) -> None:
+        marker = decode(regular_bytes(self.path("root.json")))
+        if marker == CURRENT_ROOT_MARKER:
+            self.storage_version = 2
+            return
+        if marker == OWNER_MARKER:
+            self.storage_version = 1
+            if allow_legacy:
+                return
+            raise CatalogueError("operator root requires explicit upgrade-root before writing")
+        raise CatalogueError("operator root belongs to another application")
 
     def _require_writable(self) -> None:
         self.require_writable()

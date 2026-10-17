@@ -88,6 +88,8 @@ uv run kalshi-events verify --release /absolute/operator/kalshi-events/releases/
 
 `replay` rebuilds the warehouse for the capture named by the current release, from committed raw evidence, without networking. `rebuild` does the same for that current capture and never changes published releases. Neither command publishes automatically. There is no backup or restore command. To move a publication, copy the operator root while no writer is running, or copy the immutable release directory that `verify` accepts.
 
+New captures commit each page to a checksummed, sequenced journal and snapshot every 100 transitions, at completion and at an orderly budget stop. Resume verifies the chain and replays durable progress after the snapshot; committed orphan receipts are reused. Only writer-locked resume may remove an unfinished trailing journal record. Committed corruption fails closed. Read-only commands never repair files, and incomplete legacy captures continue using their original checkpoint protocol. Do not edit recovery files by hand.
+
 Tests use synthetic source responses. Loopback HTTP is available only with both `KALSHI_EVENTS_ALLOW_LOOPBACK=1` and an explicit `KALSHI_EVENTS_API_URL=http://127.0.0.1:PORT/trade-api/v2`. No authenticated trading, WebSocket recorder or activated schedule is included. Dagster remains optional and unscheduled; it is not installed for this operator-invoked release.
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion. Both installed wheels and source checkouts include dbt resources; runtime data, credentials, local Pad state and warehouse files are excluded from distributions.

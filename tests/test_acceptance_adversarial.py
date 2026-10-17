@@ -13,6 +13,14 @@ from kalshi_events.normalize import project_pages
 from kalshi_events.transport import PublicClient
 
 
+def _legacy_checkpoint(store, state):
+    logical = dict(state)
+    logical.pop("journal_version")
+    store.remove(f"captures/{state['capture_id']}/pages.jsonl")
+    store.write(f"captures/{state['capture_id']}/state.json", logical)
+    return logical
+
+
 def test_combo_leg_with_wrong_native_event_remains_unresolved(store):
     combo = {
         **COMBO,
@@ -93,6 +101,8 @@ def test_direct_market_lookup_cannot_substitute_another_native_identity(store):
 def test_raw_market_commit_before_pending_checkpoint_is_reused_on_resume(
     store, monkeypatch, boundary
 ):
+    initial = acquisition.new_capture(store, ["MARKET"])
+    _legacy_checkpoint(store, initial)
     original = acquisition.save
     original_get = PublicClient.get
     requested = []
@@ -129,8 +139,8 @@ def test_raw_market_commit_before_pending_checkpoint_is_reused_on_resume(
     monkeypatch.setattr(PublicClient, "get", interrupted_receipt)
     monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
     with pytest.raises(RuntimeError, match="pending checkpoint"):
-        acquisition.capture(store, selected=["MARKET"], client_factory=factory)
-    capture_id = next(store.path("captures").iterdir()).name
+        acquisition.capture(store, resume=initial["capture_id"], client_factory=factory)
+    capture_id = initial["capture_id"]
     state = acquisition.read_capture(store, capture_id)
     # The market receipt was committed to raw evidence but never checkpointed as pending.
     assert state["tasks"][1]["endpoint"] == "/markets/MARKET"

@@ -238,9 +238,11 @@ def test_parent_hydration_does_not_let_newer_nested_market_override_direct_defin
 
 def test_transient_parent_information_does_not_extend_capture_state_contract(store):
     state = acquisition.capture(store, client_factory=FakeClient)
-    persisted = json.loads(store.path(f"captures/{state['capture_id']}/state.json").read_text())
+    snapshot = json.loads(store.path(f"captures/{state['capture_id']}/state.json").read_text())
+    persisted = snapshot["state"]
     assert set(persisted) == {
         "version",
+        "journal_version",
         "capture_id",
         "selected",
         "started_at",
