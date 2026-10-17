@@ -2,6 +2,8 @@
 
 Independent, operator-invoked catalogue of public Kalshi event contracts. This repository owns native series, ordinary and multivariate events, live and historical markets, rules, price grids, lifecycle and settlement definitions, relationships and observation history. `kalshi-market-data` owns prices, candles, trades and books. The two applications exchange copied immutable files; they do not share a warehouse or import each other's packages.
 
+See [native contracts and proposed storage/publication extensions](docs/contracts.md) for compatibility, recovery and incremental freshness boundaries. Proposed interfaces are marked there until their implementation lands.
+
 Python 3.12 and uv are required:
 
 ```sh
