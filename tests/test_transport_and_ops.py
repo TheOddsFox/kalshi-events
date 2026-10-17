@@ -284,7 +284,7 @@ def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(stor
 
     from conftest import FakeClient
 
-    from kalshi_events.capture import capture, read_capture
+    from kalshi_events.capture import capture, page_receipts, read_capture
     from kalshi_events.transport import accounting
 
     monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
@@ -314,7 +314,7 @@ def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(stor
         capture(store, selected=["MARKET"], client_factory=broken_source)
     capture_id = next(store.path("captures").iterdir()).name
     failed = read_capture(store, capture_id)
-    assert failed["complete"] is False and len(failed["pages"]) == 1
+    assert failed["complete"] is False and len(page_receipts(store, failed)) == 1
     assert accounting(store)["attempts"] == 5
     errors = [json.loads(path.read_text()) for path in store.path("raw").glob("*/manifest.json")]
     assert len([row for row in errors if row.get("error") == "ReadError"]) == 4

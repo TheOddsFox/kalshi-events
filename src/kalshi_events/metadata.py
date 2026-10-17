@@ -8,7 +8,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from kalshi_events.capture import capture, capture_pages, complete_capture, latest_capture
+from kalshi_events.capture import (
+    capture,
+    capture_pages,
+    complete_capture,
+    latest_complete_capture,
+)
 from kalshi_events.common import (
     MAX_BUNDLE_BYTES,
     CatalogueError,
@@ -70,7 +75,7 @@ def export(
     selected = selections(selected)
     if isinstance(max_output_bytes, bool) or not 0 < max_output_bytes <= MAX_BUNDLE_BYTES:
         raise CatalogueError("metadata output ceiling must be between 1 and 128 MiB")
-    state = complete_capture(store, capture_id or latest_capture(store))
+    state = complete_capture(store, capture_id or latest_complete_capture(store))
     if state["selected"] is not None and not set(selected).issubset(state["selected"]):
         raise CatalogueError("capture does not cover the selected markets")
     _ = store.remaining
@@ -143,6 +148,8 @@ def export(
         verify(temporary)
         _ = store.remaining
         os.rename(temporary, output)
+        if output.is_relative_to(store.root):
+            store.sync(str(output.relative_to(store.root)))
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)

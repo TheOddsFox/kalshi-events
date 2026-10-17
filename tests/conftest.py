@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
 
 import pytest
 
-from kalshi_events.common import Store, atomic_bytes, digest, json_bytes, now
+from kalshi_events.common import Store, digest, json_bytes, now
 
 SERIES = [
     {
@@ -74,6 +73,8 @@ CUTOFF = {"market_settled_ts": "2026-01-01T00:00:00Z", "trades_created_ts": "202
 
 
 class FakeClient:
+    """Offline stand-in for PublicClient with the same receipt and budget contract."""
+
     def __init__(self, store, budget, responses=None):
         self.store = store
         self.budget = budget
@@ -106,27 +107,34 @@ class FakeClient:
         )
         return (200, defaults[endpoint]) if endpoint in defaults else (404, {})
 
-    def get(self, endpoint, params=None):
-        self.budget.reserve()
-        status, payload = self.response(endpoint, params or {})
-        body = json_bytes(payload)
-        self.budget.downloaded_bytes += len(body)
-        relative = f"raw/{uuid.uuid4().hex}/manifest.json"
-        atomic_bytes(self.store.path(str(Path(relative).parent / "body.bin")), body)
-        self.store.write(
-            relative,
-            {
-                "version": 1,
-                "endpoint": endpoint,
-                "params": params or {},
-                "received_at": now(),
-                "status": status,
-                "size": len(body),
-                "sha256": digest(body),
-                "accounting_complete": True,
-            },
-        )
-        return relative
+    def get(self, endpoint, params=None, context=None):
+        allowance = self.budget.reserve()
+        try:
+            status, payload = self.response(endpoint, params or {})
+            body = json_bytes(payload)
+            attempt = uuid.uuid4().hex
+            relative = f"raw/{attempt}/manifest.json"
+            self.budget.add_download(len(body))
+            self.store.write_bytes(f"raw/{attempt}/body.bin", body)
+            self.store.write(
+                relative,
+                {
+                    **(context or {}),
+                    "page_id": attempt,
+                    "version": 1,
+                    "endpoint": endpoint,
+                    "params": params or {},
+                    "received_at": now(),
+                    "status": status,
+                    "size": len(body),
+                    "sha256": digest(body),
+                    "downloaded_bytes": len(body),
+                    "accounting_complete": True,
+                },
+            )
+            return relative
+        finally:
+            self.budget.settle(allowance)
 
 
 @pytest.fixture

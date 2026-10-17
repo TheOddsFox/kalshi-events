@@ -7,16 +7,33 @@ Python 3.12 and uv are required:
 ```sh
 uv sync --locked
 uv run kalshi-events --root /absolute/operator/kalshi-events capture
-# If complete=false, repeat with the reported capture ID to resume bounded work.
+# Exit 0 with "complete": true means the catalogue capture is ready. Exit 3 with
+# "complete": false means the invocation hit a budget; repeat with the reported capture ID.
 uv run kalshi-events --root /absolute/operator/kalshi-events capture --capture-id CAPTURE_ID
 uv run kalshi-events --root /absolute/operator/kalshi-events build --capture-id CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events publish
+uv run kalshi-events --root /absolute/operator/kalshi-events publish --capture-id CAPTURE_ID
 uv run kalshi-events --root /absolute/operator/kalshi-events current
 ```
 
-Capture writes immutable raw HTTP response bytes and per-attempt accounting before committing each cursor checkpoint. Request identity is durable before networking; resume recovers verified completed receipts even when a crash precedes their cursor checkpoint. Failed partial reads stay in attempt accounting and can be retried. The current invocation stops at its request, download, response, duration or storage allowance. Complete the requested traversal before building or publishing. Invalidated cursors restart their traversal; already committed evidence remains available. Ordinary events, multivariate events, live markets and historical markets are traversed independently. Missing parents are retained as unresolved relationships, and never derived from ticker prefixes.
+The operator root is the persistent directory passed with `--root`, or `KALSHI_EVENTS_ROOT`, or `data`. It holds raw evidence, captures, builds, releases and `current.json`. Only one writer may hold the canonical root at a time. Symlinked roots, files and destinations are refused.
 
-`build` lands verified observations with dlt, runs packaged dbt models and tests in DuckDB, then certifies the raw inventory, database and dbt artifacts. `publish` verifies that certification and writes the immutable `oddsfox.kalshi.catalogue.v1` release before atomically promoting `current.json`. An incomplete capture or failed build does not promote a publication. Native payloads remain in `payload_json`; commonly queried prices and fractional quantities are exact `DECIMAL(38,18)` columns. Current rows are the latest observed native entities, ordered deterministically by receipt time and observation identity; observation history retains every capture. Provider updates do not establish historical rule applicability.
+## Capture
+
+The public transport uses only `https://external-api.kalshi.com/trade-api/v2`. Requests are paced by one shared limiter at 10 requests per second by default. Set `--max-rate` to a positive number to change that rate; zero or negative values are rejected. All five traversals (series, ordinary events, multivariate events, live markets and historical markets) run concurrently under that one limiter. Events and multivariate events use pages of 200; live and historical markets use pages of 1000.
+
+Each attempt writes its raw HTTP response bytes and per-attempt accounting before its page is applied. A request that fails with 429, 500, 502, 503 or 504 is retried up to four attempts in total, with equal-jitter exponential backoff capped at 30 seconds. A `Retry-After` header, as delta-seconds or an HTTP date, is always honored and recorded on the attempt receipt. Resume recovers verified completed receipts without reissuing their requests.
+
+Capture stops at its request, download, response, duration or storage allowance and reports `complete: false` with exit code 3. Completed raw evidence is kept, and the capture resumes from there. Invalidated cursors restart their traversal. Each historical read is preceded by a cutoff read that is recorded as its own receipt. Missing parents are retained as unresolved relationships and are never derived from ticker prefixes.
+
+Every capture seals its response ceiling at creation, so later reads with different flags still verify the bytes it recorded.
+
+## Build and publish
+
+Builds are latest-only. `build --capture-id` lands a fresh warehouse in staging from that one complete catalogue capture, runs packaged dbt models and tests in DuckDB, and certifies the raw inventory, database and dbt artifacts before renaming the staged build into place. Without `--capture-id`, the newest complete non-targeted catalogue capture is used. Targeted metadata captures never enter the catalogue warehouse. A failed build leaves prior builds and releases untouched.
+
+`publish` promotes only a certified, complete catalogue build. It writes the immutable `oddsfox.kalshi.catalogue.v1` release and atomically promotes `current.json`. After publication and verification both succeed, older catalogue captures, their raw evidence, their builds and superseded releases are pruned. The current release, its capture and its build always remain. A failed publish or verification prunes nothing.
+
+Native payloads remain in `payload_json`. Commonly queried prices and fractional quantities are exact `DECIMAL(38,18)` columns. Current rows are the latest observed native entities, ordered deterministically by receipt time and observation identity. Provider updates do not establish historical rule applicability.
 
 The release contains `series.parquet`, `events.parquet`, `markets.parquet`, `relationships.parquet`, `combo_legs.parquet`, `observation_history.parquet`, `coverage.parquet` and a checksummed manifest. Coverage records the observed traversal interval and cutoff evidence. These endpoints do not provide an atomic exchange snapshot. Markets moving between live and historical tiers can change during the observation interval; the collector reads live before historical and retains overlap observations.
 
@@ -35,28 +52,28 @@ uv run kalshi-events metadata verify --output /absolute/new/offline-bundle
 
 `oddsfox.kalshi.metadata.v1` contains the object arrays `series.json`, `events.json`, `markets.json`, `coverage.json` and `manifest.json`. The manifest carries `contract`, `source_release_id`, UTC `received_at`, `coverage_scope: "targeted"`, and `files` entries with exact `size` and `sha256`. Its release identity is SHA-256 of the sorted, compact UTF-8 JSON file inventory, without a trailing newline. Native fields are preserved alongside normalized tickers, receipt and observation identities. Market `usable` requires authoritative event and series parents; coverage is `found`, `absent`, `unresolved` or `unusable`. Bundles, including their manifests, are limited to 128 MiB and destinations must be new directories.
 
-Refresh/export print one JSON result with `output`, `manifest_sha256`, `source_release_id`, `requests`, `downloaded_bytes` and `accounting_complete`. A consumer can pass `--max-requests`, `--max-download-bytes`, `--max-response-bytes`, `--max-duration-seconds` and `--max-output-bytes`. Failed acquisition never exports a previous selection. Retained evidence and producer storage remain in the persistent producer root; copied bundles are consumer owned.
+Refresh and export print one JSON result with `output`, `manifest_sha256`, `source_release_id`, `requests`, `downloaded_bytes` and `accounting_complete`. A consumer can pass `--max-requests`, `--max-download-bytes`, `--max-response-bytes`, `--max-duration-seconds` and `--max-output-bytes`. Failed acquisition never exports a previous selection. Retained evidence and producer storage remain in the persistent producer root; copied bundles are consumer owned.
 
 ## Resources and recovery
 
-All mutations take one OS lock on the canonical root. Symlinked roots, files and destinations are refused. The public transport uses only `https://external-api.kalshi.com/trade-api/v2`, with one worker, two attempts per second, bounded streaming, four counted attempts at most per request, explicit deadlines, no redirects, credentials or environment proxies. Each attempt reserves the smaller of its response ceiling and the remaining download allowance before networking; incomplete attempt receipts retain conservative byte reservations. Rejected streams account for every received chunk and cannot publish a page.
-
-Defaults: 25,000 attempts, 4 GiB downloaded, 16 MiB per response, four hours, 64 GiB retained root, 8 GiB temporary files and 2 GiB database including WAL. Every invocation accepts the corresponding `--max-…` flags. Storage is checked before writes and after third-party warehouse work; exhausted roots require storage relief before another run. Raw evidence is retained, with no automatic destructive pruning.
+Defaults: 25,000 requests, 4 GiB downloaded, 16 MiB per response, four hours, 64 GiB retained root, 8 GiB temporary files and 2 GiB database including WAL. Every invocation accepts the corresponding `--max-…` flags, plus `--max-rate` for the request pace. The DuckDB and dbt build runs with 4 threads and a 4 GB memory limit. Storage counters are updated incrementally, with one full reconcile at the start and one at the end of each invocation. Exhausted storage requires relief before another run.
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events status
-uv run kalshi-events --root /absolute/operator/kalshi-events replay --capture-id CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events backup --output /absolute/new/backup
-uv run kalshi-events --root /absolute/new/restored-root restore --backup /absolute/new/backup
-uv run kalshi-events --root /absolute/new/restored-root rebuild
+uv run kalshi-events --root /absolute/operator/kalshi-events replay
+uv run kalshi-events --root /absolute/operator/kalshi-events rebuild
 uv run kalshi-events verify --release /absolute/operator/kalshi-events/releases/RELEASE_ID
 ```
 
-Replay re-loads committed raw evidence idempotently and certifies the warehouse without networking. Backup verifies complete captures and the current publication, creates a checksummed disjoint snapshot, and restore only accepts a new root. Rebuild regenerates the warehouse from complete raw captures in staging, retaining the current release pointer on failure. Build/replay do not publish automatically.
+`replay` rebuilds the warehouse for the capture named by the current release, from committed raw evidence, without networking. `rebuild` does the same for that current capture and never changes published releases. Neither command publishes automatically. There is no backup or restore command. To move a publication, copy the operator root while no writer is running, or copy the immutable release directory that `verify` accepts.
 
-Tests use synthetic source responses. Loopback HTTP is available only with both `KALSHI_EVENTS_ALLOW_LOOPBACK=1` and an explicit `KALSHI_EVENTS_API_URL=http://127.0.0.1:PORT/trade-api/v2`. No live acquisition, authenticated trading, WebSocket recorder or activated schedule is included. Dagster remains optional and unscheduled; it is not installed for this operator-invoked first release.
+Tests use synthetic source responses. Loopback HTTP is available only with both `KALSHI_EVENTS_ALLOW_LOOPBACK=1` and an explicit `KALSHI_EVENTS_API_URL=http://127.0.0.1:PORT/trade-api/v2`. No authenticated trading, WebSocket recorder or activated schedule is included. Dagster remains optional and unscheduled; it is not installed for this operator-invoked release.
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion. Both installed wheels and source checkouts include dbt resources; runtime data, credentials, local Pad state and warehouse files are excluded from distributions.
+
+## Live acceptance
+
+Not yet run.
 
 ## Sources and attribution
 

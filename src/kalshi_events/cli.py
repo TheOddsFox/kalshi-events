@@ -1,4 +1,8 @@
-"""Operator-invoked catalogue commands. JSON stdout is the delegated-refresh protocol."""
+"""Operator-invoked catalogue commands. JSON stdout is the delegated-refresh protocol.
+
+Exit codes: 0 success, 1 failed invariant or invalid input, 3 budget exhausted before completion
+(the JSON on stdout carries `complete: false` and the capture resumes with `--capture-id`).
+"""
 
 from __future__ import annotations
 
@@ -12,8 +16,18 @@ from typing import Any
 
 from kalshi_events import capture as acquisition
 from kalshi_events import metadata, publish, recovery, warehouse
-from kalshi_events.common import MAX_BUNDLE_BYTES, CatalogueError, Limits, Store, json_bytes
+from kalshi_events.common import (
+    MAX_BUNDLE_BYTES,
+    BudgetExceeded,
+    CatalogueError,
+    Limits,
+    Store,
+    json_bytes,
+)
 from kalshi_events.transport import accounting
+
+EXIT_INCOMPLETE = 3
+FLOAT_LIMITS = {"max_rate", "max_duration_seconds"}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -32,21 +46,15 @@ def parser() -> argparse.ArgumentParser:
         "status",
         "current",
         "verify",
-        "backup",
-        "restore",
         "dbt",
     ):
         command = commands.add_parser(name)
-        if name in {"capture", "load", "build", "replay"}:
+        if name in {"capture", "load", "build", "publish", "replay"}:
             command.add_argument("--capture-id")
         if name == "capture":
             command.add_argument("--market-ticker", action="append")
-        if name in {"verify", "backup"}:
-            command.add_argument(
-                "--output" if name == "backup" else "--release", type=Path, required=True
-            )
-        if name == "restore":
-            command.add_argument("--backup", type=Path, required=True)
+        if name == "verify":
+            command.add_argument("--release", type=Path, required=True)
         if name == "dbt":
             command.add_argument("dbt_args", nargs=argparse.REMAINDER)
         _limits(command)
@@ -69,7 +77,7 @@ def _limits(command: argparse.ArgumentParser) -> None:
     for field in defaults.__dataclass_fields__:
         command.add_argument(
             "--" + field.replace("_", "-"),
-            type=float if field == "max_duration_seconds" else int,
+            type=float if field in FLOAT_LIMITS else int,
             default=getattr(defaults, field),
         )
 
@@ -87,35 +95,19 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             result = warehouse.dbt(store, arguments or ["parse"])
             return {"returncode": result.returncode}
     root = args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data"))
-    if args.command == "restore":
-        return recovery.restore(args.backup, root, limits)
     store = Store(root, limits)
+    try:
+        return _run(store, args)
+    finally:
+        # One full walk at invocation start (in Store) and one at its end.
+        store.reconcile()
+
+
+def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "current":
         return publish.current(store)
     if args.command == "status":
-        captures = []
-        if store.path("captures").exists():
-            for child in sorted(store.path("captures").iterdir()):
-                state = acquisition.read_capture(store, child.name)
-                captures.append(
-                    {
-                        key: state[key]
-                        for key in (
-                            "capture_id",
-                            "selected",
-                            "complete",
-                            "started_at",
-                            "completed_at",
-                            "error",
-                        )
-                    }
-                )
-        return {
-            "root": str(store.root),
-            "captures": captures,
-            "accounting": accounting(store),
-            "current": publish.current(store) if store.path("current.json").exists() else None,
-        }
+        return _status(store)
     with store.lock():
         if args.command == "capture":
             state = acquisition.capture(store, selected=args.market_ticker, resume=args.capture_id)
@@ -130,17 +122,19 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     "accounting_complete",
                 )
             }
-        if args.command in {"load", "build", "replay"}:
-            capture_id = args.capture_id or acquisition.latest_capture(store)
-            return (warehouse.load if args.command == "load" else warehouse.build)(
-                store, capture_id
-            )
+        if args.command == "load":
+            capture_id = args.capture_id or acquisition.latest_catalogue_capture(store)
+            return warehouse.load(store, capture_id)
+        if args.command == "build":
+            capture_id = args.capture_id or acquisition.latest_catalogue_capture(store)
+            return warehouse.build(store, capture_id)
+        if args.command == "replay":
+            capture_id = args.capture_id or publish.current(store)["capture_id"]
+            return warehouse.build(store, capture_id)
         if args.command == "publish":
-            return publish.publish(store)
+            return publish.publish(store, args.capture_id)
         if args.command == "rebuild":
             return recovery.rebuild(store)
-        if args.command == "backup":
-            return recovery.backup(store, args.output)
         if args.command == "dbt":
             arguments = args.dbt_args[1:] if args.dbt_args[:1] == ["--"] else args.dbt_args
             result = warehouse.dbt(store, arguments or ["parse"])
@@ -160,14 +154,44 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     raise CatalogueError("unknown command")
 
 
+def _status(store: Store) -> dict[str, Any]:
+    captures = []
+    if store.path("captures").exists():
+        for child in sorted(store.path("captures").iterdir()):
+            state = acquisition.read_capture(store, child.name)
+            captures.append(
+                {
+                    key: state[key]
+                    for key in (
+                        "capture_id",
+                        "selected",
+                        "complete",
+                        "started_at",
+                        "completed_at",
+                        "error",
+                    )
+                }
+            )
+    return {
+        "root": str(store.root),
+        "captures": captures,
+        "accounting": accounting(store),
+        "current": publish.current(store) if store.path("current.json").exists() else None,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        print(json_bytes(execute(args)).decode().strip())
-        return 0
+        result = execute(args)
+    except BudgetExceeded as exc:
+        print(json_bytes({"complete": False, "error": str(exc)}).decode().strip())
+        return EXIT_INCOMPLETE
     except (CatalogueError, OSError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1
+    print(json_bytes(result).decode().strip())
+    return EXIT_INCOMPLETE if result.get("complete") is False else 0
 
 
 if __name__ == "__main__":

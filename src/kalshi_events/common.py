@@ -7,8 +7,12 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
+import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -19,6 +23,7 @@ from filelock import FileLock, Timeout
 
 MAX_BUNDLE_BYTES = 128 * 1024**2
 TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
 
 
 class CatalogueError(RuntimeError):
@@ -133,6 +138,7 @@ def atomic_json(path: Path, value: Any) -> None:
 
 @dataclass(frozen=True)
 class Limits:
+    max_rate: float = 10.0
     max_requests: int = 25_000
     max_download_bytes: int = 4 * 1024**3
     max_response_bytes: int = 16 * 1024**2
@@ -156,21 +162,31 @@ class Limits:
 
 
 class Store:
+    """Owns one operator root.
+
+    Byte accounting is incremental: every write, append and removal made through this object
+    updates per-file sizes and category counters. `reconcile` performs the single full walk at
+    invocation start and end; `sync` re-measures one subtree after third-party work.
+    """
+
     def __init__(self, root: Path, limits: Limits | None = None):
         self.root = safe_path(root)
         if self.root == Path(self.root.anchor):
             raise CatalogueError("filesystem root cannot be an operator root")
         self.limits = limits or Limits()
         self.started = time.monotonic()
+        self._lock = threading.RLock()
+        self._sizes: dict[str, int] = {}
+        self._usage = {"retained_bytes": 0, "temporary_bytes": 0, "database_bytes": 0}
         self.root.mkdir(parents=True, exist_ok=True)
         marker = self.root / "root.json"
         if not marker.exists():
             if any(self.root.iterdir()):
                 raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
-            atomic_json(marker, {"owner": "oddsfox.kalshi.events.v1"})
-        if decode(regular_bytes(marker)) != {"owner": "oddsfox.kalshi.events.v1"}:
+            atomic_json(marker, OWNER_MARKER)
+        if decode(regular_bytes(marker)) != OWNER_MARKER:
             raise CatalogueError("operator root belongs to another application")
-        self.check_storage()
+        self.reconcile()
 
     @property
     def remaining(self) -> float:
@@ -179,39 +195,80 @@ class Store:
             raise BudgetExceeded("operation deadline exhausted")
         return seconds
 
+    def check_deadline(self) -> None:
+        _ = self.remaining
+
     def path(self, relative: str) -> Path:
         result = safe_path(self.root / relative)
         if not result.is_relative_to(self.root):
             raise CatalogueError("path escapes operator root")
         return result
 
+    def usage(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._usage)
+
     def check_storage(self, additional: int = 0) -> dict[str, int]:
-        total = temporary = database = 0
-        for base, dirs, files in os.walk(self.root, followlinks=False):
-            for name in (*dirs, *files):
-                child = Path(base) / name
-                if child.is_symlink():
-                    raise CatalogueError(f"symlink inside operator root: {child}")
-            for name in files:
-                child = Path(base) / name
-                size = child.stat().st_size
-                total += size
-                if "tmp" in child.relative_to(self.root).parts or name.startswith(".write-"):
-                    temporary += size
-                if name.endswith((".duckdb", ".wal")):
-                    database += size
-        if total + additional > self.limits.max_root_bytes:
+        usage = self.usage()
+        if usage["retained_bytes"] + additional > self.limits.max_root_bytes:
             raise BudgetExceeded("operator root storage exhausted")
-        if temporary + additional > self.limits.max_temp_bytes:
+        if usage["temporary_bytes"] + additional > self.limits.max_temp_bytes:
             raise BudgetExceeded("temporary storage exhausted")
-        if database > self.limits.max_database_bytes:
+        if usage["database_bytes"] > self.limits.max_database_bytes:
             raise BudgetExceeded("database storage exhausted")
-        return {"retained_bytes": total, "temporary_bytes": temporary, "database_bytes": database}
+        return usage
+
+    def reconcile(self) -> dict[str, int]:
+        """Full directory walk. Called once at invocation start and once at its end."""
+        with self._lock:
+            self._sizes.clear()
+            self._usage = {key: 0 for key in self._usage}
+            self._sync_prefix(self.root)
+            return dict(self._usage)
+
+    def sync(self, relative: str) -> None:
+        """Re-measure one subtree; used after third-party writers such as dlt, dbt and DuckDB."""
+        self._sync_prefix(self.path(relative))
 
     def write(self, relative: str, value: Any) -> None:
-        body = json_bytes(value)
+        self.write_bytes(relative, json_bytes(value))
+
+    def write_bytes(self, relative: str, body: bytes) -> None:
+        path = self.path(relative)
+        with self._lock:
+            previous = self._sizes.get(str(path), 0)
+        self.check_storage(max(0, len(body) - previous))
+        atomic_bytes(path, body)
+        with self._lock:
+            self._record(path, len(body))
+
+    def append(self, relative: str, body: bytes) -> None:
+        path = self.path(relative)
+        with self._lock:
+            previous = self._sizes.get(str(path), 0)
         self.check_storage(len(body))
-        atomic_bytes(self.path(relative), body)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        created = not path.exists()
+        with path.open("ab") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if created:
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        with self._lock:
+            self._record(path, previous + len(body))
+
+    def remove(self, relative: str) -> None:
+        path = self.path(relative)
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+        self.sync(relative)
 
     def lock(self) -> FileLock:
         lock = FileLock(str(self.path("writer.lock")), timeout=0)
@@ -221,14 +278,69 @@ class Store:
             raise CatalogueError("another writer holds the canonical operator root lock") from exc
         return lock
 
+    def _sync_prefix(self, path: Path) -> None:
+        prefix = str(path)
+        present: dict[str, int] = {}
+        if path.is_file():
+            present[prefix] = path.stat().st_size
+        elif path.is_dir():
+            for base, dirs, files in os.walk(path, followlinks=False):
+                for name in dirs:
+                    child = Path(base) / name
+                    if child.is_symlink():
+                        raise CatalogueError(f"symlink inside operator root: {child}")
+                for name in files:
+                    child = Path(base) / name
+                    if child.is_symlink():
+                        raise CatalogueError(f"symlink inside operator root: {child}")
+                    present[str(child)] = child.stat().st_size
+        with self._lock:
+            for key in [k for k in self._sizes if k == prefix or k.startswith(prefix + os.sep)]:
+                if key not in present:
+                    self._record(Path(key), None)
+            for key, size in present.items():
+                self._record(Path(key), size)
+
+    def _record(self, path: Path, size: int | None) -> None:
+        key = str(path)
+        previous = self._sizes.get(key, 0)
+        if size is None:
+            self._sizes.pop(key, None)
+        else:
+            self._sizes[key] = size
+        delta = (size or 0) - previous
+        if not delta:
+            return
+        self._usage["retained_bytes"] += delta
+        if "tmp" in path.relative_to(self.root).parts or path.name.startswith(".write-"):
+            self._usage["temporary_bytes"] += delta
+        if path.name.endswith((".duckdb", ".wal")):
+            self._usage["database_bytes"] += delta
+
+
+@contextmanager
+def interrupt_at_deadline(store: Store, interrupt: Callable[[], None]) -> Iterator[None]:
+    """Run `interrupt` once the operation deadline passes, while the block is executing."""
+    timer = threading.Timer(store.remaining, interrupt)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
 
 class Budget:
-    def __init__(self, store: Store):
+    """Request, download and deadline allowance for one invocation. Safe across worker threads."""
+
+    def __init__(self, store: Store, *, max_response_bytes: int | None = None):
         self.store = store
         self.limits = store.limits
-        self.started = time.monotonic()
+        self.max_response_bytes = max_response_bytes or store.limits.max_response_bytes
         self.requests = 0
         self.downloaded_bytes = 0
+        self._inflight = 0
+        self._lock = threading.Lock()
 
     @property
     def remaining(self) -> float:
@@ -236,19 +348,33 @@ class Budget:
 
     def reserve(self) -> int:
         _ = self.remaining
-        if self.requests >= self.limits.max_requests:
-            raise BudgetExceeded("request allowance exhausted")
-        remaining_bytes = self.limits.max_download_bytes - self.downloaded_bytes
-        if remaining_bytes <= 0:
-            raise BudgetExceeded("download allowance exhausted")
-        allowance = min(self.limits.max_response_bytes, remaining_bytes)
-        self.store.check_storage(allowance * 2)
-        self.requests += 1
-        return allowance
+        with self._lock:
+            if self.requests >= self.limits.max_requests:
+                raise BudgetExceeded("request allowance exhausted")
+            remaining_bytes = (
+                self.limits.max_download_bytes - self.downloaded_bytes - self._inflight
+            )
+            if remaining_bytes <= 0:
+                raise BudgetExceeded("download allowance exhausted")
+            allowance = min(self.max_response_bytes, remaining_bytes)
+            self.store.check_storage(allowance * 2)
+            self.requests += 1
+            self._inflight += allowance
+            return allowance
+
+    def settle(self, allowance: int) -> None:
+        with self._lock:
+            self._inflight -= allowance
+
+    def add_download(self, size: int) -> int:
+        with self._lock:
+            self.downloaded_bytes += size
+            return self.downloaded_bytes
 
     def result(self) -> dict[str, Any]:
-        return {
-            "requests": self.requests,
-            "downloaded_bytes": self.downloaded_bytes,
-            "accounting_complete": True,
-        }
+        with self._lock:
+            return {
+                "requests": self.requests,
+                "downloaded_bytes": self.downloaded_bytes,
+                "accounting_complete": True,
+            }
