@@ -56,7 +56,7 @@ Refresh and export print one JSON result with `output`, `manifest_sha256`, `sour
 
 ## Resources and recovery
 
-Defaults: 25,000 requests, 4 GiB downloaded, 16 MiB per response, four hours, 64 GiB retained root, 8 GiB temporary files and 2 GiB database including WAL. Every invocation accepts the corresponding `--max-…` flags, plus `--max-rate` for the request pace. The DuckDB and dbt build runs with 4 threads and a 4 GB memory limit. Storage counters are updated incrementally, with one full reconcile at the start and one at the end of each invocation. Exhausted storage requires relief before another run.
+Defaults: 25,000 requests, 4 GiB downloaded, 384 MiB per response, four hours, 64 GiB retained root, 8 GiB temporary files and 2 GiB database including WAL. Every invocation accepts the corresponding `--max-…` flags, plus `--max-rate` for the request pace. The DuckDB and dbt build runs with 4 threads and a 4 GB memory limit. Storage counters are updated incrementally, with one full reconcile at the start and one at the end of each invocation. Exhausted storage requires relief before another run.
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events status
@@ -73,7 +73,11 @@ Run `scripts/verify-fast` during development and `scripts/verify` before complet
 
 ## Live acceptance
 
-Not yet run.
+No capture has completed. The 2026-10-17 probe is not acceptance.
+
+A new capture ran for 20.1 minutes and stored 7.41 GiB across 7,802 pages. Series finished at 15,187. The other traversals were still returning full pages: 484,600 events, 590,400 multivariate events, 903,000 live markets, and 761,000 historical markets. Sharing 10 requests per second, those four moved at about 42, 34, 22, and 26 minutes per extra million. Disk use was about 22 GiB per hour. The cursors do not report a remainder, so this probe has no end time.
+
+One page exceeded the old 16 MiB response default. The probe sealed a 256 MiB ceiling and kept receiving pages. The default is now 384 MiB, 1.5 times that ceiling. `max_root_bytes` stays 64 GiB because 1.5 times the 7.41 GiB probe is 11 GiB. A finished capture can pass 64 GiB; this probe never reached the end.
 
 ## Sources and attribution
 

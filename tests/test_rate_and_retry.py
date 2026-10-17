@@ -23,6 +23,7 @@ from kalshi_events.transport import (
 
 def test_default_rate_is_ten_per_second_and_nonpositive_rates_are_rejected():
     assert Limits().max_rate == 10.0
+    assert Limits().max_response_bytes == 384 * 1024**2
     assert RateLimiter(10).interval == pytest.approx(0.1)
     for value in (0, -1, 0.0):
         with pytest.raises(CatalogueError, match="max_rate"):

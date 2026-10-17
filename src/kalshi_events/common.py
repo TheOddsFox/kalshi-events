@@ -141,7 +141,7 @@ class Limits:
     max_rate: float = 10.0
     max_requests: int = 25_000
     max_download_bytes: int = 4 * 1024**3
-    max_response_bytes: int = 16 * 1024**2
+    max_response_bytes: int = 384 * 1024**2
     max_duration_seconds: float = 4 * 3600
     max_root_bytes: int = 64 * 1024**3
     max_temp_bytes: int = 8 * 1024**3
