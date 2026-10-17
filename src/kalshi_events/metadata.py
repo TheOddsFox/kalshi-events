@@ -77,6 +77,8 @@ def export(
     if isinstance(max_output_bytes, bool) or not 0 < max_output_bytes <= MAX_BUNDLE_BYTES:
         raise CatalogueError("metadata output ceiling must be between 1 and 128 MiB")
     state = _complete_capture(store, capture_id or latest_complete_capture(store))
+    if state.get("incremental") is True:
+        raise CatalogueError("incremental captures cannot export metadata v1; use a full capture")
     if state["selected"] is not None and not set(selected).issubset(state["selected"]):
         raise CatalogueError("capture does not cover the selected markets")
     _ = store.remaining

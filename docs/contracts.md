@@ -10,15 +10,17 @@ Targeted bundles contain only found usable selected markets and their authoritat
 
 Release identity is the SHA-256 of compact sorted JSON (`separators=(",", ":")`, no trailing newline) of literal filename inventories. Inventory entry fields are `sha256` and integer `size`; filenames and digests are ASCII. File SHA-256 includes every byte, including JSON files' final newline. Catalogue/metadata manifests have separate versioned contract identifiers.
 
-## Proposed storage and publication extensions
+## Storage and publication formats
 
-The contracts below freeze the compatibility boundaries for the performance work. They are proposed until the corresponding implementation and verification land; this section does not imply that the new flags or formats are already available. Existing catalogue v1 and metadata v1 behavior remains supported.
+These are separate compatibility boundaries for compressed receipts, journal recovery and composed catalogue releases. Existing catalogue v1 and metadata v1 behavior remains supported.
 
 ### Operator roots and rollback
 
 The legacy root marker is exactly `{"owner":"oddsfox.kalshi.events.v1"}`. New operator roots use `{"owner":"oddsfox.kalshi.events.v1","storage_version":2}` in `root.json`. The changed marker makes existing binaries, which require exact equality with the legacy marker, reject an upgraded root before writing.
 
 Updated binaries read legacy roots and their existing artifacts. Creating new-format artifacts in a legacy root requires the explicit `upgrade-root` command. Upgrade takes the canonical writer lock, checks the marker again under that lock, and atomically replaces only `root.json`; it does not rewrite evidence, captures, journals, builds or publications. An incomplete legacy capture may resume using its original checkpoint protocol. Upgrading its root must not switch that capture to a new journal protocol partway through recovery.
+
+The first v2 catalogue operation creates `root-id.json`, a stable logical root identity used by composed lineage. A whole-root copy retains that identity; copying unrelated composed artifacts into another root does not establish valid ancestry. The storage marker itself remains unchanged.
 
 Stop writers before upgrading an existing root. Initial rollout uses a separate operator root. Binary rollback uses a separate legacy root and a retained verified v1 publication. Never downgrade the marker or allow an old binary to write an upgraded root.
 
@@ -54,6 +56,8 @@ Opt-in `capture --incremental` pins a certified v2 publication when present, oth
 
 `current`, `replay`, `rebuild` and `publish` accept `--catalogue-version 1|2`, defaulting to 1. `verify --release` dispatches from the supplied manifest contract. Metadata v1 export rejects incremental captures instead of exporting only their changed subset. Full exports, checksums and independent release verification remain required for both catalogue versions. A pre-existing release destination must match its contract and capture identity as well as its verified files.
 
+A v2 manifest additionally carries `root_id`, `baseline_release_id`, `baseline_manifest_sha256`, `baseline_capture_id`, `previous_watermark`, `watermark_started_at`, `delta_depth` and `membership_sha256`. Baseline fields name the immediate pinned predecessor for a delta and are null for a full rebase. Full depth is zero; each delta increments depth. The membership digest commits sorted scope/entity-kind/native-ticker entries, including membership not visible in the current relations. These fields are also included in v2 coverage, binding them into the release identity. Publication pointers contain the release ID and manifest checksum.
+
 ### Incremental acquisition and freshness
 
 Each incremental capture seals a UTC start watermark before its first request. Its ordinary-event and supported non-combo market metadata queries begin at the previous published watermark minus a fixed 300-second overlap. Series, combo events, combo markets and historical markets are fully reconciled on every composed refresh. The watermark advances to the sealed start only after verified publication. Resume retains the original baseline, watermark and query window even if another publication appears.
@@ -72,15 +76,19 @@ Membership is an explicit input to current projections, distinct from observatio
 
 Applicable live and historical market memberships are combined before resolving current markets. Removal from current membership retains observation history; reappearance can restore membership. Parent hydration resolves declared relationships without claiming that a lookup enumerated an entire reconciliation scope. Reassignment updates the affected relationship and dependent combo legs.
 
-Current events include listed event membership plus authoritative parents of active markets. Current series include listed series membership plus authoritative parents of active events. Lookup-only parents reachable solely from inactive historical rows do not become permanent members. Removing historical membership does not remove a market still retained by live membership; delta omission supplies no live tombstone, so authoritative removal in that case requires a full rebase.
+Current events include listed event membership plus authoritative parents of active markets positively resolved during this capture. Current series include listed series membership plus authoritative parents of active events positively resolved during this capture. A prior observation alone is not a successful fresh parent lookup; a 404 does not restore parent eligibility. Lookup-only parents reachable solely from inactive historical rows do not become permanent members. Removing historical membership does not remove a market still retained by live membership; delta omission supplies no live tombstone, so authoritative removal in that case requires a full rebase.
 
 Current winners remain `received_at DESC, observation_id DESC`. Provider timestamps never silently replace that order. Direct market definitions remain authoritative over event-embedded references. Carried and new rows retain their original source capture, receipt and observation provenance; carried evidence is never relabeled as newly acquired.
+
+Full v2 baselines project the final completed cursor generation's memberships into their own certified warehouse under `builds-v2/<capture_id>`; the v1 warehouse remains unchanged. When a legacy full capture lacks fresh parent-resolution evidence needed by that projection, a new full capture is required. A direct v1 bootstrap preserves the pinned v1 current ordinary events and live non-combo markets with successful non-singular list evidence, including earlier cursor generations; singular hydration and history-only markets cannot seed those scopes. This preserves the selected baseline's semantics until a scope is explicitly reconciled.
+
+Baseline copying requires a closed, checkpointed certified warehouse. Rebuilding the same baseline may change database bytes; accepting that rebuild still requires fresh certification, schema and row-multiset equivalence against the pinned immutable release, and equivalent membership state. Published source databases are never opened for writable checkpointing. Carrying a baseline does not relabel its evidence as newly acquired.
 
 ### Ancestry, retention and discard
 
 A composed baseline permits at most eight delta captures. Another delta requires a verified full rebase. Missing, cyclic, corrupted or cross-root ancestry is rejected before build or publication.
 
-Retention preserves the complete evidence closure reachable from both publication pointers and incomplete captures. Incomplete captures stay pinned indefinitely unless explicitly discarded. An extant descendant also keeps its referenced ancestry, including for a completed but unpublished composition. No recovery pin expires merely because time elapsed.
+Retention preserves the complete evidence closure reachable from both publication pointers and incomplete captures. Incomplete captures stay pinned indefinitely unless explicitly discarded. Retained completed compositions also keep their referenced ancestry. Completed captures at or after the relevant full baseline start remain candidates for publication; an older unreachable group may be pruned together, with children retired before parents. No incomplete recovery pin expires merely because time elapsed.
 
 Explicit discard is allowed only for an incomplete capture that no publication or descendant references. Pruning computes the retained dependency closure before deleting anything, and removes obsolete dependencies only after successful verification and promotion. A failed build, verification or promotion cannot prune evidence needed by either publication or recovery.
 

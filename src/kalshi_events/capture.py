@@ -213,6 +213,20 @@ def _state_digest(state: dict[str, Any], seen: dict[int, set[str]]) -> str:
     return digest(json_bytes({"state": dict(state), "seen_cursors": _seen_value(seen)}))
 
 
+def _task_identity(work: dict[str, Any]) -> str:
+    return digest(
+        json_bytes(
+            [
+                work.get("endpoint"),
+                work.get("params"),
+                work.get("kind"),
+                work.get("singular"),
+                work.get("requested"),
+            ]
+        )
+    )
+
+
 def _journal_checksum(record: dict[str, Any]) -> str:
     return digest(json_bytes({key: value for key, value in record.items() if key != "sha256"}))
 
@@ -227,7 +241,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         or not isinstance(state.get("coverage"), dict)
     ):
         raise CatalogueError("invalid journal capture state")
-    endpoints: set[str] = set()
+    identities: set[str] = set()
     for work in state["tasks"]:
         if not isinstance(work, dict) or set(work) != {
             "endpoint",
@@ -245,7 +259,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         if (
             not isinstance(work.get("endpoint"), str)
             or not work["endpoint"].startswith("/")
-            or work["endpoint"] in endpoints
+            or _task_identity(work) in identities
             or work.get("kind") not in {"events", "series", "markets", None}
             or not isinstance(work.get("singular"), bool)
             or not isinstance(work.get("params"), dict)
@@ -260,7 +274,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             or not isinstance(work.get("cutoff_due"), bool)
         ):
             raise CatalogueError("invalid journal traversal state")
-        endpoints.add(work["endpoint"])
+        identities.add(_task_identity(work))
     # Reuse legacy sealed-limit validation without serializing runtime metadata.
     if "max_response_bytes" not in state:
         raise CatalogueError("invalid sealed response ceiling")
@@ -276,6 +290,51 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         or state.get("compression", "identity") not in {"identity", "gzip"}
     ):
         raise CatalogueError("invalid sealed response settings")
+    if state.get("incremental", False):
+        pin = state.get("baseline")
+        if (
+            not isinstance(pin, dict)
+            or pin.get("catalogue_version") not in {1, 2}
+            or not all(
+                isinstance(pin.get(key), str)
+                for key in ("source_release_id", "manifest_sha256", "capture_id", "root_id")
+            )
+            or not isinstance(state.get("task_scopes"), dict)
+            or not isinstance(state.get("query_from"), int)
+            or isinstance(state.get("query_from"), bool)
+        ):
+            raise CatalogueError("invalid sealed incremental baseline")
+    scopes = state.get("task_scopes", {})
+    if not isinstance(scopes, dict):
+        raise CatalogueError("invalid sealed reconciliation scopes")
+    valid_scopes = {
+        "series",
+        "events_live",
+        "events_combo",
+        "markets_live",
+        "markets_combo",
+        "markets_history",
+    }
+    for key, scope in scopes.items():
+        if (
+            not isinstance(key, str)
+            or not key.isdigit()
+            or int(key) >= len(state["tasks"])
+            or scope not in valid_scopes
+        ):
+            raise CatalogueError("invalid sealed reconciliation scope")
+        work = state["tasks"][int(key)]
+        endpoint = work["endpoint"]
+        expected = {
+            "series": endpoint == "/series",
+            "events_live": endpoint == "/events",
+            "events_combo": endpoint == "/events/multivariate",
+            "markets_live": endpoint == "/markets" and work["params"].get("mve_filter") != "only",
+            "markets_combo": endpoint == "/markets" and work["params"].get("mve_filter") == "only",
+            "markets_history": endpoint == "/historical/markets",
+        }[scope]
+        if not expected or work["singular"]:
+            raise CatalogueError("reconciliation scope does not match its traversal")
     return state
 
 
@@ -293,22 +352,29 @@ def _validate_control_transition(
         "max_decoded_response_bytes",
         "compression",
         "journal_version",
+        "incremental",
+        "baseline",
+        "root_id",
+        "watermark_started_at",
+        "previous_watermark",
+        "query_from",
+        "task_scopes",
     )
     if any(candidate.get(key) != genesis.get(key) for key in immutable):
         raise CatalogueError("journal control altered sealed capture settings")
-    task_map = {work.get("endpoint"): work for work in candidate["tasks"] if isinstance(work, dict)}
+    task_map = {_task_identity(work): work for work in candidate["tasks"] if isinstance(work, dict)}
     if len(task_map) != len(candidate["tasks"]) or not set(known_tasks).issubset(task_map):
         raise CatalogueError("journal control removed or duplicated a traversal")
-    for endpoint, old in known_tasks.items():
-        new = task_map[endpoint]
+    for identity, old in known_tasks.items():
+        new = task_map[identity]
         for key in ("endpoint", "kind", "singular", "params", "requested"):
             if new.get(key) != old.get(key):
                 raise CatalogueError("journal control altered traversal identity")
     if kind == "hydrate":
         if candidate.get("complete") is not False:
             raise CatalogueError("hydration control cannot complete a capture")
-        for endpoint, work in task_map.items():
-            known_tasks.setdefault(endpoint, copy.deepcopy(work))
+        for identity, work in task_map.items():
+            known_tasks.setdefault(identity, copy.deepcopy(work))
         return
     if kind == "complete":
         if candidate.get("complete") is not True or not isinstance(
@@ -353,7 +419,7 @@ def _apply_control_record(
             or len(coverage) > 128
         ):
             raise CatalogueError("hydration control exceeds its bounded delta")
-        endpoints: set[str] = set()
+        identities: set[str] = set()
         for work in additions:
             if (
                 not isinstance(work, dict)
@@ -380,6 +446,7 @@ def _apply_control_record(
             ):
                 raise CatalogueError("invalid hydration task")
             endpoint = work["endpoint"]
+            identity = _task_identity(work)
             expected_prefix = "/events/" if work.get("kind") == "events" else "/series/"
             if (
                 work.get("kind") not in {"events", "series"}
@@ -392,9 +459,9 @@ def _apply_control_record(
             ):
                 raise CatalogueError("invalid hydration task state")
             ticker(endpoint[len(expected_prefix) :])
-            if endpoint in known_tasks or endpoint in endpoints:
+            if identity in known_tasks or identity in identities:
                 raise CatalogueError("hydration control duplicates a traversal")
-            endpoints.add(endpoint)
+            identities.add(identity)
         if not _is_sha256(payload.get("state_sha256")):
             raise CatalogueError("invalid hydration state checksum")
         for key, item in coverage.items():
@@ -416,7 +483,7 @@ def _apply_control_record(
             state.update(candidate)
         else:
             for work in additions:
-                known_tasks[work["endpoint"]] = copy.deepcopy(work)
+                known_tasks[_task_identity(work)] = copy.deepcopy(work)
         return
     if kind == "complete":
         if set(payload) != {"kind", "completed_at", "state_sha256"}:
@@ -566,7 +633,7 @@ def _read_v2(
     transition_count = 0
     seen_request_ids: set[str] = set()
     seen_relatives: set[str] = set()
-    known_tasks = {work["endpoint"]: work for work in base["tasks"]}
+    known_tasks = {_task_identity(work): work for work in base["tasks"]}
     complete_seen = False
     anchor_key = (1, first_end, first["sha256"], 0)
     if envelope is not None:
@@ -895,11 +962,11 @@ def _commit_control(
     store: Store, state: _CaptureState, kind: str, candidate: dict[str, Any]
 ) -> None:
     if kind == "hydrate":
-        known = {work["endpoint"]: work for work in state["tasks"]}
+        known = {_task_identity(work): work for work in state["tasks"]}
         _validate_control_transition(state, candidate, kind, known)
-        current_endpoints = {work["endpoint"] for work in state["tasks"]}
+        current_identities = {_task_identity(work) for work in state["tasks"]}
         additions = [
-            work for work in candidate["tasks"] if work["endpoint"] not in current_endpoints
+            work for work in candidate["tasks"] if _task_identity(work) not in current_identities
         ]
         coverage = {
             key: value
@@ -956,7 +1023,7 @@ def _commit_control_delta(store: Store, state: _CaptureState, delta: dict[str, A
         candidate["error"] = None
     else:
         raise CatalogueError("unsupported journal control")
-    known = {work["endpoint"]: work for work in state["tasks"]}
+    known = {_task_identity(work): work for work in state["tasks"]}
     _validate_control_transition(state, candidate, kind, known)
     payload = {
         **delta,
@@ -1031,12 +1098,46 @@ def capture_pages(
 
 
 def new_capture(
-    store: Store, selected: list[str] | None, compression: str = "identity"
+    store: Store,
+    selected: list[str] | None,
+    compression: str = "identity",
+    *,
+    incremental: bool = False,
 ) -> dict[str, Any]:
     if compression not in {"identity", "gzip"}:
         raise CatalogueError("compression must be identity or gzip")
+    if incremental and selected:
+        raise CatalogueError("incremental capture cannot be combined with market selection")
+    started_at = now()
+    pin = None
+    if incremental:
+        from kalshi_events.incremental import baseline
+
+        pin = baseline(store, started_at=started_at)
     work = [task("/historical/cutoff", None, singular=True)]
-    if selected is None:
+    if incremental:
+        params = {"with_nested_markets": "false", "limit": EVENT_PAGE_LIMIT}
+        work += [
+            task("/series", "series"),
+            task("/events", "events", params={**params, "min_updated_ts": pin["query_from"]}),
+            task("/events/multivariate", "events", params=params),
+            task(
+                "/markets",
+                "markets",
+                params={"limit": MARKET_PAGE_LIMIT, "mve_filter": "only"},
+            ),
+            task(
+                "/markets",
+                "markets",
+                params={
+                    "limit": MARKET_PAGE_LIMIT,
+                    "mve_filter": "exclude",
+                    "min_updated_ts": pin["query_from"],
+                },
+            ),
+            task("/historical/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
+        ]
+    elif selected is None:
         work += [
             task("/series", "series"),
             task(
@@ -1057,12 +1158,27 @@ def new_capture(
             task(f"/markets/{ticker(value)}", "markets", singular=True, requested=value)
             for value in selections(selected)
         ]
+    scopes: dict[str, str] = {}
+    for index, item in enumerate(work):
+        endpoint = item["endpoint"]
+        if endpoint == "/series":
+            scopes[str(index)] = "series"
+        elif endpoint == "/events":
+            scopes[str(index)] = "events_live"
+        elif endpoint == "/events/multivariate":
+            scopes[str(index)] = "events_combo"
+        elif endpoint == "/markets":
+            scopes[str(index)] = (
+                "markets_combo" if item["params"].get("mve_filter") == "only" else "markets_live"
+            )
+        elif endpoint == "/historical/markets":
+            scopes[str(index)] = "markets_history"
     state = {
         "version": 1,
         "journal_version": JOURNAL_VERSION,
         "capture_id": uuid.uuid4().hex,
         "selected": selected,
-        "started_at": now(),
+        "started_at": started_at,
         "completed_at": None,
         "complete": False,
         # Sealed at creation: every later read of this capture uses this ceiling.
@@ -1070,10 +1186,14 @@ def new_capture(
         "max_decoded_response_bytes": store.limits.max_decoded_response_bytes,
         "compression": compression,
         "tasks": work,
+        "task_scopes": scopes,
+        "incremental": incremental,
         "cutoff": None,
         "coverage": {},
         "error": None,
     }
+    if pin is not None:
+        state.update(pin)
     return _initialize_v2(store, state)
 
 
@@ -1092,7 +1212,7 @@ def _request_context(state: dict[str, Any], index: int) -> dict[str, Any]:
     work = state["tasks"][index]
     phase = _phase(work)
     _, _, kind, singular = _plan(work, phase)
-    return {
+    context = {
         "capture_id": state["capture_id"],
         "task_index": index,
         "phase": phase,
@@ -1102,6 +1222,10 @@ def _request_context(state: dict[str, Any], index: int) -> dict[str, Any]:
         "entity_kind": kind,
         "singular": singular,
     }
+    scope = state.get("task_scopes", {}).get(str(index))
+    if scope is not None:
+        context.update(task_scope=scope, task_generation=work["restarts"])
+    return context
 
 
 def _record_cutoff(state: dict[str, Any], payload: Any) -> None:
@@ -1295,16 +1419,28 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
     series = identities.series
     markets = {identity: value[2] for identity, value in identities.markets.items()}
     existing = {work["endpoint"] for work in state["tasks"]}
-    missing_events = set(markets.values()) - events.keys()
-    missing_series = {value for value in events.values() if value} - series.keys()
-    for kind, identities, endpoint in (
+    if state.get("incremental"):
+        missing_events = set()
+        missing_series = set()
+    else:
+        missing_events = set(markets.values()) - events.keys()
+        missing_series = {value for value in events.values() if value} - series.keys()
+    for kind, missing, endpoint in (
         ("events", missing_events, "/events"),
         ("series", missing_series, "/series"),
     ):
-        for identity in sorted(identities):
+        for identity in sorted(missing):
             path = f"{endpoint}/{ticker(identity)}"
             if path not in existing:
                 state["tasks"].append(task(path, kind, singular=True))
+    if state.get("task_scopes"):
+        from kalshi_events.incremental import parent_lookup_tasks
+
+        existing_identities = {_task_identity(work) for work in state["tasks"]}
+        for work in parent_lookup_tasks(store, state, identities):
+            if _task_identity(work) not in existing_identities:
+                state["tasks"].append(work)
+                existing_identities.add(_task_identity(work))
     if any(not work["done"] for work in state["tasks"]):
         if state.get("journal_version") != JOURNAL_VERSION:
             save(store, state)
@@ -1449,6 +1585,7 @@ def _capture_locked(
     resume: str | None = None,
     client_factory: Any = None,
     compression: str | None = None,
+    incremental: bool = False,
 ) -> dict[str, Any]:
     factory = client_factory or PublicClient
     identities = ParentIndex()
@@ -1460,8 +1597,19 @@ def _capture_locked(
             _parent_index=identities,
         )
         if resume
-        else new_capture(store, selected, compression or "identity")
+        else new_capture(
+            store,
+            selected,
+            compression or "identity",
+            incremental=incremental,
+        )
     )
+    if resume and incremental and not state.get("incremental"):
+        raise CatalogueError("cannot resume a full capture as incremental")
+    if state.get("incremental"):
+        from kalshi_events.incremental import verify_pin
+
+        verify_pin(store, state)
     if isinstance(state, _CaptureState) and resume:
         current_hash = _state_digest(state, state.seen_cursors)
         if state.snapshot_seq != state.journal_head["seq"]:
@@ -1544,14 +1692,19 @@ def capture(
     resume: str | None = None,
     client_factory: Any = None,
     compression: str | None = None,
+    incremental: bool = False,
 ) -> dict[str, Any]:
     with store.writer_guard():
+        from kalshi_events.incremental import finish_pending_retirement
+
+        finish_pending_retirement(store)
         return _capture_locked(
             store,
             selected=selected,
             resume=resume,
             client_factory=client_factory,
             compression=compression,
+            incremental=incremental,
         )
 
 
@@ -1579,8 +1732,10 @@ def _completed(store: Store, *, catalogue: bool | None) -> list[tuple[str, str]]
     if directory.exists():
         for child in directory.iterdir():
             state = read_capture(store, child.name)
-            if state["complete"] and (
-                catalogue is None or (state["selected"] is None) == catalogue
+            if (
+                state["complete"]
+                and not state.get("incremental")
+                and (catalogue is None or (state["selected"] is None) == catalogue)
             ):
                 found.append((state["completed_at"], state["capture_id"]))
     return found

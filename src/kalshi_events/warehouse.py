@@ -6,6 +6,7 @@ directory to `builds/<capture_id>`. Failures leave every previous build and rele
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import os
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from contextlib import nullcontext
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -36,10 +38,14 @@ from kalshi_events.common import (
     decode,
     digest,
     file_digest,
+    fsync_directory,
+    fsync_file,
+    interrupt_at_deadline,
+    json_bytes,
     now,
     regular_bytes,
 )
-from kalshi_events.normalize import ENTITY_KEYS, observations
+from kalshi_events.normalize import ENTITY_KEYS, ParentIndex, observations
 from kalshi_events.transport import read_page
 
 RELATIONS = {
@@ -54,8 +60,8 @@ DBT_MEMORY_LIMIT = "4GB"
 DBT_THREADS = 4
 
 
-def build_directory(capture_id: str) -> str:
-    return f"builds/{capture_id}"
+def build_directory(capture_id: str, catalogue_version: int = 1) -> str:
+    return f"builds-v2/{capture_id}" if catalogue_version == 2 else f"builds/{capture_id}"
 
 
 def catalogue_capture(store: Store, capture_id: str) -> dict[str, Any]:
@@ -124,10 +130,17 @@ def _land(
     directory: Path,
     *,
     verified_pages: dict[str, str] | None = None,
+    parent_index: ParentIndex | None = None,
 ) -> int:
     """Land one capture into a fresh warehouse under `directory`. Returns observation count."""
     with metrics.phase("landing"):
-        return _land_rows(store, state, directory, verified_pages=verified_pages)
+        return _land_rows(
+            store,
+            state,
+            directory,
+            verified_pages=verified_pages,
+            parent_index=parent_index,
+        )
 
 
 def _land_rows(
@@ -136,6 +149,7 @@ def _land_rows(
     directory: Path,
     *,
     verified_pages: dict[str, str] | None = None,
+    parent_index: ParentIndex | None = None,
 ) -> int:
     capture_id = state["capture_id"]
     observation_count = 0
@@ -143,23 +157,29 @@ def _land_rows(
 
     def rows():
         nonlocal observation_count
-        for row in observations(capture_pages(store, state, evidence=verified_pages)):
-            store.check_deadline()
-            observation_count += 1
-            kind = row["entity_kind"]
-            yield {
-                "observation_id": row["observation_id"],
-                "capture_id": capture_id,
-                "entity_kind": kind,
-                "entity_ticker": row[ENTITY_KEYS[kind]],
-                "received_at": row["received_at"],
-                "provider_updated_at": row["provider_updated_at"],
-                "source_endpoint": row["source_endpoint"],
-                "source_kind": row["source_kind"],
-                "payload_json": row["payload_json"],
-                "event_ticker": row.get("event_ticker"),
-                "series_ticker": row.get("series_ticker"),
-            }
+        for manifest, payload in capture_pages(store, state, evidence=verified_pages):
+            manifest = _scope_manifest(state, manifest)
+            if parent_index is not None:
+                parent_index.add_page(manifest, payload)
+            for row in observations(((manifest, payload),)):
+                store.check_deadline()
+                observation_count += 1
+                kind = row["entity_kind"]
+                yield {
+                    "observation_id": row["observation_id"],
+                    "capture_id": capture_id,
+                    "entity_kind": kind,
+                    "entity_ticker": row[ENTITY_KEYS[kind]],
+                    "received_at": row["received_at"],
+                    "provider_updated_at": row["provider_updated_at"],
+                    "source_endpoint": row["source_endpoint"],
+                    "source_kind": row["source_kind"],
+                    "payload_json": row["payload_json"],
+                    "event_ticker": row.get("event_ticker"),
+                    "series_ticker": row.get("series_ticker"),
+                    "task_scope": manifest.get("task_scope"),
+                    "task_generation": str(manifest.get("task_generation", "")),
+                }
 
     stream = rows()
     first = next(stream, None)
@@ -175,7 +195,13 @@ def _land_rows(
             columns = {
                 key: {
                     "data_type": "text",
-                    "nullable": key in {"provider_updated_at", "event_ticker", "series_ticker"},
+                    "nullable": key
+                    in {
+                        "provider_updated_at",
+                        "event_ticker",
+                        "series_ticker",
+                        "task_scope",
+                    },
                 }
                 for key in first
             }
@@ -193,7 +219,7 @@ def _land_rows(
             with duckdb.connect(str(database)) as connection:
                 connection.execute("create schema if not exists landing")
                 connection.execute(
-                    "create table if not exists landing.observations (observation_id varchar, capture_id varchar, entity_kind varchar, entity_ticker varchar, received_at varchar, provider_updated_at varchar, source_endpoint varchar, source_kind varchar, payload_json varchar, event_ticker varchar, series_ticker varchar)"
+                    "create table if not exists landing.observations (observation_id varchar, capture_id varchar, entity_kind varchar, entity_ticker varchar, received_at varchar, provider_updated_at varchar, source_endpoint varchar, source_kind varchar, payload_json varchar, event_ticker varchar, series_ticker varchar, task_scope varchar, task_generation varchar)"
                 )
     except Exception as exc:
         budget = _as_budget(exc)
@@ -206,8 +232,16 @@ def _land_rows(
 
 
 def load(store: Store, capture_id: str) -> dict[str, Any]:
+    with store.writer_guard():
+        return _load_locked(store, capture_id)
+
+
+def _load_locked(store: Store, capture_id: str) -> dict[str, Any]:
     """Land a catalogue capture into a throwaway warehouse; reports the landing without publishing."""
     store.require_writable()
+    from kalshi_events.incremental import finish_pending_retirement
+
+    finish_pending_retirement(store)
     state = catalogue_capture(store, capture_id)
     relative = f"tmp/load-{uuid.uuid4().hex}"
     directory = store.path(relative)
@@ -233,6 +267,7 @@ def dbt(
     timeout: float | None = None,
     database: str = "warehouse.duckdb",
     artifacts: str | None = None,
+    variables: dict[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run the packaged dbt project against `database` (root-relative)."""
     store.require_writable()
@@ -268,19 +303,22 @@ def dbt(
         }
         environment["DBT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
         with metrics.phase("dbt"):
+            command = [
+                executable,
+                *args,
+                "--project-dir",
+                str(project),
+                "--profiles-dir",
+                str(runtime),
+                "--target-path",
+                str(runtime / "target"),
+                "--log-path",
+                str(runtime / "logs"),
+            ]
+            if variables:
+                command.extend(["--vars", json.dumps(variables, separators=(",", ":"))])
             result = subprocess.run(
-                [
-                    executable,
-                    *args,
-                    "--project-dir",
-                    str(project),
-                    "--profiles-dir",
-                    str(runtime),
-                    "--target-path",
-                    str(runtime / "target"),
-                    "--log-path",
-                    str(runtime / "logs"),
-                ],
+                command,
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -305,10 +343,519 @@ def dbt(
         store.sync(runtime_relative)
 
 
+SCOPE_KIND = {
+    "series": "series",
+    "events_live": "events",
+    "events_combo": "events",
+    "markets_live": "markets",
+    "markets_combo": "markets",
+    "markets_history": "markets",
+}
+
+
+def _task_scopes(state: dict[str, Any]) -> dict[str, str]:
+    """Return explicit or legacy-reconstructed list scopes by task index."""
+    scopes = state.get("task_scopes")
+    if isinstance(scopes, dict) and scopes:
+        return {str(index): scope for index, scope in scopes.items()}
+    result: dict[str, str] = {}
+    for index, work in enumerate(state.get("tasks", [])):
+        if not isinstance(work, dict) or work.get("singular"):
+            continue
+        endpoint = work.get("endpoint")
+        kind = work.get("kind")
+        if endpoint == "/series" and kind == "series":
+            scope = "series"
+        elif endpoint == "/events" and kind == "events":
+            scope = "events_live"
+        elif endpoint == "/events/multivariate" and kind == "events":
+            scope = "events_combo"
+        elif endpoint == "/markets" and kind == "markets":
+            scope = (
+                "markets_combo"
+                if work.get("params", {}).get("mve_filter") == "only"
+                else "markets_live"
+            )
+        elif endpoint == "/historical/markets" and kind == "markets":
+            scope = "markets_history"
+        else:
+            continue
+        result[str(index)] = scope
+    return result
+
+
+def _scope_manifest(state: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    """Attach list scope/generation to older page manifests from task identity."""
+    if manifest.get("task_scope") is not None:
+        return manifest
+    task_index = manifest.get("task_index")
+    if isinstance(task_index, int) and not isinstance(task_index, bool):
+        scope = _task_scopes(state).get(str(task_index))
+        if scope is not None:
+            work = state["tasks"][task_index]
+            return {
+                **manifest,
+                "task_scope": scope,
+                "task_generation": work.get("restarts", 0),
+            }
+    return manifest
+
+
+def _capture_membership(state: dict[str, Any], index: ParentIndex) -> dict[str, set[str]]:
+    result = {scope: set() for scope in SCOPE_KIND}
+    for task_index, scope in _task_scopes(state).items():
+        work = state["tasks"][int(task_index)]
+        generation = work["restarts"]
+        result.setdefault(scope, set()).update(
+            index.scope_membership.get(scope, {}).get(generation, set())
+        )
+        if scope == "markets_live" and not work.get("params", {}).get("mve_filter"):
+            result["markets_combo"].update(
+                index.scope_membership.get("markets_combo", {}).get(generation, set())
+            )
+    return result
+
+
+def _write_parent_outcomes(
+    connection: duckdb.DuckDBPyConnection,
+    capture_id: str,
+    index: ParentIndex,
+) -> None:
+    connection.execute(
+        """create table if not exists landing.parent_eligibility (
+             capture_id varchar, entity_kind varchar, entity_ticker varchar,
+             status integer, receipt varchar)"""
+    )
+    connection.execute("delete from landing.parent_eligibility where capture_id = ?", [capture_id])
+    rows = [
+        (capture_id, kind, identity, status, page_id)
+        for (kind, identity), (status, page_id, _) in sorted(index.parent_lookups.items())
+    ]
+    if rows:
+        connection.executemany(
+            "insert into landing.parent_eligibility values (?, ?, ?, ?, ?)", rows
+        )
+
+
+def _write_membership(
+    connection: duckdb.DuckDBPyConnection, membership: dict[str, set[str]]
+) -> None:
+    connection.execute(
+        """create table if not exists landing.membership (
+             scope varchar, entity_kind varchar, entity_ticker varchar)"""
+    )
+    connection.execute("delete from landing.membership")
+    rows = [
+        (scope, SCOPE_KIND[scope], ticker)
+        for scope, values in sorted(membership.items())
+        for ticker in sorted(values)
+        if scope in SCOPE_KIND
+    ]
+    if rows:
+        connection.executemany("insert into landing.membership values (?, ?, ?)", rows)
+
+
+def _ensure_affected(connection: duckdb.DuckDBPyConnection) -> None:
+    for table, column in (
+        ("affected_series", "series_ticker"),
+        ("affected_events", "event_ticker"),
+        ("affected_markets", "market_ticker"),
+    ):
+        connection.execute(f"create table if not exists landing.{table} ({column} varchar)")
+        connection.execute(f"delete from landing.{table}")
+
+
+def _insert_affected(connection: duckdb.DuckDBPyConnection, table: str, values: set[str]) -> None:
+    if values:
+        connection.executemany(
+            f"insert into landing.{table} values (?)", [(value,) for value in sorted(values)]
+        )
+
+
+def _read_membership(connection: duckdb.DuckDBPyConnection) -> dict[str, set[str]]:
+    try:
+        rows = connection.execute("select scope, entity_ticker from landing.membership").fetchall()
+    except duckdb.CatalogException:
+        return {scope: set() for scope in SCOPE_KIND}
+    result = {scope: set() for scope in SCOPE_KIND}
+    for scope, identity in rows:
+        if scope in SCOPE_KIND:
+            result[scope].add(identity)
+    return result
+
+
+def _copy_closed_database(
+    store: Store,
+    source_relative: str,
+    staging: Path,
+    *,
+    expected_sha256: str,
+) -> None:
+    source = store.path(source_relative)
+    if store.path(source_relative + ".wal").exists():
+        raise CatalogueError("baseline warehouse has an uncheckpointed WAL")
+    size = source.stat().st_size
+    if store.usage()["database_bytes"] + size > store.limits.max_database_bytes:
+        raise CatalogueError("baseline copy exceeds the configured database storage limit")
+    store.reserve_storage(size)
+    try:
+        destination = staging / "warehouse.duckdb"
+        copied = 0
+        with source.open("rb") as input_stream, destination.open("wb") as output_stream:
+            while chunk := input_stream.read(1024 * 1024):
+                store.check_deadline()
+                output_stream.write(chunk)
+                copied += len(chunk)
+        if copied != size:
+            raise CatalogueError("baseline warehouse changed while it was copied")
+        if file_digest(destination, store.limits.max_database_bytes)[0] != expected_sha256:
+            raise CatalogueError("copied baseline warehouse differs from its certified identity")
+        fsync_file(destination)
+        fsync_directory(staging)
+        store.sync(str(staging.relative_to(store.root)))
+    finally:
+        store.release_storage(size)
+
+
+def _projection_membership(
+    store: Store,
+    state: dict[str, Any],
+    index: ParentIndex,
+    connection: duckdb.DuckDBPyConnection,
+    previous_membership: dict[str, set[str]] | None = None,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    previous = previous_membership or _read_membership(connection)
+    incoming = _capture_membership(state, index)
+    if state.get("incremental"):
+        membership = {scope: set(values) for scope, values in previous.items()}
+        for scope, values in incoming.items():
+            if scope in {"events_live", "markets_live"}:
+                membership.setdefault(scope, set()).update(values)
+            else:
+                membership[scope] = set(values)
+    else:
+        membership = incoming
+    changes = {
+        scope: previous.get(scope, set()) ^ membership.get(scope, set()) for scope in SCOPE_KIND
+    }
+    _write_membership(connection, membership)
+    _write_parent_outcomes(connection, state["capture_id"], index)
+    return membership, changes
+
+
+def _affected_keys(
+    connection: duckdb.DuckDBPyConnection,
+    state: dict[str, Any],
+    membership_changes: dict[str, set[str]],
+) -> tuple[set[str], set[str], set[str]]:
+    """Find the dependency closure that must be replaced after this delta.
+
+    Membership changes and direct observations seed the projection. Parent
+    availability is also a seed: a fresh 404 changes current eligibility even
+    though it deliberately adds no observation to history.
+    """
+    capture_id = state["capture_id"]
+    series = set(membership_changes.get("series", set()))
+    events = set(membership_changes.get("events_live", set())) | set(
+        membership_changes.get("events_combo", set())
+    )
+    markets = set().union(
+        membership_changes.get("markets_live", set()),
+        membership_changes.get("markets_combo", set()),
+        membership_changes.get("markets_history", set()),
+    )
+    direct = {"series": set(), "events": set(), "markets": set()}
+    for kind, target in direct.items():
+        target.update(
+            row[0]
+            for row in connection.execute(
+                """select distinct entity_ticker from landing.observations
+                   where capture_id = ? and entity_kind = ? and source_kind = 'direct'""",
+                [capture_id, kind],
+            ).fetchall()
+        )
+    series.update(direct["series"])
+    events.update(direct["events"])
+    markets.update(direct["markets"])
+
+    # Capture-local 200 and 404 outcomes are projection inputs even when a 404
+    # adds no observation to history. Only eligibility transitions propagate
+    # to dependent entities; routine full-scope refreshes must stay narrow.
+    eligibility = connection.execute(
+        "select entity_kind, entity_ticker, status from landing.parent_eligibility where capture_id = ?",
+        [capture_id],
+    ).fetchall()
+    current_series = {
+        row[0]
+        for row in connection.execute("select series_ticker from main.current_series").fetchall()
+    }
+    current_events = {
+        row[0]
+        for row in connection.execute("select event_ticker from main.current_events").fetchall()
+    }
+    structural_series = set(membership_changes.get("series", set()))
+    structural_events = set(membership_changes.get("events_live", set())) | set(
+        membership_changes.get("events_combo", set())
+    )
+    structural_markets = set().union(
+        membership_changes.get("markets_live", set()),
+        membership_changes.get("markets_combo", set()),
+        membership_changes.get("markets_history", set()),
+    )
+    for kind, identity, status in eligibility:
+        if kind == "events":
+            events.add(identity)
+            if (identity in current_events) != (status == 200):
+                structural_events.add(identity)
+        elif kind == "series":
+            series.add(identity)
+            if (identity in current_series) != (status == 200):
+                structural_series.add(identity)
+
+    prior_event_series = {
+        event: parent
+        for event, parent in connection.execute(
+            "select event_ticker, series_ticker from main.current_events"
+        ).fetchall()
+    }
+    latest_event_series = {
+        event: parent
+        for event, parent in connection.execute(
+            """select entity_ticker, series_ticker from landing.observations
+               where entity_kind='events' and source_kind='direct'
+               qualify row_number() over (
+                 partition by entity_ticker order by received_at desc, observation_id desc
+               ) = 1"""
+        ).fetchall()
+    }
+    event_parents = dict(prior_event_series)
+    event_parents.update(latest_event_series)
+    # Event direct updates refresh their own rows. They propagate only when
+    # current presence or the series relationship actually changes.
+    for event in direct["events"]:
+        old_parent = prior_event_series.get(event)
+        new_parent = latest_event_series.get(event)
+        if event not in current_events or old_parent != new_parent:
+            structural_events.add(event)
+            series.update(parent for parent in (old_parent, new_parent) if parent)
+            structural_series.update(parent for parent in (old_parent, new_parent) if parent)
+
+    # A series presence transition affects every event that points to it.
+    structural_events.update(
+        event for event, parent in event_parents.items() if parent in structural_series
+    )
+    events.update(structural_events)
+    for event in structural_events:
+        series.update(
+            parent
+            for parent in (prior_event_series.get(event), latest_event_series.get(event))
+            if parent
+        )
+
+    market_membership = {
+        row[0]
+        for row in connection.execute(
+            "select distinct entity_ticker from landing.membership where entity_kind='markets'"
+        ).fetchall()
+    }
+    prior_market_parents = {
+        market: event
+        for market, event in connection.execute(
+            "select market_ticker, event_ticker from main.current_markets"
+        ).fetchall()
+    }
+    latest_market_parents = {
+        market: event
+        for market, event in connection.execute(
+            """select entity_ticker, event_ticker from landing.observations
+               where entity_kind='markets' and source_kind='direct'
+               qualify row_number() over (
+                 partition by entity_ticker order by received_at desc, observation_id desc
+               ) = 1"""
+        ).fetchall()
+    }
+    market_parents = dict(prior_market_parents)
+    market_parents.update(latest_market_parents)
+    affected_events = set(events)
+    affected_markets = set(markets)
+
+    for market in direct["markets"]:
+        old_parent = prior_market_parents.get(market)
+        new_parent = latest_market_parents.get(market)
+        if market not in prior_market_parents or old_parent != new_parent:
+            structural_markets.add(market)
+            structural_events.update(parent for parent in (old_parent, new_parent) if parent)
+            affected_events.update(parent for parent in (old_parent, new_parent) if parent)
+
+    # Parent reassignment/removal on any changed market affects both its old
+    # and new parent event, even when those parents came from lookup-only
+    # closure and have no direct observation in this capture.
+    for market in structural_markets:
+        parents = {
+            parent
+            for parent in (prior_market_parents.get(market), latest_market_parents.get(market))
+            if parent
+        }
+        affected_events.update(parents)
+        structural_events.update(parents)
+
+    # Close dependencies to a fixed point. Combo markets may depend on either a
+    # market or native event, and their own event parent may then change too.
+    changed = True
+    while changed:
+        before = (len(series), len(affected_events), len(affected_markets))
+        structural_events.update(
+            event for event, parent in event_parents.items() if parent in structural_series
+        )
+        affected_events.update(structural_events)
+        for event in structural_events:
+            series.update(
+                parent
+                for parent in (prior_event_series.get(event), latest_event_series.get(event))
+                if parent
+            )
+        affected_markets.update(
+            market
+            for market in market_membership
+            if market_parents.get(market) in structural_events
+        )
+        if affected_markets or affected_events:
+            affected_markets.update(
+                row[0]
+                for row in connection.execute(
+                    """select distinct m.market_ticker
+                       from main.current_markets m,
+                            lateral json_each(json_extract(m.payload_json, '$.mve_selected_legs')) leg
+                       where json_extract_string(leg.value, '$.market_ticker') in (
+                           select unnest(?)
+                       ) or json_extract_string(leg.value, '$.event_ticker') in (
+                           select unnest(?)
+                       )""",
+                    [sorted(affected_markets), sorted(affected_events)],
+                ).fetchall()
+            )
+        for market in structural_markets | affected_markets:
+            affected_events.update(
+                parent
+                for parent in (prior_market_parents.get(market), latest_market_parents.get(market))
+                if parent
+            )
+        changed = before != (len(series), len(affected_events), len(affected_markets))
+    _ensure_affected(connection)
+    _insert_affected(connection, "affected_series", series)
+    _insert_affected(connection, "affected_events", affected_events)
+    _insert_affected(connection, "affected_markets", affected_markets)
+    return series, affected_events, affected_markets
+
+
+def _delete_affected(connection: duckdb.DuckDBPyConnection) -> None:
+    for table, key, source in (
+        ("current_series", "series_ticker", "affected_series"),
+        ("current_events", "event_ticker", "affected_events"),
+        ("current_markets", "market_ticker", "affected_markets"),
+    ):
+        connection.execute(
+            f"delete from main.{table} where {key} in (select {key} from landing.{source})"
+        )
+    connection.execute(
+        """delete from main.relationships
+           where (child_kind='events' and child_ticker in
+                    (select event_ticker from landing.affected_events))
+              or (child_kind='markets' and child_ticker in
+                    (select market_ticker from landing.affected_markets))"""
+    )
+    connection.execute(
+        "delete from main.combo_legs where combo_market_ticker in "
+        "(select market_ticker from landing.affected_markets)"
+    )
+
+
+def membership_fingerprint(
+    store: Store,
+    capture_id: str,
+    *,
+    connection: duckdb.DuckDBPyConnection | None = None,
+) -> str:
+    """Hash sorted certified scope membership without materializing the relation."""
+    directory = build_directory(capture_id, 2)
+    database = store.path(f"{directory}/warehouse.duckdb")
+    if store.path(f"{directory}/warehouse.duckdb.wal").exists():
+        raise CatalogueError("v2 warehouse has an uncheckpointed WAL")
+    checksum = hashlib.sha256()
+    owns_connection = connection is None
+    spill_directory: Path | None = None
+    spill_budget = 0
+    if connection is None:
+        usage = store.usage()
+        spill_budget = min(
+            store.limits.max_temp_bytes - usage["temporary_bytes"],
+            store.limits.max_root_bytes - usage["retained_bytes"],
+        )
+        if spill_budget < 1:
+            raise BudgetExceeded(
+                "no bounded temporary storage is available for membership verification"
+            )
+        store.reserve_storage(spill_budget)
+        spill_directory = store.path(f"tmp/membership-verify-{uuid.uuid4().hex}")
+        spill_directory.mkdir(parents=True)
+        connection = duckdb.connect(
+            str(database),
+            read_only=True,
+            config={
+                "memory_limit": "512MB",
+                "temp_directory": str(spill_directory),
+                "max_temp_directory_size": f"{spill_budget}B",
+            },
+        )
+    try:
+        deadline = (
+            interrupt_at_deadline(store, connection.interrupt) if owns_connection else nullcontext()
+        )
+        with deadline:
+            try:
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "select table_name from information_schema.tables where table_schema='landing'"
+                    ).fetchall()
+                }
+                if "membership" not in tables:
+                    raise CatalogueError("v2 warehouse lacks certified scope membership")
+                cursor = connection.execute(
+                    "select scope, entity_kind, entity_ticker from landing.membership "
+                    "order by scope, entity_kind, entity_ticker"
+                )
+                while rows := cursor.fetchmany(4096):
+                    store.check_deadline()
+                    for row in rows:
+                        checksum.update(json_bytes(list(row)).rstrip(b"\n"))
+                        checksum.update(b"\n")
+                return checksum.hexdigest()
+            except duckdb.InterruptException as exc:
+                raise BudgetExceeded("operation deadline exhausted") from exc
+    finally:
+        if owns_connection:
+            connection.close()
+            if spill_directory is not None:
+                shutil.rmtree(spill_directory, ignore_errors=True)
+                store.sync("tmp")
+                store.release_storage(spill_budget)
+
+
 def build(store: Store, capture_id: str) -> dict[str, Any]:
+    with store.writer_guard():
+        return _build_locked(store, capture_id)
+
+
+def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
     """Build a fresh, certified warehouse for one complete catalogue capture."""
     store.require_writable()
+    from kalshi_events.incremental import finish_pending_retirement
+
+    finish_pending_retirement(store)
     state = catalogue_capture(store, capture_id)
+    if state.get("incremental"):
+        return _build_delta(store, state)
     store.check_deadline()
     staging_relative = f"tmp/build-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
@@ -360,15 +907,351 @@ def build(store: Store, capture_id: str) -> dict[str, Any]:
     return receipt
 
 
+def _recover_v2_build(store: Store, capture_id: str) -> None:
+    destination = store.path(build_directory(capture_id, 2))
+    backup_relative = f"tmp/replaced-{capture_id}-v2"
+    backup = store.path(backup_relative)
+    if not backup.exists():
+        return
+    if destination.exists():
+        try:
+            certified(store, capture_id, catalogue_version=2)
+        except BudgetExceeded:
+            raise
+        except (CatalogueError, OSError):
+            try:
+                certified(
+                    store,
+                    capture_id,
+                    catalogue_version=2,
+                    _directory=backup,
+                )
+            except BudgetExceeded:
+                raise
+            except (CatalogueError, OSError) as exc:
+                raise CatalogueError(
+                    "neither v2 build nor its replacement backup is certified"
+                ) from exc
+            shutil.rmtree(destination)
+            os.rename(backup, destination)
+            fsync_directory(destination.parent)
+            fsync_directory(backup.parent)
+        else:
+            shutil.rmtree(backup)
+            fsync_directory(backup.parent)
+    else:
+        certified(store, capture_id, catalogue_version=2, _directory=backup)
+        os.rename(backup, destination)
+        fsync_directory(destination.parent)
+        fsync_directory(backup.parent)
+    store.sync(build_directory(capture_id, 2))
+    store.sync(backup_relative)
+
+
+def _install_v2_build(store: Store, capture_id: str, staging: Path) -> dict[str, Any]:
+    destination_relative = build_directory(capture_id, 2)
+    destination = store.path(destination_relative)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    backup_relative = f"tmp/replaced-{capture_id}-v2"
+    backup = store.path(backup_relative)
+    if backup.exists():
+        _recover_v2_build(store, capture_id)
+    previous = destination.exists()
+    if previous:
+        os.rename(destination, backup)
+        fsync_directory(destination.parent)
+        fsync_directory(backup.parent)
+    try:
+        os.rename(staging, destination)
+        fsync_directory(staging.parent)
+        fsync_directory(destination.parent)
+        store.sync(destination_relative)
+        receipt = certified(store, capture_id, catalogue_version=2)
+    except BaseException:
+        if destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+        if previous and backup.exists():
+            os.rename(backup, destination)
+            fsync_directory(destination.parent)
+            fsync_directory(backup.parent)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+        fsync_directory(backup.parent)
+    store.sync(destination_relative)
+    store.sync(backup_relative)
+    return receipt
+
+
+def _projection_index(
+    store: Store,
+    state: dict[str, Any],
+    *,
+    verified_pages: dict[str, str] | None = None,
+) -> ParentIndex:
+    index = ParentIndex()
+    for manifest, payload in capture_pages(store, state, evidence=verified_pages):
+        index.add_page(_scope_manifest(state, manifest), payload)
+    return index
+
+
+def _parent_closure_is_fresh(
+    connection: duckdb.DuckDBPyConnection,
+    state: dict[str, Any],
+    index: ParentIndex,
+) -> None:
+    listed_events = {
+        identity
+        for scope in ("events_live", "events_combo")
+        for identity in _capture_membership(state, index).get(scope, set())
+    }
+    listed_series = _capture_membership(state, index).get("series", set())
+    active_markets = {
+        identity
+        for scope in ("markets_live", "markets_combo", "markets_history")
+        for identity in _capture_membership(state, index).get(scope, set())
+    }
+    if not active_markets:
+        return
+    rows = connection.execute(
+        """select entity_ticker, event_ticker from landing.observations
+           where entity_kind='markets' and source_kind='direct'
+             and entity_ticker in (select unnest(?))
+           qualify row_number() over (
+             partition by entity_ticker order by received_at desc, observation_id desc
+           ) = 1""",
+        [sorted(active_markets)],
+    ).fetchall()
+    required_events = {parent for _, parent in rows if parent}
+    for event in required_events - listed_events:
+        if ("events", event) not in index.parent_lookups:
+            raise CatalogueError(
+                "full capture lacks fresh parent evidence for final membership; capture a new full baseline"
+            )
+    active_events = listed_events | {
+        identity
+        for (kind, identity), outcome in index.parent_lookups.items()
+        if kind == "events" and outcome[0] == 200
+    }
+    if not active_events:
+        return
+    event_rows = connection.execute(
+        """select entity_ticker, series_ticker from landing.observations
+           where entity_kind='events' and source_kind='direct'
+             and entity_ticker in (select unnest(?))
+           qualify row_number() over (
+             partition by entity_ticker order by received_at desc, observation_id desc
+           ) = 1""",
+        [sorted(active_events)],
+    ).fetchall()
+    for _, parent in event_rows:
+        if (
+            parent
+            and parent not in listed_series
+            and ("series", parent) not in index.parent_lookups
+        ):
+            raise CatalogueError(
+                "full capture lacks fresh series evidence for final membership; capture a new full baseline"
+            )
+
+
+def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dict[str, Any]:
+    capture_id = state["capture_id"]
+    if not state.get("task_scopes") and any(
+        int(work.get("restarts", 0)) > 0 for work in state.get("tasks", [])
+    ):
+        raise CatalogueError(
+            "legacy full capture lacks final-generation membership after cursor reset; capture a new full baseline"
+        )
+    store.check_deadline()
+    _recover_v2_build(store, capture_id)
+    staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
+    staging = store.path(staging_relative)
+    staging.mkdir(parents=True)
+    verified_pages: dict[str, str] = {}
+    try:
+        source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
+        source_exists = store.path(source_relative).exists()
+        if source_exists and not rebuild:
+            source_receipt = certified(store, capture_id, catalogue_version=1)
+            _copy_closed_database(
+                store,
+                source_relative,
+                staging,
+                expected_sha256=source_receipt["warehouse_sha256"],
+            )
+            index = _projection_index(store, state, verified_pages=verified_pages)
+        else:
+            index = ParentIndex()
+            _land(
+                store,
+                state,
+                staging,
+                verified_pages=verified_pages,
+                parent_index=index,
+            )
+        with duckdb.connect(str(staging / "warehouse.duckdb")) as connection:
+            _projection_membership(store, state, index, connection)
+            _parent_closure_is_fresh(connection, state, index)
+        dbt(
+            store,
+            ["build"],
+            database=f"{staging_relative}/warehouse.duckdb",
+            artifacts=f"{staging_relative}/build-artifacts.json",
+            variables={
+                "catalogue_version": 2,
+                "incremental_update": False,
+                "current_capture_id": capture_id,
+                "delta_capture_id": capture_id,
+            },
+        )
+        store.sync(staging_relative)
+        database = staging / "warehouse.duckdb"
+        fsync_file(database)
+        fsync_directory(staging)
+        receipt = {
+            "version": 2,
+            "catalogue_version": 2,
+            "capture_id": capture_id,
+            "built_at": now(),
+            "scope": "catalogue",
+            "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
+            "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
+            "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
+        }
+        store.write(f"{staging_relative}/build.json", receipt)
+        fsync_directory(staging)
+        promoted = _install_v2_build(store, capture_id, staging)
+        store.check_storage()
+        return promoted
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+            fsync_directory(staging.parent)
+        store.sync(staging_relative)
+
+
+def build_v2_full(store: Store, capture_id: str, *, rebuild: bool = False) -> dict[str, Any]:
+    with store.writer_guard():
+        return _build_v2_full_locked(store, capture_id, rebuild=rebuild)
+
+
+def _build_v2_full_locked(
+    store: Store, capture_id: str, *, rebuild: bool = False
+) -> dict[str, Any]:
+    """Create a membership-aware v2 full baseline without modifying the v1 build."""
+    store.require_writable()
+    from kalshi_events.incremental import finish_pending_retirement
+
+    finish_pending_retirement(store)
+    state = catalogue_capture(store, capture_id)
+    if state.get("incremental"):
+        raise CatalogueError("a delta cannot be built as a full v2 rebase")
+    return _full_v2_build(store, state, rebuild=rebuild)
+
+
+def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
+    from kalshi_events.incremental import baseline_membership, verify_pin
+
+    capture_id = state["capture_id"]
+    pin = state.get("baseline")
+    if not isinstance(pin, dict):
+        raise CatalogueError("incremental capture lacks a baseline pin")
+    verify_pin(store, state)
+    baseline_receipt = certified(
+        store,
+        pin["capture_id"],
+        catalogue_version=pin["catalogue_version"],
+    )
+    staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
+    staging = store.path(staging_relative)
+    staging.mkdir(parents=True)
+    verified_pages: dict[str, str] = {}
+    try:
+        previous_membership = baseline_membership(store, pin)
+        source_relative = (
+            build_directory(pin["capture_id"], pin["catalogue_version"]) + "/warehouse.duckdb"
+        )
+        _copy_closed_database(
+            store,
+            source_relative,
+            staging,
+            expected_sha256=baseline_receipt["warehouse_sha256"],
+        )
+        index = ParentIndex()
+        _land(
+            store,
+            state,
+            staging,
+            verified_pages=verified_pages,
+            parent_index=index,
+        )
+        with duckdb.connect(str(staging / "warehouse.duckdb")) as connection:
+            _, changes = _projection_membership(
+                store,
+                state,
+                index,
+                connection,
+                previous_membership=previous_membership,
+            )
+            _affected_keys(connection, state, changes)
+            _delete_affected(connection)
+        dbt(
+            store,
+            ["build"],
+            database=f"{staging_relative}/warehouse.duckdb",
+            artifacts=f"{staging_relative}/build-artifacts.json",
+            variables={
+                "catalogue_version": 2,
+                "incremental_update": True,
+                "current_capture_id": capture_id,
+                "delta_capture_id": capture_id,
+            },
+        )
+        store.sync(staging_relative)
+        database = staging / "warehouse.duckdb"
+        fsync_file(database)
+        fsync_directory(staging)
+        receipt = {
+            "version": 2,
+            "catalogue_version": 2,
+            "capture_id": capture_id,
+            "built_at": now(),
+            "scope": "catalogue",
+            "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
+            "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
+            "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
+        }
+        store.write(f"{staging_relative}/build.json", receipt)
+        fsync_directory(staging)
+        promoted = _install_v2_build(store, capture_id, staging)
+        store.check_storage()
+        return promoted
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+            fsync_directory(staging.parent)
+        store.sync(staging_relative)
+
+
 def certified(
     store: Store,
     capture_id: str,
     *,
     cutoff_sink: list[dict[str, Any]] | None = None,
+    catalogue_version: int = 1,
+    _directory: Path | None = None,
 ) -> dict[str, Any]:
-    directory = build_directory(capture_id)
-    receipt = decode(regular_bytes(store.path(f"{directory}/build.json")))
-    if receipt.get("capture_id") != capture_id or receipt.get("version") != 1:
+    if catalogue_version not in {1, 2}:
+        raise CatalogueError("catalogue version must be 1 or 2")
+    directory = build_directory(capture_id, catalogue_version)
+    directory_path = _directory or store.path(directory)
+    receipt = decode(regular_bytes(directory_path / "build.json"))
+    if (
+        receipt.get("capture_id") != capture_id
+        or receipt.get("version") != catalogue_version
+        or receipt.get("catalogue_version", catalogue_version) != catalogue_version
+    ):
         raise CatalogueError("build receipt does not match the requested capture")
     state = read_capture(store, capture_id)
     rows = page_receipts(store, state)
@@ -402,10 +1285,12 @@ def certified(
             cutoff_sink.append({"received_at": manifest["received_at"], "cutoff": payload})
     if actual_files != expected_files:
         raise CatalogueError("build evidence integrity mismatch")
-    warehouse = store.path(f"{directory}/warehouse.duckdb")
+    warehouse = directory_path / "warehouse.duckdb"
     if file_digest(warehouse, store.limits.max_database_bytes)[0] != receipt["warehouse_sha256"]:
         raise CatalogueError("warehouse changed after certified build")
-    artifacts = store.path(f"{directory}/build-artifacts.json")
+    artifacts = directory_path / "build-artifacts.json"
     if digest(regular_bytes(artifacts)) != receipt["dbt_artifacts_sha256"]:
         raise CatalogueError("dbt certification artifacts changed")
+    if catalogue_version == 2 and warehouse.with_name(warehouse.name + ".wal").exists():
+        raise CatalogueError("v2 warehouse has an uncheckpointed WAL")
     return receipt

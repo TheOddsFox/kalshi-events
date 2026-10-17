@@ -4,3 +4,8 @@ sources:
     schema: landing
     tables:
       - name: observations
+      - name: membership
+      - name: parent_eligibility
+      - name: affected_series
+      - name: affected_events
+      - name: affected_markets

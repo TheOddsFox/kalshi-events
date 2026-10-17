@@ -252,9 +252,19 @@ def test_transient_parent_information_does_not_extend_capture_state_contract(sto
         "max_decoded_response_bytes",
         "compression",
         "tasks",
+        "task_scopes",
+        "incremental",
         "cutoff",
         "coverage",
         "error",
+    }
+    assert persisted["incremental"] is False
+    assert persisted["task_scopes"] == {
+        "1": "series",
+        "2": "events_live",
+        "3": "events_combo",
+        "4": "markets_live",
+        "5": "markets_history",
     }
     telemetry = {"requests", "downloaded_bytes", "accounting_complete", "budget_exhausted"}
     assert {key: value for key, value in state.items() if key not in telemetry} == persisted

@@ -1,8 +1,7 @@
 """Immutable verified catalogue releases with atomic last-good promotion.
 
-Publication promotes `current.json` only after verification. Superseded captures, their raw
-evidence, builds and releases are pruned after that promotion, so the current release, its
-capture and its build always remain.
+Publication promotes a versioned pointer only after verification, then prunes evidence outside
+both publication closures and in-progress captures.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from kalshi_events import metrics
 from kalshi_events.capture import (
     _complete_capture,
     latest_catalogue_capture,
-    read_capture,
 )
 from kalshi_events.common import (
     BudgetExceeded,
@@ -31,6 +29,8 @@ from kalshi_events.common import (
     decode,
     digest,
     file_digest,
+    fsync_directory,
+    fsync_file,
     interrupt_at_deadline,
     json_bytes,
     now,
@@ -40,6 +40,7 @@ from kalshi_events.common import (
 from kalshi_events.warehouse import RELATIONS, build_directory, certified
 
 CONTRACT = "oddsfox.kalshi.catalogue.v1"
+CONTRACT_V2 = "oddsfox.kalshi.catalogue.v2"
 FILES = {name + ".parquet" for name in (*RELATIONS, "coverage")}
 ORDER_KEYS = {
     "series": "series_ticker",
@@ -69,10 +70,17 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
     manifest = decode(regular_bytes(directory / "manifest.json", 1024**2))
     if (
         not isinstance(manifest, dict)
-        or manifest.get("contract") != CONTRACT
-        or set(manifest.get("files", {})) != FILES
+        or manifest.get("contract")
+        not in (
+            CONTRACT,
+            CONTRACT_V2,
+        )
+        or not isinstance(manifest.get("files"), dict)
+        or set(manifest["files"]) != FILES
     ):
         raise CatalogueError("invalid catalogue contract or relation inventory")
+    if manifest["contract"] == CONTRACT_V2:
+        _validate_v2_manifest(manifest)
     if {p.name for p in directory.iterdir()} != FILES | {"manifest.json"}:
         raise CatalogueError("release contains unexpected or missing files")
     actual = inventory(directory, FILES, limit)
@@ -88,21 +96,124 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
     return manifest
 
 
-def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
+def _validate_v2_manifest(manifest: dict[str, Any]) -> None:
+    fields = (
+        "root_id",
+        "baseline_release_id",
+        "baseline_manifest_sha256",
+        "baseline_capture_id",
+        "previous_watermark",
+        "watermark_started_at",
+        "delta_depth",
+        "membership_sha256",
+    )
+    if any(name not in manifest for name in fields):
+        raise CatalogueError("invalid catalogue-v2 lineage fields")
+    if not _hex_id(manifest.get("root_id"), 32) or not _hex_id(manifest.get("capture_id"), 32):
+        raise CatalogueError("invalid catalogue-v2 root or capture identity")
+    depth = manifest.get("delta_depth")
+    if isinstance(depth, bool) or not isinstance(depth, int) or not 0 <= depth <= 8:
+        raise CatalogueError("invalid catalogue-v2 delta depth")
+    if not _hex_id(manifest.get("membership_sha256"), 64):
+        raise CatalogueError("invalid catalogue-v2 membership fingerprint")
+    baseline_id = manifest.get("baseline_release_id")
+    baseline_sha = manifest.get("baseline_manifest_sha256")
+    baseline_capture = manifest.get("baseline_capture_id")
+    previous = manifest.get("previous_watermark")
+    if depth == 0:
+        if any(
+            value is not None for value in (baseline_id, baseline_sha, baseline_capture, previous)
+        ):
+            raise CatalogueError("invalid full catalogue-v2 lineage")
+    elif (
+        not _hex_id(baseline_id, 64)
+        or not _hex_id(baseline_sha, 64)
+        or not _hex_id(baseline_capture, 32)
+        or baseline_id == manifest.get("source_release_id")
+        or baseline_capture == manifest.get("capture_id")
+        or not _utc_timestamp(previous)
+    ):
+        raise CatalogueError("invalid delta catalogue-v2 lineage")
+    if not _utc_timestamp(manifest.get("watermark_started_at")):
+        raise CatalogueError("invalid catalogue-v2 watermark")
+    if depth:
+        from datetime import datetime
+
+        if datetime.fromisoformat(previous.replace("Z", "+00:00")) > datetime.fromisoformat(
+            manifest["watermark_started_at"].replace("Z", "+00:00")
+        ):
+            raise CatalogueError("catalogue-v2 watermark moves backwards")
+
+
+def _hex_id(value: Any, size: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == size
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _utc_timestamp(value: Any) -> bool:
+    from datetime import UTC, datetime, timedelta
+
+    if not isinstance(value, str):
+        return False
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return instant.utcoffset() == timedelta(0) and instant.astimezone(UTC).isoformat().endswith(
+        "+00:00"
+    )
+
+
+def publish(
+    store: Store, capture_id: str | None = None, *, catalogue_version: int = 1
+) -> dict[str, Any]:
+    if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2):
+        raise CatalogueError("catalogue version must be 1 or 2")
+    with store.writer_guard():
+        return _publish(store, capture_id, catalogue_version)
+
+
+def _publish(store: Store, capture_id: str | None, catalogue_version: int) -> dict[str, Any]:
     store.require_writable()
+    from kalshi_events import incremental
+
+    incremental.finish_pending_retirement(store)
+    explicit_capture_id = bool(capture_id)
     capture_id = capture_id or latest_catalogue_capture(store)
     state = _complete_capture(store, capture_id)
+    if catalogue_version == 1 and state.get("incremental") is True:
+        raise CatalogueError("incremental captures can only publish as catalogue version 2")
+    if catalogue_version == 2 and state.get("incremental") is True and not explicit_capture_id:
+        raise CatalogueError("publishing an incremental capture requires an explicit capture ID")
     if state["selected"] is not None:
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
+    if catalogue_version == 2:
+        from kalshi_events import incremental
+
+        if state.get("incremental") is True:
+            incremental.verify_pin(store, state)
+            if not store.path(f"{build_directory(capture_id, 2)}/build.json").exists():
+                from kalshi_events.warehouse import build
+
+                build(store, capture_id)
+        else:
+            from kalshi_events.warehouse import build_v2_full
+
+            if not store.path(f"{build_directory(capture_id, 2)}/build.json").exists():
+                build_v2_full(store, capture_id)
     cutoffs: list[dict[str, Any]] = []
-    receipt = certified(store, capture_id, cutoff_sink=cutoffs)
+    receipt = certified(store, capture_id, cutoff_sink=cutoffs, catalogue_version=catalogue_version)
     if receipt["scope"] != "catalogue":
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
     store.check_deadline()
-    warehouse = store.path(f"{build_directory(capture_id)}/warehouse.duckdb")
+    warehouse = store.path(f"{build_directory(capture_id, catalogue_version)}/warehouse.duckdb")
     temporary_relative = f"tmp/publish-{uuid.uuid4().hex}"
     temporary = store.path(temporary_relative)
     temporary.mkdir(parents=True)
+    fsync_directory(temporary.parent)
     try:
         with (
             duckdb.connect(str(warehouse), read_only=True) as connection,
@@ -125,56 +236,112 @@ def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
                     )
                 except duckdb.InterruptException as exc:
                     raise BudgetExceeded("operation deadline exhausted") from exc
-        coverage = [
-            {
-                "capture_id": state["capture_id"],
-                "coverage_scope": "catalogue",
-                "started_at": state["started_at"],
-                "completed_at": state["completed_at"],
-                "atomic_snapshot": False,
-                "traversals_json": json_bytes(state["tasks"]).decode().strip(),
-                "cutoff_json": json_bytes(cutoffs).decode().strip(),
-            }
-        ]
+        coverage_row = {
+            "capture_id": state["capture_id"],
+            "coverage_scope": "catalogue",
+            "started_at": state["started_at"],
+            "completed_at": state["completed_at"],
+            "atomic_snapshot": False,
+            "traversals_json": json_bytes(state["tasks"]).decode().strip(),
+            "cutoff_json": json_bytes(cutoffs).decode().strip(),
+        }
+        release_metadata = {}
+        if catalogue_version == 2:
+            from kalshi_events import incremental
+
+            release_metadata = incremental.release_fields(store, state)
+            coverage_row.update(release_metadata)
+        coverage = [coverage_row]
         store.check_deadline()
         pq.write_table(pa.Table.from_pylist(coverage), temporary / "coverage.parquet")
+        for name in FILES:
+            fsync_file(temporary / name)
+        fsync_directory(temporary)
         store.sync(temporary_relative)
         store.check_storage()
         evidence = inventory(temporary, FILES, store.limits.max_root_bytes)
         release_id = digest(json_bytes(evidence).rstrip(b"\n"))
         manifest = {
-            "contract": CONTRACT,
+            "contract": CONTRACT_V2 if catalogue_version == 2 else CONTRACT,
             "source_release_id": release_id,
             "capture_id": state["capture_id"],
             "received_at": now(),
             "coverage_scope": "catalogue",
             "files": evidence,
         }
+        manifest.update(release_metadata)
         atomic_json(temporary / "manifest.json", manifest)
+        fsync_directory(temporary)
         verify_release(temporary, store.limits.max_root_bytes)
         destination = store.path(f"releases/{release_id}")
-        destination.parent.mkdir(exist_ok=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fsync_directory(destination.parent.parent)
         if destination.exists():
-            verify_release(destination, store.limits.max_root_bytes)
+            existing = verify_release(destination, store.limits.max_root_bytes)
+            if (
+                existing.get("contract") != manifest["contract"]
+                or existing.get("capture_id") != capture_id
+                or any(existing.get(name) != value for name, value in release_metadata.items())
+            ):
+                raise CatalogueError(
+                    "release identity collides with different publication metadata"
+                )
+            for name in FILES | {"manifest.json"}:
+                fsync_file(destination / name)
+            fsync_directory(destination)
+            if catalogue_version == 2:
+                manifest = existing
         else:
             os.rename(temporary, destination)
+        fsync_directory(temporary.parent)
+        fsync_directory(destination.parent)
         store.sync(temporary_relative)
         store.sync(f"releases/{release_id}")
         store.check_deadline()
-        with metrics.phase("promotion"):
-            store.write(
-                "current.json",
-                {
-                    "source_release_id": release_id,
-                    "manifest_sha256": digest(regular_bytes(destination / "manifest.json")),
-                },
+        pointer_name = "current-v2.json" if catalogue_version == 2 else "current.json"
+        # A delta may be retried after pointer promotion and before pruning completed.
+        already_current = False
+        if catalogue_version == 2 and store.path(pointer_name).exists():
+            existing_current = current(store, catalogue_version=2)
+            already_current = (
+                existing_current["source_release_id"] == release_id
+                and existing_current["capture_id"] == capture_id
+                and all(
+                    existing_current.get(name) == value for name, value in release_metadata.items()
+                )
             )
+        if catalogue_version == 2 and not already_current and state.get("incremental") is True:
+            from kalshi_events import incremental
+
+            incremental.verify_predecessor(store, state)
+        elif catalogue_version == 2 and state.get("incremental") is not True:
+            from kalshi_events import incremental
+
+            incremental.verify_full_rebase(store, state)
+        with metrics.phase("promotion"):
+            if not already_current:
+                store.write(
+                    pointer_name,
+                    {
+                        "source_release_id": release_id,
+                        "manifest_sha256": digest(regular_bytes(destination / "manifest.json")),
+                    },
+                )
         # Pruning runs only after the promoted pointer re-verifies end to end.
-        promoted = current(store)
+        promoted = (
+            current(store)
+            if catalogue_version == 1
+            else current(store, catalogue_version=catalogue_version)
+        )
         if promoted["capture_id"] != capture_id:
             raise CatalogueError("promoted release does not belong to the published capture")
         with metrics.phase("pruning"):
-            pruned = prune_superseded(store, state, release_id)
+            if catalogue_version == 1:
+                pruned = prune_superseded(store, state, release_id)
+            else:
+                from kalshi_events import incremental
+
+                pruned = incremental.prune(store, state, release_id, catalogue_version)
         return {"output": str(destination), **manifest, "pruned_captures": pruned}
     finally:
         if temporary.exists():
@@ -183,49 +350,32 @@ def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
 
 
 def prune_superseded(store: Store, state: dict[str, Any], release_id: str) -> list[str]:
-    """Delete catalogue captures older than the published one, with their raw evidence, builds
-    and superseded releases. Runs only after the release is verified and promoted."""
-    store.require_writable()
-    keep = state["capture_id"]
-    removed = []
-    captures = store.path("captures")
-    for child in sorted(captures.iterdir()) if captures.exists() else []:
-        old = read_capture(store, child.name)
-        if (
-            old["selected"] is None
-            and child.name != keep
-            and old["started_at"] < state["started_at"]
-        ):
-            removed.append(child.name)
-    if removed:
-        gone = set(removed)
-        for name in removed:
-            shutil.rmtree(store.path(f"captures/{name}"))
-        store.sync("captures")
-        for manifest in list(store.path("raw").glob("*/manifest.json")):
-            if decode(regular_bytes(manifest, 1024**2)).get("capture_id") in gone:
-                shutil.rmtree(manifest.parent)
-        store.sync("raw")
-    builds = store.path("builds")
-    for child in sorted(builds.iterdir()) if builds.exists() else []:
-        if child.name != keep:
-            shutil.rmtree(child)
-    store.sync("builds")
-    releases = store.path("releases")
-    for child in sorted(releases.iterdir()) if releases.exists() else []:
-        if child.name != release_id:
-            shutil.rmtree(child)
-    store.sync("releases")
-    return removed
+    """Keep the evidence reachable from both publications and in-progress captures."""
+    from kalshi_events import incremental
+
+    return incremental.prune(store, state, release_id, 1)
 
 
-def current(store: Store) -> dict[str, Any]:
-    pointer = decode(regular_bytes(store.path("current.json"), 1024**2))
+def current(store: Store, *, catalogue_version: int = 1) -> dict[str, Any]:
+    if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2):
+        raise CatalogueError("catalogue version must be 1 or 2")
+    pointer_name = "current-v2.json" if catalogue_version == 2 else "current.json"
+    expected_contract = CONTRACT_V2 if catalogue_version == 2 else CONTRACT
+    pointer = decode(regular_bytes(store.path(pointer_name), 1024**2))
+    if not isinstance(pointer, dict):
+        raise CatalogueError("invalid current release pointer")
     release_id = pointer.get("source_release_id", "")
-    if len(release_id) != 64 or any(c not in "0123456789abcdef" for c in release_id):
+    if not _hex_id(release_id, 64):
         raise CatalogueError("invalid current release identity")
     directory = store.path(f"releases/{release_id}")
     manifest = verify_release(directory, store.limits.max_root_bytes)
+    if manifest.get("contract") != expected_contract:
+        raise CatalogueError("current pointer references a different catalogue contract")
     if digest(regular_bytes(directory / "manifest.json")) != pointer.get("manifest_sha256"):
         raise CatalogueError("current pointer manifest mismatch")
+    if catalogue_version == 2:
+        from kalshi_events.incremental import root_id
+
+        if manifest["root_id"] != root_id(store):
+            raise CatalogueError("v2 release belongs to a different logical operator root")
     return {"output": str(directory), **manifest}

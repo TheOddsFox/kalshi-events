@@ -152,6 +152,29 @@ def atomic_json(path: Path, value: Any) -> None:
     atomic_bytes(path, json_bytes(value))
 
 
+def fsync_file(path: Path) -> None:
+    """Durably flush an already closed regular file."""
+    path = safe_path(path)
+    if not path.is_file():
+        raise CatalogueError("cannot sync a missing or nonregular file")
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    metrics.add("fsync_calls")
+
+
+def fsync_directory(path: Path) -> None:
+    """Durably flush directory entries after rename or unlink operations."""
+    path = safe_path(path)
+    if not path.is_dir():
+        raise CatalogueError("cannot sync a missing directory")
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    metrics.add("fsync_calls")
+
+
 @dataclass(frozen=True)
 class Limits:
     max_rate: float = 10.0

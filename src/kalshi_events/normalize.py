@@ -73,6 +73,8 @@ class ParentIndex:
         self.events: dict[str, tuple[str, str, str | None]] = {}
         self.markets: dict[str, tuple[str, str, str]] = {}
         self.processed: set[str] = set()
+        self.scope_membership: dict[str, dict[int, set[str]]] = {}
+        self.parent_lookups: dict[tuple[str, str], tuple[int, str, str]] = {}
 
     @staticmethod
     def _put(target: dict[str, tuple], identity: str, winner: tuple) -> None:
@@ -81,9 +83,19 @@ class ParentIndex:
             target[identity] = winner
 
     def add_page(self, manifest: dict[str, Any], payload: Any) -> None:
+        kind = manifest.get("entity_kind")
+        if manifest.get("singular") and kind in {"events", "series"}:
+            endpoint = manifest.get("endpoint", "")
+            prefix = "/events/" if kind == "events" else "/series/"
+            if endpoint.startswith(prefix):
+                identity = endpoint[len(prefix) :]
+                self.parent_lookups[(kind, identity)] = (
+                    manifest.get("status", 0),
+                    manifest.get("page_id", ""),
+                    manifest.get("request_id", ""),
+                )
         if manifest.get("status") != 200:
             return
-        kind = manifest.get("entity_kind")
         if kind not in ENTITY_KEYS:
             return
         envelope = {"series": "series", "events": "events", "markets": "markets"}[kind]
@@ -97,6 +109,27 @@ class ParentIndex:
             records(payload, envelope, singular=manifest.get("singular", False))
         ):
             identity, parent = native_identity(kind, native)
+            scope = manifest.get("task_scope")
+            generation = manifest.get("task_generation", 0)
+            if (
+                isinstance(scope, str)
+                and isinstance(generation, int)
+                and not isinstance(generation, bool)
+                and not manifest.get("singular")
+            ):
+                if (
+                    kind == "markets"
+                    and scope == "markets_live"
+                    and (
+                        native.get("mve_collection_ticker") or bool(native.get("mve_selected_legs"))
+                    )
+                ):
+                    membership_scope = "markets_combo"
+                else:
+                    membership_scope = scope
+                self.scope_membership.setdefault(membership_scope, {}).setdefault(
+                    generation, set()
+                ).add(identity)
             winner = (
                 provenance["received_at"],
                 digest(json_bytes([provenance["page_id"], f"/{envelope}/{index}"])),

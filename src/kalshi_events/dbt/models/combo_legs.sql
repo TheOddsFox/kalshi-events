@@ -1,3 +1,6 @@
+{% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
+{{ config(materialized='incremental', incremental_strategy='append') }}
+{% endif %}
 select m.market_ticker as combo_market_ticker,
        cast(leg.key as integer) as leg_index,
        json_extract_string(leg.value, '$.event_ticker') as event_ticker,
@@ -10,3 +13,6 @@ from {{ ref('current_markets') }} m,
      lateral json_each(json_extract(m.payload_json, '$.mve_selected_legs')) leg
 left join {{ ref('current_markets') }} target on json_extract_string(leg.value, '$.market_ticker') = target.market_ticker
 left join {{ ref('current_events') }} native_event on json_extract_string(leg.value, '$.event_ticker') = native_event.event_ticker
+{% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
+where m.market_ticker in (select market_ticker from {{ source('landing', 'affected_markets') }})
+{% endif %}

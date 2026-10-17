@@ -2,7 +2,7 @@
 
 Independent, operator-invoked catalogue of public Kalshi event contracts. This repository owns native series, ordinary and multivariate events, live and historical markets, rules, price grids, lifecycle and settlement definitions, relationships and observation history. `kalshi-market-data` owns prices, candles, trades and books. The two applications exchange copied immutable files; they do not share a warehouse or import each other's packages.
 
-See [native contracts and proposed storage/publication extensions](docs/contracts.md) for compatibility, recovery and incremental freshness boundaries. Proposed interfaces are marked there until their implementation lands.
+See [native contracts and storage/publication formats](docs/contracts.md) for compatibility, recovery and incremental freshness boundaries.
 
 Python 3.12 and uv are required:
 
@@ -17,7 +17,7 @@ uv run kalshi-events --root /absolute/operator/kalshi-events publish --capture-i
 uv run kalshi-events --root /absolute/operator/kalshi-events current
 ```
 
-The operator root is the persistent directory passed with `--root`, or `KALSHI_EVENTS_ROOT`, or `data`. It holds raw evidence, captures, builds, releases and `current.json`. Only one writer may hold the canonical root at a time. Symlinked roots, files and destinations are refused.
+The operator root is the persistent directory passed with `--root`, or `KALSHI_EVENTS_ROOT`, or `data`. It holds raw evidence, captures, builds, releases and the versioned publication pointers. Only one writer may hold the canonical root at a time. Symlinked roots, files and destinations are refused.
 
 New roots use storage version 2. Existing roots remain readable; stop writers and explicitly run `kalshi-events --root /absolute/operator/kalshi-events upgrade-root` before further writes. Upgrade changes only the marker under the writer lock. Existing incomplete captures retain their original checkpoint protocol. Older binaries refuse an upgraded root; binary rollback requires a separate legacy root and retained verified v1 publication. Never downgrade the marker.
 
@@ -50,13 +50,45 @@ Inspect the probe's raw receipts: version 2 with `content_encoding: "gzip"` prov
 
 ## Build and publish
 
-Builds are latest-only. `build --capture-id` lands a fresh warehouse in staging from that one complete catalogue capture, runs packaged dbt models and tests in DuckDB, and certifies the raw inventory, database and dbt artifacts before renaming the staged build into place. Without `--capture-id`, the newest complete non-targeted catalogue capture is used. Targeted metadata captures never enter the catalogue warehouse. A failed build leaves prior builds and releases untouched.
+A full `build --capture-id` lands a fresh warehouse in staging from that one complete catalogue capture, runs packaged dbt models and tests in DuckDB, and certifies the raw inventory, database and dbt artifacts before renaming the staged build into place. Without `--capture-id`, the newest complete full catalogue capture is used. Incremental and targeted captures are excluded from this default. Targeted metadata captures never enter the catalogue warehouse. A failed build leaves prior builds and releases untouched.
 
-`publish` promotes only a certified, complete catalogue build. It writes the immutable `oddsfox.kalshi.catalogue.v1` release and atomically promotes `current.json`. After publication and verification both succeed, older catalogue captures, their raw evidence, their builds and superseded releases are pruned. The current release, its capture and its build always remain. A failed publish or verification prunes nothing.
+`publish` promotes only a certified, complete catalogue build. It writes the immutable `oddsfox.kalshi.catalogue.v1` release and atomically promotes `current.json`. After publication and verification both succeed, obsolete catalogue captures, raw evidence, builds and releases may be pruned. Both publication pointers and every incomplete capture retain their complete dependency closure. A failed publish or verification prunes nothing.
 
 Native payloads remain in `payload_json`. Commonly queried prices and fractional quantities are exact `DECIMAL(38,18)` columns. Current rows are the latest observed native entities, ordered deterministically by receipt time and observation identity. Provider updates do not establish historical rule applicability.
 
-The release contains `series.parquet`, `events.parquet`, `markets.parquet`, `relationships.parquet`, `combo_legs.parquet`, `observation_history.parquet`, `coverage.parquet` and a checksummed manifest. Coverage records the observed traversal interval and cutoff evidence. These endpoints do not provide an atomic exchange snapshot. Markets moving between live and historical tiers can change during the observation interval; the collector reads live before historical and retains overlap observations.
+The release contains `series.parquet`, `events.parquet`, `markets.parquet`, `relationships.parquet`, `combo_legs.parquet`, `observation_history.parquet`, `coverage.parquet` and a checksummed manifest. Coverage records the observed traversal interval and cutoff evidence. These endpoints do not provide an atomic exchange snapshot. Markets moving between live and historical tiers can change during the observation interval; live and historical traversals overlap, and repeated direct observations are retained.
+
+## Opt-in incremental refresh
+
+A full capture remains the default. To create a version 2 baseline from a complete full capture, first build it normally, then publish it with the version selector. Version 2 uses a separate `builds-v2` warehouse and `current-v2.json`; version 1 uses `builds` and `current.json`.
+
+```sh
+uv run kalshi-events --root /absolute/operator/kalshi-events publish \
+  --capture-id FULL_CAPTURE_ID --catalogue-version 2
+uv run kalshi-events --root /absolute/operator/kalshi-events capture --incremental
+# Resume an incomplete refresh with its reported ID; its original baseline/window stay sealed.
+uv run kalshi-events --root /absolute/operator/kalshi-events capture --capture-id DELTA_CAPTURE_ID
+uv run kalshi-events --root /absolute/operator/kalshi-events build --capture-id DELTA_CAPTURE_ID
+uv run kalshi-events --root /absolute/operator/kalshi-events publish \
+  --capture-id DELTA_CAPTURE_ID --catalogue-version 2
+uv run kalshi-events --root /absolute/operator/kalshi-events current --catalogue-version 2
+```
+
+An incremental capture pins the certified v2 publication when one exists, otherwise the certified v1 publication. A corrupt v2 publication fails closed. Composed builds and publications require explicit capture IDs. Legacy default selection continues to choose a full capture, and metadata v1 export rejects an explicit incremental capture.
+
+Ordinary events and supported non-combo live markets use metadata-update filters from the previous published capture's start time minus five minutes. Series, combo events, combo markets and historical markets are fully reconciled on every refresh. A refresh seals its start before requesting data and advances the published watermark to that time only after verification and promotion. Provider timestamps never determine the winning observation.
+
+This mode permits dated price, volume and open-interest values. Carried rows retain their actual observation timestamps and source capture/receipt identities. Metadata-update filters are not a universal change feed: late updates outside the overlap, and removal from a scope queried only for changes, may require a full rebase. Coverage describes the acquisition interval rather than a fresh atomic exchange snapshot.
+
+Membership is separate from historical observations. A complete reconciliation replaces its scope's membership, while omission from a delta removes nothing. Live and historical membership are combined before resolving current markets. Removed entities retain their history and can reappear. Parent lookups resolve declared relationships without turning lookup-only entities into permanent list members.
+
+Each baseline supports at most eight deltas. Retained baseline and delta warehouses, including WAL and staging copies, count toward the storage limits; size those limits for the retained chain before refreshing. To rebase, acquire and build a new full capture, then publish that capture with `--catalogue-version 2`. A refresh whose pinned predecessor has been superseded cannot publish; acquire a new refresh against the current publication. Incomplete captures remain recovery pins indefinitely. Explicitly abandon an unreferenced incomplete capture with:
+
+```sh
+uv run kalshi-events --root /absolute/operator/kalshi-events discard --capture-id CAPTURE_ID
+```
+
+Discard refuses complete captures and captures referenced by a publication or descendant. Subsequent verified publication can prune obsolete dependencies. Missing, cyclic, corrupted or cross-root ancestry prevents composition and publication. Never manually delete pinned captures, raw evidence, builds or releases.
 
 ## Targeted metadata handoff
 
@@ -86,9 +118,11 @@ uv run kalshi-events --root /absolute/operator/kalshi-events rebuild
 uv run kalshi-events verify --release /absolute/operator/kalshi-events/releases/RELEASE_ID
 ```
 
-`replay` rebuilds the warehouse for the capture named by the current release, from committed raw evidence, without networking. `rebuild` does the same for that current capture and never changes published releases. Neither command publishes automatically. There is no backup or restore command. To move a publication, copy the operator root while no writer is running, or copy the immutable release directory that `verify` accepts.
+`replay` rebuilds the warehouse for the capture named by the current release, from committed raw evidence, without networking. `rebuild` does the same for that current capture and never changes published releases. Use `--catalogue-version 2` for the v2 pointer. Neither command publishes automatically. There is no backup or restore command. To move a publication, copy the operator root while no writer is running, or copy the immutable release directory that `verify` accepts.
 
 New captures commit each page to a checksummed, sequenced journal and snapshot every 100 transitions, at completion and at an orderly budget stop. Resume verifies the chain and replays durable progress after the snapshot; committed orphan receipts are reused. Only writer-locked resume may remove an unfinished trailing journal record. Committed corruption fails closed. Read-only commands never repair files, and incomplete legacy captures continue using their original checkpoint protocol. Do not edit recovery files by hand.
+
+Version 2 build replacement retains a certified backup until the replacement verifies. After interrupted build promotion, rerun replay or rebuild with the same catalogue version. An interrupted publication may leave a verified immutable release before its pointer is promoted; retry publication with the same capture ID. Cleanup records durable ownership and progress before retiring files, and the next writer resumes that plan before new work. Read-only inspection never repairs or deletes files. Preserve the root and investigate a corrupt plan or unknown cleanup artifact rather than deleting recovery files manually.
 
 Tests use synthetic source responses. Loopback HTTP is available only with both `KALSHI_EVENTS_ALLOW_LOOPBACK=1` and an explicit `KALSHI_EVENTS_API_URL=http://127.0.0.1:PORT/trade-api/v2`. No authenticated trading, WebSocket recorder or activated schedule is included. Dagster remains optional and unscheduled; it is not installed for this operator-invoked release.
 

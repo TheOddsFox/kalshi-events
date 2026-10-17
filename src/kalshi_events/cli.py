@@ -52,6 +52,7 @@ def parser() -> argparse.ArgumentParser:
         "verify",
         "dbt",
         "upgrade-root",
+        "discard",
     ):
         command = commands.add_parser(name)
         if name in {"capture", "load", "build", "publish", "replay"}:
@@ -59,6 +60,11 @@ def parser() -> argparse.ArgumentParser:
         if name == "capture":
             command.add_argument("--market-ticker", action="append")
             command.add_argument("--compression", choices=("identity", "gzip"), default=None)
+            command.add_argument("--incremental", action="store_true")
+        if name in {"current", "replay", "rebuild", "publish"}:
+            command.add_argument("--catalogue-version", type=int, choices=(1, 2), default=1)
+        if name == "discard":
+            command.add_argument("--capture-id", required=True)
         if name == "verify":
             command.add_argument("--release", type=Path, required=True)
         if name == "dbt":
@@ -111,7 +117,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
 
 def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "current":
-        return publish.current(store)
+        return publish.current(store, catalogue_version=args.catalogue_version)
     if args.command == "status":
         return _status(store)
     if args.command == "upgrade-root":
@@ -119,6 +125,9 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
             store.upgrade_root(writer_lock)
         return {"storage_version": store.storage_version, "upgraded": True}
     with store.lock():
+        from kalshi_events.incremental import finish_pending_retirement
+
+        finish_pending_retirement(store)
         if args.command == "capture":
             with metrics.phase("capture"):
                 state = acquisition.capture(
@@ -126,6 +135,7 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
                     selected=args.market_ticker,
                     resume=args.capture_id,
                     compression=args.compression,
+                    incremental=args.incremental,
                 )
             return {
                 key: state[key]
@@ -145,12 +155,15 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
             capture_id = args.capture_id or acquisition.latest_catalogue_capture(store)
             return warehouse.build(store, capture_id)
         if args.command == "replay":
-            capture_id = args.capture_id or publish.current(store)["capture_id"]
-            return warehouse.build(store, capture_id)
+            return recovery.replay(store, args.capture_id, catalogue_version=args.catalogue_version)
         if args.command == "publish":
-            return publish.publish(store, args.capture_id)
+            return publish.publish(store, args.capture_id, catalogue_version=args.catalogue_version)
         if args.command == "rebuild":
-            return recovery.rebuild(store)
+            return recovery.rebuild(store, catalogue_version=args.catalogue_version)
+        if args.command == "discard":
+            from kalshi_events.incremental import discard
+
+            return discard(store, args.capture_id)
         if args.command == "dbt":
             arguments = args.dbt_args[1:] if args.dbt_args[:1] == ["--"] else args.dbt_args
             result = warehouse.dbt(store, arguments or ["parse"])
@@ -177,15 +190,18 @@ def _status(store: Store) -> dict[str, Any]:
             state = acquisition.read_capture(store, child.name)
             captures.append(
                 {
-                    key: state[key]
-                    for key in (
-                        "capture_id",
-                        "selected",
-                        "complete",
-                        "started_at",
-                        "completed_at",
-                        "error",
-                    )
+                    "incremental": state.get("incremental") is True,
+                    **{
+                        key: state[key]
+                        for key in (
+                            "capture_id",
+                            "selected",
+                            "complete",
+                            "started_at",
+                            "completed_at",
+                            "error",
+                        )
+                    },
                 }
             )
     return {
@@ -193,6 +209,11 @@ def _status(store: Store) -> dict[str, Any]:
         "captures": captures,
         "accounting": accounting(store),
         "current": publish.current(store) if store.path("current.json").exists() else None,
+        "current_v2": (
+            publish.current(store, catalogue_version=2)
+            if store.path("current-v2.json").exists()
+            else None
+        ),
     }
 
 
