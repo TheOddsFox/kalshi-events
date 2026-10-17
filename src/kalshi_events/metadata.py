@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from kalshi_events.capture import (
+    _complete_capture,
     capture,
     capture_pages,
-    complete_capture,
     latest_complete_capture,
 )
 from kalshi_events.common import (
@@ -76,7 +76,7 @@ def export(
     selected = selections(selected)
     if isinstance(max_output_bytes, bool) or not 0 < max_output_bytes <= MAX_BUNDLE_BYTES:
         raise CatalogueError("metadata output ceiling must be between 1 and 128 MiB")
-    state = complete_capture(store, capture_id or latest_complete_capture(store))
+    state = _complete_capture(store, capture_id or latest_complete_capture(store))
     if state["selected"] is not None and not set(selected).issubset(state["selected"]):
         raise CatalogueError("capture does not cover the selected markets")
     _ = store.remaining

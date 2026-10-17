@@ -19,8 +19,7 @@ import pyarrow.parquet as pq
 
 from kalshi_events import metrics
 from kalshi_events.capture import (
-    capture_pages,
-    complete_capture,
+    _complete_capture,
     latest_catalogue_capture,
     read_capture,
 )
@@ -84,10 +83,11 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
 def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
     store.require_writable()
     capture_id = capture_id or latest_catalogue_capture(store)
-    state = complete_capture(store, capture_id)
+    state = _complete_capture(store, capture_id)
     if state["selected"] is not None:
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
-    receipt = certified(store, capture_id)
+    cutoffs: list[dict[str, Any]] = []
+    receipt = certified(store, capture_id, cutoff_sink=cutoffs)
     if receipt["scope"] != "catalogue":
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
     store.check_deadline()
@@ -112,11 +112,6 @@ def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
                     )
                 except duckdb.InterruptException as exc:
                     raise BudgetExceeded("operation deadline exhausted") from exc
-        cutoffs = [
-            {"received_at": manifest["received_at"], "cutoff": payload}
-            for manifest, payload in capture_pages(store, state)
-            if manifest.get("endpoint") == "/historical/cutoff" and manifest.get("status") == 200
-        ]
         coverage = [
             {
                 "capture_id": state["capture_id"],

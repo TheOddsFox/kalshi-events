@@ -26,7 +26,7 @@ def records(payload: Any, key: str, *, singular: bool = False) -> list[dict[str,
 def observation(
     kind: str, native: dict[str, Any], provenance: dict[str, Any], pointer: str
 ) -> dict[str, Any]:
-    identity = native.get("event_ticker") if kind == "events" else native.get("ticker")
+    identity, parent = native_identity(kind, native)
     key = ENTITY_KEYS[kind]
     row = {
         **native,
@@ -37,11 +37,23 @@ def observation(
         "payload_json": json_bytes(native).decode().strip(),
     }
     if kind == "events":
-        if native.get("series_ticker"):
-            ticker(native["series_ticker"])
-        row["series_ticker"] = native.get("series_ticker")
+        row["series_ticker"] = parent
     if kind == "markets":
-        row["event_ticker"] = ticker(native.get("event_ticker"))
+        row["event_ticker"] = parent
+    return row
+
+
+def native_identity(kind: str, native: dict[str, Any]) -> tuple[str, Any]:
+    """Validate native identity and relationship fields without serializing payloads."""
+    identity = native.get("event_ticker") if kind == "events" else native.get("ticker")
+    identity = ticker(identity)
+    parent = None
+    if kind == "events":
+        parent = native.get("series_ticker")
+        if parent:
+            ticker(parent)
+    elif kind == "markets":
+        parent = ticker(native.get("event_ticker"))
         legs = native.get("mve_selected_legs", [])
         if not isinstance(legs, list) or any(not isinstance(leg, dict) for leg in legs):
             raise CatalogueError("malformed native combo legs")
@@ -50,7 +62,57 @@ def observation(
             ticker(leg.get("market_ticker"))
             if leg.get("side") not in {"yes", "no"}:
                 raise CatalogueError("malformed native combo side")
-    return row
+    return identity, parent
+
+
+class ParentIndex:
+    """Compact winner identities needed to resolve capture-time parent lookups."""
+
+    def __init__(self) -> None:
+        self.series: dict[str, tuple[str, str, None]] = {}
+        self.events: dict[str, tuple[str, str, str | None]] = {}
+        self.markets: dict[str, tuple[str, str, str]] = {}
+        self.processed: set[str] = set()
+
+    @staticmethod
+    def _put(target: dict[str, tuple], identity: str, winner: tuple) -> None:
+        previous = target.get(identity)
+        if previous is None or winner[:2] > previous[:2]:
+            target[identity] = winner
+
+    def add_page(self, manifest: dict[str, Any], payload: Any) -> None:
+        if manifest.get("status") != 200:
+            return
+        kind = manifest.get("entity_kind")
+        if kind not in ENTITY_KEYS:
+            return
+        envelope = {"series": "series", "events": "events", "markets": "markets"}[kind]
+        if manifest.get("singular"):
+            envelope = {"series": "series", "events": "event", "markets": "market"}[kind]
+        provenance = {
+            "page_id": manifest["page_id"],
+            "received_at": manifest["received_at"],
+        }
+        for index, native in enumerate(
+            records(payload, envelope, singular=manifest.get("singular", False))
+        ):
+            identity, parent = native_identity(kind, native)
+            winner = (
+                provenance["received_at"],
+                digest(json_bytes([provenance["page_id"], f"/{envelope}/{index}"])),
+                parent,
+            )
+            if kind == "series":
+                self._put(self.series, identity, winner[:2] + (None,))
+            elif kind == "events":
+                self._put(self.events, identity, winner)
+                if "markets" in native:
+                    for market in records(native, "markets"):
+                        if market.get("event_ticker") != identity:
+                            raise CatalogueError("nested market parent contradicts event")
+                        native_identity("markets", market)
+            else:
+                self._put(self.markets, identity, winner)
 
 
 def observations(pages: Iterable[tuple[dict[str, Any], Any]]) -> Iterator[dict[str, Any]]:

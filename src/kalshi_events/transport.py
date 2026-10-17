@@ -115,13 +115,18 @@ def read_page(
     relative: str,
     limit: int | None = None,
     decoded_limit: int | None = None,
+    *,
+    decode_json: bool = True,
+    decode_endpoints: set[str] | None = None,
+    inventory: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Verify one raw receipt. Limits may be the capture's sealed response ceilings."""
     limit = store.limits.max_response_bytes if limit is None else limit
     decoded_limit = (
         store.limits.max_decoded_response_bytes if decoded_limit is None else decoded_limit
     )
-    manifest = decode(regular_bytes(store.path(relative), 1024**2))
+    manifest_body = regular_bytes(store.path(relative), 1024**2)
+    manifest = decode(manifest_body)
     store.check_deadline()
     if (
         not isinstance(manifest, dict)
@@ -137,10 +142,12 @@ def read_page(
     metrics.add("raw_body_reads")
     metrics.add("raw_body_read_bytes", len(body))
     version = manifest["version"]
+    actual_encoded_sha: str
     if version == 1:
-        if len(body) != _checked_size(manifest.get("size"), "size") or _encoded_digest(
-            body
-        ) != _checked_digest(manifest.get("sha256"), "sha256"):
+        actual_encoded_sha = _encoded_digest(body)
+        if len(body) != _checked_size(
+            manifest.get("size"), "size"
+        ) or actual_encoded_sha != _checked_digest(manifest.get("sha256"), "sha256"):
             raise CatalogueError("raw response evidence integrity mismatch")
         decoded = body
     else:
@@ -153,7 +160,7 @@ def read_page(
         if (
             len(body) != encoded_size
             or len(body) != _checked_size(manifest.get("size"), "size")
-            or _encoded_digest(body) != encoded_sha
+            or (actual_encoded_sha := _encoded_digest(body)) != encoded_sha
             or manifest.get("sha256") != encoded_sha
         ):
             raise CatalogueError("raw response evidence integrity mismatch")
@@ -164,10 +171,18 @@ def read_page(
         raise CatalogueError("decoded response exceeds byte ceiling")
     if version == 1 and len(body) > decoded_limit:
         raise CatalogueError("decoded response exceeds byte ceiling")
-    if status == 200:
+    if inventory is not None:
+        inventory[relative] = digest(manifest_body)
+        inventory[str(body_path.relative_to(store.root))] = actual_encoded_sha
+    should_decode = (
+        status == 200
+        and decode_json
+        and (decode_endpoints is None or manifest.get("endpoint") in decode_endpoints)
+    )
+    if should_decode:
         metrics.add("raw_body_json_decodes")
     store.check_deadline()
-    payload = decode(decoded) if status == 200 else None
+    payload = decode(decoded) if should_decode else None
     store.check_deadline()
     return manifest, payload
 

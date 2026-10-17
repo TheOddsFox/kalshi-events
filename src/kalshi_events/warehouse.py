@@ -21,7 +21,13 @@ import dlt
 import duckdb
 
 from kalshi_events import metrics
-from kalshi_events.capture import capture_pages, complete_capture, page_receipts
+from kalshi_events.capture import (
+    _complete_capture,
+    capture_pages,
+    complete_capture,
+    page_receipts,
+    read_capture,
+)
 from kalshi_events.common import (
     BudgetExceeded,
     CatalogueError,
@@ -34,6 +40,7 @@ from kalshi_events.common import (
     regular_bytes,
 )
 from kalshi_events.normalize import ENTITY_KEYS, observations
+from kalshi_events.transport import read_page
 
 RELATIONS = {
     "series": "current_series",
@@ -52,19 +59,33 @@ def build_directory(capture_id: str) -> str:
 
 
 def catalogue_capture(store: Store, capture_id: str) -> dict[str, Any]:
-    state = complete_capture(store, capture_id)
+    state = _complete_capture(store, capture_id)
     if state["selected"] is not None:
         raise CatalogueError("targeted metadata captures never enter the catalogue warehouse")
     return state
 
 
-def evidence_inventory(store: Store, capture_id: str) -> dict[str, str]:
-    state = complete_capture(store, capture_id)
+def evidence_inventory(
+    store: Store, capture_id: str, *, verified_pages: dict[str, str] | None = None
+) -> dict[str, str]:
+    state = (
+        complete_capture(store, capture_id)
+        if verified_pages is None
+        else _complete_capture(store, capture_id)
+    )
     base = f"captures/{capture_id}"
     result = {
         f"{base}/state.json": digest(regular_bytes(store.path(f"{base}/state.json"))),
         f"{base}/pages.jsonl": digest(regular_bytes(store.path(f"{base}/pages.jsonl"))),
     }
+    if verified_pages is not None:
+        expected = set()
+        for row in page_receipts(store, state):
+            relative = row["relative"]
+            expected.update({relative, str(Path(relative).parent / "body.bin")})
+        if set(verified_pages) != expected:
+            raise CatalogueError("verified evidence inventory does not match the capture journal")
+        return {**result, **verified_pages}
     for row in page_receipts(store, state):
         store.check_deadline()
         relative = row["relative"]
@@ -85,20 +106,32 @@ def _as_budget(exc: BaseException) -> BudgetExceeded | None:
     return None
 
 
-def _land(store: Store, state: dict[str, Any], directory: Path) -> int:
+def _land(
+    store: Store,
+    state: dict[str, Any],
+    directory: Path,
+    *,
+    verified_pages: dict[str, str] | None = None,
+) -> int:
     """Land one capture into a fresh warehouse under `directory`. Returns observation count."""
     with metrics.phase("landing"):
-        return _land_rows(store, state, directory)
+        return _land_rows(store, state, directory, verified_pages=verified_pages)
 
 
-def _land_rows(store: Store, state: dict[str, Any], directory: Path) -> int:
+def _land_rows(
+    store: Store,
+    state: dict[str, Any],
+    directory: Path,
+    *,
+    verified_pages: dict[str, str] | None = None,
+) -> int:
     capture_id = state["capture_id"]
     observation_count = 0
     store.check_storage()
 
     def rows():
         nonlocal observation_count
-        for row in observations(capture_pages(store, state)):
+        for row in observations(capture_pages(store, state, evidence=verified_pages)):
             store.check_deadline()
             observation_count += 1
             kind = row["entity_kind"]
@@ -168,7 +201,8 @@ def load(store: Store, capture_id: str) -> dict[str, Any]:
     directory = store.path(relative)
     directory.mkdir(parents=True)
     try:
-        observation_count = _land(store, state, directory)
+        verified_pages: dict[str, str] = {}
+        observation_count = _land(store, state, directory, verified_pages=verified_pages)
     finally:
         shutil.rmtree(directory, ignore_errors=True)
         store.sync(relative)
@@ -176,7 +210,7 @@ def load(store: Store, capture_id: str) -> dict[str, Any]:
         "capture_id": capture_id,
         "loaded_at": now(),
         "observation_count": observation_count,
-        "evidence": evidence_inventory(store, capture_id),
+        "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
     }
 
 
@@ -271,7 +305,8 @@ def build(store: Store, capture_id: str) -> dict[str, Any]:
     replaced_relative = f"tmp/replaced-{uuid.uuid4().hex}"
     replaced = store.path(replaced_relative)
     try:
-        _land(store, state, staging)
+        verified_pages: dict[str, str] = {}
+        _land(store, state, staging, verified_pages=verified_pages)
         dbt(
             store,
             ["build"],
@@ -284,7 +319,7 @@ def build(store: Store, capture_id: str) -> dict[str, Any]:
             "capture_id": capture_id,
             "built_at": now(),
             "scope": "catalogue",
-            "evidence": evidence_inventory(store, capture_id),
+            "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
             "warehouse_sha256": file_digest(
                 staging / "warehouse.duckdb", store.limits.max_database_bytes
             )[0],
@@ -313,15 +348,51 @@ def build(store: Store, capture_id: str) -> dict[str, Any]:
     return receipt
 
 
-def certified(store: Store, capture_id: str) -> dict[str, Any]:
+def certified(
+    store: Store,
+    capture_id: str,
+    *,
+    cutoff_sink: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     directory = build_directory(capture_id)
     receipt = decode(regular_bytes(store.path(f"{directory}/build.json")))
     if receipt.get("capture_id") != capture_id or receipt.get("version") != 1:
         raise CatalogueError("build receipt does not match the requested capture")
-    for relative, expected in receipt["evidence"].items():
+    state = read_capture(store, capture_id)
+    rows = page_receipts(store, state)
+    base = f"captures/{capture_id}"
+    required = {f"{base}/state.json", f"{base}/pages.jsonl"}
+    for row in rows:
+        relative = row["relative"]
+        required.update({relative, str(Path(relative).parent / "body.bin")})
+    expected_files = receipt.get("evidence")
+    if not isinstance(expected_files, dict) or set(expected_files) != required:
+        raise CatalogueError("build evidence inventory does not match the capture journal")
+    actual_files: dict[str, str] = {}
+    for relative in (f"{base}/state.json", f"{base}/pages.jsonl"):
         store.check_deadline()
-        if file_digest(store.path(relative), store.limits.max_root_bytes)[0] != expected:
-            raise CatalogueError("build evidence integrity mismatch")
+        actual_files[relative] = file_digest(store.path(relative), store.limits.max_root_bytes)[0]
+    for row in rows:
+        store.check_deadline()
+        relative = row["relative"]
+        manifest, payload = read_page(
+            store,
+            relative,
+            state["max_response_bytes"],
+            state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+            decode_endpoints={"/historical/cutoff"} if cutoff_sink is not None else set(),
+            inventory=actual_files,
+        )
+        if manifest.get("capture_id") != capture_id:
+            raise CatalogueError("raw evidence belongs to another capture")
+        if (
+            cutoff_sink is not None
+            and manifest.get("endpoint") == "/historical/cutoff"
+            and manifest.get("status") == 200
+        ):
+            cutoff_sink.append({"received_at": manifest["received_at"], "cutoff": payload})
+    if actual_files != expected_files:
+        raise CatalogueError("build evidence integrity mismatch")
     warehouse = store.path(f"{directory}/warehouse.duckdb")
     if file_digest(warehouse, store.limits.max_database_bytes)[0] != receipt["warehouse_sha256"]:
         raise CatalogueError("warehouse changed after certified build")

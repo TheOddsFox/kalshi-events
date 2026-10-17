@@ -27,7 +27,7 @@ from kalshi_events.common import (
     selections,
     ticker,
 )
-from kalshi_events.normalize import observations, records
+from kalshi_events.normalize import ParentIndex, records
 from kalshi_events.transport import MAX_CONCURRENT_REQUESTS, PublicClient, read_page
 
 EVENT_PAGE_LIMIT = 200
@@ -120,7 +120,12 @@ def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def capture_pages(store: Store, state: dict[str, Any]) -> Iterator[tuple[dict[str, Any], Any]]:
+def capture_pages(
+    store: Store,
+    state: dict[str, Any],
+    *,
+    evidence: dict[str, str] | None = None,
+) -> Iterator[tuple[dict[str, Any], Any]]:
     for row in page_receipts(store, state):
         store.check_deadline()
         manifest, payload = read_page(
@@ -128,6 +133,7 @@ def capture_pages(store: Store, state: dict[str, Any]) -> Iterator[tuple[dict[st
             row["relative"],
             state["max_response_bytes"],
             state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+            inventory=evidence,
         )
         if manifest.get("capture_id") != state["capture_id"]:
             raise CatalogueError("raw evidence belongs to another capture")
@@ -314,6 +320,7 @@ def _consume(
     index: int,
     relative: str,
     seen: dict[int, set[str]],
+    identities: ParentIndex,
 ) -> None:
     work = state["tasks"][index]
     manifest, payload = read_page(
@@ -330,12 +337,19 @@ def _consume(
         _record_cutoff(state, payload)
         work["cutoff_due"] = False
     else:
+        identities.add_page(manifest, payload)
         _apply(state, index, manifest, payload, seen)
+    identities.processed.add(relative)
     work["pending"] = None
     save(store, state)
 
 
-def _settle(store: Store, state: dict[str, Any], seen: dict[int, set[str]]) -> None:
+def _settle(
+    store: Store,
+    state: dict[str, Any],
+    seen: dict[int, set[str]],
+    identities: ParentIndex,
+) -> None:
     """Apply pages whose raw receipts were committed before a previous process stopped."""
     logged = {row["relative"] for row in page_receipts(store, state)}
     index = 0
@@ -345,29 +359,22 @@ def _settle(store: Store, state: dict[str, Any], seen: dict[int, set[str]]) -> N
             if pending not in logged:
                 store.append(_journal(state), json_bytes({"index": index, "relative": pending}))
                 logged.add(pending)
-            _consume(store, state, index, pending, seen)
+            _consume(store, state, index, pending, seen, identities)
         index += 1
 
 
-def _hydrate(store: Store, state: dict[str, Any]) -> bool:
+def _hydrate(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
     with metrics.phase("hydration"):
-        return _hydrate_pages(store, state)
+        return _hydrate_pages(store, state, identities)
 
 
-def _hydrate_pages(store: Store, state: dict[str, Any]) -> bool:
-    events = {}
-    series = set()
-    markets = {}
-    for row in observations(capture_pages(store, state)):
-        if row["entity_kind"] == "series":
-            series.add(row["series_ticker"])
-        elif row["entity_kind"] == "events":
-            events[row["event_ticker"]] = row.get("series_ticker")
-        elif row["source_kind"] == "direct":
-            markets[row["market_ticker"]] = row["event_ticker"]
+def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
+    events = {identity: value[2] for identity, value in identities.events.items()}
+    series = identities.series
+    markets = {identity: value[2] for identity, value in identities.markets.items()}
     existing = {work["endpoint"] for work in state["tasks"]}
     missing_events = set(markets.values()) - events.keys()
-    missing_series = {value for value in events.values() if value} - series
+    missing_series = {value for value in events.values() if value} - series.keys()
     for kind, identities, endpoint in (
         ("events", missing_events, "/events"),
         ("series", missing_series, "/series"),
@@ -428,12 +435,6 @@ def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
             or manifest.get("singular") != singular
         ):
             raise CatalogueError("uncommitted raw receipt contradicts request identity")
-        read_page(
-            store,
-            relative,
-            state["max_response_bytes"],
-            state.get("max_decoded_response_bytes", state["max_response_bytes"]),
-        )
         if context["request_id"] in recovered:
             raise CatalogueError("multiple completed raw receipts claim the same request identity")
         recovered[context["request_id"]] = relative
@@ -448,6 +449,7 @@ def _run(
     recovered: dict[str, str],
     seen: dict[int, set[str]],
     budget: Budget,
+    identities: ParentIndex,
 ) -> None:
     running: dict[Future, int] = {}
     busy: set[int] = set()
@@ -466,7 +468,7 @@ def _run(
                     relative = recovered.pop(context["request_id"], None)
                     if relative is not None:
                         _stage(store, state, index, relative)
-                        _consume(store, state, index, relative, seen)
+                        _consume(store, state, index, relative, seen, identities)
                         continue
                     endpoint, params, _, _ = _plan(work, _phase(work))
                     busy.add(index)
@@ -485,7 +487,7 @@ def _run(
         if not running:
             if failure is not None:
                 raise failure
-            if _hydrate(store, state):
+            if _hydrate(store, state, identities):
                 continue
             state.update(complete=True, completed_at=now(), error=None)
             save(store, state)
@@ -502,7 +504,7 @@ def _run(
             try:
                 _stage(store, state, index, relative)
                 if failure is None:
-                    _consume(store, state, index, relative, seen)
+                    _consume(store, state, index, relative, seen, identities)
             except (CatalogueError, OSError) as exc:
                 failure = failure or exc
 
@@ -537,6 +539,7 @@ def capture(
         return {**state, **budget.result(), "budget_exhausted": False}
     state["error"] = None
     seen: dict[int, set[str]] = {}
+    identities = ParentIndex()
     budget_exhausted = False
     try:
         with (
@@ -549,9 +552,23 @@ def capture(
                 max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="kalshi-traversal"
             ) as pool,
         ):
-            _settle(store, state, seen)
+            _settle(store, state, seen, identities)
+            if resume:
+                for row in page_receipts(store, state):
+                    if row["relative"] in identities.processed:
+                        continue
+                    manifest, payload = read_page(
+                        store,
+                        row["relative"],
+                        state["max_response_bytes"],
+                        decoded_ceiling,
+                    )
+                    if manifest.get("capture_id") != state["capture_id"]:
+                        raise CatalogueError("raw evidence belongs to another capture")
+                    identities.add_page(manifest, payload)
+                    identities.processed.add(row["relative"])
             recovered = _recover_receipts(store, state) if resume else {}
-            _run(store, state, client, pool, recovered, seen, budget)
+            _run(store, state, client, pool, recovered, seen, budget, identities)
     except (CatalogueError, OSError) as exc:
         state["error"] = str(exc)
         save(store, state)
@@ -561,7 +578,7 @@ def capture(
     return {**state, **budget.result(), "budget_exhausted": budget_exhausted}
 
 
-def complete_capture(store: Store, capture_id: str) -> dict[str, Any]:
+def _complete_capture(store: Store, capture_id: str) -> dict[str, Any]:
     state = read_capture(store, capture_id)
     if (
         not state.get("complete")
@@ -569,6 +586,11 @@ def complete_capture(store: Store, capture_id: str) -> dict[str, Any]:
         or any(not work["done"] for work in state["tasks"])
     ):
         raise CatalogueError("capture is incomplete; resume before build or publish")
+    return state
+
+
+def complete_capture(store: Store, capture_id: str) -> dict[str, Any]:
+    state = _complete_capture(store, capture_id)
     for _ in capture_pages(store, state):
         pass
     return state
