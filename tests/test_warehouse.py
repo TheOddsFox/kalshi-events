@@ -350,11 +350,21 @@ def test_failed_publication_rename_restores_previous_build(store, factory, monke
 
 def test_evidence_walk_checks_deadline_on_every_page(store, factory, monkeypatch):
     state = capture(store, client_factory=factory)
-    monkeypatch.setattr(warehouse, "complete_capture", lambda *_: state)
-    expired = Store(store.root, Limits(max_duration_seconds=1))
-    expired.started -= 60
+    expired = Store(store.root, Limits(max_duration_seconds=60))
+    file_digest = warehouse.file_digest
+    body_reads = []
+
+    def expire_after_first_body(path, *args, **kwargs):
+        result = file_digest(path, *args, **kwargs)
+        if Path(path).name == "body.bin":
+            body_reads.append(path)
+            expired.started -= 120
+        return result
+
+    monkeypatch.setattr(warehouse, "file_digest", expire_after_first_body)
     with pytest.raises(BudgetExceeded, match="deadline"):
         warehouse.evidence_inventory(expired, state["capture_id"])
+    assert len(body_reads) == 1
 
 
 def test_status_and_current_report_the_published_release(store, factory, capsys):

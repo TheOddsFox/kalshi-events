@@ -58,6 +58,10 @@ Opt-in `capture --incremental` pins a certified v2 publication when present, oth
 
 A v2 manifest additionally carries `root_id`, `baseline_release_id`, `baseline_manifest_sha256`, `baseline_capture_id`, `previous_watermark`, `watermark_started_at`, `delta_depth` and `membership_sha256`. Baseline fields name the immediate pinned predecessor for a delta and are null for a full rebase. Full depth is zero; each delta increments depth. The membership digest commits sorted scope/entity-kind/native-ticker entries, including membership not visible in the current relations. These fields are also included in v2 coverage, binding them into the release identity. Publication pointers contain the release ID and manifest checksum.
 
+Version 2 verification requires one coverage row whose capture identity and all eight lineage fields exactly match the manifest. It reads only those bounded primitive columns after verifying the file inventory, and rejects missing columns, invalid types, extra rows or mismatched values. Publication time and the optional physical warehouse checksum are outside this coverage binding. Version 1 verification is unchanged.
+
+New v2 manifests also record the optional `warehouse_sha256` of the freshly certified, checkpointed database. It is a verification hint outside the release identity and coverage fields. Matching freshly verified database bytes avoid a repeated semantic comparison; a missing or different hash requires schema, row-multiset and membership equivalence against the pinned release. Existing v2 manifests remain valid and immutable. V1 manifests do not gain this field.
+
 ### Incremental acquisition and freshness
 
 Each incremental capture seals a UTC start watermark before its first request. Its ordinary-event and supported non-combo market metadata queries begin at the previous published watermark minus a fixed 300-second overlap. Series, combo events, combo markets and historical markets are fully reconciled on every composed refresh. The watermark advances to the sealed start only after verified publication. Resume retains the original baseline, watermark and query window even if another publication appears.

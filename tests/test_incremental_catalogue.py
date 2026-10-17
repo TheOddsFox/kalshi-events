@@ -14,7 +14,7 @@ import pytest
 from conftest import CUTOFF, MARKET, FakeClient
 
 from kalshi_events import capture as acquisition
-from kalshi_events import metadata, recovery, warehouse
+from kalshi_events import metadata, metrics, recovery, warehouse
 from kalshi_events import publish as publishing
 from kalshi_events.cli import main
 from kalshi_events.common import CatalogueError, Limits, Store, json_bytes
@@ -249,6 +249,20 @@ def baseline(certified_baseline, tmp_path):
     return Store(root), capture_id, legacy, version_two
 
 
+@pytest.fixture(scope="module")
+def affected_baseline(tmp_path_factory):
+    store = Store(tmp_path_factory.mktemp("affected-key-baseline") / "root")
+    snapshot = Snapshot()
+    snapshot.live = [{**snapshot.live[0], "ticker": f"M{number}"} for number in range(40)]
+    state = capture_at(store, snapshot, BASE_TIME)
+    warehouse.build(store, state["capture_id"])
+    publishing.publish(store, state["capture_id"])
+    publishing.publish(store, state["capture_id"], catalogue_version=2)
+    frozen = tree_inventory(store.root)
+    yield store.root, state["capture_id"]
+    assert tree_inventory(store.root) == frozen
+
+
 def build_delta(store, snapshot, timestamp=DELTA_TIME):
     state = capture_at(store, snapshot, timestamp, incremental=True)
     assert state["complete"]
@@ -258,6 +272,39 @@ def build_delta(store, snapshot, timestamp=DELTA_TIME):
     assert not store.path(f"builds/{state['capture_id']}").exists()
     assert_provenance(store, state["capture_id"])
     return state
+
+
+@pytest.mark.parametrize("sparse_change", [False, True])
+def test_no_change_and_sparse_refresh_report_bounded_affected_key_counts(
+    affected_baseline, tmp_path, sparse_change
+):
+    source, baseline_id = affected_baseline
+    shutil.copytree(source, tmp_path / "root")
+    store = Store(tmp_path / "root")
+    before = keyed(store, baseline_id, "current_markets", "market_ticker")
+    snapshot = Snapshot()
+    if sparse_change:
+        snapshot.market_updates = [
+            {**snapshot.live[0], "ticker": "M20", "last_price_dollars": "0.23456789"}
+        ]
+    delta = capture_at(store, snapshot, incremental=True)
+    with metrics.collect() as measured:
+        receipt = warehouse.build(store, delta["capture_id"])
+    counters = measured.report()["counters"]
+    assert counters["affected_series"] == 2
+    assert counters["affected_events"] == 2
+    assert counters["affected_markets"] == 2 + int(sparse_change)
+    assert counters["affected_markets"] < len(before) // 10
+    assert not any(
+        name in receipt for name in ("affected_series", "affected_events", "affected_markets")
+    )
+    after = keyed(store, delta["capture_id"], "current_markets", "market_ticker")
+    for number in range(40):
+        identity = f"M{number}"
+        if sparse_change and identity == "M20":
+            assert after[identity]["last_price_dollars"] == Decimal("0.23456789")
+        else:
+            assert after[identity] == before[identity]
 
 
 def test_empty_metadata_delta_preserves_carried_times_and_distinct_observations(baseline):

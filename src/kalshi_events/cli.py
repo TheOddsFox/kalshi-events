@@ -227,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             metrics_path = safe_path(args.metrics_file)
             if metrics_path.is_relative_to(root):
                 raise CatalogueError("metrics report must be outside the operator root")
+            _validate_metrics_output_overlap(args, metrics_path)
             if metrics_path.exists():
                 raise CatalogueError("metrics report path already exists")
             report_stream = metrics.reserve_report(metrics_path)
@@ -253,6 +254,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(json_bytes(result).decode().strip())
     return EXIT_INCOMPLETE if result.get("complete") is False else 0
+
+
+def _validate_metrics_output_overlap(args: argparse.Namespace, metrics_path: Path) -> None:
+    outputs: list[Path] = []
+    if args.command == "verify":
+        outputs.append(safe_path(args.release))
+    elif args.command == "metadata":
+        outputs.append(safe_path(args.output))
+
+    for output in outputs:
+        if metrics_path.is_relative_to(output) or output.is_relative_to(metrics_path):
+            raise CatalogueError("metrics report must not overlap a verified or metadata bundle")
 
 
 if __name__ == "__main__":

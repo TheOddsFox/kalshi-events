@@ -1708,8 +1708,12 @@ def capture(
         )
 
 
-def _complete_capture(store: Store, capture_id: str) -> dict[str, Any]:
-    state = read_capture(store, capture_id)
+def _complete_capture(
+    store: Store, capture_id: str, *, _state: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    state = read_capture(store, capture_id) if _state is None else _state
+    if state.get("capture_id") != capture_id:
+        raise CatalogueError("capture state does not match the requested capture")
     if (
         not state.get("complete")
         or any(work["pending"] is not None for work in state["tasks"])

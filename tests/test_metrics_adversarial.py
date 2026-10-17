@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 
 import pytest
 from conftest import FakeClient
 
-from kalshi_events import cli, metrics
+from kalshi_events import cli, metadata, metrics, publish, warehouse
 from kalshi_events.capture import capture
-from kalshi_events.common import BudgetExceeded, CatalogueError
+from kalshi_events.common import BudgetExceeded, CatalogueError, Store
 
 
 def test_capture_propagates_active_measurement_into_every_worker(store):
@@ -148,3 +149,142 @@ def test_report_sibling_with_shared_root_prefix_is_allowed(tmp_path, capsys):
     assert "metrics" not in result
     assert json.loads(report.read_text())["version"] == 1
     assert not list(root.rglob("*metrics*"))
+
+
+@pytest.fixture(scope="module")
+def certified_metrics_artifacts(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("metrics-artifacts")
+    store = Store(directory / "root")
+    state = capture(store, client_factory=FakeClient)
+    warehouse.build(store, state["capture_id"])
+    release = publish.publish(store, state["capture_id"])
+    bundle = directory / "metadata"
+    metadata.export(store, ["MARKET"], bundle, capture_id=state["capture_id"])
+    return bundle, store.path(f"releases/{release['source_release_id']}")
+
+
+def _artifact_bytes(directory):
+    return {
+        str(path.relative_to(directory)): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("kind", ["metadata", "release"])
+@pytest.mark.parametrize("report_location", ["equal", "child", "nested"])
+def test_metrics_cannot_change_a_standalone_verified_artifact(
+    certified_metrics_artifacts, tmp_path, capsys, kind, report_location
+):
+    source = certified_metrics_artifacts[kind == "release"]
+    artifact = tmp_path / "artifact"
+    shutil.copytree(source, artifact)
+    verify = metadata.verify if kind == "metadata" else publish.verify_release
+    expected = verify(artifact)
+    before = _artifact_bytes(artifact)
+    report = {
+        "equal": artifact,
+        "child": artifact / "metrics.json",
+        "nested": artifact / "reports" / "metrics.json",
+    }[report_location]
+    arguments = (
+        ["metadata", "verify", "--output", str(artifact)]
+        if kind == "metadata"
+        else ["verify", "--release", str(artifact)]
+    )
+    root = tmp_path / "unrelated-root"
+
+    assert cli.main(["--root", str(root), "--metrics-file", str(report), *arguments]) == 1
+    assert capsys.readouterr().out == ""
+    assert _artifact_bytes(artifact) == before
+    assert verify(artifact) == expected
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("action", ["refresh", "export"])
+@pytest.mark.parametrize("report_location", ["equal", "child", "nested", "ancestor"])
+def test_metadata_metrics_overlap_rejected_before_acquisition_or_output_creation(
+    tmp_path, monkeypatch, capsys, action, report_location
+):
+    output = tmp_path / "artifact" / "metadata"
+    report = {
+        "equal": output,
+        "child": output / "metrics.json",
+        "nested": output / "reports" / "metrics.json",
+        "ancestor": output.parent,
+    }[report_location]
+    acquisitions = []
+
+    def unexpected_capture(*args, **kwargs):
+        acquisitions.append((args, kwargs))
+        raise AssertionError("metrics overlap must be rejected before acquisition")
+
+    monkeypatch.setattr(metadata, "capture", unexpected_capture)
+    root = tmp_path / "unrelated-root"
+    arguments = [
+        "--root",
+        str(root),
+        "--metrics-file",
+        str(report),
+        "metadata",
+        action,
+        "--market-ticker",
+        "MARKET",
+        "--output",
+        str(output),
+    ]
+
+    assert cli.main(arguments) == 1
+    assert capsys.readouterr().out == ""
+    assert acquisitions == []
+    assert not output.parent.exists()
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("kind", ["metadata", "release"])
+def test_standalone_verification_allows_external_sibling_metrics(
+    certified_metrics_artifacts, tmp_path, capsys, kind
+):
+    source = certified_metrics_artifacts[kind == "release"]
+    artifact = tmp_path / "artifact"
+    shutil.copytree(source, artifact)
+    before = _artifact_bytes(artifact)
+    report = tmp_path / "artifact-reports" / "metrics.json"
+    arguments = (
+        ["metadata", "verify", "--output", str(artifact)]
+        if kind == "metadata"
+        else ["verify", "--release", str(artifact)]
+    )
+
+    assert cli.main(["--metrics-file", str(report), *arguments]) == 0
+    assert json.loads(capsys.readouterr().out)["source_release_id"]
+    assert json.loads(report.read_bytes())["version"] == 1
+    assert _artifact_bytes(artifact) == before
+
+
+@pytest.mark.parametrize("action", ["refresh", "export"])
+def test_metadata_output_allows_external_sibling_metrics(tmp_path, monkeypatch, capsys, action):
+    store = Store(tmp_path / "root")
+    monkeypatch.setattr("kalshi_events.capture.PublicClient", FakeClient)
+    if action == "export":
+        capture(store, selected=["MARKET"], client_factory=FakeClient)
+    output = tmp_path / "artifact"
+    report = tmp_path / "artifact-reports" / "metrics.json"
+    arguments = [
+        "--root",
+        str(store.root),
+        "--metrics-file",
+        str(report),
+        "metadata",
+        action,
+        "--market-ticker",
+        "MARKET",
+        "--output",
+        str(output),
+    ]
+
+    assert cli.main(arguments) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert metadata.verify(output)["source_release_id"] == result["source_release_id"]
+    assert json.loads(report.read_bytes())["version"] == 1
+    assert not list(output.rglob("*metrics*"))

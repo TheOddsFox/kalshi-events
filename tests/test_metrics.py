@@ -47,6 +47,21 @@ def test_metrics_phase_and_counters_are_thread_safe():
     assert report["counters"]["observations"] == 1
 
 
+def test_failed_fsync_call_is_counted_and_still_propagates(tmp_path, monkeypatch):
+    from kalshi_events import common
+
+    path = tmp_path / "durable-file"
+    path.write_bytes(b"evidence")
+
+    def failed_fsync(_descriptor):
+        raise OSError("synthetic fsync failure")
+
+    monkeypatch.setattr(common.os, "fsync", failed_fsync)
+    with collect() as measured, pytest.raises(OSError, match="synthetic fsync failure"):
+        common.fsync_file(path)
+    assert measured.report()["counters"]["fsync_calls"] == 1
+
+
 @pytest.mark.timeout(60)
 def test_offline_benchmark_smoke(tmp_path):
     repository = Path(__file__).resolve().parents[1]
@@ -56,7 +71,7 @@ def test_offline_benchmark_smoke(tmp_path):
             sys.executable,
             str(repository / "scripts" / "benchmark-pipeline.py"),
             "--markets",
-            "12",
+            "1203",
             "--runs",
             "1",
             "--warmups",
@@ -70,6 +85,11 @@ def test_offline_benchmark_smoke(tmp_path):
         cwd=repository,
     )
     summary = json.loads((report_dir / "benchmark-summary.json").read_text())
-    assert summary["fixture"]["markets"] == 12
-    assert summary["results"]["source"][0]["observations"] == 15
-    assert summary["paired_comparisons"][0]["artifacts_match"]
+    assert summary["fixture"]["markets"] == 1203
+    assert summary["fixture"]["full_scope_market_pages"] == 7
+    assert summary["fixture"]["combo_markets"] == 1
+    assert summary["fixture"]["combo_legs_expected"] == 1
+    assert summary["results"]["source"][0]["observations"] == 1206
+    assert summary["results"]["source"][0]["counters"]["requests"] == 13
+    assert summary["paired_comparisons"][0]["artifact_bytes_match"]
+    assert summary["correctness_gate"]["passed"]

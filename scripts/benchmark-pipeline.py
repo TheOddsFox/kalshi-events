@@ -7,9 +7,11 @@ import argparse
 import contextlib
 import contextvars
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -20,13 +22,21 @@ from typing import Any
 from urllib.parse import parse_qs
 
 FIXED_TIME = "2026-01-01T00:00:00Z"
+FIXED_ROOT_ID = "b" * 32
 PAGE_SIZE = 200
 _request_id = contextvars.ContextVar("fixture_request_id")
+_inside_page_read = contextvars.ContextVar("benchmark_inside_page_read", default=False)
 
 
-def _baseline_metrics() -> Any:
+def _baseline_metrics(source_root: Path) -> Any:
     """Load current recorder standalone so archived source gets comparable read/decode counts."""
-    path = Path(__file__).resolve().parents[1] / "src/kalshi_events/metrics.py"
+    candidates = [
+        source_root / "src/kalshi_events/metrics.py",
+        Path.cwd() / "src/kalshi_events/metrics.py",
+    ]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise RuntimeError("benchmark needs an installed metrics.py from the candidate checkout")
     spec = importlib.util.spec_from_file_location("benchmark_metrics", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -47,11 +57,13 @@ def _instrument_baseline(metrics: Any, modules: list[Any]) -> None:
             if not callable(original) or getattr(original, "_bench_wrapped", False):
                 continue
 
-            def observe(*args, __name=name, __original=original, **kwargs):
+            def observe(*args, __name=name, __original=original, __module=module, **kwargs):
                 if __name == "decode":
                     body = args[0]
                     metrics.add("json_decodes")
                     metrics.add("json_decoded_bytes", len(body))
+                    with metrics.phase("json_parsing"):
+                        return __original(*args, **kwargs)
                 elif __name == "regular_bytes":
                     body = __original(*args, **kwargs)
                     metrics.add("file_reads")
@@ -60,7 +72,12 @@ def _instrument_baseline(metrics: Any, modules: list[Any]) -> None:
                 elif __name == "digest":
                     metrics.add("hashes")
                     metrics.add("hash_bytes", len(args[0]))
-                    with metrics.phase("hashing"):
+                    phase = (
+                        "encoded_hashing"
+                        if _inside_page_read.get() or hasattr(__module, "PublicClient")
+                        else "hashing"
+                    )
+                    with metrics.phase(phase):
                         return __original(*args, **kwargs)
                 elif __name == "file_digest":
                     metrics.add("hashes")
@@ -68,8 +85,19 @@ def _instrument_baseline(metrics: Any, modules: list[Any]) -> None:
                     with metrics.phase("hashing"):
                         result = __original(*args, **kwargs)
                     metrics.add("hash_bytes", result[1])
+                    path = Path(args[0])
+                    if path.name == "body.bin" and path.parent.parent.name == "raw":
+                        metrics.add("raw_body_reads")
+                        metrics.add("raw_body_read_bytes", result[1])
                     return result
-                result = __original(*args, **kwargs)
+                if __name == "read_page":
+                    token = _inside_page_read.set(True)
+                    try:
+                        result = __original(*args, **kwargs)
+                    finally:
+                        _inside_page_read.reset(token)
+                else:
+                    result = __original(*args, **kwargs)
                 if __name == "read_page":
                     store, relative = args[:2]
                     body_path = store.path(str(Path(relative).parent / "body.bin"))
@@ -82,6 +110,14 @@ def _instrument_baseline(metrics: Any, modules: list[Any]) -> None:
             observe._bench_wrapped = True
             setattr(module, name, observe)
     store_type = next(module.Store for module in expanded if hasattr(module, "Store"))
+    original_sync_prefix = store_type._sync_prefix
+
+    def sync_prefix(store, *args, **kwargs):
+        metrics.add("metadata_scans")
+        with metrics.phase("metadata_scan"):
+            return original_sync_prefix(store, *args, **kwargs)
+
+    store_type._sync_prefix = sync_prefix
     original_record = store_type._record
 
     def record(store, path, size):
@@ -145,6 +181,57 @@ def _instrument_baseline(metrics: Any, modules: list[Any]) -> None:
         transport.RateLimiter.acquire = _timed_function(
             transport.RateLimiter.acquire, metrics, "rate_wait"
         )
+
+
+class _JsonLoadsObserver:
+    """A warehouse-local json proxy that counts its direct first-party artifact parses."""
+
+    def __init__(self, json_module: Any, metrics: Any):
+        self._json_module = json_module
+        self._metrics = metrics
+
+    def loads(self, body: Any, *args: Any, **kwargs: Any) -> Any:
+        size = len(body) if isinstance(body, (str, bytes, bytearray)) else 0
+        self._metrics.add("json_decodes")
+        self._metrics.add("json_decoded_bytes", size)
+        self._metrics.add("first_party_artifact_json_decodes")
+        self._metrics.add("first_party_artifact_json_decoded_bytes", size)
+        with self._metrics.phase("json_parsing"):
+            return self._json_module.loads(body, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._json_module, name)
+
+
+def _instrument_warehouse_json_loads(warehouse: Any, metrics: Any) -> None:
+    """Count warehouse's two direct dbt-artifact parses without touching global json.loads."""
+    warehouse.json = _JsonLoadsObserver(warehouse.json, metrics)
+
+
+def _instrument_current_raw_file_reads(metrics: Any, modules: list[Any]) -> None:
+    """Classify hash-only raw body reads without changing native recorder behavior."""
+    expanded = list(modules)
+    for module in modules:
+        for name in ("common", "warehouse", "publish"):
+            target = getattr(module, name, None)
+            if target is not None and target not in expanded:
+                expanded.append(target)
+    for module in expanded:
+        original = getattr(module, "file_digest", None)
+        if not callable(original):
+            continue
+
+        def observe(path, *args, __original=original, **kwargs):
+            result = __original(path, *args, **kwargs)
+            path = Path(path)
+            if path.name == "body.bin" and path.parent.parent.name == "raw":
+                metrics.add("raw_body_reads")
+                metrics.add("raw_body_read_bytes", result[1])
+            return result
+
+        module.file_digest = observe
+    transport = next((module for module in expanded if hasattr(module, "PublicClient")), None)
+    if transport is not None:
         transport.PublicClient._pause = _timed_function(
             transport.PublicClient._pause, metrics, "retry_wait"
         )
@@ -169,10 +256,12 @@ def _timed_write(function: Any, metrics: Any) -> Any:
 
 
 class FixtureClient:
-    """Deterministic capture client with stable receipt IDs and response completion order."""
+    """Deterministic full and metadata-update snapshots for offline profiles."""
 
-    def __init__(self, markets: int) -> None:
+    def __init__(self, markets: int, scenario: str = "full", stage: str = "full") -> None:
         self.markets = markets
+        self.scenario = scenario
+        self.stage = stage
 
     def response(self, endpoint: str, params: dict[str, Any]) -> tuple[int, Any]:
         if endpoint == "/historical/cutoff":
@@ -183,35 +272,91 @@ class FixtureClient:
         if endpoint == "/series":
             return 200, {"series": [{"ticker": "SERIES", "title": "Fixture contracts"}]}
         if endpoint == "/events":
-            return 200, {
-                "events": [{"event_ticker": "EVENT", "series_ticker": "SERIES"}],
-                "cursor": "",
-            }
+            rows = [self._event()]
+            if "min_updated_ts" in params:
+                rows = rows if self.stage == "refresh" and self.scenario != "no-change" else []
+            return 200, {"events": rows, "cursor": ""}
         if endpoint == "/events/multivariate":
             return 200, {
                 "events": [{"event_ticker": "COMBOEVENT", "series_ticker": "SERIES"}],
                 "cursor": "",
             }
         if endpoint == "/markets":
+            if params.get("mve_filter") == "only":
+                indexes = [i for i in range(self.markets) if self._is_combo(i)]
+            elif params.get("mve_filter") == "exclude":
+                indexes = [i for i in range(self.markets) if not self._is_combo(i)]
+                if "min_updated_ts" in params:
+                    if self.stage != "refresh" or self.scenario == "no-change":
+                        indexes = []
+                    elif self.scenario == "sparse-change":
+                        indexes = [i for i in indexes if i == 0]
+            else:
+                indexes = list(range(self.markets))
             start = int(params.get("cursor", "0"))
-            stop = min(self.markets, start + PAGE_SIZE)
-            rows = [self._market(index) for index in range(start, stop)]
-            return 200, {"markets": rows, "cursor": str(stop) if stop < self.markets else ""}
+            page = indexes[start : start + PAGE_SIZE]
+            stop = start + len(page)
+            rows = [self._market(index) for index in page]
+            return 200, {
+                "markets": rows,
+                "cursor": str(stop) if stop < len(indexes) else "",
+            }
         if endpoint == "/historical/markets":
-            return 200, {"markets": [], "cursor": ""}
+            rows = []
+            if self.scenario != "full":
+                rows = [
+                    {
+                        "ticker": "HIST-000001",
+                        "event_ticker": "EVENT",
+                        "status": "finalized",
+                        "result": "yes",
+                        "settlement_ts": "2025-12-01T00:00:00Z",
+                        "settlement_value_dollars": "1.000000000000000001",
+                        "last_price_dollars": "1.000",
+                        "volume_fp": "12.3456789",
+                        "open_interest_fp": "2.125",
+                    }
+                ]
+            return 200, {"markets": rows, "cursor": ""}
         if endpoint == "/events/EVENT":
-            return 200, {"event": {"event_ticker": "EVENT", "series_ticker": "SERIES"}}
+            return 200, {"event": self._event()}
         if endpoint == "/events/COMBOEVENT":
             return 200, {"event": {"event_ticker": "COMBOEVENT", "series_ticker": "SERIES"}}
         if endpoint == "/series/SERIES":
             return 200, {"series": {"ticker": "SERIES", "title": "Fixture contracts"}}
+        if endpoint.startswith("/markets/"):
+            ticker = endpoint.removeprefix("/markets/")
+            try:
+                index = int(ticker.removeprefix("MKT-"))
+            except ValueError:
+                return 404, {}
+            if index < self.markets:
+                return 200, {"market": self._market(index)}
         return 404, {}
 
+    def _event(self) -> dict[str, Any]:
+        event = {"event_ticker": "EVENT", "series_ticker": "SERIES"}
+        if self.scenario != "full":
+            event["title"] = (
+                "Sparse update"
+                if self.stage == "refresh" and self.scenario != "no-change"
+                else "Fixture event"
+            )
+        return event
+
     @staticmethod
-    def _market(index: int) -> dict[str, Any]:
+    def _is_combo(index: int) -> bool:
+        return index > 1 and index % 1000 == 1
+
+    def _market(self, index: int) -> dict[str, Any]:
         ticker = f"MKT-{index:06d}"
-        combo = index > 1 and index % 1000 == 1
-        return {
+        combo = self._is_combo(index)
+        changed = (
+            self.stage == "refresh"
+            and self.scenario != "no-change"
+            and (self.scenario == "all-change" or index == 0)
+        )
+        row = {
             "ticker": ticker,
             "event_ticker": "COMBOEVENT" if combo else "EVENT",
             "status": "active",
@@ -228,114 +373,687 @@ class FixtureClient:
                 else []
             ),
         }
+        if self.scenario != "full":
+            row["title"] = "Updated contract" if changed else f"Fixture contract {index}"
+        return row
 
 
-def _worker(source_root: Path, root: Path, markets: int, result_path: Path) -> None:
+def _worker(
+    source_root: Path,
+    root: Path,
+    markets: int,
+    result_path: Path,
+    profile: str = "full",
+    scenario: str = "full",
+    refresh_mode: str = "full",
+    baseline_capture_id: str | None = None,
+) -> None:
     os.environ["DLT_TELEMETRY"] = "0"
     os.environ["DLT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
     sys.path.insert(0, str(source_root / "src"))
-    from kalshi_events import capture, common, publish, transport, warehouse
+    from kalshi_events import capture, common, metadata, normalize, publish, transport, warehouse
     from kalshi_events.common import Limits, Store
 
     legacy_metrics = False
     try:
         from kalshi_events import metrics
-    except ImportError:  # Older baseline source has no instrumentation hooks.
-        metrics = _baseline_metrics()
+    except ImportError:
+        metrics = _baseline_metrics(source_root)
         legacy_metrics = True
-        _instrument_baseline(metrics, [common, capture, transport, warehouse, publish])
+        _instrument_baseline(
+            metrics, [common, capture, metadata, normalize, transport, warehouse, publish]
+        )
+    if not legacy_metrics:
+        _instrument_current_raw_file_reads(
+            metrics, [common, capture, metadata, normalize, transport, warehouse, publish]
+        )
+    _instrument_warehouse_json_loads(warehouse, metrics)
+    capture.capture = _timed_function(capture.capture, metrics, "capture")
 
-    measured_context = metrics.collect() if metrics else contextlib.nullcontext(None)
-    with measured_context as measured:
-        # Freeze source capture identities and times; changing them is scoped to this worker.
-        capture.uuid = SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="0" * 31 + "1"))
-        capture.now = lambda: FIXED_TIME
-        os.environ["KALSHI_EVENTS_ALLOW_LOOPBACK"] = "1"
-        os.environ["KALSHI_EVENTS_API_URL"] = "http://127.0.0.1/trade-api/v2"
-        import httpx
+    # Each independent process gets deterministic, noncolliding capture identities.
+    seed = 1 if profile in {"full", "targeted", "resume", "baseline-setup"} else 2
+    sequence = {"value": seed - 1}
 
-        transport.now = lambda: FIXED_TIME
-        transport.uuid = SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=_request_id.get()))
-        fixture = FixtureClient(markets)
+    def next_capture_id():
+        sequence["value"] += 1
+        return SimpleNamespace(hex=f"{sequence['value']:032x}")
 
-        def handler(request):
-            params = {
-                key: values[-1] for key, values in parse_qs(request.url.query.decode()).items()
-            }
-            status, payload = fixture.response(
-                request.url.path.removeprefix("/trade-api/v2"), params
-            )
-            body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-            if legacy_metrics:
-                metrics.add("requests")
-                metrics.add("encoded_bytes", len(body))
-                metrics.add("decoded_bytes", len(body))
-            return httpx.Response(
-                status,
-                headers={"content-type": "application/json"},
-                stream=httpx.ByteStream(body),
-            )
+    capture.uuid = SimpleNamespace(uuid4=next_capture_id)
+    os.environ["KALSHI_EVENTS_ALLOW_LOOPBACK"] = "1"
+    os.environ["KALSHI_EVENTS_API_URL"] = "http://127.0.0.1/trade-api/v2"
+    import httpx
 
-        def client_factory(root_store, budget):
-            client = transport.PublicClient(root_store, budget)
-            client.client.close()
-            client.client = httpx.Client(transport=httpx.MockTransport(handler))
-            original_get = client.get
+    transport.uuid = SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=_request_id.get()))
+    capture_time = (
+        "2026-01-01T00:00:00Z"
+        if profile == "baseline-setup"
+        else "2026-01-02T00:00:00Z"
+        if profile in {"no-change", "sparse-change", "all-change"}
+        else FIXED_TIME
+    )
+    capture.now = lambda: capture_time
+    transport.now = lambda: capture_time
+    common.now = lambda: capture_time
+    warehouse.now = lambda: capture_time
+    publish.now = lambda: capture_time
+    fixture_stage = "baseline" if profile == "baseline-setup" else "refresh"
+    fixture_scenario = (
+        scenario
+        if profile in {"baseline-setup", "no-change", "sparse-change", "all-change"}
+        else "full"
+    )
+    fixture = FixtureClient(markets, fixture_scenario, fixture_stage)
 
-            def get(endpoint, params=None, context=None):
-                token = _request_id.set(context["request_id"])
-                recorder_token = metrics._active.set(measured) if legacy_metrics else None
-                try:
-                    return original_get(endpoint, params, context)
-                finally:
-                    if legacy_metrics:
-                        metrics._active.reset(recorder_token)
-                    _request_id.reset(token)
+    def handler(request):
+        params = {key: values[-1] for key, values in parse_qs(request.url.query.decode()).items()}
+        status, payload = fixture.response(request.url.path.removeprefix("/trade-api/v2"), params)
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        if legacy_metrics:
+            metrics.add("requests")
+            metrics.add("encoded_bytes", len(body))
+            metrics.add("decoded_bytes", len(body))
+        return httpx.Response(
+            status,
+            headers={"content-type": "application/json"},
+            stream=httpx.ByteStream(body),
+        )
 
-            client.get = get
-            return client
+    def client_factory(root_store, budget):
+        client = transport.PublicClient(root_store, budget)
+        client.client.close()
+        client.client = httpx.Client(transport=httpx.MockTransport(handler))
+        original_get = client.get
 
-        from contextlib import nullcontext
+        def get(endpoint, params=None, context=None):
+            token = _request_id.set(context["request_id"])
+            recorder_token = metrics._active.set(measured) if legacy_metrics else None
+            try:
+                return original_get(endpoint, params, context)
+            finally:
+                if legacy_metrics:
+                    metrics._active.reset(recorder_token)
+                _request_id.reset(token)
 
-        limits = Limits(max_rate=1000, max_requests=10000, max_download_bytes=2 * 1024**3)
-        store = Store(root, limits)
-        capture_phase = metrics.phase("capture") if metrics else nullcontext()
-        with capture_phase:
+        client.get = get
+        return client
+
+    download_limit = (
+        4 * 1024**3
+        if profile in {"baseline-setup", "no-change", "sparse-change", "all-change"}
+        else 2 * 1024**3
+    )
+    limits = Limits(max_rate=1000, max_requests=10000, max_download_bytes=download_limit)
+    profile_metrics = metrics.collect() if metrics else contextlib.nullcontext(None)
+    with profile_metrics as measured:
+        if profile == "baseline-setup":
+            store = Store(root, limits)
+            if refresh_mode == "incremental":
+                _seed_incremental_root(store)
+            state = capture.capture(store, client_factory=client_factory)
+            _require_complete(state, profile)
+            warehouse.build(store, state["capture_id"])
+            release = publish.publish(Store(root, limits), state["capture_id"])
+            if refresh_mode == "incremental":
+                release = publish.publish(
+                    Store(root, limits), state["capture_id"], catalogue_version=2
+                )
+            output = Path(release["output"])
+        elif profile in {"no-change", "sparse-change", "all-change"}:
+            store = Store(root, limits)
+            if refresh_mode == "incremental":
+                state = capture.capture(store, client_factory=client_factory, incremental=True)
+            else:
+                state = capture.capture(store, client_factory=client_factory)
+            _require_complete(state, profile)
+            warehouse.build(store, state["capture_id"])
+            if refresh_mode == "incremental":
+                release = publish.publish(
+                    Store(root, limits),
+                    state["capture_id"],
+                    catalogue_version=2,
+                )
+            else:
+                release = publish.publish(Store(root, limits), state["capture_id"])
+            output = Path(release["output"])
+        elif profile == "resume":
+            initial_limits = Limits(max_rate=1000, max_requests=4, max_download_bytes=2 * 1024**3)
+            partial = capture.capture(Store(root, initial_limits), client_factory=client_factory)
             state = capture.capture(
-                store,
-                client_factory=client_factory,
+                Store(root, limits), resume=partial["capture_id"], client_factory=client_factory
             )
-        store.reconcile()
-        store = Store(root, limits)
-        warehouse.build(store, state["capture_id"])
-        store.reconcile()
-        store = Store(root, limits)
-        release = publish.publish(store, state["capture_id"])
-        store.reconcile()
-        output = Path(release["output"])
-        files = {
+            _require_complete(state, profile)
+            warehouse.build(Store(root, limits), state["capture_id"])
+            release = publish.publish(Store(root, limits), state["capture_id"])
+            output = Path(release["output"])
+        else:
+            selected = ["MKT-000000"] if profile == "targeted" else None
+            state = capture.capture(
+                Store(root, limits), client_factory=client_factory, selected=selected
+            )
+            if profile == "targeted":
+                from kalshi_events import metadata
+
+                output = result_path.with_suffix(".metadata")
+                release = metadata.export(
+                    Store(root, limits),
+                    ["MKT-000000"],
+                    output,
+                    capture_id=state["capture_id"],
+                )
+            else:
+                _require_complete(state, profile)
+                warehouse.build(Store(root, limits), state["capture_id"])
+                release = publish.publish(Store(root, limits), state["capture_id"])
+                output = Path(release["output"])
+
+        result = measured.report() if measured else {"version": 0}
+        result["pipeline_elapsed_seconds"] = result.pop("elapsed_seconds", None)
+        result["worker_inclusive_seconds"] = result["pipeline_elapsed_seconds"]
+        result["timing_semantics"] = (
+            "Phase timings are inclusive and may be nested; do not sum them. "
+            "pipeline_elapsed_seconds comes from the worker's native collector and covers the profile operations. "
+            "worker_wall_seconds includes subprocess startup, standalone verification, output checksums, and post-run diagnostics. "
+            "Refresh pipeline time excludes separately prepared baseline setup."
+        )
+        counters = result.setdefault("counters", {})
+        counters["metadata_json_decodes"] = max(
+            0, counters.get("json_decodes", 0) - counters.get("raw_body_json_decodes", 0)
+        )
+        result.update(
+            capture_id=state["capture_id"],
+            baseline_capture_id=baseline_capture_id,
+            observations=(
+                3
+                if profile == "targeted"
+                else markets
+                + (
+                    4
+                    if profile in {"no-change", "sparse-change", "all-change", "baseline-setup"}
+                    else 3
+                )
+            ),
+            profile=profile,
+            refresh_mode=refresh_mode
+            if profile in {"no-change", "sparse-change", "all-change"}
+            else None,
+            release_id=release.get("source_release_id"),
+        )
+        if legacy_metrics:
+            result["unsupported_phases"] = ["request", "decompression", "export"]
+            result["unsupported_phase_notes"] = {
+                "request": "legacy observer does not time HTTP calls independently of waits and writes",
+                "decompression": "offline fixtures use identity encoding; no decompression is timed",
+                "export": "legacy observer does not isolate publication export timing",
+            }
+
+    files = (
+        {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(output.iterdir())
+            if path.is_file()
+        }
+        if profile == "targeted"
+        else {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(output.glob("*.parquet"))
         }
-        result = measured.report() if measured else {"version": 0}
-        result.update(
-            capture_id=state["capture_id"],
-            observations=markets + 3,
-            release_id=release["source_release_id"],
-            parquet_sha256=files,
+    )
+    result["artifact_sha256"] = files
+    result["consumer_output_bytes"] = (
+        sum(path.stat().st_size for path in output.iterdir() if path.is_file())
+        if profile == "targeted"
+        else None
+    )
+    if profile == "targeted":
+        metadata_manifest = json.loads((output / "manifest.json").read_text())
+        metadata_inventory = metadata_manifest["files"]
+        assert set(metadata_inventory) == {
+            "coverage.json",
+            "events.json",
+            "markets.json",
+            "series.json",
+        }
+        result["metadata_source_release_id"] = metadata_manifest["source_release_id"]
+        result["metadata_inventory"] = metadata_inventory
+    manifest_path = output / "manifest.json"
+    result["release_manifest_sha256"] = (
+        hashlib.sha256(manifest_path.read_bytes()).hexdigest() if manifest_path.is_file() else None
+    )
+    pointer_name = _publication_pointer_name(profile, refresh_mode)
+    result["publication_pointer_sha256"] = (
+        _publication_pointer_sha256(
+            root,
+            pointer_name,
+            result.get("release_id"),
+            result.get("release_manifest_sha256"),
+        )
+        if profile != "targeted"
+        else None
+    )
+    result["fixture_timestamps_frozen"] = {
+        "capture": capture_time,
+        "transport": capture_time,
+        "common": capture_time,
+        "warehouse": capture_time,
+        "publish": capture_time,
+    }
+    if profile in {"no-change", "sparse-change", "all-change"}:
+        result["semantic_relations"] = _semantic_relation_hashes(
+            root, state["capture_id"], catalogue_version=2 if refresh_mode == "incremental" else 1
+        )
+        if refresh_mode == "incremental":
+            result["lineage"] = _assert_lineage_manifest(
+                output, baseline_capture_id, refresh_mode, root, state["capture_id"]
+            )
+            result["observation_counts"] = _assert_history_composition(
+                root, output, profile, markets
+            )
+        result["provenance_assertions"] = _assert_incremental_provenance(
+            root,
+            state["capture_id"],
+            baseline_capture_id,
+            profile,
+            refresh_mode,
+            markets,
         )
         if legacy_metrics:
-            result["unsupported_phases"] = ["request", "export"]
-    result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+            result["unsupported_phases"] = ["request", "decompression", "export"]
+            result["unsupported_phase_notes"] = {
+                "request": "legacy observer does not time HTTP calls independently of waits and writes",
+                "decompression": "offline fixtures use identity encoding; no decompression is timed",
+                "export": "legacy observer does not isolate publication export timing",
+            }
+
+    if profile != "baseline-setup":
+        verification_context = metrics.collect() if metrics else contextlib.nullcontext(None)
+        with verification_context as verified:
+            verify_store = Store(root, limits)
+            capture.complete_capture(verify_store, state["capture_id"])
+            if profile == "targeted":
+                from kalshi_events import metadata
+
+                metadata.verify(output)
+            else:
+                publish.verify_release(output)
+            verification = verified.report() if verified else {"version": 0}
+        result["standalone_verification"] = verification
+        verification_counters = verification.setdefault("counters", {})
+        verification_counters["metadata_json_decodes"] = max(
+            0,
+            verification_counters.get("json_decodes", 0)
+            - verification_counters.get("raw_body_json_decodes", 0),
+        )
+    result["provenance"] = _environment(source_root, limits, root)
+    result_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def _require_complete(state: dict[str, Any], profile: str) -> None:
+    if state.get("complete") is not True:
+        raise RuntimeError(
+            f"{profile} capture {state.get('capture_id')} is incomplete: {state.get('error')}"
+        )
+
+
+def _seed_incremental_root(store: Any) -> None:
+    """Give benchmark v2 lineage a fixed root identity under the normal writer lock."""
+    with store.writer_guard():
+        store.write("root-id.json", {"version": 1, "root_id": FIXED_ROOT_ID})
+
+
+def _publication_pointer_name(profile: str, refresh_mode: str) -> str:
+    incremental_publication = profile in {
+        "baseline-setup",
+        "no-change",
+        "sparse-change",
+        "all-change",
+    }
+    return (
+        "current-v2.json"
+        if incremental_publication and refresh_mode == "incremental"
+        else "current.json"
+    )
+
+
+def _publication_pointer_sha256(
+    root: Path, name: str, release_id: str | None, manifest_sha256: str | None
+) -> str:
+    pointer_path = root / name
+    pointer = json.loads(pointer_path.read_text())
+    assert pointer.get("source_release_id") == release_id, (
+        "publication pointer selects another release"
+    )
+    assert pointer.get("manifest_sha256") == manifest_sha256, (
+        "publication pointer does not certify the published manifest"
+    )
+    return hashlib.sha256(pointer_path.read_bytes()).hexdigest()
+
+
+def _semantic_relation_hashes(
+    root: Path, capture_id: str, *, catalogue_version: int
+) -> dict[str, Any]:
+    import duckdb
+
+    from kalshi_events.warehouse import RELATIONS
+
+    build_dir = "builds-v2" if catalogue_version == 2 else "builds"
+    database = root / f"{build_dir}/{capture_id}/warehouse.duckdb"
+    drop = {"observation_id", "capture_id", "received_at"}
+    result = {}
+    with duckdb.connect(str(database), read_only=True) as connection:
+        for _relation, table in RELATIONS.items():
+            if table == "observation_history":
+                continue
+            cursor = connection.execute(f"select * from main.{table}")
+            names = [column[0] for column in cursor.description]
+            kept = [name for name in names if name not in drop]
+            indexes = [names.index(name) for name in kept]
+            rows = [
+                {name: values[index] for name, index in zip(kept, indexes, strict=True)}
+                for values in cursor.fetchall()
+            ]
+            encoded = sorted(
+                json.dumps(row, sort_keys=True, separators=(",", ":"), default=str) for row in rows
+            )
+            result[table] = {
+                "rows": len(rows),
+                "sha256": hashlib.sha256("\n".join(encoded).encode()).hexdigest(),
+            }
+    return result
+
+
+def _assert_lineage_manifest(
+    output: Path,
+    baseline_capture_id: str | None,
+    refresh_mode: str,
+    root: Path,
+    capture_id: str,
+) -> dict[str, Any]:
+    manifest = json.loads((output / "manifest.json").read_text())
+    lineage_fields = {
+        "root_id",
+        "baseline_release_id",
+        "baseline_manifest_sha256",
+        "baseline_capture_id",
+        "previous_watermark",
+        "watermark_started_at",
+        "delta_depth",
+        "membership_sha256",
+        "warehouse_sha256",
+    }
+    assert lineage_fields.issubset(manifest), "v2 manifest is missing lineage fields"
+    membership = manifest["membership_sha256"]
+    assert len(membership) == 64 and all(c in "0123456789abcdef" for c in membership)
+    root_id = manifest["root_id"]
+    assert len(root_id) == 32 and all(c in "0123456789abcdef" for c in root_id)
+    warehouse_sha256 = manifest["warehouse_sha256"]
+    assert len(warehouse_sha256) == 64 and all(c in "0123456789abcdef" for c in warehouse_sha256)
+    build_receipt = json.loads((root / "builds-v2" / capture_id / "build.json").read_text())
+    assert warehouse_sha256 == build_receipt.get("warehouse_sha256"), (
+        "v2 manifest warehouse checksum differs from the certified build receipt"
+    )
+    for field in ("baseline_release_id", "baseline_manifest_sha256"):
+        value = manifest[field]
+        if refresh_mode == "incremental":
+            assert isinstance(value, str) and len(value) == 64
+            assert all(c in "0123456789abcdef" for c in value)
+    if refresh_mode == "incremental":
+        assert manifest["delta_depth"] == 1
+        assert manifest["baseline_capture_id"] == baseline_capture_id
+    else:
+        assert manifest["delta_depth"] == 0
+        assert manifest["baseline_capture_id"] is None
+    return {
+        "lineage_field_count": len(lineage_fields),
+        "membership_sha256": membership,
+        "delta_depth": manifest["delta_depth"],
+        "baseline_capture_id": manifest["baseline_capture_id"],
+        "root_id": root_id,
+        "baseline_release_id": manifest["baseline_release_id"],
+        "baseline_manifest_sha256": manifest["baseline_manifest_sha256"],
+        "previous_watermark": manifest["previous_watermark"],
+        "watermark_started_at": manifest["watermark_started_at"],
+        "warehouse_sha256": warehouse_sha256,
+    }
+
+
+def _assert_history_composition(
+    root: Path, output: Path, profile: str, markets: int
+) -> dict[str, int]:
+    import duckdb
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    baseline_id = manifest.get("baseline_release_id")
+    assert isinstance(baseline_id, str)
+    baseline_file = root / f"releases/{baseline_id}/observation_history.parquet"
+    current_file = output / "observation_history.parquet"
+    connection = duckdb.connect()
+    try:
+        missing = connection.execute(
+            "select count(*) from (select * from read_parquet(?) "
+            "except all select * from read_parquet(?))",
+            [str(baseline_file), str(current_file)],
+        ).fetchone()[0]
+        baseline_rows = connection.execute(
+            "select count(*) from read_parquet(?)", [str(baseline_file)]
+        ).fetchone()[0]
+        total_rows = connection.execute(
+            "select count(*) from read_parquet(?)", [str(current_file)]
+        ).fetchone()[0]
+        new_rows = connection.execute(
+            "select count(*) from read_parquet(?) where capture_id = ?",
+            [str(current_file), json.loads((output / "manifest.json").read_text())["capture_id"]],
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert missing == 0, "composed history dropped or altered baseline observations"
+    combo_count = sum(FixtureClient._is_combo(index) for index in range(markets))
+    event_updates = 0 if profile == "no-change" else 1
+    market_updates = (
+        0 if profile == "no-change" else 1 if profile == "sparse-change" else markets - combo_count
+    )
+    expected_new = 3 + combo_count + event_updates + market_updates
+    assert new_rows == expected_new, f"expected {expected_new} T1 observations, found {new_rows}"
+    assert total_rows == baseline_rows + new_rows
+    return {
+        "baseline_observations": baseline_rows,
+        "new_t1_observations": new_rows,
+        "total_observations": total_rows,
+    }
+
+
+def _assert_incremental_provenance(
+    root: Path,
+    capture_id: str,
+    baseline_capture_id: str | None,
+    profile: str,
+    refresh_mode: str,
+    markets: int,
+) -> dict[str, Any]:
+    import duckdb
+
+    build_dir = "builds-v2" if refresh_mode == "incremental" else "builds"
+    database = root / f"{build_dir}/{capture_id}/warehouse.duckdb"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        rows = {
+            row[0]: {"capture_id": row[1], "received_at": str(row[2])}
+            for row in connection.execute(
+                "select market_ticker, capture_id, received_at from main.current_markets "
+                "where market_ticker in ('MKT-000000', 'MKT-000001')"
+            ).fetchall()
+        }
+    assertions = {}
+    with duckdb.connect(str(database), read_only=True) as connection:
+        event_row = connection.execute(
+            "select capture_id, received_at from main.current_events where event_ticker='EVENT'"
+        ).fetchone()
+    if event_row is not None:
+        if refresh_mode == "incremental" and profile == "no-change":
+            expected_event_id, expected_event_time = baseline_capture_id, "2026-01-01"
+        else:
+            expected_event_id, expected_event_time = capture_id, "2026-01-02"
+        assert event_row[0] == expected_event_id and str(event_row[1]).startswith(
+            expected_event_time
+        )
+        assertions["event_source"] = {
+            "capture_id": event_row[0],
+            "received_at": str(event_row[1]),
+        }
+    if markets > 1:
+        carried = rows["MKT-000001"]
+        if profile == "all-change":
+            expected_id = capture_id
+            expected_prefix = "2026-01-02"
+        else:
+            expected_id = baseline_capture_id if refresh_mode == "incremental" else capture_id
+            expected_prefix = "2026-01-01" if refresh_mode == "incremental" else "2026-01-02"
+        assert carried["capture_id"] == expected_id and carried["received_at"].startswith(
+            expected_prefix
+        )
+        assertions["unchanged_market_source"] = carried
+    if profile != "no-change" and refresh_mode == "incremental":
+        refreshed = rows["MKT-000000"]
+        assert refreshed["capture_id"] == capture_id
+        assert refreshed["received_at"].startswith("2026-01-02")
+        assertions["refreshed_market_source"] = refreshed
+    return assertions
+
+
+def _worker_command(
+    source_root: Path,
+    root: Path,
+    result_path: Path,
+    markets: int,
+    profile: str,
+    scenario: str = "full",
+    refresh_mode: str = "full",
+    baseline_capture_id: str | None = None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        __file__,
+        "--worker",
+        "--source-root",
+        str(source_root),
+        "--root",
+        str(root),
+        "--markets",
+        str(markets),
+        "--result",
+        str(result_path),
+        "--worker-profile",
+        profile,
+        "--scenario",
+        scenario,
+        "--refresh-mode",
+        refresh_mode,
+    ]
+    if baseline_capture_id:
+        command += ["--baseline-capture-id", baseline_capture_id]
+    return command
+
+
+def _prepare_incremental_baseline(
+    source_root: Path,
+    report_dir: Path,
+    label: str,
+    pair: int,
+    markets: int,
+    scenario: str,
+    role: str,
+) -> tuple[Path, dict[str, Any], float]:
+    root = report_dir / f"baseline-{label}-{pair}"
+    result_path = report_dir / f"baseline-{label}-{pair}.json"
+    started = time.perf_counter()
+    subprocess.run(
+        _worker_command(
+            source_root,
+            root,
+            result_path,
+            markets,
+            "baseline-setup",
+            scenario,
+            "incremental" if role == "candidate" else "full",
+        ),
+        check=True,
+        env=os.environ.copy(),
+    )
+    setup_seconds = round(time.perf_counter() - started, 6)
+    return root, json.loads(result_path.read_text()), setup_seconds
 
 
 def _run_one(
-    source_root: Path, report_dir: Path, label: str, pair: int, markets: int
+    source_root: Path,
+    report_dir: Path,
+    label: str,
+    pair: int,
+    markets: int,
+    profile: str = "full",
+    role: str = "reference",
+    prepared_baseline: tuple[Path, dict[str, Any], float] | None = None,
 ) -> dict[str, Any]:
+    import shutil
+
     root = report_dir / f"root-{label}-{pair}"
     result_path = report_dir / f"run-{label}-{pair}.json"
+    setup_result = None
+    setup_seconds = None
+    scenario = profile if profile in {"no-change", "sparse-change", "all-change"} else "full"
+    refresh_mode = "incremental" if role == "candidate" else "full"
+    if scenario != "full":
+        if prepared_baseline is None:
+            baseline_root, setup_result, setup_seconds = _prepare_incremental_baseline(
+                source_root, report_dir, label, pair, markets, scenario, role
+            )
+            remove_baseline = True
+        else:
+            baseline_root, setup_result, setup_seconds = prepared_baseline
+            remove_baseline = False
+        clone_started = time.perf_counter()
+        shutil.copytree(baseline_root, root)
+        baseline_clone_seconds = round(time.perf_counter() - clone_started, 6)
+        baseline_capture_id = setup_result["capture_id"]
+    else:
+        baseline_root = None
+        baseline_capture_id = None
+        baseline_clone_seconds = None
+
     started = time.perf_counter()
     subprocess.run(
+        _worker_command(
+            source_root,
+            root,
+            result_path,
+            markets,
+            profile,
+            scenario,
+            refresh_mode,
+            baseline_capture_id,
+        ),
+        check=True,
+        env=os.environ.copy(),
+    )
+    result = json.loads(result_path.read_text())
+    result["worker_wall_seconds"] = round(time.perf_counter() - started, 6)
+    result["role"] = role
+    if setup_result is not None:
+        result["baseline_setup_seconds"] = setup_seconds
+        result["baseline_clone_seconds"] = baseline_clone_seconds
+        result["baseline_setup_metrics"] = setup_result
+    shutil.rmtree(root)
+    if baseline_root is not None and (scenario == "full" or remove_baseline):
+        shutil.rmtree(baseline_root)
+    if result.get("profile") == "targeted":
+        shutil.rmtree(result_path.with_suffix(".metadata"), ignore_errors=True)
+    return result
+
+
+def _sampled_storage_run(
+    source_root: Path, report_dir: Path, label: str, markets: int, profile: str
+) -> dict[str, Any]:
+    """Run an untimed duplicate while sampling actual on-disk high-water usage."""
+    root = report_dir / f"storage-root-{label}"
+    result_path = report_dir / f"storage-run-{label}.json"
+    process = subprocess.Popen(
         [
             sys.executable,
             __file__,
@@ -348,22 +1066,224 @@ def _run_one(
             str(markets),
             "--result",
             str(result_path),
+            "--worker-profile",
+            profile,
         ],
-        check=True,
         env=os.environ.copy(),
     )
-    result = json.loads(result_path.read_text())
-    result["elapsed_seconds"] = round(time.perf_counter() - started, 6)
-    import shutil
+    retained_peak = temporary_peak = samples = 0
+    interval = 0.05
+    try:
+        while process.poll() is None:
+            retained = temporary = 0
+            if root.exists():
+                for directory, _, filenames in os.walk(root, followlinks=False):
+                    for filename in filenames:
+                        path = Path(directory) / filename
+                        try:
+                            size = path.stat(follow_symlinks=False).st_size
+                        except FileNotFoundError:
+                            continue
+                        if path.is_file() and not path.is_symlink():
+                            relative = path.relative_to(root)
+                            is_temporary = "tmp" in relative.parts or filename.startswith(".write-")
+                            retained += size
+                            if is_temporary:
+                                temporary += size
+            retained_peak = max(retained_peak, retained)
+            temporary_peak = max(temporary_peak, temporary)
+            samples += 1
+            time.sleep(interval)
+        if process.wait() != 0:
+            raise subprocess.CalledProcessError(process.returncode, process.args)
+    finally:
+        import shutil
 
-    shutil.rmtree(root)
-    return result
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(result_path.with_suffix(".metadata"), ignore_errors=True)
+    return {
+        "source": str(source_root),
+        "sample_interval_seconds": interval,
+        "samples": samples,
+        "sampled_actual_high_water_bytes_lower_bound": {
+            "retained": retained_peak,
+            "temporary": temporary_peak,
+        },
+        "timing_included": False,
+    }
+
+
+def _revision(root: Path) -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _environment(source_root: Path, limits: Any, data_root: Path | None = None) -> dict[str, Any]:
+    packages = {}
+    for package in ("dlt", "duckdb", "httpx", "pyarrow", "dbt-core", "dbt-duckdb", "filelock"):
+        try:
+            packages[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            packages[package] = None
+    try:
+        filesystem_device = (data_root or source_root).stat().st_dev
+    except OSError:
+        filesystem_device = None
+    return {
+        "platform": platform.platform(),
+        "python": sys.version,
+        "python_executable": sys.executable,
+        "packages": packages,
+        "filesystem_device": filesystem_device,
+        "limits": vars(limits) if limits is not None else None,
+    }
+
+
+def _fixture_sha256(markets: int, profile: str = "full") -> str:
+    digest = hashlib.sha256()
+    scenario = profile if profile in {"no-change", "sparse-change", "all-change"} else "full"
+    digest.update(
+        json.dumps(
+            {
+                "baseline_time": "2026-01-01T00:00:00Z",
+                "refresh_time": "2026-01-02T00:00:00Z",
+                "page_size": PAGE_SIZE,
+                "scenario": scenario,
+            },
+            sort_keys=True,
+        ).encode()
+    )
+    for stage in ("baseline", "refresh"):
+        fixture = FixtureClient(markets, scenario, stage)
+        digest.update(json.dumps(fixture._event(), sort_keys=True, separators=(",", ":")).encode())
+        for endpoint, params in (
+            ("/historical/cutoff", {}),
+            ("/series", {}),
+            ("/events/multivariate", {}),
+            ("/historical/markets", {}),
+        ):
+            digest.update(
+                json.dumps(
+                    [endpoint, fixture.response(endpoint, params)],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            )
+        for index in range(markets):
+            digest.update(
+                json.dumps(fixture._market(index), sort_keys=True, separators=(",", ":")).encode()
+            )
+    return digest.hexdigest()
+
+
+def _script_checkout() -> Path:
+    script_path = Path(__file__).resolve()
+    return script_path.parents[1] if script_path.parent.name == "scripts" else script_path.parent
+
+
+def _validate_worker_destinations(
+    root: Path,
+    result_path: Path,
+    source_root: Path,
+    compare_root: Path | None = None,
+) -> None:
+    protected = [_script_checkout(), source_root.resolve()]
+    if compare_root is not None:
+        protected.append(compare_root.resolve())
+    for destination in (root.resolve(), result_path.resolve()):
+        if any(
+            destination == checkout or destination.is_relative_to(checkout)
+            for checkout in protected
+        ):
+            raise ValueError(
+                f"worker destination must be outside every source checkout: {destination}"
+            )
+        if any((ancestor / ".git").exists() for ancestor in (destination, *destination.parents)):
+            raise ValueError(f"worker destination cannot be inside a Git checkout: {destination}")
+
+
+def _correctness_gate(
+    comparisons: list[dict[str, Any]],
+    *,
+    incremental: bool,
+    identity_stability: dict[str, bool],
+) -> dict[str, Any]:
+    required = (
+        ("semantics_match",)
+        if incremental
+        else (
+            "artifact_bytes_match",
+            "release_id_match",
+            "release_manifest_match",
+            "publication_pointer_match",
+        )
+    )
+    failed_pairs = [
+        pair["pair"] for pair in comparisons if not all(pair.get(key) is True for key in required)
+    ]
+    return {
+        "passed": not failed_pairs and all(identity_stability.values()),
+        "failed_pairs": failed_pairs,
+        "identity_stability": identity_stability,
+        "basis": "semantic current relations" if incremental else "artifact file checksums",
+    }
+
+
+def _identity_stability(
+    results: dict[str, list[dict[str, Any]]], *, incremental: bool
+) -> dict[str, bool]:
+    stability: dict[str, bool] = {}
+    for label, runs in results.items():
+        candidate_incremental = incremental and label == "compare"
+        fields = (
+            ("release_id", "artifact_sha256")
+            if candidate_incremental
+            else ("release_id", "release_manifest_sha256", "publication_pointer_sha256")
+        )
+        stable = all(
+            all(run.get(field) == runs[0].get(field) for run in runs[1:]) for field in fields
+        )
+        if candidate_incremental and runs:
+            stable = stable and all(
+                all(
+                    run.get("lineage", {}).get(field) == runs[0].get("lineage", {}).get(field)
+                    for field in (
+                        "root_id",
+                        "baseline_release_id",
+                        "baseline_manifest_sha256",
+                        "baseline_capture_id",
+                        "previous_watermark",
+                        "watermark_started_at",
+                        "delta_depth",
+                        "membership_sha256",
+                    )
+                )
+                and len(run.get("lineage", {}).get("warehouse_sha256", "")) == 64
+                for run in runs
+            )
+        stability[label] = stable
+    return stability
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--compare-root", type=Path)
+    parser.add_argument("--source-revision", default=None)
+    parser.add_argument("--compare-revision", default=None)
+    parser.add_argument(
+        "--profile",
+        choices=("full", "targeted", "resume", "no-change", "sparse-change", "all-change"),
+        default="full",
+    )
+    parser.add_argument("--sample-storage", action="store_true")
     parser.add_argument(
         "--report-dir", type=Path, default=Path(tempfile.gettempdir()) / "kalshi-events-benchmark"
     )
@@ -376,20 +1296,70 @@ def main() -> int:
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker-profile",
+        choices=(
+            "full",
+            "targeted",
+            "resume",
+            "baseline-setup",
+            "no-change",
+            "sparse-change",
+            "all-change",
+        ),
+        default="full",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=("full", "no-change", "sparse-change", "all-change"),
+        default="full",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--refresh-mode", choices=("full", "incremental"), default="full", help=argparse.SUPPRESS
+    )
+    parser.add_argument("--baseline-capture-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker:
-        _worker(args.source_root.resolve(), args.root, args.markets, args.result)
+        if args.markets is None or args.markets < 1:
+            parser.error("worker --markets must be positive")
+        if args.root is None or args.result is None:
+            parser.error("worker mode requires --root and --result")
+        try:
+            _validate_worker_destinations(
+                args.root, args.result, args.source_root, args.compare_root
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        _worker(
+            args.source_root.resolve(),
+            args.root,
+            args.markets,
+            args.result,
+            args.worker_profile,
+            args.scenario,
+            args.refresh_mode,
+            args.baseline_capture_id,
+        )
         return 0
     if args.runs < 1 or args.warmups < 0:
         parser.error("--runs must be positive and --warmups nonnegative")
-    markets = args.markets or (249997 if args.scale else 197)
+    markets = args.markets if args.markets is not None else (249997 if args.scale else 197)
     if markets < 1:
         parser.error("--markets must be positive")
+    incremental_profile = args.profile in {"no-change", "sparse-change", "all-change"}
+    if incremental_profile and not args.compare_root:
+        parser.error(
+            "incremental refresh profiles require --compare-root for reference/candidate comparison"
+        )
+    if incremental_profile and args.sample_storage:
+        parser.error("--sample-storage currently supports full, targeted, or resume profiles only")
     report_dir = args.report_dir.resolve()
     if report_dir.exists():
         parser.error("--report-dir must name a new directory outside the repository")
     for _, source_root in [
-        ("script", Path(__file__).resolve().parents[1]),
+        ("script", _script_checkout()),
         ("source", args.source_root.resolve()),
         *([("compare", args.compare_root.resolve())] if args.compare_root else []),
     ]:
@@ -399,22 +1369,108 @@ def main() -> int:
     roots = [("source", args.source_root.resolve())]
     if args.compare_root:
         roots.append(("compare", args.compare_root.resolve()))
+    prepared_baselines: dict[str, tuple[Path, dict[str, Any], float]] = {}
+    if incremental_profile:
+        scenario = args.profile
+        for label, root in roots:
+            role = "candidate" if label == "compare" else "reference"
+            prepared_baselines[label] = _prepare_incremental_baseline(
+                root, report_dir, f"{label}-shared", 0, markets, scenario, role
+            )
     for label, root in roots:
         for warmup in range(args.warmups):
-            _run_one(root, report_dir, f"{label}-warmup", warmup, markets)
+            role = "candidate" if label == "compare" else "reference"
+            _run_one(
+                root,
+                report_dir,
+                f"{label}-warmup",
+                warmup,
+                markets,
+                args.profile,
+                role,
+                prepared_baselines.get(label),
+            )
     results: dict[str, list[dict[str, Any]]] = {label: [] for label, _ in roots}
     for pair in range(args.runs):
-        for label, root in roots:
-            results[label].append(_run_one(root, report_dir, label, pair, markets))
+        ordered = roots if pair % 2 == 0 else list(reversed(roots))
+        for label, root in ordered:
+            role = "candidate" if label == "compare" else "reference"
+            results[label].append(
+                _run_one(
+                    root,
+                    report_dir,
+                    label,
+                    pair,
+                    markets,
+                    args.profile,
+                    role,
+                    prepared_baselines.get(label),
+                )
+            )
     summary = {
         "fixture": {
             "markets": markets,
-            "observations_expected": markets + 3,
+            "observations_expected": (
+                3 if args.profile == "targeted" else markets + (4 if incremental_profile else 3)
+            ),
             "page_size": PAGE_SIZE,
+            "full_scope_market_pages": (markets + PAGE_SIZE - 1) // PAGE_SIZE,
+            "combo_markets": sum(FixtureClient._is_combo(index) for index in range(markets)),
+            "combo_legs_expected": sum(FixtureClient._is_combo(index) for index in range(markets)),
+            "incremental_updated_market_pages": (
+                (
+                    0
+                    if args.profile == "no-change"
+                    else (
+                        1
+                        if args.profile == "sparse-change"
+                        else (
+                            markets
+                            - sum(FixtureClient._is_combo(i) for i in range(markets))
+                            + PAGE_SIZE
+                            - 1
+                        )
+                        // PAGE_SIZE
+                    )
+                )
+                if incremental_profile
+                else None
+            ),
+            "fixture_sha256": _fixture_sha256(markets, args.profile),
+        },
+        "environment": _environment(args.source_root.resolve(), None),
+        "source_revisions": {
+            "source": args.source_revision or _revision(args.source_root.resolve()),
+            "compare": (
+                args.compare_revision or _revision(args.compare_root.resolve())
+                if args.compare_root
+                else None
+            ),
         },
         "runs": args.runs,
         "warmups": args.warmups,
+        "profile": args.profile,
+        "counter_legend": {
+            "raw_body_reads": "A body-file read, including hash-only file_digest passes; not just JSON reads.",
+            "raw_body_json_decodes": "JSON parses of committed raw bodies; metadata JSON parsing is counted separately.",
+            "json_decodes": "Counted common.decode calls plus direct first-party warehouse artifact parses; excludes third-party subprocess/internal JSON parsing.",
+            "first_party_artifact_json_decodes": "Direct warehouse.json.loads parses of dbt manifest.json and run_results.json; subset of json_decodes, not additive.",
+            "hashes": "Instrumented common.digest/file_digest calls, including normalize/metadata aliases, plus explicitly counted transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hashing.",
+            "hash_bytes": "Bytes counted by instrumented common.digest/file_digest and explicit transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hash bytes.",
+            "fsync_calls": "Python-level explicit fsync calls observed or inferred by the legacy observer; excludes DuckDB/C++ internal syncs.",
+            "encoded_hashing": "Hash time for encoded HTTP entity bodies; legacy observer also classifies transport.digest calls here.",
+            "metadata_scans": "Filesystem inventory walk/reconcile calls; metadata JSON parsing is counted separately.",
+            "metadata_scan": "Elapsed time in filesystem inventory walk/reconcile operations, excluding metadata JSON decoding.",
+        },
         "results": results,
+        "baseline_preparations": {
+            label: {
+                "setup_seconds": setup_seconds,
+                "setup_metrics": setup_result,
+                "shared_across_warmups_and_pairs": True,
+            }
+            for label, (_, setup_result, setup_seconds) in prepared_baselines.items()
+        },
     }
     if len(results) == 2:
         reference, candidate = results.values()
@@ -426,17 +1482,70 @@ def main() -> int:
         summary["paired_comparisons"] = [
             {
                 "pair": index,
-                "elapsed_ratio": round(
-                    candidate[index]["elapsed_seconds"] / reference[index]["elapsed_seconds"], 4
+                "refresh_elapsed_ratio": round(
+                    candidate[index]["pipeline_elapsed_seconds"]
+                    / reference[index]["pipeline_elapsed_seconds"],
+                    4,
                 ),
-                "artifacts_match": reference[index].get("parquet_sha256")
-                == candidate[index].get("parquet_sha256"),
+                "semantics_match": (
+                    reference[index].get("semantic_relations")
+                    == candidate[index].get("semantic_relations")
+                    if incremental_profile
+                    else None
+                ),
+                "artifact_bytes_match": (
+                    reference[index].get("artifact_sha256")
+                    == candidate[index].get("artifact_sha256")
+                    if not incremental_profile
+                    else None
+                ),
+                "release_id_match": (
+                    reference[index].get("release_id") == candidate[index].get("release_id")
+                    if not incremental_profile
+                    else None
+                ),
+                "release_manifest_match": (
+                    reference[index].get("release_manifest_sha256")
+                    == candidate[index].get("release_manifest_sha256")
+                    if not incremental_profile
+                    else None
+                ),
+                "publication_pointer_match": (
+                    reference[index].get("publication_pointer_sha256")
+                    == candidate[index].get("publication_pointer_sha256")
+                    if not incremental_profile
+                    else None
+                ),
+                "timing_scope": (
+                    "native worker pipeline timing: reference full T1 acquisition/build/publication vs candidate baseline-plus-delta T1 refresh; baseline setup, worker startup, standalone verification, and post-run diagnostics excluded"
+                    if incremental_profile
+                    else "native worker pipeline timing; worker startup, standalone verification, and output checksums excluded"
+                ),
             }
             for index in range(args.runs)
         ]
+        identity_stability = _identity_stability(results, incremental=incremental_profile)
+        summary["correctness_gate"] = _correctness_gate(
+            summary["paired_comparisons"],
+            incremental=incremental_profile,
+            identity_stability=identity_stability,
+        )
+    if args.sample_storage:
+        summary["untimed_storage_samples"] = {
+            label: _sampled_storage_run(root, report_dir, label, markets, args.profile)
+            for label, root in roots
+        }
     report = report_dir / "benchmark-summary.json"
     report.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    if summary.get("correctness_gate", {}).get("passed"):
+        import shutil
+
+        for baseline_root, _, _ in prepared_baselines.values():
+            shutil.rmtree(baseline_root, ignore_errors=True)
     print(report)
+    if summary.get("correctness_gate", {}).get("passed") is False:
+        print("paired correctness gate failed; see benchmark-summary.json", file=sys.stderr)
+        return 1
     return 0
 
 

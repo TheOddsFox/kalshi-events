@@ -84,6 +84,80 @@ def recovery_root(certified_recovery_root, tmp_path):
     return root, captures.copy()
 
 
+@pytest.fixture(scope="module")
+def published_delta_recovery_root(certified_recovery_root, tmp_path_factory):
+    source, _ = certified_recovery_root
+    root = tmp_path_factory.mktemp("published-delta-recovery") / "root"
+    shutil.copytree(source, root)
+    delta = _capture_at(root, "2026-01-06T12:00:00+00:00", incremental=True)
+    assert delta["complete"]
+    warehouse.build(Store(root), delta["capture_id"])
+    manifest = publishing.publish(Store(root), delta["capture_id"], catalogue_version=2)
+    assert manifest["delta_depth"] == 1
+    return root, delta["capture_id"]
+
+
+@pytest.mark.parametrize("command", ["rebuild", "replay"])
+def test_published_delta_retry_recovers_redundant_backup_with_the_same_database_budget(
+    published_delta_recovery_root, tmp_path, monkeypatch, command
+):
+    source, capture_id = published_delta_recovery_root
+    reference_root, root = tmp_path / "reference", tmp_path / "recovery"
+    shutil.copytree(source, reference_root)
+    shutil.copytree(source, root)
+    run = getattr(recovery, command)
+    peak_database_bytes = 0
+    check_storage = Store.check_storage
+
+    def measure_reference_usage(store, additional=0):
+        nonlocal peak_database_bytes
+        if store.root == reference_root:
+            peak_database_bytes = max(peak_database_bytes, store.usage()["database_bytes"])
+        return check_storage(store, additional)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Store, "check_storage", measure_reference_usage)
+        run(Store(reference_root), catalogue_version=2)
+    assert peak_database_bytes > 0
+
+    destination = root / "builds-v2" / capture_id
+    backup = root / "tmp" / f"replaced-{capture_id}-v2"
+    shutil.copytree(destination, backup)
+    initial_database_bytes = Store(root).usage()["database_bytes"]
+    ceiling = max(peak_database_bytes, initial_database_bytes)
+    state = acquisition.read_capture(Store(root), capture_id)
+    baseline_database = (
+        root / warehouse.build_directory(state["baseline"]["capture_id"], 2) / "warehouse.duckdb"
+    )
+    assert ceiling - initial_database_bytes < baseline_database.stat().st_size
+
+    immutable_before = {
+        str(path.relative_to(root)): path.read_bytes()
+        for directory in (root / "captures", root / "raw", root / "releases")
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    pointers = {name: (root / name).read_bytes() for name in ("current.json", "current-v2.json")}
+    limited = Store(root, Limits(max_database_bytes=ceiling))
+    limited.check_storage()
+
+    result = run(limited, catalogue_version=2)
+
+    assert result["capture_id"] == capture_id
+    assert not backup.exists()
+    limited.check_storage()
+    warehouse.certified(limited, capture_id, catalogue_version=2)
+    assert {name: (root / name).read_bytes() for name in pointers} == pointers
+    assert {
+        str(path.relative_to(root)): path.read_bytes()
+        for directory in (root / "captures", root / "raw", root / "releases")
+        for path in directory.rglob("*")
+        if path.is_file()
+    } == immutable_before
+    manifest = publishing.current(limited, catalogue_version=2)
+    assert manifest["capture_id"] == capture_id
+
+
 def _python(root, captures, script, *arguments):
     environment = os.environ.copy()
     source = str(Path(__file__).resolve().parents[1] / "src")
@@ -127,7 +201,9 @@ from kalshi_events import recovery
 from kalshi_events import publish as publishing
 
 root, captures, boundary = Path(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3]
-baseline = root / 'builds-v2' / captures['baseline']
+catalogue_version = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+build_capture = captures['legacy'] if catalogue_version == 1 else captures['baseline']
+baseline = root / ('builds' if catalogue_version == 1 else 'builds-v2') / build_capture
 obsolete = root / 'captures' / captures['obsolete']
 original_rename, original_replace, original_rmtree = os.rename, os.replace, shutil.rmtree
 retired = None
@@ -183,7 +259,7 @@ def interrupted_delete(path, *args, **kwargs):
 
 shutil.rmtree = interrupted_delete
 if boundary.startswith('build-'):
-    recovery.rebuild(Store(root), catalogue_version=2)
+    recovery.rebuild(Store(root), catalogue_version=catalogue_version)
 else:
     publishing.publish(Store(root), captures['candidate'], catalogue_version=2)
 raise AssertionError('requested crash boundary was not reached: ' + boundary)
@@ -242,16 +318,20 @@ def _check_fresh(root, captures, *, require_builds=True):
 
 
 @pytest.mark.parametrize("boundary", ["build-backup", "build-install"])
-def test_process_exit_during_build_replacement_is_recoverable(recovery_root, boundary):
+@pytest.mark.parametrize("catalogue_version", [1, 2])
+def test_process_exit_during_build_replacement_is_recoverable(
+    recovery_root, boundary, catalogue_version
+):
     root, captures = recovery_root
     pointers = _check_fresh(root, captures)
-    result = _python(root, captures, CRASH_SCRIPT, boundary)
+    result = _python(root, captures, CRASH_SCRIPT, boundary, str(catalogue_version))
     assert result.returncode == CRASH_EXIT, result.stdout + result.stderr
     assert _check_fresh(root, captures, require_builds=False) == pointers
-    recovery.rebuild(Store(root), catalogue_version=2)
-    warehouse.certified(Store(root), captures["baseline"], catalogue_version=2)
-    published = publishing.publish(Store(root), captures["baseline"], catalogue_version=2)
-    assert published["source_release_id"] == pointers["v2"]
+    capture_id = captures["legacy"] if catalogue_version == 1 else captures["baseline"]
+    recovery.rebuild(Store(root), catalogue_version=catalogue_version)
+    warehouse.certified(Store(root), capture_id, catalogue_version=catalogue_version)
+    published = publishing.publish(Store(root), capture_id, catalogue_version=catalogue_version)
+    assert published["source_release_id"] == pointers["legacy" if catalogue_version == 1 else "v2"]
     assert _check_fresh(root, captures) == pointers
 
 
@@ -597,6 +677,61 @@ def _trace_syncs(monkeypatch, events, *, fail_file=None, fail_directory=None):
         for module in (common, warehouse, publishing):
             if getattr(module, name, None) is original:
                 monkeypatch.setattr(module, name, traced)
+
+
+@pytest.mark.parametrize("catalogue_version", [1, 2])
+def test_failed_install_never_deletes_good_destination_before_validating_corrupt_backup(
+    recovery_root, monkeypatch, catalogue_version
+):
+    root, captures = recovery_root
+    store = Store(root)
+    capture_id = captures["legacy"] if catalogue_version == 1 else captures["baseline"]
+    relative = warehouse.build_directory(capture_id, catalogue_version)
+    destination = store.path(relative)
+    staging = store.path(f"tmp/installer-proof-{uuid.uuid4().hex}")
+    shutil.copytree(destination, staging)
+    store.sync("tmp")
+    warehouse.certified(store, capture_id, catalogue_version=catalogue_version, _directory=staging)
+    corrupted = json.loads((destination / "build.json").read_bytes())
+    corrupted["warehouse_sha256"] = "0" * 64
+    store.write(f"{relative}/build.json", corrupted)
+    corrupt_receipt = (destination / "build.json").read_bytes()
+    pointers = {name: (root / name).read_bytes() for name in ("current.json", "current-v2.json")}
+    renamed = os.rename
+    synced = warehouse.fsync_directory
+    installed = failed = False
+
+    def observed_rename(source, target, *args, **kwargs):
+        nonlocal installed
+        result = renamed(source, target, *args, **kwargs)
+        if Path(source) == staging and Path(target) == destination:
+            installed = True
+        return result
+
+    def fail_after_install(path):
+        nonlocal failed
+        if installed and not failed:
+            failed = True
+            raise OSError("transient sync failure after valid candidate installation")
+        return synced(path)
+
+    monkeypatch.setattr(os, "rename", observed_rename)
+    monkeypatch.setattr(warehouse, "fsync_directory", fail_after_install)
+    with store.writer_guard(), pytest.raises(CatalogueError):
+        warehouse._install_build(store, capture_id, catalogue_version, staging)
+    assert installed and failed
+    backup = store.path(f"tmp/replaced-{capture_id}-v{catalogue_version}")
+    assert backup.is_dir() and destination.is_dir()
+    assert (backup / "build.json").read_bytes() == corrupt_receipt
+    warehouse.certified(Store(root), capture_id, catalogue_version=catalogue_version)
+    assert {name: (root / name).read_bytes() for name in pointers} == pointers
+    _check_fresh(root, captures)
+    fresh = Store(root)
+    with fresh.writer_guard():
+        warehouse._recover_build(fresh, capture_id, catalogue_version)
+    assert not backup.exists()
+    warehouse.certified(Store(root), capture_id, catalogue_version=catalogue_version)
+    assert {name: (root / name).read_bytes() for name in pointers} == pointers
 
 
 def test_staged_warehouse_sync_failure_preserves_certified_build(recovery_root, monkeypatch):

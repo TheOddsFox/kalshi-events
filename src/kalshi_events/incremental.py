@@ -14,6 +14,7 @@ from typing import Any
 
 import duckdb
 
+from kalshi_events import metrics
 from kalshi_events.common import (
     BudgetExceeded,
     CatalogueError,
@@ -177,12 +178,12 @@ def _rows(connection: duckdb.DuckDBPyConnection, table: str) -> list[dict[str, A
 
 
 @contextmanager
-def _baseline_data(
+def _baseline_data_impl(
     store: Store, capture_id: str, version: int, pin: dict[str, Any] | None = None
 ) -> Iterator[duckdb.DuckDBPyConnection]:
     from kalshi_events.warehouse import certified
 
-    certified(store, capture_id, catalogue_version=version)
+    receipt = certified(store, capture_id, catalogue_version=version)
     if not isinstance(pin, dict):
         raise CatalogueError("baseline semantic verification requires its release pin")
     from kalshi_events import publish
@@ -221,42 +222,47 @@ def _baseline_data(
         )
         from kalshi_events.warehouse import RELATIONS, membership_fingerprint
 
+        warehouse_hash_fast_path = version == 2 and manifest.get("warehouse_sha256") == receipt.get(
+            "warehouse_sha256"
+        )
         with interrupt_at_deadline(store, connection.interrupt):
             try:
-                for relation, table in RELATIONS.items():
-                    store.check_deadline()
-                    parquet = str(directory / f"{relation}.parquet")
-                    parquet_schema = connection.execute(
-                        "describe select * from read_parquet(?)", [parquet]
-                    ).fetchall()
-                    warehouse_schema = connection.execute(
-                        f"describe select * from main.{table}"
-                    ).fetchall()
-                    if [(row[0], row[1]) for row in parquet_schema] != [
-                        (row[0], row[1]) for row in warehouse_schema
-                    ]:
-                        raise CatalogueError(
-                            f"baseline {relation} schema differs from its pinned release"
-                        )
-                    for left, right, label in (
-                        (
-                            "select * from read_parquet(?)",
-                            f"select * from main.{table}",
-                            "release",
-                        ),
-                        (
-                            f"select * from main.{table}",
-                            "select * from read_parquet(?)",
-                            "warehouse",
-                        ),
-                    ):
+                if not warehouse_hash_fast_path:
+                    metrics.add("baseline_semantic_comparisons")
+                    for relation, table in RELATIONS.items():
                         store.check_deadline()
-                        query = f"select 1 from (({left}) except all ({right})) limit 1"
-                        if connection.execute(query, [parquet]).fetchone():
+                        parquet = str(directory / f"{relation}.parquet")
+                        parquet_schema = connection.execute(
+                            "describe select * from read_parquet(?)", [parquet]
+                        ).fetchall()
+                        warehouse_schema = connection.execute(
+                            f"describe select * from main.{table}"
+                        ).fetchall()
+                        if [(row[0], row[1]) for row in parquet_schema] != [
+                            (row[0], row[1]) for row in warehouse_schema
+                        ]:
                             raise CatalogueError(
-                                f"baseline {relation} {label} rows differ from its pinned release"
+                                f"baseline {relation} schema differs from its pinned release"
                             )
-                if version == 2:
+                        for left, right, label in (
+                            (
+                                "select * from read_parquet(?)",
+                                f"select * from main.{table}",
+                                "release",
+                            ),
+                            (
+                                f"select * from main.{table}",
+                                "select * from read_parquet(?)",
+                                "warehouse",
+                            ),
+                        ):
+                            store.check_deadline()
+                            query = f"select 1 from (({left}) except all ({right})) limit 1"
+                            if connection.execute(query, [parquet]).fetchone():
+                                raise CatalogueError(
+                                    f"baseline {relation} {label} rows differ from its pinned release"
+                                )
+                if version == 2 and not warehouse_hash_fast_path:
                     expected = manifest.get("membership_sha256")
                     if not isinstance(expected, str):
                         raise CatalogueError("pinned v2 publication lacks a membership fingerprint")
@@ -273,6 +279,17 @@ def _baseline_data(
         shutil.rmtree(spill_directory, ignore_errors=True)
         store.sync("tmp")
         store.release_storage(spill_budget)
+
+
+@contextmanager
+def _baseline_data(
+    store: Store, capture_id: str, version: int, pin: dict[str, Any] | None = None
+) -> Iterator[duckdb.DuckDBPyConnection]:
+    with (
+        metrics.phase("baseline_verification"),
+        _baseline_data_impl(store, capture_id, version, pin) as connection,
+    ):
+        yield connection
 
 
 def baseline_membership(store: Store, pin: dict[str, Any]) -> dict[str, set[str]]:
@@ -696,18 +713,20 @@ def release_fields(store: Store, state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _lineage(
+def _lineage_impl(
     store: Store,
     release_id: str,
     *,
     manifest_sha256: str | None = None,
     expected_root: str | None = None,
+    _context: Any = None,
 ) -> tuple[set[str], set[str], datetime | None]:
     from kalshi_events import publish
 
     releases: set[str] = set()
     captures: set[str] = set()
     evidence: dict[str, tuple[int, dict[str, Any]]] = {}
+    capture_states: dict[str, dict[str, Any]] = {}
     root = expected_root
     baseline_started: datetime | None = None
     child_depth: int | None = None
@@ -731,7 +750,11 @@ def _lineage(
                 raise CatalogueError("v2 lineage depth does not match its v1 bootstrap")
             from kalshi_events.capture import read_capture
 
-            baseline_state = read_capture(store, capture_id)
+            cached = _context.captures.get((capture_id, 1)) if _context is not None else None
+            baseline_state = (
+                cached.proof.state if cached is not None else read_capture(store, capture_id)
+            )
+            capture_states[capture_id] = baseline_state
             baseline_started = _utc(baseline_state.get("started_at"), "v1 baseline start")
             evidence[capture_id] = (1, manifest)
             break
@@ -756,7 +779,11 @@ def _lineage(
                 raise CatalogueError("invalid v2 full baseline ancestry")
             from kalshi_events.capture import read_capture
 
-            baseline_state = read_capture(store, capture_id)
+            cached = _context.captures.get((capture_id, 2)) if _context is not None else None
+            baseline_state = (
+                cached.proof.state if cached is not None else read_capture(store, capture_id)
+            )
+            capture_states[capture_id] = baseline_state
             baseline_started = _utc(baseline_state.get("started_at"), "full baseline start")
             break
         if (
@@ -779,10 +806,28 @@ def _lineage(
     # Release checksums protect exported files, while each capture's own build
     # receipt protects its raw evidence inventory. Verify every reachable
     # capture once, including grandparents, before accepting the lineage.
+    from kalshi_events.capture import page_receipts, read_capture
     from kalshi_events.warehouse import certified, membership_fingerprint
 
     for capture_id, (version, manifest) in evidence.items():
-        certified(store, capture_id, catalogue_version=version)
+        cached = _context.captures.get((capture_id, version)) if _context is not None else None
+        if cached is None:
+            capture_state = capture_states.get(capture_id)
+            if capture_state is None:
+                capture_state = read_capture(store, capture_id)
+            page_rows = page_receipts(store, capture_state)
+        else:
+            capture_state = cached.proof.state
+            page_rows = list(cached.proof.page_rows)
+        capture_states[capture_id] = capture_state
+        certified(
+            store,
+            capture_id,
+            catalogue_version=version,
+            _state=capture_state,
+            _page_rows=page_rows,
+            _context=_context,
+        )
         if version == 2:
             expected_membership = manifest.get("membership_sha256")
             if (
@@ -791,6 +836,24 @@ def _lineage(
             ):
                 raise CatalogueError("release ancestry membership fingerprint mismatch")
     return releases, captures, baseline_started
+
+
+def _lineage(
+    store: Store,
+    release_id: str,
+    *,
+    manifest_sha256: str | None = None,
+    expected_root: str | None = None,
+    _context: Any = None,
+) -> tuple[set[str], set[str], datetime | None]:
+    with metrics.phase("lineage_verification"):
+        return _lineage_impl(
+            store,
+            release_id,
+            manifest_sha256=manifest_sha256,
+            expected_root=expected_root,
+            _context=_context,
+        )
 
 
 def _validate_retirement_artifact(store: Store, path: Path, root: str, identity: str) -> str | None:
@@ -1140,9 +1203,16 @@ def prune(
     state: dict[str, Any],
     release_id: str,
     catalogue_version: int,
+    *,
+    _context: Any = None,
 ) -> list[str]:
     with store.writer_guard():
-        return _prune_locked(store, state, release_id, catalogue_version)
+        if _context is None:
+            from kalshi_events.warehouse import operation_context
+
+            with operation_context(store) as context:
+                return _prune_locked(store, state, release_id, catalogue_version, context=context)
+        return _prune_locked(store, state, release_id, catalogue_version, context=_context)
 
 
 def _prune_locked(
@@ -1150,6 +1220,8 @@ def _prune_locked(
     state: dict[str, Any],
     release_id: str,
     catalogue_version: int,
+    *,
+    context: Any,
 ) -> list[str]:
     """Retire only validated, unreachable evidence after successful publication."""
     from kalshi_events import publish
@@ -1189,6 +1261,7 @@ def _prune_locked(
                 )
             ).hexdigest(),
             expected_root=manifest.get("root_id") if version == 2 else None,
+            _context=context,
         )
         keep_releases.update(ids)
         keep_captures.update(captures)
@@ -1203,7 +1276,15 @@ def _prune_locked(
     for path in sorted(captures_dir.iterdir()) if captures_dir.exists() else []:
         if not path.is_dir() or path.is_symlink():
             continue
-        capture_state = read_capture(store, path.name)
+        cached = next(
+            (
+                context.captures.get((path.name, version))
+                for version in (1, 2)
+                if context.captures.get((path.name, version)) is not None
+            ),
+            None,
+        )
+        capture_state = cached.proof.state if cached is not None else read_capture(store, path.name)
         capture_states[path.name] = capture_state
         if not capture_state.get("complete"):
             keep_captures.add(path.name)
@@ -1217,6 +1298,7 @@ def _prune_locked(
                     pin["source_release_id"],
                     manifest_sha256=pin["manifest_sha256"],
                     expected_root=pin["root_id"],
+                    _context=context,
                 )
                 keep_releases.update(ids)
                 keep_captures.update(ancestors)
@@ -1234,6 +1316,7 @@ def _prune_locked(
                     pin["source_release_id"],
                     manifest_sha256=pin["manifest_sha256"],
                     expected_root=pin["root_id"],
+                    _context=context,
                 )
                 keep_releases.update(ids)
                 keep_captures.update(ancestors)
@@ -1258,6 +1341,7 @@ def _prune_locked(
                 expected_root=manifest.get("root_id")
                 if manifest.get("contract") == "oddsfox.kalshi.catalogue.v2"
                 else None,
+                _context=context,
             )
             keep_releases.update(ids)
             keep_captures.update(ancestors)
@@ -1266,9 +1350,17 @@ def _prune_locked(
 
     raw_dirs: set[Path] = set()
     raw_root = store.path("raw")
+    verified_raw_owners = {
+        row["relative"]: capture_id
+        for (capture_id, _version), cached in context.captures.items()
+        for row in cached.proof.page_rows
+    }
     for manifest_path in raw_root.glob("*/manifest.json") if raw_root.exists() else []:
-        manifest = decode(regular_bytes(manifest_path, 1024**2))
-        identity = manifest.get("capture_id")
+        relative = manifest_path.relative_to(store.root).as_posix()
+        identity = verified_raw_owners.get(relative)
+        if identity is None:
+            manifest = decode(regular_bytes(manifest_path, 1024**2))
+            identity = manifest.get("capture_id")
         if identity in capture_states and identity not in keep_captures:
             raw_dirs.add(manifest_path.parent)
 
@@ -1349,6 +1441,10 @@ def _prune_locked(
                 "target": f"prune-trash/{uuid.uuid4().hex}-{path.parent.name}-{path.name}",
             }
         )
+    if not entries:
+        return removed_captures
+    # No cached proof is used after retention has selected the complete removal set.
+    context.captures.clear()
     store.write("prune-plan.json", {"version": 1, "kind": "prune", "entries": entries})
     fsync_directory(store.root)
     _finish_retirement_plan(store)

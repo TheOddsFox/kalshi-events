@@ -59,6 +59,9 @@ def _reject(value: Any) -> Any:
     raise TypeError(f"cannot encode {type(value).__name__}")
 
 
+CANONICAL_CURRENT_ROOT_MARKER_BYTES = json_bytes(CURRENT_ROOT_MARKER)
+
+
 def decode(body: bytes) -> Any:
     metrics.add("json_decodes")
     metrics.add("json_decoded_bytes", len(body))
@@ -135,15 +138,15 @@ def atomic_bytes(path: Path, body: bytes) -> None:
         with os.fdopen(fd, "wb") as stream:
             stream.write(body)
             stream.flush()
-            os.fsync(stream.fileno())
             metrics.add("fsync_calls")
+            os.fsync(stream.fileno())
         os.replace(name, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
+            metrics.add("fsync_calls")
             os.fsync(directory)
         finally:
             os.close(directory)
-            metrics.add("fsync_calls")
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -158,8 +161,8 @@ def fsync_file(path: Path) -> None:
     if not path.is_file():
         raise CatalogueError("cannot sync a missing or nonregular file")
     with path.open("rb") as stream:
+        metrics.add("fsync_calls")
         os.fsync(stream.fileno())
-    metrics.add("fsync_calls")
 
 
 def fsync_directory(path: Path) -> None:
@@ -169,10 +172,10 @@ def fsync_directory(path: Path) -> None:
         raise CatalogueError("cannot sync a missing directory")
     descriptor = os.open(path, os.O_RDONLY)
     try:
+        metrics.add("fsync_calls")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    metrics.add("fsync_calls")
 
 
 @dataclass(frozen=True)
@@ -308,15 +311,15 @@ class Store:
         with path.open("ab") as stream:
             stream.write(body)
             stream.flush()
-            os.fsync(stream.fileno())
             metrics.add("fsync_calls")
+            os.fsync(stream.fileno())
         if created:
             directory = os.open(path.parent, os.O_RDONLY)
             try:
+                metrics.add("fsync_calls")
                 os.fsync(directory)
             finally:
                 os.close(directory)
-            metrics.add("fsync_calls")
         with self._lock:
             self._record(path, previous + len(body))
 
@@ -424,7 +427,11 @@ class Store:
             raise CatalogueError("operator root requires explicit upgrade-root before writing")
 
     def _refresh_storage_version(self, *, allow_legacy: bool = False) -> None:
-        marker = decode(regular_bytes(self.path("root.json")))
+        marker_bytes = regular_bytes(self.path("root.json"))
+        if marker_bytes == CANONICAL_CURRENT_ROOT_MARKER_BYTES:
+            self.storage_version = 2
+            return
+        marker = decode(marker_bytes)
         if marker == CURRENT_ROOT_MARKER:
             self.storage_version = 2
             return
@@ -438,7 +445,9 @@ class Store:
     def _require_writable(self) -> None:
         self.require_writable()
 
+    @metrics.phase("metadata_scan")
     def _sync_prefix(self, path: Path) -> None:
+        metrics.add("metadata_scans")
         prefix = str(path)
         present: dict[str, int] = {}
         if path.is_file():
@@ -510,8 +519,8 @@ class EvidenceSpool:
         if self.closed:
             raise CatalogueError("evidence spool is already closed")
         self.stream.flush()
-        os.fsync(self.stream.fileno())
         metrics.add("fsync_calls")
+        os.fsync(self.stream.fileno())
         self.stream.close()
         self.closed = True
         with self.store._lock:
@@ -520,10 +529,10 @@ class EvidenceSpool:
             self.store._record(self.destination, self.size)
             directory = os.open(self.destination.parent, os.O_RDONLY)
             try:
+                metrics.add("fsync_calls")
                 os.fsync(directory)
             finally:
                 os.close(directory)
-                metrics.add("fsync_calls")
 
     def abort(self) -> None:
         if not self.closed:

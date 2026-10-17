@@ -6,6 +6,7 @@ directory to `builds/<capture_id>`. Failures leave every previous build and rele
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import itertools
 import json
@@ -13,8 +14,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -26,9 +29,7 @@ from kalshi_events import metrics
 from kalshi_events.capture import (
     _complete_capture,
     capture_pages,
-    complete_capture,
     page_receipts,
-    read_capture,
 )
 from kalshi_events.common import (
     BudgetExceeded,
@@ -64,6 +65,198 @@ def build_directory(capture_id: str, catalogue_version: int = 1) -> str:
     return f"builds-v2/{capture_id}" if catalogue_version == 2 else f"builds/{capture_id}"
 
 
+@dataclass(frozen=True)
+class _OperationEvidence:
+    capture_id: str
+    catalogue_version: int
+    root: str
+    writer_token: int
+    writer_lock: Any
+    state: dict[str, Any]
+    page_rows: tuple[dict[str, Any], ...]
+    checkpoints: dict[str, str]
+    verified_pages: dict[str, str] | None
+    evidence: dict[str, str]
+    state_sha256: str
+    binding_sha256: str
+
+
+@dataclass
+class _VerifiedCapture:
+    proof: _OperationEvidence
+    receipt: dict[str, Any]
+    build_sha256: str
+    warehouse_sha256: str
+    artifacts_sha256: str
+    cutoff_rows: tuple[str, ...]
+    cutoff_records: tuple[dict[str, Any], ...] | None
+    binding_sha256: str
+
+
+@dataclass
+class _OperationContext:
+    root: str
+    writer_lock: Any
+    owner_thread: int
+    captures: dict[tuple[str, int], _VerifiedCapture]
+    closed: bool = False
+
+
+@contextmanager
+def operation_context(store: Store):
+    """Share freshly verified evidence only inside one writer-lock operation."""
+    if not store.writer_locked_by_current_thread:
+        raise CatalogueError("operation verification requires the canonical writer lock")
+    context = _OperationContext(
+        str(store.root.resolve()), store._writer_lock, threading.get_ident(), {}
+    )
+    try:
+        yield context
+    finally:
+        context.closed = True
+        context.captures.clear()
+
+
+def _check_operation_context(store: Store, context: _OperationContext) -> None:
+    if (
+        context.closed
+        or context.root != str(store.root.resolve())
+        or context.writer_lock is not store._writer_lock
+        or context.owner_thread != threading.get_ident()
+        or not store.writer_locked_by_current_thread
+    ):
+        raise CatalogueError("operation verification context is outside its writer lease")
+
+
+def _operation_evidence_binding(
+    capture_id: str,
+    catalogue_version: int,
+    root: str,
+    writer_token: int,
+    page_rows: tuple[dict[str, Any], ...],
+    checkpoints: dict[str, str],
+    verified_pages: dict[str, str] | None,
+    evidence: dict[str, str],
+    state_sha256: str,
+) -> str:
+    return digest(
+        json_bytes(
+            {
+                "capture_id": capture_id,
+                "catalogue_version": catalogue_version,
+                "root": root,
+                "writer_token": writer_token,
+                "page_rows": list(page_rows),
+                "checkpoints": checkpoints,
+                "verified_pages": verified_pages,
+                "evidence": evidence,
+                "state_sha256": state_sha256,
+            }
+        )
+    )
+
+
+def _operation_evidence(
+    store: Store,
+    state: dict[str, Any],
+    catalogue_version: int,
+    verified_pages: dict[str, str] | None,
+) -> _OperationEvidence:
+    capture_id = state.get("capture_id")
+    if (
+        not isinstance(capture_id, str)
+        or catalogue_version not in {1, 2}
+        or not store.writer_locked_by_current_thread
+    ):
+        raise CatalogueError("operation evidence lacks a capture identity")
+    _complete_capture(store, capture_id, _state=state)
+    rows = tuple(page_receipts(store, state))
+    expected: set[str] = set()
+    for row in rows:
+        relative = row.get("relative")
+        if not isinstance(relative, str):
+            raise CatalogueError("invalid operation-local capture receipt inventory")
+        expected.update({relative, str(Path(relative).parent / "body.bin")})
+    if verified_pages is not None and set(verified_pages) != expected:
+        raise CatalogueError("verified evidence inventory does not match the capture journal")
+    checkpoints = _checkpoint_inventory(store, state)
+    evidence = {**checkpoints, **(verified_pages or {})}
+    state_sha256 = digest(json_bytes(dict(state)))
+    root = str(store.root.resolve())
+    writer_token = id(store._writer_lock)
+    binding = _operation_evidence_binding(
+        capture_id,
+        catalogue_version,
+        root,
+        writer_token,
+        rows,
+        checkpoints,
+        verified_pages,
+        evidence,
+        state_sha256,
+    )
+    return _OperationEvidence(
+        capture_id,
+        catalogue_version,
+        root,
+        writer_token,
+        store._writer_lock,
+        state,
+        rows,
+        checkpoints,
+        None if verified_pages is None else dict(verified_pages),
+        evidence,
+        state_sha256,
+        binding,
+    )
+
+
+def _validate_operation_evidence(
+    store: Store, proof: _OperationEvidence, capture_id: str, catalogue_version: int
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    if (
+        proof.capture_id != capture_id
+        or proof.catalogue_version != catalogue_version
+        or proof.root != str(store.root.resolve())
+        or not store.writer_locked_by_current_thread
+        or store._writer_lock is not proof.writer_lock
+        or proof.writer_token != id(store._writer_lock)
+        or proof.state.get("capture_id") != capture_id
+        or digest(json_bytes(dict(proof.state))) != proof.state_sha256
+    ):
+        raise CatalogueError("operation evidence identity mismatch")
+    if (
+        _operation_evidence_binding(
+            proof.capture_id,
+            proof.catalogue_version,
+            proof.root,
+            proof.writer_token,
+            proof.page_rows,
+            proof.checkpoints,
+            proof.verified_pages,
+            proof.evidence,
+            proof.state_sha256,
+        )
+        != proof.binding_sha256
+    ):
+        raise CatalogueError("operation evidence binding mismatch")
+    state = _complete_capture(store, capture_id, _state=proof.state)
+    checkpoints = _checkpoint_inventory(store, state)
+    if checkpoints != proof.checkpoints:
+        raise CatalogueError("capture checkpoint changed during the operation")
+    expected: set[str] = set()
+    for row in proof.page_rows:
+        relative = row.get("relative")
+        if not isinstance(relative, str):
+            raise CatalogueError("invalid operation-local capture receipt inventory")
+        expected.update({relative, str(Path(relative).parent / "body.bin")})
+    if proof.verified_pages is not None and set(proof.verified_pages) != expected:
+        raise CatalogueError("operation evidence receipts do not match the capture journal")
+    if proof.evidence != {**checkpoints, **(proof.verified_pages or {})}:
+        raise CatalogueError("operation evidence inventory mismatch")
+    return state, proof.page_rows
+
+
 def catalogue_capture(store: Store, capture_id: str) -> dict[str, Any]:
     state = _complete_capture(store, capture_id)
     if state["selected"] is not None:
@@ -88,23 +281,36 @@ def _checkpoint_inventory(store: Store, state: dict[str, Any]) -> dict[str, str]
 
 
 def evidence_inventory(
-    store: Store, capture_id: str, *, verified_pages: dict[str, str] | None = None
+    store: Store,
+    capture_id: str,
+    *,
+    verified_pages: dict[str, str] | None = None,
+    _state: dict[str, Any] | None = None,
+    _page_rows: list[dict[str, Any]] | None = None,
+    _proof: _OperationEvidence | None = None,
 ) -> dict[str, str]:
-    state = (
-        complete_capture(store, capture_id)
-        if verified_pages is None
-        else _complete_capture(store, capture_id)
-    )
+    if _proof is not None:
+        state, proof_rows = _validate_operation_evidence(
+            store, _proof, capture_id, _proof.catalogue_version
+        )
+        if verified_pages != _proof.verified_pages:
+            raise CatalogueError("operation evidence does not match verified landing pages")
+        _state = state
+        _page_rows = list(proof_rows)
+    state = _complete_capture(store, capture_id, _state=_state)
+    rows = page_receipts(store, state) if _page_rows is None else _page_rows
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise CatalogueError("invalid operation-local capture receipt inventory")
     result = _checkpoint_inventory(store, state)
     if verified_pages is not None:
         expected = set()
-        for row in page_receipts(store, state):
+        for row in rows:
             relative = row["relative"]
             expected.update({relative, str(Path(relative).parent / "body.bin")})
         if set(verified_pages) != expected:
             raise CatalogueError("verified evidence inventory does not match the capture journal")
         return {**result, **verified_pages}
-    for row in page_receipts(store, state):
+    for row in rows:
         store.check_deadline()
         relative = row["relative"]
         result[relative] = file_digest(store.path(relative), store.limits.max_root_bytes)[0]
@@ -256,7 +462,9 @@ def _load_locked(store: Store, capture_id: str) -> dict[str, Any]:
         "capture_id": capture_id,
         "loaded_at": now(),
         "observation_count": observation_count,
-        "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
+        "evidence": evidence_inventory(
+            store, capture_id, verified_pages=verified_pages, _state=state
+        ),
     }
 
 
@@ -484,7 +692,7 @@ def _read_membership(connection: duckdb.DuckDBPyConnection) -> dict[str, set[str
     return result
 
 
-def _copy_closed_database(
+def _copy_closed_database_impl(
     store: Store,
     source_relative: str,
     staging: Path,
@@ -515,6 +723,22 @@ def _copy_closed_database(
         store.sync(str(staging.relative_to(store.root)))
     finally:
         store.release_storage(size)
+
+
+def _copy_closed_database(
+    store: Store,
+    source_relative: str,
+    staging: Path,
+    *,
+    expected_sha256: str,
+) -> None:
+    with metrics.phase("warehouse_copy"):
+        _copy_closed_database_impl(
+            store,
+            source_relative,
+            staging,
+            expected_sha256=expected_sha256,
+        )
 
 
 def _projection_membership(
@@ -745,6 +969,9 @@ def _affected_keys(
     _insert_affected(connection, "affected_series", series)
     _insert_affected(connection, "affected_events", affected_events)
     _insert_affected(connection, "affected_markets", affected_markets)
+    metrics.add("affected_series", len(series))
+    metrics.add("affected_events", len(affected_events))
+    metrics.add("affected_markets", len(affected_markets))
     return series, affected_events, affected_markets
 
 
@@ -853,6 +1080,7 @@ def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
     from kalshi_events.incremental import finish_pending_retirement
 
     finish_pending_retirement(store)
+    _recover_build(store, capture_id, 1)
     state = catalogue_capture(store, capture_id)
     if state.get("incremental"):
         return _build_delta(store, state)
@@ -860,9 +1088,6 @@ def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
     staging_relative = f"tmp/build-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
     staging.mkdir(parents=True)
-    destination_relative = build_directory(capture_id)
-    replaced_relative = f"tmp/replaced-{uuid.uuid4().hex}"
-    replaced = store.path(replaced_relative)
     try:
         verified_pages: dict[str, str] = {}
         _land(store, state, staging, verified_pages=verified_pages)
@@ -873,49 +1098,42 @@ def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
             artifacts=f"{staging_relative}/build-artifacts.json",
         )
         store.sync(staging_relative)
+        operation_evidence = _operation_evidence(store, state, 1, verified_pages)
         receipt = {
             "version": 1,
             "capture_id": capture_id,
             "built_at": now(),
             "scope": "catalogue",
-            "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
+            "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(
                 staging / "warehouse.duckdb", store.limits.max_database_bytes
             )[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
         }
         store.write(f"{staging_relative}/build.json", receipt)
-        destination = store.path(destination_relative)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        previous = destination.exists()
-        if previous:
-            os.rename(destination, replaced)
-        try:
-            os.rename(staging, destination)
-        except BaseException:
-            if previous:
-                os.rename(replaced, destination)
-            raise
-        if previous:
-            shutil.rmtree(replaced, ignore_errors=True)
+        fsync_directory(staging)
+        receipt = _install_build(store, capture_id, 1, staging, operation_evidence)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
         store.sync(staging_relative)
-        store.sync(replaced_relative)
-        store.sync(destination_relative)
+        store.sync(build_directory(capture_id, 1))
     store.check_storage()
     return receipt
 
 
-def _recover_v2_build(store: Store, capture_id: str) -> None:
-    destination = store.path(build_directory(capture_id, 2))
-    backup_relative = f"tmp/replaced-{capture_id}-v2"
+def _recover_build(store: Store, capture_id: str, catalogue_version: int) -> None:
+    if catalogue_version not in {1, 2}:
+        raise CatalogueError("catalogue version must be 1 or 2")
+    if not store.writer_locked_by_current_thread:
+        raise CatalogueError("build recovery requires the canonical writer lock")
+    destination = store.path(build_directory(capture_id, catalogue_version))
+    backup_relative = f"tmp/replaced-{capture_id}-v{catalogue_version}"
     backup = store.path(backup_relative)
     if not backup.exists():
         return
     if destination.exists():
         try:
-            certified(store, capture_id, catalogue_version=2)
+            certified(store, capture_id, catalogue_version=catalogue_version)
         except BudgetExceeded:
             raise
         except (CatalogueError, OSError):
@@ -923,14 +1141,14 @@ def _recover_v2_build(store: Store, capture_id: str) -> None:
                 certified(
                     store,
                     capture_id,
-                    catalogue_version=2,
+                    catalogue_version=catalogue_version,
                     _directory=backup,
                 )
             except BudgetExceeded:
                 raise
             except (CatalogueError, OSError) as exc:
                 raise CatalogueError(
-                    "neither v2 build nor its replacement backup is certified"
+                    "neither build nor its replacement backup is certified"
                 ) from exc
             shutil.rmtree(destination)
             os.rename(backup, destination)
@@ -940,22 +1158,30 @@ def _recover_v2_build(store: Store, capture_id: str) -> None:
             shutil.rmtree(backup)
             fsync_directory(backup.parent)
     else:
-        certified(store, capture_id, catalogue_version=2, _directory=backup)
+        certified(store, capture_id, catalogue_version=catalogue_version, _directory=backup)
         os.rename(backup, destination)
         fsync_directory(destination.parent)
         fsync_directory(backup.parent)
-    store.sync(build_directory(capture_id, 2))
+    store.sync(build_directory(capture_id, catalogue_version))
     store.sync(backup_relative)
 
 
-def _install_v2_build(store: Store, capture_id: str, staging: Path) -> dict[str, Any]:
-    destination_relative = build_directory(capture_id, 2)
+def _install_build(
+    store: Store,
+    capture_id: str,
+    catalogue_version: int,
+    staging: Path,
+    proof: _OperationEvidence | None = None,
+) -> dict[str, Any]:
+    if catalogue_version not in {1, 2}:
+        raise CatalogueError("catalogue version must be 1 or 2")
+    destination_relative = build_directory(capture_id, catalogue_version)
     destination = store.path(destination_relative)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    backup_relative = f"tmp/replaced-{capture_id}-v2"
+    backup_relative = f"tmp/replaced-{capture_id}-v{catalogue_version}"
     backup = store.path(backup_relative)
     if backup.exists():
-        _recover_v2_build(store, capture_id)
+        _recover_build(store, capture_id, catalogue_version)
     previous = destination.exists()
     if previous:
         os.rename(destination, backup)
@@ -966,14 +1192,27 @@ def _install_v2_build(store: Store, capture_id: str, staging: Path) -> dict[str,
         fsync_directory(staging.parent)
         fsync_directory(destination.parent)
         store.sync(destination_relative)
-        receipt = certified(store, capture_id, catalogue_version=2)
+        receipt = certified(
+            store,
+            capture_id,
+            catalogue_version=catalogue_version,
+            _proof=proof,
+        )
+    except BudgetExceeded:
+        raise
     except BaseException:
-        if destination.exists():
-            shutil.rmtree(destination, ignore_errors=True)
         if previous and backup.exists():
+            # Never discard the installed candidate until the rollback copy is known-good.
+            # If validation is interrupted or the backup is corrupt, retain both directories;
+            # the next writer can certify the destination and resolve the exact backup name.
+            certified(store, capture_id, catalogue_version=catalogue_version, _directory=backup)
+            if destination.exists():
+                shutil.rmtree(destination)
             os.rename(backup, destination)
             fsync_directory(destination.parent)
             fsync_directory(backup.parent)
+        elif destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
         raise
     if backup.exists():
         shutil.rmtree(backup)
@@ -1064,7 +1303,7 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
             "legacy full capture lacks final-generation membership after cursor reset; capture a new full baseline"
         )
     store.check_deadline()
-    _recover_v2_build(store, capture_id)
+    _recover_build(store, capture_id, 2)
     staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
     staging.mkdir(parents=True)
@@ -1090,7 +1329,10 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
                 verified_pages=verified_pages,
                 parent_index=index,
             )
-        with duckdb.connect(str(staging / "warehouse.duckdb")) as connection:
+        with (
+            duckdb.connect(str(staging / "warehouse.duckdb")) as connection,
+            metrics.phase("current_projection"),
+        ):
             _projection_membership(store, state, index, connection)
             _parent_closure_is_fresh(connection, state, index)
         dbt(
@@ -1106,6 +1348,7 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
             },
         )
         store.sync(staging_relative)
+        operation_evidence = _operation_evidence(store, state, 2, verified_pages)
         database = staging / "warehouse.duckdb"
         fsync_file(database)
         fsync_directory(staging)
@@ -1115,13 +1358,13 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
             "capture_id": capture_id,
             "built_at": now(),
             "scope": "catalogue",
-            "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
+            "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
         }
         store.write(f"{staging_relative}/build.json", receipt)
         fsync_directory(staging)
-        promoted = _install_v2_build(store, capture_id, staging)
+        promoted = _install_build(store, capture_id, 2, staging, operation_evidence)
         store.check_storage()
         return promoted
     finally:
@@ -1154,6 +1397,7 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
     from kalshi_events.incremental import baseline_membership, verify_pin
 
     capture_id = state["capture_id"]
+    _recover_build(store, capture_id, 2)
     pin = state.get("baseline")
     if not isinstance(pin, dict):
         raise CatalogueError("incremental capture lacks a baseline pin")
@@ -1186,7 +1430,10 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             verified_pages=verified_pages,
             parent_index=index,
         )
-        with duckdb.connect(str(staging / "warehouse.duckdb")) as connection:
+        with (
+            duckdb.connect(str(staging / "warehouse.duckdb")) as connection,
+            metrics.phase("current_projection"),
+        ):
             _, changes = _projection_membership(
                 store,
                 state,
@@ -1209,6 +1456,7 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             },
         )
         store.sync(staging_relative)
+        operation_evidence = _operation_evidence(store, state, 2, verified_pages)
         database = staging / "warehouse.duckdb"
         fsync_file(database)
         fsync_directory(staging)
@@ -1218,13 +1466,13 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             "capture_id": capture_id,
             "built_at": now(),
             "scope": "catalogue",
-            "evidence": evidence_inventory(store, capture_id, verified_pages=verified_pages),
+            "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
         }
         store.write(f"{staging_relative}/build.json", receipt)
         fsync_directory(staging)
-        promoted = _install_v2_build(store, capture_id, staging)
+        promoted = _install_build(store, capture_id, 2, staging, operation_evidence)
         store.check_storage()
         return promoted
     finally:
@@ -1241,20 +1489,58 @@ def certified(
     cutoff_sink: list[dict[str, Any]] | None = None,
     catalogue_version: int = 1,
     _directory: Path | None = None,
+    _state: dict[str, Any] | None = None,
+    _page_rows: list[dict[str, Any]] | None = None,
+    _proof: _OperationEvidence | None = None,
+    _context: _OperationContext | None = None,
 ) -> dict[str, Any]:
     if catalogue_version not in {1, 2}:
         raise CatalogueError("catalogue version must be 1 or 2")
+    if _context is not None:
+        _check_operation_context(store, _context)
+        cached = _context.captures.get((capture_id, catalogue_version))
+        if cached is not None:
+            if _state is not None and digest(json_bytes(dict(_state))) != cached.proof.state_sha256:
+                raise CatalogueError("operation verification state does not match its cached input")
+            if _page_rows is not None and tuple(_page_rows) != cached.proof.page_rows:
+                raise CatalogueError("operation verification receipts do not match cached input")
+            return _reuse_certified(
+                store,
+                capture_id,
+                catalogue_version,
+                _context,
+                cached,
+                cutoff_sink,
+            )
     directory = build_directory(capture_id, catalogue_version)
     directory_path = _directory or store.path(directory)
-    receipt = decode(regular_bytes(directory_path / "build.json"))
+    receipt_body = regular_bytes(directory_path / "build.json")
+    receipt = decode(receipt_body)
     if (
         receipt.get("capture_id") != capture_id
         or receipt.get("version") != catalogue_version
         or receipt.get("catalogue_version", catalogue_version) != catalogue_version
     ):
         raise CatalogueError("build receipt does not match the requested capture")
-    state = read_capture(store, capture_id)
-    rows = page_receipts(store, state)
+    proof_pages: dict[str, str] | None = None
+    cutoff_rows: list[str] = []
+    cutoff_start = len(cutoff_sink) if cutoff_sink is not None else 0
+    if _proof is not None and cutoff_sink is None:
+        state, proof_rows = _validate_operation_evidence(
+            store, _proof, capture_id, catalogue_version
+        )
+        rows = list(proof_rows)
+        proof_pages = _proof.verified_pages
+    else:
+        state = _complete_capture(store, capture_id, _state=_state)
+        expected_rows = page_receipts(store, state)
+        rows = expected_rows if _page_rows is None else _page_rows
+        if (
+            not isinstance(rows, list)
+            or any(not isinstance(row, dict) for row in rows)
+            or rows != expected_rows
+        ):
+            raise CatalogueError("invalid operation-local capture receipt inventory")
     base = f"captures/{capture_id}"
     required = {f"{base}/state.json", f"{base}/pages.jsonl"}
     for row in rows:
@@ -1263,26 +1549,40 @@ def certified(
     expected_files = receipt.get("evidence")
     if not isinstance(expected_files, dict) or set(expected_files) != required:
         raise CatalogueError("build evidence inventory does not match the capture journal")
-    actual_files = _checkpoint_inventory(store, state)
-    for row in rows:
-        store.check_deadline()
-        relative = row["relative"]
-        manifest, payload = read_page(
-            store,
-            relative,
-            state["max_response_bytes"],
-            state.get("max_decoded_response_bytes", state["max_response_bytes"]),
-            decode_endpoints={"/historical/cutoff"} if cutoff_sink is not None else set(),
-            inventory=actual_files,
-        )
-        if manifest.get("capture_id") != capture_id:
-            raise CatalogueError("raw evidence belongs to another capture")
-        if (
-            cutoff_sink is not None
-            and manifest.get("endpoint") == "/historical/cutoff"
-            and manifest.get("status") == 200
-        ):
-            cutoff_sink.append({"received_at": manifest["received_at"], "cutoff": payload})
+    actual_files = (
+        dict(_proof.checkpoints) if proof_pages is not None else _checkpoint_inventory(store, state)
+    )
+    if proof_pages is not None:
+        expected_pages = {
+            relative: checksum
+            for relative, checksum in _proof.evidence.items()
+            if relative not in actual_files
+        }
+        if expected_pages != proof_pages:
+            raise CatalogueError("operation evidence receipt inventory mismatch")
+        actual_files.update(proof_pages)
+    else:
+        for row in rows:
+            store.check_deadline()
+            relative = row["relative"]
+            manifest, payload = read_page(
+                store,
+                relative,
+                state["max_response_bytes"],
+                state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+                decode_endpoints={"/historical/cutoff"} if cutoff_sink is not None else set(),
+                inventory=actual_files,
+            )
+            if manifest.get("capture_id") != capture_id:
+                raise CatalogueError("raw evidence belongs to another capture")
+            if manifest.get("endpoint") == "/historical/cutoff" and manifest.get("status") == 200:
+                cutoff_rows.append(relative)
+            if (
+                cutoff_sink is not None
+                and manifest.get("endpoint") == "/historical/cutoff"
+                and manifest.get("status") == 200
+            ):
+                cutoff_sink.append({"received_at": manifest["received_at"], "cutoff": payload})
     if actual_files != expected_files:
         raise CatalogueError("build evidence integrity mismatch")
     warehouse = directory_path / "warehouse.duckdb"
@@ -1291,6 +1591,137 @@ def certified(
     artifacts = directory_path / "build-artifacts.json"
     if digest(regular_bytes(artifacts)) != receipt["dbt_artifacts_sha256"]:
         raise CatalogueError("dbt certification artifacts changed")
-    if catalogue_version == 2 and warehouse.with_name(warehouse.name + ".wal").exists():
-        raise CatalogueError("v2 warehouse has an uncheckpointed WAL")
+    if warehouse.with_name(warehouse.name + ".wal").exists():
+        raise CatalogueError("warehouse has an uncheckpointed WAL")
+    if _context is not None and _proof is None and _directory is None:
+        checkpoint_paths = set(_checkpoint_inventory(store, state))
+        verified_pages = {
+            relative: checksum
+            for relative, checksum in actual_files.items()
+            if relative not in checkpoint_paths
+        }
+        proof = _operation_evidence(store, state, catalogue_version, verified_pages)
+        _context.captures[(capture_id, catalogue_version)] = _VerifiedCapture(
+            proof=proof,
+            receipt=copy.deepcopy(receipt),
+            build_sha256=digest(receipt_body),
+            warehouse_sha256=receipt["warehouse_sha256"],
+            artifacts_sha256=receipt["dbt_artifacts_sha256"],
+            cutoff_rows=tuple(cutoff_rows),
+            cutoff_records=(
+                tuple(copy.deepcopy(cutoff_sink[cutoff_start:]))
+                if cutoff_sink is not None
+                else None
+            ),
+            binding_sha256=_verified_capture_binding(
+                receipt,
+                digest(receipt_body),
+                receipt["warehouse_sha256"],
+                receipt["dbt_artifacts_sha256"],
+                tuple(cutoff_rows),
+                tuple(copy.deepcopy(cutoff_sink[cutoff_start:]))
+                if cutoff_sink is not None
+                else None,
+            ),
+        )
     return receipt
+
+
+def _reuse_certified(
+    store: Store,
+    capture_id: str,
+    catalogue_version: int,
+    context: _OperationContext,
+    cached: _VerifiedCapture,
+    cutoff_sink: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Reuse parsed evidence only after rehashing every bound file in this writer lease."""
+    _check_operation_context(store, context)
+    if (
+        _verified_capture_binding(
+            cached.receipt,
+            cached.build_sha256,
+            cached.warehouse_sha256,
+            cached.artifacts_sha256,
+            cached.cutoff_rows,
+            cached.cutoff_records,
+        )
+        != cached.binding_sha256
+    ):
+        raise CatalogueError("operation verification cache binding mismatch")
+    proof = cached.proof
+    state, _ = _validate_operation_evidence(store, proof, capture_id, catalogue_version)
+    expected_pages = proof.verified_pages or {}
+    cutoff_paths = set(cached.cutoff_rows) if cutoff_sink is not None else set()
+    cutoff_files = {
+        path
+        for relative in cutoff_paths
+        for path in (relative, str(Path(relative).parent / "body.bin"))
+    }
+    cutoff_inventory: dict[str, str] = {}
+    for relative, checksum in expected_pages.items():
+        if relative in cutoff_files and cutoff_sink is not None and cached.cutoff_records is None:
+            continue
+        size_limit = (
+            1024**2
+            if relative.endswith("/manifest.json")
+            else state["max_response_bytes"]
+            if relative.endswith("/body.bin")
+            else store.limits.max_root_bytes
+        )
+        if file_digest(store.path(relative), size_limit)[0] != checksum:
+            raise CatalogueError("raw evidence changed during the operation")
+    directory = store.path(build_directory(capture_id, catalogue_version))
+    receipt_path = directory / "build.json"
+    if file_digest(receipt_path, store.limits.max_root_bytes)[0] != cached.build_sha256:
+        raise CatalogueError("build receipt changed during the operation")
+    warehouse = directory / "warehouse.duckdb"
+    if file_digest(warehouse, store.limits.max_database_bytes)[0] != cached.warehouse_sha256:
+        raise CatalogueError("warehouse changed during the operation")
+    artifacts = directory / "build-artifacts.json"
+    if digest(regular_bytes(artifacts)) != cached.artifacts_sha256:
+        raise CatalogueError("dbt certification artifacts changed during the operation")
+    if warehouse.with_name(warehouse.name + ".wal").exists():
+        raise CatalogueError("warehouse has an uncheckpointed WAL")
+    if cutoff_sink is not None:
+        if cached.cutoff_records is not None:
+            cutoff_sink.extend(copy.deepcopy(cached.cutoff_records))
+        else:
+            for relative in cached.cutoff_rows:
+                manifest, payload = read_page(
+                    store,
+                    relative,
+                    state["max_response_bytes"],
+                    state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+                    decode_endpoints={"/historical/cutoff"},
+                    inventory=cutoff_inventory,
+                )
+                if manifest.get("capture_id") != capture_id:
+                    raise CatalogueError("raw evidence belongs to another capture")
+                cutoff_sink.append({"received_at": manifest["received_at"], "cutoff": payload})
+            for relative in cutoff_files:
+                if cutoff_inventory.get(relative) != expected_pages.get(relative):
+                    raise CatalogueError("raw cutoff evidence changed during the operation")
+    return copy.deepcopy(cached.receipt)
+
+
+def _verified_capture_binding(
+    receipt: dict[str, Any],
+    build_sha256: str,
+    warehouse_sha256: str,
+    artifacts_sha256: str,
+    cutoff_rows: tuple[str, ...],
+    cutoff_records: tuple[dict[str, Any], ...] | None,
+) -> str:
+    return digest(
+        json_bytes(
+            {
+                "receipt": receipt,
+                "build_sha256": build_sha256,
+                "warehouse_sha256": warehouse_sha256,
+                "artifacts_sha256": artifacts_sha256,
+                "cutoff_rows": list(cutoff_rows),
+                "cutoff_records": cutoff_records,
+            }
+        )
+    )

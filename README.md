@@ -35,6 +35,8 @@ Identity encoding remains the default. `capture --compression gzip` requests gzi
 
 ### Optional transport diagnostics
 
+Metrics reports must stay outside the operator root, immutable release directories and metadata bundle destinations. The CLI rejects overlapping paths before creating a report or starting acquisition, including when the bundle destination does not exist yet.
+
 Capability and rate checks are manual, bounded operations. Use a new disposable root and a known market ticker with a new metrics report path:
 
 ```sh
@@ -122,11 +124,15 @@ uv run kalshi-events verify --release /absolute/operator/kalshi-events/releases/
 
 New captures commit each page to a checksummed, sequenced journal and snapshot every 100 transitions, at completion and at an orderly budget stop. Resume verifies the chain and replays durable progress after the snapshot; committed orphan receipts are reused. Only writer-locked resume may remove an unfinished trailing journal record. Committed corruption fails closed. Read-only commands never repair files, and incomplete legacy captures continue using their original checkpoint protocol. Do not edit recovery files by hand.
 
-Version 2 build replacement retains a certified backup until the replacement verifies. After interrupted build promotion, rerun replay or rebuild with the same catalogue version. An interrupted publication may leave a verified immutable release before its pointer is promoted; retry publication with the same capture ID. Cleanup records durable ownership and progress before retiring files, and the next writer resumes that plan before new work. Read-only inspection never repairs or deletes files. Preserve the root and investigate a corrupt plan or unknown cleanup artifact rather than deleting recovery files manually.
+Build replacement for either catalogue version retains a certified backup until the replacement verifies. After interrupted build promotion, rerun replay or rebuild with the same catalogue version. Delta rebuilds recover their version 2 replacement before allocating another staging warehouse, so a redundant backup does not consume the retry's database allowance. An interrupted publication may leave a verified immutable release before its pointer is promoted; retry publication with the same capture ID. Cleanup records durable ownership and progress before retiring files, and the next writer resumes that plan before new work. Read-only inspection never repairs or deletes files. Preserve the root and investigate a corrupt plan or unknown cleanup artifact rather than deleting recovery files manually.
 
 Tests use synthetic source responses. Loopback HTTP is available only with both `KALSHI_EVENTS_ALLOW_LOOPBACK=1` and an explicit `KALSHI_EVENTS_API_URL=http://127.0.0.1:PORT/trade-api/v2`. No authenticated trading, WebSocket recorder or activated schedule is included. Dagster remains optional and unscheduled; it is not installed for this operator-invoked release.
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion. Both installed wheels and source checkouts include dbt resources; runtime data, credentials, local Pad state and warehouse files are excluded from distributions.
+
+## Offline benchmarking
+
+See [performance measurements](docs/performance.md) for frozen fixtures, paired baseline comparisons, resource counters, standalone verification and the costs that remain after incremental acquisition. Benchmark roots and reports stay outside Git and distributions. Offline results do not establish live catalogue duration or a higher supported public request rate.
 
 ## Live acceptance
 

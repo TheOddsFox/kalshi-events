@@ -20,6 +20,7 @@ from kalshi_events import metrics
 from kalshi_events.capture import (
     _complete_capture,
     latest_catalogue_capture,
+    page_receipts,
 )
 from kalshi_events.common import (
     BudgetExceeded,
@@ -50,6 +51,17 @@ ORDER_KEYS = {
     "combo_legs": "combo_market_ticker, leg_index",
     "relationships": "parent_kind, parent_ticker, child_kind, child_ticker",
 }
+V2_LINEAGE_FIELDS = (
+    "root_id",
+    "baseline_release_id",
+    "baseline_manifest_sha256",
+    "baseline_capture_id",
+    "previous_watermark",
+    "watermark_started_at",
+    "delta_depth",
+    "membership_sha256",
+)
+MAX_V2_COVERAGE_LINEAGE_BYTES = 1024**2
 
 
 def inventory(directory: Path, names: set[str], limit: int) -> dict[str, dict[str, Any]]:
@@ -93,21 +105,13 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
             _ = pq.ParquetFile(directory / name).schema
         except Exception as exc:
             raise CatalogueError("invalid Parquet release relation") from exc
+    if manifest["contract"] == CONTRACT_V2:
+        _validate_v2_coverage(directory / "coverage.parquet", manifest)
     return manifest
 
 
 def _validate_v2_manifest(manifest: dict[str, Any]) -> None:
-    fields = (
-        "root_id",
-        "baseline_release_id",
-        "baseline_manifest_sha256",
-        "baseline_capture_id",
-        "previous_watermark",
-        "watermark_started_at",
-        "delta_depth",
-        "membership_sha256",
-    )
-    if any(name not in manifest for name in fields):
+    if any(name not in manifest for name in V2_LINEAGE_FIELDS):
         raise CatalogueError("invalid catalogue-v2 lineage fields")
     if not _hex_id(manifest.get("root_id"), 32) or not _hex_id(manifest.get("capture_id"), 32):
         raise CatalogueError("invalid catalogue-v2 root or capture identity")
@@ -116,6 +120,8 @@ def _validate_v2_manifest(manifest: dict[str, Any]) -> None:
         raise CatalogueError("invalid catalogue-v2 delta depth")
     if not _hex_id(manifest.get("membership_sha256"), 64):
         raise CatalogueError("invalid catalogue-v2 membership fingerprint")
+    if "warehouse_sha256" in manifest and not _hex_id(manifest["warehouse_sha256"], 64):
+        raise CatalogueError("invalid catalogue-v2 warehouse checksum")
     baseline_id = manifest.get("baseline_release_id")
     baseline_sha = manifest.get("baseline_manifest_sha256")
     baseline_capture = manifest.get("baseline_capture_id")
@@ -143,6 +149,80 @@ def _validate_v2_manifest(manifest: dict[str, Any]) -> None:
             manifest["watermark_started_at"].replace("Z", "+00:00")
         ):
             raise CatalogueError("catalogue-v2 watermark moves backwards")
+
+
+def _validate_v2_coverage(path: Path, manifest: dict[str, Any]) -> None:
+    fields = ("capture_id", *V2_LINEAGE_FIELDS)
+    expected = {name: manifest.get(name) for name in fields}
+    try:
+        parquet = pq.ParquetFile(
+            path,
+            thrift_string_size_limit=MAX_V2_COVERAGE_LINEAGE_BYTES,
+            thrift_container_size_limit=10_000,
+        )
+        metadata = parquet.metadata
+        schema = parquet.schema_arrow
+        if metadata.num_rows != 1 or metadata.num_row_groups != 1:
+            raise CatalogueError("catalogue-v2 coverage must contain exactly one row")
+        scalar_types = (
+            pa.types.is_string,
+            pa.types.is_large_string,
+            pa.types.is_boolean,
+            pa.types.is_int64,
+            pa.types.is_null,
+        )
+        if metadata.num_columns != len(schema) or any(
+            not any(is_type(field.type) for is_type in scalar_types) for field in schema
+        ):
+            raise CatalogueError("catalogue-v2 coverage must use flat primitive columns")
+        indices = {name: schema.get_field_index(name) for name in fields}
+        if any(index < 0 for index in indices.values()):
+            raise CatalogueError("catalogue-v2 coverage is missing lineage columns")
+        if any(
+            metadata.row_group(0).column(index).path_in_schema != name
+            for name, index in indices.items()
+        ):
+            raise CatalogueError("catalogue-v2 coverage lineage columns are not flat")
+        selected_columns = [metadata.row_group(0).column(index) for index in indices.values()]
+        compressed_sizes = [column.total_compressed_size for column in selected_columns]
+        uncompressed_sizes = [column.total_uncompressed_size for column in selected_columns]
+        if (
+            any(
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or size > MAX_V2_COVERAGE_LINEAGE_BYTES
+                for size in (*compressed_sizes, *uncompressed_sizes)
+            )
+            or sum(uncompressed_sizes) > MAX_V2_COVERAGE_LINEAGE_BYTES
+        ):
+            raise CatalogueError("catalogue-v2 coverage lineage columns exceed the size limit")
+        for name, value in expected.items():
+            field_type = schema.field(name).type
+            if value is None:
+                if not (pa.types.is_null(field_type) or pa.types.is_string(field_type)):
+                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+            elif isinstance(value, str):
+                if not (pa.types.is_string(field_type) or pa.types.is_large_string(field_type)):
+                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+            elif isinstance(value, int) and not isinstance(value, bool):
+                if not pa.types.is_int64(field_type):
+                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+            else:
+                raise CatalogueError("invalid catalogue-v2 manifest lineage value")
+        table = parquet.read(columns=list(fields))
+        if table.num_rows != 1:
+            raise CatalogueError("catalogue-v2 coverage must contain exactly one row")
+        row = table.to_pylist()[0]
+    except CatalogueError:
+        raise
+    except Exception as exc:
+        raise CatalogueError("invalid catalogue-v2 coverage lineage") from exc
+
+    for name, value in expected.items():
+        actual = row.get(name)
+        if type(actual) is not type(value) or actual != value:
+            raise CatalogueError(f"catalogue-v2 coverage lineage mismatch: {name}")
 
 
 def _hex_id(value: Any, size: int) -> bool:
@@ -176,7 +256,21 @@ def publish(
         return _publish(store, capture_id, catalogue_version)
 
 
-def _publish(store: Store, capture_id: str | None, catalogue_version: int) -> dict[str, Any]:
+def _publish(
+    store: Store,
+    capture_id: str | None,
+    catalogue_version: int,
+    *,
+    _context: Any = None,
+) -> dict[str, Any]:
+    from kalshi_events.warehouse import operation_context
+
+    if not store.writer_locked_by_current_thread:
+        with store.writer_guard(), operation_context(store) as context:
+            return _publish(store, capture_id, catalogue_version, _context=context)
+    if _context is None:
+        with operation_context(store) as context:
+            return _publish(store, capture_id, catalogue_version, _context=context)
     store.require_writable()
     from kalshi_events import incremental
 
@@ -205,7 +299,16 @@ def _publish(store: Store, capture_id: str | None, catalogue_version: int) -> di
             if not store.path(f"{build_directory(capture_id, 2)}/build.json").exists():
                 build_v2_full(store, capture_id)
     cutoffs: list[dict[str, Any]] = []
-    receipt = certified(store, capture_id, cutoff_sink=cutoffs, catalogue_version=catalogue_version)
+    rows = page_receipts(store, state)
+    receipt = certified(
+        store,
+        capture_id,
+        cutoff_sink=cutoffs,
+        catalogue_version=catalogue_version,
+        _state=state,
+        _page_rows=rows,
+        _context=_context,
+    )
     if receipt["scope"] != "catalogue":
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
     store.check_deadline()
@@ -270,6 +373,8 @@ def _publish(store: Store, capture_id: str | None, catalogue_version: int) -> di
             "files": evidence,
         }
         manifest.update(release_metadata)
+        if catalogue_version == 2:
+            manifest["warehouse_sha256"] = receipt["warehouse_sha256"]
         atomic_json(temporary / "manifest.json", manifest)
         fsync_directory(temporary)
         verify_release(temporary, store.limits.max_root_bytes)
@@ -337,11 +442,17 @@ def _publish(store: Store, capture_id: str | None, catalogue_version: int) -> di
             raise CatalogueError("promoted release does not belong to the published capture")
         with metrics.phase("pruning"):
             if catalogue_version == 1:
-                pruned = prune_superseded(store, state, release_id)
+                pruned = prune_superseded(store, state, release_id, _context=_context)
             else:
                 from kalshi_events import incremental
 
-                pruned = incremental.prune(store, state, release_id, catalogue_version)
+                pruned = incremental.prune(
+                    store,
+                    state,
+                    release_id,
+                    catalogue_version,
+                    _context=_context,
+                )
         return {"output": str(destination), **manifest, "pruned_captures": pruned}
     finally:
         if temporary.exists():
@@ -349,11 +460,13 @@ def _publish(store: Store, capture_id: str | None, catalogue_version: int) -> di
         store.sync(temporary_relative)
 
 
-def prune_superseded(store: Store, state: dict[str, Any], release_id: str) -> list[str]:
+def prune_superseded(
+    store: Store, state: dict[str, Any], release_id: str, *, _context: Any = None
+) -> list[str]:
     """Keep the evidence reachable from both publications and in-progress captures."""
     from kalshi_events import incremental
 
-    return incremental.prune(store, state, release_id, 1)
+    return incremental.prune(store, state, release_id, 1, _context=_context)
 
 
 def current(store: Store, *, catalogue_version: int = 1) -> dict[str, Any]:
