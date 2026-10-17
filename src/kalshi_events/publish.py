@@ -41,6 +41,14 @@ from kalshi_events.warehouse import RELATIONS, build_directory, certified
 
 CONTRACT = "oddsfox.kalshi.catalogue.v1"
 FILES = {name + ".parquet" for name in (*RELATIONS, "coverage")}
+ORDER_KEYS = {
+    "series": "series_ticker",
+    "events": "event_ticker",
+    "markets": "market_ticker",
+    "observation_history": "observation_id",
+    "combo_legs": "combo_market_ticker, leg_index",
+    "relationships": "parent_kind, parent_ticker, child_kind, child_ticker",
+}
 
 
 def inventory(directory: Path, names: set[str], limit: int) -> dict[str, dict[str, Any]]:
@@ -106,8 +114,13 @@ def publish(store: Store, capture_id: str | None = None) -> dict[str, Any]:
                 destination = temporary / (name + ".parquet")
                 # DuckDB's path parameter keeps the operator path out of SQL syntax.
                 try:
+                    keys = ORDER_KEYS[name]
+                    if connection.execute(
+                        f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
+                    ).fetchone():
+                        raise CatalogueError(f"non-unique publication ordering key: {name}")
                     connection.execute(
-                        f"copy (select * from main.{table} order by all) to ? (format parquet)",
+                        f"copy (select * from main.{table} order by {keys}) to ? (format parquet)",
                         [str(destination)],
                     )
                 except duckdb.InterruptException as exc:
