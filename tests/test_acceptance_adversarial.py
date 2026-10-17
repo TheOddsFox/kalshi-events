@@ -113,17 +113,14 @@ def test_raw_market_commit_before_pending_checkpoint_is_reused_on_resume(
         return client
 
     def interrupted(actual_store, state):
-        pending = state["pending"]
-        if (
-            boundary == "before_checkpoint"
-            and pending
-            and state["tasks"][pending["index"]]["endpoint"] == "/markets/MARKET"
+        if boundary == "before_checkpoint" and any(
+            work["pending"] and work["endpoint"] == "/markets/MARKET" for work in state["tasks"]
         ):
             raise RuntimeError("process death before pending checkpoint")
         original(actual_store, state)
 
-    def interrupted_receipt(client, endpoint, params=None):
-        relative = original_get(client, endpoint, params)
+    def interrupted_receipt(client, endpoint, params=None, context=None):
+        relative = original_get(client, endpoint, params, context=context)
         if boundary != "before_checkpoint" and endpoint == "/markets/MARKET":
             raise RuntimeError("process death before pending checkpoint")
         return relative
@@ -135,7 +132,9 @@ def test_raw_market_commit_before_pending_checkpoint_is_reused_on_resume(
         acquisition.capture(store, selected=["MARKET"], client_factory=factory)
     capture_id = next(store.path("captures").iterdir()).name
     state = acquisition.read_capture(store, capture_id)
-    assert state["pending"] is None and len(state["pages"]) == 1
+    # The market receipt was committed to raw evidence but never checkpointed as pending.
+    assert state["tasks"][1]["endpoint"] == "/markets/MARKET"
+    assert state["tasks"][1]["pending"] is None
     assert len(list(store.path("raw").glob("*/manifest.json"))) == 2
     monkeypatch.setattr(acquisition, "save", original)
     monkeypatch.setattr(PublicClient, "get", original_get)

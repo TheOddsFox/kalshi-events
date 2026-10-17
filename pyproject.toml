@@ -1,6 +1,6 @@
 [project]
 name = "oddsfox-kalshi-events"
-version = "0.1.0"
+version = "1.0.0"
 description = "Bounded public Kalshi native catalogue and immutable metadata handoffs"
 readme = "README.md"
 license = {file = "LICENSE"}

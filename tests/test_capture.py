@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import json
+
 import pytest
-from conftest import EVENTS, MARKET, FakeClient
+from conftest import EVENTS, HISTORICAL, MARKET, FakeClient
 
 from kalshi_events import capture as acquisition
-from kalshi_events.common import CatalogueError, Limits, Store
+from kalshi_events.cli import main
+from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store
 from kalshi_events.normalize import project_pages
 
 
 def test_native_full_catalogue_keeps_history_and_relationships(store, factory):
     state = acquisition.capture(store, client_factory=factory)
     assert state["complete"]
-    assert state["requests"] == 6
+    assert state["requests"] == 7
     projected = project_pages(acquisition.capture_pages(store, state))
     assert {m["market_ticker"] for m in projected["markets"]} == {
         "MARKET",
@@ -29,6 +32,35 @@ def test_native_full_catalogue_keeps_history_and_relationships(store, factory):
     assert archived["result"] == "no"
 
 
+def test_checkpoint_stays_small_while_pages_go_to_journal(store, factory):
+    state = acquisition.capture(store, client_factory=factory)
+    checkpoint = json.loads(store.path(f"captures/{state['capture_id']}/state.json").read_text())
+    assert "pages" not in checkpoint
+    assert "seen_cursors" not in json.dumps(checkpoint["tasks"])
+    journal = store.path(f"captures/{state['capture_id']}/pages.jsonl").read_text().splitlines()
+    assert len(journal) == state["requests"]
+
+
+def test_each_historical_read_records_its_own_cutoff(store):
+    def markets(params):
+        if params.get("cursor"):
+            return 200, {"markets": [], "cursor": ""}
+        return 200, {"markets": [HISTORICAL], "cursor": "page-2"}
+
+    state = acquisition.capture(
+        store, client_factory=lambda s, b: FakeClient(s, b, {"/historical/markets": markets})
+    )
+    assert state["complete"]
+    cutoffs = [
+        manifest
+        for manifest, _ in acquisition.capture_pages(store, state)
+        if manifest["endpoint"] == "/historical/cutoff"
+    ]
+    # One cutoff for the catalogue-start read plus one before each of the two historical pages.
+    assert len(cutoffs) == 3
+    assert all(manifest["status"] == 200 for manifest in cutoffs)
+
+
 def test_budget_stop_resumes_without_publishing_incomplete(store, factory):
     bounded = Store(store.root, Limits(max_requests=2))
     state = acquisition.capture(bounded, client_factory=factory)
@@ -38,7 +70,43 @@ def test_budget_stop_resumes_without_publishing_incomplete(store, factory):
         acquisition.complete_capture(store, state["capture_id"])
     resumed = acquisition.capture(store, resume=state["capture_id"], client_factory=factory)
     assert resumed["complete"]
-    assert resumed["requests"] == 4
+    # The two receipts from the first run are applied from the journal, never reissued.
+    assert resumed["requests"] == 5
+
+
+def test_budget_exhaustion_exits_three_with_incomplete_json(store, factory, monkeypatch, capsys):
+    monkeypatch.setattr(acquisition, "PublicClient", factory)
+    code = main(["--root", str(store.root), "capture", "--max-requests", "2"])
+    output = json.loads(capsys.readouterr().out)
+    assert code == 3
+    assert output["complete"] is False
+    assert output["requests"] == 2
+
+
+def test_fully_complete_capture_exits_zero(store, factory, monkeypatch, capsys):
+    monkeypatch.setattr(acquisition, "PublicClient", factory)
+    code = main(["--root", str(store.root), "capture"])
+    output = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert output["complete"] is True
+
+
+def test_evidence_walk_checks_deadline_on_every_page(store, factory):
+    state = acquisition.capture(store, client_factory=factory)
+    expired = Store(store.root, Limits(max_duration_seconds=1))
+    expired.started -= 60
+    with pytest.raises(BudgetExceeded, match="deadline"):
+        list(acquisition.capture_pages(expired, state))
+
+
+def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
+    state = acquisition.capture(store, client_factory=factory)
+    relative = f"captures/{state['capture_id']}/state.json"
+    legacy = json.loads(store.path(relative).read_text())
+    del legacy["max_response_bytes"]
+    store.write(relative, legacy)
+    with pytest.raises(CatalogueError, match="pre-1.0 captures are not readable"):
+        acquisition.read_capture(store, state["capture_id"])
 
 
 def test_raw_commit_crash_is_recoverable_without_reissuing_request(store, factory, monkeypatch):
@@ -52,12 +120,14 @@ def test_raw_commit_crash_is_recoverable_without_reissuing_request(store, factor
         acquisition.capture(store, client_factory=factory)
     capture_id = next(store.path("captures").iterdir()).name
     state = acquisition.read_capture(store, capture_id)
-    assert state["pending"]
+    assert [work for work in state["tasks"] if work["pending"]]
     assert len(list(acquisition.capture_pages(store, state))) == 1
     monkeypatch.setattr(acquisition, "_consume", original)
     resumed = acquisition.capture(store, resume=capture_id, client_factory=factory)
     assert resumed["complete"]
-    assert resumed["requests"] == 5
+    # Every request issued before the crash committed its raw receipt; none is repeated.
+    assert resumed["requests"] == 1
+    assert len(list(store.path("raw").glob("*/manifest.json"))) == 7
 
 
 def test_invalidated_cursor_restarts_and_retains_all_observations(store):
@@ -131,4 +201,15 @@ def test_targeted_absence_checks_historical_and_never_reuses_previous(store, fac
     )
     assert first["coverage"]["MARKET"]["status"] == "found"
     assert second["coverage"]["MARKET"]["status"] == "absent"
-    assert second["requests"] == 3
+    # Cutoff, live lookup, historical cutoff, historical lookup.
+    assert second["requests"] == 4
+
+
+def test_sealed_response_ceiling_governs_later_reads(store, factory):
+    state = acquisition.capture(store, client_factory=factory)
+    assert state["max_response_bytes"] == store.limits.max_response_bytes
+    tighter = Store(store.root, Limits(max_response_bytes=1))
+    assert len(list(acquisition.capture_pages(tighter, state))) == state["requests"]
+    assert acquisition.complete_capture(tighter, state["capture_id"])["max_response_bytes"] == (
+        store.limits.max_response_bytes
+    )
