@@ -16,6 +16,7 @@ from kalshi_events.capture import (
 )
 from kalshi_events.common import (
     MAX_BUNDLE_BYTES,
+    BudgetExceeded,
     CatalogueError,
     Store,
     atomic_bytes,
@@ -170,9 +171,10 @@ def refresh(
 ) -> dict[str, Any]:
     state = capture(store, selected=selections(selected))
     if not state["complete"]:
-        raise CatalogueError(
-            "targeted metadata acquisition incomplete: " + (state["error"] or "unknown error")
-        )
+        message = "targeted metadata acquisition incomplete: " + (state["error"] or "unknown error")
+        if state["budget_exhausted"]:
+            raise BudgetExceeded(message)
+        raise CatalogueError(message)
     result = export(
         store, selected, output, capture_id=state["capture_id"], max_output_bytes=max_output_bytes
     )

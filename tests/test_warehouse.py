@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from decimal import Decimal
 from pathlib import Path
@@ -312,6 +313,48 @@ def test_combo_leg_with_missing_authoritative_event_remains_unresolved_in_wareho
             "select resolved from read_parquet(?)",
             [str(Path(release["output"]) / "combo_legs.parquet")],
         ).fetchall() == [(False,)]
+
+
+def test_dbt_operation_deadline_is_a_budget_stop(store, monkeypatch, capsys):
+    def timed_out(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(warehouse.subprocess, "run", timed_out)
+    with pytest.raises(BudgetExceeded, match="deadline"):
+        warehouse.dbt(store, ["parse"])
+    assert main(["--root", str(store.root), "dbt", "--", "parse"]) == 3
+    assert json.loads(capsys.readouterr().out)["complete"] is False
+
+
+def test_failed_publication_rename_restores_previous_build(store, factory, monkeypatch):
+    state = capture(store, client_factory=factory)
+    build(store, state["capture_id"])
+    release = publish(store)
+    before = certified(store, state["capture_id"])
+    destination = str(warehouse_path(store, state["capture_id"]).parent)
+    real_rename = os.rename
+
+    def failing_rename(source, target, *args, **kwargs):
+        if str(target) == destination and Path(source).name.startswith("build-"):
+            raise OSError("synthetic staging rename failure")
+        return real_rename(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(warehouse.os, "rename", failing_rename)
+    with pytest.raises(OSError, match="synthetic"):
+        build(store, state["capture_id"])
+    assert certified(store, state["capture_id"]) == before
+    assert current(store)["source_release_id"] == release["source_release_id"]
+    assert not list(store.path("tmp").glob("replaced-*"))
+    assert not list(store.path("tmp").glob("build-*"))
+
+
+def test_evidence_walk_checks_deadline_on_every_page(store, factory, monkeypatch):
+    state = capture(store, client_factory=factory)
+    monkeypatch.setattr(warehouse, "complete_capture", lambda *_: state)
+    expired = Store(store.root, Limits(max_duration_seconds=1))
+    expired.started -= 60
+    with pytest.raises(BudgetExceeded, match="deadline"):
+        warehouse.evidence_inventory(expired, state["capture_id"])
 
 
 def test_status_and_current_report_the_published_release(store, factory, capsys):

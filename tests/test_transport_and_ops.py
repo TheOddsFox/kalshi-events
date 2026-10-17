@@ -85,7 +85,7 @@ def test_remaining_download_ceiling_rejects_oversized_next_response(store, monke
             transport=httpx.MockTransport(lambda _: responses.pop(0)), trust_env=False
         )
         read_page(bounded, client.get("/series"))
-        with pytest.raises(CatalogueError, match="ceiling"):
+        with pytest.raises(BudgetExceeded, match="download allowance exhausted"):
             client.get("/series")
     receipts = [
         json.loads(path.read_text()) for path in bounded.path("raw").glob("*/manifest.json")
@@ -166,8 +166,9 @@ def test_streaming_cap_and_retry_attempts_accounted(store, monkeypatch):
             ),
             trust_env=False,
         )
-        with pytest.raises(CatalogueError, match="ceiling"):
+        with pytest.raises(CatalogueError, match="ceiling") as raised:
             client.get("/series")
+    assert not isinstance(raised.value, BudgetExceeded)
 
 
 def test_redirect_is_rejected_without_second_host_request(store, monkeypatch):
@@ -322,3 +323,35 @@ def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(stor
     assert resumed["complete"] and resumed["requests"] == 3
     assert accounting(store)["attempts"] == 8
     assert accounting(store)["accounting_complete"] is True
+
+
+def test_deadline_cut_retry_keeps_known_retry_fields(store, monkeypatch):
+    import json
+
+    from kalshi_events.common import digest
+
+    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
+    body = b'{"rate":"limited"}'
+    short = Store(store.root, Limits(max_requests=4, max_duration_seconds=5))
+    with PublicClient(short, Budget(short)) as client:
+        client.client.close()
+        client.client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    429, headers={"Retry-After": "7"}, stream=httpx.ByteStream(body)
+                )
+            ),
+            trust_env=False,
+        )
+        with pytest.raises(BudgetExceeded, match="retry"):
+            client.get("/series")
+    (receipt,) = [
+        json.loads(path.read_text()) for path in short.path("raw").glob("*/manifest.json")
+    ]
+    assert receipt["status"] == 429
+    assert receipt["retry_after"] == "7"
+    assert receipt["retry_delay_seconds"] == 7.0
+    assert receipt["error"] == "budget exhausted"
+    assert receipt["accounting_complete"] is True
+    assert receipt["size"] == len(body)
+    assert receipt["sha256"] == digest(body)

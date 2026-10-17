@@ -6,8 +6,34 @@ import pytest
 from conftest import MARKET, FakeClient
 
 from kalshi_events.capture import capture
+from kalshi_events.cli import main
 from kalshi_events.common import CatalogueError, Limits, Store, selections
 from kalshi_events.metadata import export, verify
+
+
+def test_refresh_budget_stop_exits_three_with_incomplete_json(
+    store, factory, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr("kalshi_events.capture.PublicClient", factory)
+    output = tmp_path / "metadata"
+    code = main(
+        [
+            "--root",
+            str(store.root),
+            "metadata",
+            "refresh",
+            "--market-ticker",
+            "MARKET",
+            "--output",
+            str(output),
+            "--max-requests",
+            "2",
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert code == 3
+    assert report["complete"] is False
+    assert not output.exists()
 
 
 def test_targeted_contract_lossless_and_checksums(store, factory, tmp_path):

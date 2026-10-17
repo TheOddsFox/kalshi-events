@@ -7,7 +7,7 @@ from conftest import EVENTS, HISTORICAL, MARKET, FakeClient
 
 from kalshi_events import capture as acquisition
 from kalshi_events.cli import main
-from kalshi_events.common import CatalogueError, Limits, Store
+from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store
 from kalshi_events.normalize import project_pages
 
 
@@ -89,6 +89,24 @@ def test_fully_complete_capture_exits_zero(store, factory, monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert code == 0
     assert output["complete"] is True
+
+
+def test_evidence_walk_checks_deadline_on_every_page(store, factory):
+    state = acquisition.capture(store, client_factory=factory)
+    expired = Store(store.root, Limits(max_duration_seconds=1))
+    expired.started -= 60
+    with pytest.raises(BudgetExceeded, match="deadline"):
+        list(acquisition.capture_pages(expired, state))
+
+
+def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
+    state = acquisition.capture(store, client_factory=factory)
+    relative = f"captures/{state['capture_id']}/state.json"
+    legacy = json.loads(store.path(relative).read_text())
+    del legacy["max_response_bytes"]
+    store.write(relative, legacy)
+    with pytest.raises(CatalogueError, match="pre-1.0 captures are not readable"):
+        acquisition.read_capture(store, state["capture_id"])
 
 
 def test_raw_commit_crash_is_recoverable_without_reissuing_request(store, factory, monkeypatch):

@@ -72,6 +72,8 @@ def read_capture(store: Store, capture_id: str) -> dict[str, Any]:
     state = decode(regular_bytes(store.path(f"captures/{capture_id}/state.json")))
     if state.get("capture_id") != capture_id or state.get("version") != 1:
         raise CatalogueError("invalid capture state")
+    if "max_response_bytes" not in state:
+        raise CatalogueError("pre-1.0 captures are not readable; a new operator root is required")
     ceiling = state.get("max_response_bytes")
     if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
         raise CatalogueError("invalid sealed response ceiling")
@@ -108,6 +110,7 @@ def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def capture_pages(store: Store, state: dict[str, Any]) -> Iterator[tuple[dict[str, Any], Any]]:
     for row in page_receipts(store, state):
+        store.check_deadline()
         manifest, payload = read_page(store, row["relative"], state["max_response_bytes"])
         if manifest.get("capture_id") != state["capture_id"]:
             raise CatalogueError("raw evidence belongs to another capture")
@@ -471,9 +474,10 @@ def capture(
         raise CatalogueError("resume selection differs from capture")
     budget = Budget(store, max_response_bytes=state["max_response_bytes"])
     if state["complete"]:
-        return {**state, **budget.result()}
+        return {**state, **budget.result(), "budget_exhausted": False}
     state["error"] = None
     seen: dict[int, set[str]] = {}
+    budget_exhausted = False
     try:
         with (
             factory(store, budget) as client,
@@ -489,7 +493,8 @@ def capture(
         save(store, state)
         if not isinstance(exc, BudgetExceeded):
             raise
-    return {**state, **budget.result()}
+        budget_exhausted = True
+    return {**state, **budget.result(), "budget_exhausted": budget_exhausted}
 
 
 def complete_capture(store: Store, capture_id: str) -> dict[str, Any]:

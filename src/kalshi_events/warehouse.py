@@ -65,6 +65,7 @@ def evidence_inventory(store: Store, capture_id: str) -> dict[str, str]:
         f"{base}/pages.jsonl": digest(regular_bytes(store.path(f"{base}/pages.jsonl"))),
     }
     for row in page_receipts(store, state):
+        store.check_deadline()
         relative = row["relative"]
         result[relative] = file_digest(store.path(relative), store.limits.max_root_bytes)[0]
         body = str(Path(relative).parent / "body.bin")
@@ -243,7 +244,7 @@ def dbt(
         store.check_storage()
         return result
     except subprocess.TimeoutExpired as exc:
-        raise CatalogueError("dbt exceeded operation deadline") from exc
+        raise BudgetExceeded("dbt exceeded operation deadline") from exc
     finally:
         shutil.rmtree(runtime, ignore_errors=True)
         store.sync(runtime_relative)
@@ -257,6 +258,8 @@ def build(store: Store, capture_id: str) -> dict[str, Any]:
     staging = store.path(staging_relative)
     staging.mkdir(parents=True)
     destination_relative = build_directory(capture_id)
+    replaced_relative = f"tmp/replaced-{uuid.uuid4().hex}"
+    replaced = store.path(replaced_relative)
     try:
         _land(store, state, staging)
         dbt(
@@ -280,12 +283,21 @@ def build(store: Store, capture_id: str) -> dict[str, Any]:
         store.write(f"{staging_relative}/build.json", receipt)
         destination = store.path(destination_relative)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            shutil.rmtree(destination)
-        os.rename(staging, destination)
+        previous = destination.exists()
+        if previous:
+            os.rename(destination, replaced)
+        try:
+            os.rename(staging, destination)
+        except BaseException:
+            if previous:
+                os.rename(replaced, destination)
+            raise
+        if previous:
+            shutil.rmtree(replaced, ignore_errors=True)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
         store.sync(staging_relative)
+        store.sync(replaced_relative)
         store.sync(destination_relative)
     store.check_storage()
     return receipt
@@ -297,6 +309,7 @@ def certified(store: Store, capture_id: str) -> dict[str, Any]:
     if receipt.get("capture_id") != capture_id or receipt.get("version") != 1:
         raise CatalogueError("build receipt does not match the requested capture")
     for relative, expected in receipt["evidence"].items():
+        store.check_deadline()
         if file_digest(store.path(relative), store.limits.max_root_bytes)[0] != expected:
             raise CatalogueError("build evidence integrity mismatch")
     warehouse = store.path(f"{directory}/warehouse.duckdb")

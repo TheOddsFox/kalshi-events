@@ -174,6 +174,7 @@ class PublicClient:
             streamed = 0
             status: int | None = None
             retry_after: str | None = None
+            committed: dict[str, Any] | None = None
             try:
                 self.store.write(relative, reservation)
                 with self.client.stream(
@@ -191,16 +192,15 @@ class PublicClient:
                         raise CatalogueError("compressed response is not permitted")
                     declared = response.headers.get("content-length")
                     if declared and int(declared) > allowance:
-                        raise CatalogueError("response exceeds byte ceiling")
+                        raise self._ceiling_error(allowance)
                     for chunk in response.iter_raw():
                         _ = self.budget.remaining
                         streamed += len(chunk)
                         downloaded = self.budget.add_download(len(chunk))
-                        if (
-                            len(body) + len(chunk) > allowance
-                            or downloaded > self.budget.limits.max_download_bytes
-                        ):
-                            raise CatalogueError("stream exceeded response/download byte ceiling")
+                        if downloaded > self.budget.limits.max_download_bytes:
+                            raise BudgetExceeded("download allowance exhausted")
+                        if len(body) + len(chunk) > allowance:
+                            raise self._ceiling_error(allowance)
                         body.extend(chunk)
                 payload = bytes(body)
                 self.store.write_bytes(f"raw/{attempt_id}/body.bin", payload)
@@ -218,9 +218,11 @@ class PublicClient:
                     delay = backoff_seconds(attempt, retry_after_seconds(retry_after))
                     receipt["retry_delay_seconds"] = round(delay, 3)
                     self.store.write(relative, receipt)
+                    committed = receipt
                     self._pause(delay)
                     continue
                 self.store.write(relative, receipt)
+                committed = receipt
                 if status not in ACCEPTED_STATUSES:
                     raise CatalogueError(f"source request failed with HTTP {status}")
                 return relative
@@ -242,15 +244,19 @@ class PublicClient:
                 label = (
                     "budget exhausted" if isinstance(exc, BudgetExceeded) else "rejected response"
                 )
-                self._record_failure(
-                    relative,
-                    reservation,
-                    status=status,
-                    size=len(body),
-                    downloaded=streamed,
-                    extra={"error": label},
-                    delay=None,
-                )
+                if committed is not None:
+                    # Response already hashed: keep its evidence and retry fields.
+                    self.store.write(relative, {**committed, "error": label})
+                else:
+                    self._record_failure(
+                        relative,
+                        reservation,
+                        status=status,
+                        size=len(body),
+                        downloaded=streamed,
+                        extra={"error": label},
+                        delay=None,
+                    )
                 raise
             finally:
                 self.budget.settle(allowance)
@@ -278,6 +284,12 @@ class PublicClient:
         if delay is not None:
             receipt["retry_delay_seconds"] = round(delay, 3)
         self.store.write(relative, receipt)
+
+    def _ceiling_error(self, allowance: int) -> CatalogueError:
+        """Past the remaining download allowance is a budget stop; past the sealed ceiling is not."""
+        if allowance < self.budget.max_response_bytes:
+            return BudgetExceeded("download allowance exhausted")
+        return CatalogueError("response exceeds byte ceiling")
 
     def _pause(self, delay: float) -> None:
         if delay >= self.budget.remaining:
