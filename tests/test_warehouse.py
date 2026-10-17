@@ -22,7 +22,7 @@ from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store
 from kalshi_events.normalize import project_pages
 from kalshi_events.publish import current, publish, verify_release
 from kalshi_events.recovery import rebuild
-from kalshi_events.warehouse import build, load
+from kalshi_events.warehouse import build, certified, load
 
 
 def warehouse_path(store, capture_id):
@@ -112,6 +112,20 @@ def test_latest_only_build_ignores_targeted_capture(store, factory, monkeypatch,
     assert json.loads(capsys.readouterr().out)["capture_id"] == catalogue["capture_id"]
 
 
+def test_catalogue_build_lands_only_its_own_observations(store, factory):
+    catalogue = capture(store, client_factory=factory)
+    targeted = capture(store, selected=["MARKET"], client_factory=factory)
+    assert targeted["complete"]
+    build(store, catalogue["capture_id"])
+    with duckdb.connect(
+        str(warehouse_path(store, catalogue["capture_id"])), read_only=True
+    ) as connection:
+        owners = connection.execute(
+            "select capture_id, count(*) from main.observation_history group by capture_id"
+        ).fetchall()
+    assert owners == [(catalogue["capture_id"], 7)]
+
+
 def test_prune_after_verify_keeps_current_capture(store, factory):
     first = capture(store, client_factory=factory)
     build(store, first["capture_id"])
@@ -131,6 +145,20 @@ def test_prune_after_verify_keeps_current_capture(store, factory):
         for path in store.path("raw").glob("*/manifest.json")
     }
     assert raw_owners == {second["capture_id"]}
+
+
+def test_prune_deletes_superseded_raw_bodies_not_just_receipts(store, factory):
+    first = capture(store, client_factory=factory)
+    build(store, first["capture_id"])
+    publish(store)
+    superseded = {path.name for path in store.path("raw").iterdir()}
+    second = capture(store, client_factory=factory)
+    build(store, second["capture_id"])
+    publish(store)
+    remaining = {path.name for path in store.path("raw").iterdir()}
+    assert superseded and not superseded & remaining
+    assert remaining == {path.parent.name for path in store.path("raw").glob("*/manifest.json")}
+    assert all((store.path("raw") / name / "body.bin").is_file() for name in remaining)
 
 
 def test_verification_failure_blocks_pruning(store, factory, monkeypatch):
@@ -174,6 +202,17 @@ def test_missing_body_of_current_capture_fails_build_and_publish(store, factory)
     with pytest.raises(CatalogueError, match="missing|integrity|evidence"):
         publish(store, state["capture_id"])
     assert current(store)["source_release_id"] == release["source_release_id"]
+
+
+def test_certification_rejects_missing_body_of_current_capture(store, factory):
+    state = capture(store, client_factory=factory)
+    build(store, state["capture_id"])
+    assert certified(store, state["capture_id"])["capture_id"] == state["capture_id"]
+    body = store.path(page_receipts(store, state)[0]["relative"]).parent / "body.bin"
+    body.unlink()
+    # Directly exercises certification; build and publish reject earlier, in capture completion.
+    with pytest.raises(CatalogueError, match="missing"):
+        certified(store, state["capture_id"])
 
 
 def test_rebuild_rebuilds_only_the_current_capture(store, factory):
