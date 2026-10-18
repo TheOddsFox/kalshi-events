@@ -95,6 +95,181 @@ def test_structural_fixture_covers_pagination_combo_legs_and_native_decimals():
     assert combos[0]["volume_fp"] == "12.3456789"
 
 
+def test_selected_stress_fixture_covers_lookup_edges_without_changing_frozen_full_fixture():
+    tickers = benchmark.selected_stress_tickers()
+    fixture = benchmark.SelectedStressFixtureClient()
+    assert len(tickers) == len(set(tickers)) == 100
+    assert len(tickers[-1]) == 256
+    assert (
+        benchmark._selected_stress_fixture_sha256() == benchmark._selected_stress_fixture_sha256()
+    )
+
+    assert fixture.response("/markets/S000", {})[0] == 200
+    assert fixture.response("/markets/HIST", {})[0] == 404
+    assert fixture.response("/historical/markets/HIST", {})[0] == 200
+    assert fixture.response("/markets/MISS", {})[0] == 404
+    assert fixture.response("/historical/markets/MISS", {})[0] == 404
+    assert fixture.response("/markets/ORPHAN", {})[0] == 200
+    assert fixture.response("/events/ORPHAN-EVENT", {})[0] == 404
+    event = fixture.response("/events/EVENT", {})[1]["event"]
+    assert len(event["markets"]) == 2000
+    market = fixture.response("/markets/S000", {})[1]["market"]
+    assert market["close_time"] is None
+    assert market["updated_time"].endswith("+01:00")
+
+
+def test_selected_stress_batch_and_parent_filter_are_exact_and_paginated():
+    fixture = benchmark.SelectedStressFixtureClient()
+    selected = benchmark.selected_stress_tickers()
+    status, first = fixture.response("/markets", {"tickers": ",".join(selected), "limit": "1000"})
+    assert status == 200
+    assert first["cursor"] == ""
+    assert [row["ticker"] for row in first["markets"]] == [
+        *[f"S{i:03d}" for i in range(96)],
+        "ORPHAN",
+        selected[-1],
+    ]
+    assert len(fixture.response("/events/EVENT", {})[1]["event"]["markets"]) == 2000
+    filtered = fixture.response("/events/EVENT", {"exclude_markets": "true"})[1]["event"]
+    assert "markets" not in filtered
+
+
+def test_selected_native_semantics_ignore_only_capture_provenance(tmp_path: Path):
+    rows = {
+        "markets": [
+            {
+                "market_ticker": "MKT-1",
+                "title": "Native title",
+                "payload_json": '{"ticker":"MKT-1","title":"Native title"}',
+                "capture_id": "a",
+                "page_id": "b",
+                "received_at": "time-a",
+                "source_endpoint": "/markets/MKT-1",
+                "payload_sha256": "c",
+                "source_kind": "direct",
+                "observation_id": "d",
+            }
+        ],
+        "events": [],
+        "series": [],
+    }
+    for relation, values in rows.items():
+        (tmp_path / f"{relation}.json").write_text(json.dumps(values))
+    reference = benchmark._selected_relation_semantics(tmp_path)
+    rows["markets"][0].update(capture_id="new-capture", page_id="new-page", received_at="time-b")
+    (tmp_path / "markets.json").write_text(json.dumps(rows["markets"]))
+    candidate = benchmark._selected_relation_semantics(tmp_path)
+    assert reference == candidate
+
+    rows["markets"][0]["title"] = "Tampered native title"
+    rows["markets"][0]["payload_json"] = '{"ticker":"MKT-1","title":"Tampered native title"}'
+    (tmp_path / "markets.json").write_text(json.dumps(rows["markets"]))
+    assert benchmark._selected_relation_semantics(tmp_path) != reference
+
+
+def test_selected_comparison_rejects_native_coverage_or_provenance_mismatch():
+    reference = {
+        "selected_semantics": {"markets": {"sha256": "a"}},
+        "selected_coverage": [{"market_ticker": "MKT-1", "status": "found"}],
+        "selected_provenance_valid": True,
+    }
+    candidate = json.loads(json.dumps(reference))
+    assert all(benchmark._selected_comparison(reference, candidate).values())
+    for key, value in (
+        ("selected_semantics", {"markets": {"sha256": "tampered"}}),
+        ("selected_coverage", [{"market_ticker": "MKT-1", "status": "absent"}]),
+        ("selected_provenance_valid", False),
+    ):
+        modified = {**candidate, key: value}
+        assert not all(benchmark._selected_comparison(reference, modified).values())
+
+
+def test_selected_raw_receipt_provenance_tampering_fails(tmp_path: Path, monkeypatch):
+    from kalshi_events import capture, normalize
+
+    manifest = {
+        "capture_id": "a" * 32,
+        "page_id": "b" * 32,
+        "received_at": "2026-01-01T00:00:00Z",
+        "endpoint": "/markets/A",
+        "params": {},
+        "sha256": "c" * 64,
+        "entity_kind": "markets",
+        "singular": True,
+        "status": 200,
+    }
+    payload = {
+        "market": {
+            "ticker": "A",
+            "event_ticker": "E",
+            "status": "active",
+            "title": "Native",
+        }
+    }
+    monkeypatch.setattr(capture, "capture_pages", lambda _store, _state: [(manifest, payload)])
+    row = next(normalize.observations([(manifest, payload)]))
+    row["entity_kind"] = "markets"
+    for relation, rows in (
+        ("markets", [row]),
+        ("events", []),
+        ("series", []),
+        ("coverage", [{"market_ticker": "A", "status": "found"}]),
+    ):
+        (tmp_path / f"{relation}.json").write_text(json.dumps(rows))
+    state = {"selected": ["A"]}
+    assert benchmark._selected_provenance_is_valid(object(), state, tmp_path, ["A"])
+
+    tampered = dict(row, payload_sha256="d" * 64)
+    (tmp_path / "markets.json").write_text(json.dumps([tampered]))
+    assert not benchmark._selected_provenance_is_valid(object(), state, tmp_path, ["A"])
+
+
+def test_history_stress_fixture_is_broad_and_refreshes_about_one_percent():
+    fixture = benchmark.FixtureClient(1000, "history-sparse", "baseline")
+    history = benchmark.FixtureClient._historical_market(249_999)
+    assert benchmark.HISTORY_STRESS_COUNT == 250_000
+    assert benchmark.HISTORY_STRESS_IDENTITIES == 10_000
+    assert benchmark.HISTORY_STRESS_PASSES == 25
+    assert history["ticker"] == "HIST-249999"
+    assert history["settlement_ts"].endswith("+01:00")
+
+    status, first = fixture.response("/historical/markets", {})
+    _, repeated = fixture.response(
+        "/historical/markets", {"cursor": str(benchmark.HISTORY_STRESS_IDENTITIES)}
+    )
+    assert status == 200
+    assert len(first["markets"]) == len(repeated["markets"]) == benchmark.PAGE_SIZE
+    assert first["markets"][0] == repeated["markets"][0]
+
+    refresh = benchmark.FixtureClient(1000, "history-sparse", "refresh")
+    assert len(refresh.response("/historical/markets", {})[1]["markets"]) == 1
+
+    selected = refresh.response("/markets", {"mve_filter": "exclude", "min_updated_ts": "1"})[1][
+        "markets"
+    ]
+    assert len(selected) == 10
+    assert [row["ticker"] for row in selected[:3]] == [
+        "MKT-000000",
+        "MKT-000100",
+        "MKT-000200",
+    ]
+
+
+def test_existing_byte_identity_profiles_freeze_legacy_acquisition_protocol():
+    class Capture:
+        def _initialize_v2(self, _store, state):
+            return state
+
+    capture = Capture()
+    assert benchmark._freeze_legacy_acquisition("full", "full", capture)
+    state = {"acquisition_protocol": 3}
+    assert capture._initialize_v2(None, state) == {}
+
+    current = Capture()
+    assert not benchmark._freeze_legacy_acquisition("selected-stress", "full", current)
+    assert not benchmark._freeze_legacy_acquisition("history-sparse", "history-sparse", current)
+
+
 def test_incremental_fixture_honors_update_and_reconciliation_filters():
     no_change = benchmark.FixtureClient(1203, "no-change", "refresh")
     sparse = benchmark.FixtureClient(1203, "sparse-change", "refresh")
@@ -187,6 +362,7 @@ def test_incremental_root_seed_uses_writer_guard_and_fixed_identity():
         ("full", "incremental", "current.json"),
         ("targeted", "incremental", "current.json"),
         ("baseline-setup", "incremental", "current-v2.json"),
+        ("baseline-v2-setup", "full", "current-v2.json"),
         ("baseline-setup", "full", "current.json"),
         ("resume", "incremental", "current.json"),
         ("no-change", "incremental", "current-v2.json"),
@@ -195,6 +371,19 @@ def test_incremental_root_seed_uses_writer_guard_and_fixed_identity():
 )
 def test_publication_pointer_follows_published_contract(profile, refresh_mode, expected):
     assert benchmark._publication_pointer_name(profile, refresh_mode) == expected
+
+
+def test_baseline_v2_setup_calls_only_direct_v2_build():
+    calls = []
+
+    class Warehouse:
+        @staticmethod
+        def build_v2_full(store, capture_id):
+            calls.append((store, capture_id))
+            return "v2-build"
+
+    assert benchmark._direct_v2_setup_build(Warehouse, "store", "capture") == "v2-build"
+    assert calls == [("store", "capture")]
 
 
 def test_publication_pointer_observer_checks_release_and_manifest(tmp_path: Path):
