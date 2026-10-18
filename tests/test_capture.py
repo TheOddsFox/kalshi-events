@@ -7,7 +7,7 @@ from conftest import EVENTS, HISTORICAL, MARKET, FakeClient
 
 from kalshi_events import capture as acquisition
 from kalshi_events.cli import main
-from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store
+from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store, digest, json_bytes
 from kalshi_events.normalize import project_pages
 
 
@@ -15,6 +15,7 @@ def _legacy_checkpoint(store, state):
     """Convert a pristine v2 genesis into a v1 fixture for legacy resume tests."""
     logical = dict(state)
     logical.pop("journal_version")
+    logical.pop("acquisition_protocol", None)
     store.remove(f"captures/{state['capture_id']}/pages.jsonl")
     store.write(f"captures/{state['capture_id']}/state.json", logical)
     return logical
@@ -54,6 +55,24 @@ def test_journal_control_size_does_not_scale_with_cursor_history(store):
     assert record["op"] == "control"
     assert "seen_cursors" not in record["payload"]
     assert len(json.dumps(record).encode()) < 2048
+
+
+def test_acquisition_protocol_is_sealed_and_legacy_missing_protocol_keeps_request_identity(store):
+    state = acquisition.new_capture(store, ["MARKET"])
+    assert state["acquisition_protocol"] == 3
+    context = acquisition._request_context(state, 0)
+    assert context["acquisition_protocol"] == 3
+
+    state.pop("acquisition_protocol")
+    request_key = [state["capture_id"], 0, "page", "", 0]
+    legacy = acquisition._request_context(state, 0)
+    assert "acquisition_protocol" not in legacy
+    assert legacy["request_id"] == digest(json_bytes(request_key))
+
+    for invalid in (True, False, 2, 4, 3.0, "3"):
+        state["acquisition_protocol"] = invalid
+        with pytest.raises(CatalogueError, match="unsupported acquisition protocol"):
+            acquisition._request_context(state, 0)
 
 
 def test_checkpoint_stays_small_while_pages_go_to_journal(store, factory):
@@ -128,6 +147,7 @@ def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
     relative = f"captures/{state['capture_id']}/state.json"
     legacy = dict(state)
     legacy.pop("journal_version")
+    legacy.pop("acquisition_protocol", None)
     del legacy["max_response_bytes"]
     store.write(relative, legacy)
     with pytest.raises(CatalogueError, match="pre-1.0 captures are not readable"):

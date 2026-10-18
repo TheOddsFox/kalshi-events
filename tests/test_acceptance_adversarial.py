@@ -16,6 +16,7 @@ from kalshi_events.transport import PublicClient
 def _legacy_checkpoint(store, state):
     logical = dict(state)
     logical.pop("journal_version")
+    logical.pop("acquisition_protocol", None)
     store.remove(f"captures/{state['capture_id']}/pages.jsonl")
     store.write(f"captures/{state['capture_id']}/state.json", logical)
     return logical

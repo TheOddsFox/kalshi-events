@@ -39,6 +39,7 @@ MARKET_PAGE_LIMIT = 1000
 CUTOFF_ENDPOINT = "/historical/cutoff"
 HISTORICAL_PREFIX = "/historical/markets"
 JOURNAL_VERSION = 2
+ACQUISITION_PROTOCOL = 3
 MAX_JOURNAL_RECORD_BYTES = 16 * 1024**2
 _GENESIS = "0" * 64
 
@@ -138,6 +139,7 @@ def read_capture(
         return recovered
     if state.get("capture_id") != capture_id or state.get("version") != 1:
         raise CatalogueError("invalid capture state")
+    _acquisition_protocol(state)
     if "max_response_bytes" not in state:
         raise CatalogueError("pre-1.0 captures are not readable; a new operator root is required")
     ceiling = state.get("max_response_bytes")
@@ -227,6 +229,15 @@ def _task_identity(work: dict[str, Any]) -> str:
     )
 
 
+def _acquisition_protocol(state: dict[str, Any]) -> int:
+    if "acquisition_protocol" not in state:
+        return 2
+    protocol = state["acquisition_protocol"]
+    if isinstance(protocol, bool) or not isinstance(protocol, int) or protocol != ACQUISITION_PROTOCOL:
+        raise CatalogueError("unsupported acquisition protocol")
+    return protocol
+
+
 def _journal_checksum(record: dict[str, Any]) -> str:
     return digest(json_bytes({key: value for key, value in record.items() if key != "sha256"}))
 
@@ -241,6 +252,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         or not isinstance(state.get("coverage"), dict)
     ):
         raise CatalogueError("invalid journal capture state")
+    _acquisition_protocol(state)
     identities: set[str] = set()
     for work in state["tasks"]:
         if not isinstance(work, dict) or set(work) != {
@@ -352,6 +364,7 @@ def _validate_control_transition(
         "max_decoded_response_bytes",
         "compression",
         "journal_version",
+        "acquisition_protocol",
         "incremental",
         "baseline",
         "root_id",
@@ -665,6 +678,7 @@ def _read_v2(
             "compression",
             "started_at",
             "selected",
+            "acquisition_protocol",
         ):
             if snapshot_state.get(key) != base.get(key):
                 raise CatalogueError("capture snapshot settings differ from journal genesis")
@@ -845,9 +859,11 @@ def _replay_page(
     )
     if manifest.get("capture_id") != state["capture_id"]:
         raise CatalogueError("raw evidence belongs to another capture")
+    context = _request_context(state, index)
     if (
         manifest.get("request_id") != request_id
-        or request_id != _request_context(state, index)["request_id"]
+        or request_id != context["request_id"]
+        or not _receipt_matches_context(manifest, context)
     ):
         raise CatalogueError("journal receipt does not match its traversal")
     work = state["tasks"][index]
@@ -1176,6 +1192,7 @@ def new_capture(
     state = {
         "version": 1,
         "journal_version": JOURNAL_VERSION,
+        "acquisition_protocol": ACQUISITION_PROTOCOL,
         "capture_id": uuid.uuid4().hex,
         "selected": selected,
         "started_at": started_at,
@@ -1212,20 +1229,37 @@ def _request_context(state: dict[str, Any], index: int) -> dict[str, Any]:
     work = state["tasks"][index]
     phase = _phase(work)
     _, _, kind, singular = _plan(work, phase)
+    protocol = _acquisition_protocol(state)
+    request_key = [state["capture_id"], index, phase, work["cursor"], work["restarts"]]
     context = {
         "capture_id": state["capture_id"],
         "task_index": index,
         "phase": phase,
-        "request_id": digest(
-            json_bytes([state["capture_id"], index, phase, work["cursor"], work["restarts"]])
-        ),
+        "request_id": digest(json_bytes([*request_key, protocol]))
+        if protocol == ACQUISITION_PROTOCOL
+        else digest(json_bytes(request_key)),
         "entity_kind": kind,
         "singular": singular,
     }
+    if protocol == ACQUISITION_PROTOCOL:
+        context["acquisition_protocol"] = protocol
     scope = state.get("task_scopes", {}).get(str(index))
     if scope is not None:
         context.update(task_scope=scope, task_generation=work["restarts"])
     return context
+
+
+def _receipt_matches_context(manifest: dict[str, Any], context: dict[str, Any]) -> bool:
+    if ("acquisition_protocol" in manifest) != ("acquisition_protocol" in context):
+        return False
+    if "acquisition_protocol" not in context:
+        return True
+    protocol = manifest["acquisition_protocol"]
+    return (
+        isinstance(protocol, int)
+        and not isinstance(protocol, bool)
+        and protocol == context["acquisition_protocol"]
+    )
 
 
 def _record_cutoff(state: dict[str, Any], payload: Any) -> None:
@@ -1367,7 +1401,11 @@ def _consume(
         state["max_response_bytes"],
         state.get("max_decoded_response_bytes", state["max_response_bytes"]),
     )
-    if manifest.get("request_id") != _request_context(state, index)["request_id"]:
+    context = _request_context(state, index)
+    if (
+        manifest.get("request_id") != context["request_id"]
+        or not _receipt_matches_context(manifest, context)
+    ):
         raise CatalogueError("raw receipt does not match its traversal")
     if _phase(work) == "cutoff":
         if manifest["status"] != 200:
@@ -1486,6 +1524,8 @@ def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
         context = _request_context(state, index)
         if manifest.get("request_id") != context["request_id"]:
             continue
+        if not _receipt_matches_context(manifest, context):
+            raise CatalogueError("uncommitted raw receipt contradicts acquisition protocol")
         endpoint, params, kind, singular = _plan(work, _phase(work))
         if (
             manifest.get("endpoint") != endpoint

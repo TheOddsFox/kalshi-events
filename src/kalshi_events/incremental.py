@@ -46,8 +46,8 @@ def _utc(value: Any, label: str) -> datetime:
 
 def root_id(store: Store, *, create: bool = False) -> str:
     """Read the stable logical root identity, creating it only for v2 work."""
-    if store.storage_version != 2:
-        raise CatalogueError("incremental catalogue work requires an upgraded storage-v2 root")
+    if store.storage_version != 3 and (create or store.storage_version != 2):
+        raise CatalogueError("incremental catalogue work requires an upgraded storage-v3 root")
     if create and not store.writer_locked_by_current_thread:
         raise CatalogueError("root identity creation requires the canonical writer lock")
     path = store.path("root-id.json")

@@ -26,7 +26,8 @@ from kalshi_events import metrics
 MAX_BUNDLE_BYTES = 128 * 1024**2
 TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
-CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
+CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 3}
+PREVIOUS_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
 
 
 class CatalogueError(RuntimeError):
@@ -57,6 +58,21 @@ def json_bytes(value: Any) -> bytes:
 
 def _reject(value: Any) -> Any:
     raise TypeError(f"cannot encode {type(value).__name__}")
+
+
+def _root_storage_version(marker: Any) -> int:
+    if marker == OWNER_MARKER:
+        return 1
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != {"owner", "storage_version"}
+        or marker.get("owner") != OWNER_MARKER["owner"]
+        or isinstance(marker.get("storage_version"), bool)
+        or not isinstance(marker.get("storage_version"), int)
+        or marker["storage_version"] not in {2, 3}
+    ):
+        raise CatalogueError("operator root belongs to another application")
+    return marker["storage_version"]
 
 
 CANONICAL_CURRENT_ROOT_MARKER_BYTES = json_bytes(CURRENT_ROOT_MARKER)
@@ -250,9 +266,7 @@ class Store:
                 raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
             atomic_json(marker, CURRENT_ROOT_MARKER)
         marker_value = decode(regular_bytes(marker))
-        if marker_value not in (OWNER_MARKER, CURRENT_ROOT_MARKER):
-            raise CatalogueError("operator root belongs to another application")
-        self.storage_version = 1 if marker_value == OWNER_MARKER else 2
+        self.storage_version = _root_storage_version(marker_value)
         self.reconcile()
 
     @property
@@ -426,13 +440,12 @@ class Store:
         if not lock.is_locked or str(lock.lock_file) != expected_lock:
             raise CatalogueError("root upgrade requires the writer lock")
         current = decode(regular_bytes(self.path("root.json"), 1024**2))
-        if current == CURRENT_ROOT_MARKER:
-            self.storage_version = 2
+        version = _root_storage_version(current)
+        if version == 3:
+            self.storage_version = version
             return
-        if current != OWNER_MARKER:
-            raise CatalogueError("operator root belongs to another application")
         atomic_json(self.path("root.json"), CURRENT_ROOT_MARKER)
-        self.storage_version = 2
+        self.storage_version = 3
 
     def reserve_storage(self, amount: int) -> None:
         with self._lock:
@@ -451,24 +464,25 @@ class Store:
         return EvidenceSpool(self, relative)
 
     def require_writable(self) -> None:
-        if self.storage_version != 2:
+        if self.storage_version != 3:
             raise CatalogueError("operator root requires explicit upgrade-root before writing")
 
     def _refresh_storage_version(self, *, allow_legacy: bool = False) -> None:
         marker_bytes = regular_bytes(self.path("root.json"))
         if marker_bytes == CANONICAL_CURRENT_ROOT_MARKER_BYTES:
-            self.storage_version = 2
+            self.storage_version = 3
             return
         marker = decode(marker_bytes)
-        if marker == CURRENT_ROOT_MARKER:
-            self.storage_version = 2
+        version = _root_storage_version(marker)
+        if version in {2, 3}:
+            self.storage_version = version
+            if version == 2 and not allow_legacy:
+                raise CatalogueError("operator root requires explicit upgrade-root before writing")
             return
-        if marker == OWNER_MARKER:
-            self.storage_version = 1
-            if allow_legacy:
-                return
-            raise CatalogueError("operator root requires explicit upgrade-root before writing")
-        raise CatalogueError("operator root belongs to another application")
+        self.storage_version = version
+        if allow_legacy:
+            return
+        raise CatalogueError("operator root requires explicit upgrade-root before writing")
 
     def _require_writable(self) -> None:
         self.require_writable()

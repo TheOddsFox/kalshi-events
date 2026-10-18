@@ -33,11 +33,11 @@ def test_canonical_writer_guards_read_fresh_bytes_without_json_decodes(store, mo
     with metrics.collect() as measured:
         with store.writer_guard():
             with store.writer_guard():
-                assert store.storage_version == 2
+                assert store.storage_version == 3
             with store.writer_guard():
-                assert store.storage_version == 2
+                assert store.storage_version == 3
         with store.writer_guard():
-            assert store.storage_version == 2
+            assert store.storage_version == 3
 
     assert reads == [expected] * 4
     assert measured.report()["counters"].get("json_decodes", 0) == 0
@@ -57,7 +57,7 @@ def test_equivalent_noncanonical_markers_use_the_json_fallback(store, encoding):
     marker.write_bytes(body)
 
     with metrics.collect() as measured, store.writer_guard(), store.writer_guard():
-        assert store.storage_version == 2
+        assert store.storage_version == 3
 
     assert measured.report()["counters"]["json_decodes"] == 2
     assert marker.read_bytes() == body
@@ -80,6 +80,29 @@ def test_legacy_marker_remains_readable_only_with_explicit_legacy_writer_lock(tm
     assert marker.read_bytes() == json_bytes(OWNER_MARKER)
 
 
+def test_storage_v2_root_is_readable_but_requires_explicit_upgrade(tmp_path):
+    root = tmp_path / "v2"
+    root.mkdir()
+    marker = root / "root.json"
+    marker.write_bytes(json_bytes(common.PREVIOUS_ROOT_MARKER))
+    (root / "root-id.json").write_bytes(
+        json_bytes({"version": 1, "root_id": "0123456789abcdef0123456789abcdef"})
+    )
+    store = Store(root)
+    assert store.storage_version == 2
+    from kalshi_events.incremental import root_id
+
+    assert root_id(store) == "0123456789abcdef0123456789abcdef"
+    with pytest.raises(CatalogueError, match="storage-v3"):
+        root_id(store, create=True)
+    with pytest.raises(CatalogueError, match="upgrade-root"), store.writer_guard():
+        pytest.fail("a storage-v2 root cannot enter a normal writer guard")
+    with store.lock(allow_legacy=True) as lock:
+        store.upgrade_root(lock)
+    assert json.loads(marker.read_text()) == CURRENT_ROOT_MARKER
+    assert store.storage_version == 3
+
+
 def _change_marker(marker, change, tmp_path):
     if change == "missing":
         marker.unlink()
@@ -91,8 +114,11 @@ def _change_marker(marker, change, tmp_path):
     else:
         body = {
             "legacy": json_bytes(OWNER_MARKER),
+            "storage-v2": json_bytes(common.PREVIOUS_ROOT_MARKER),
+            "storage-v2-float": json_bytes({**common.PREVIOUS_ROOT_MARKER, "storage_version": 2.0}),
+            "storage-v3-float": json_bytes({**CURRENT_ROOT_MARKER, "storage_version": 3.0}),
             "foreign": json_bytes({"owner": "another.application", "storage_version": 2}),
-            "wrong-version": json_bytes({**CURRENT_ROOT_MARKER, "storage_version": 3}),
+            "wrong-version": json_bytes({**CURRENT_ROOT_MARKER, "storage_version": 4}),
             "malformed": b'{"owner":',
             "trailing-data": json_bytes(CURRENT_ROOT_MARKER) + b"not-json",
             "nonobject": b"[]\n",
@@ -104,6 +130,9 @@ def _change_marker(marker, change, tmp_path):
     "change",
     [
         "legacy",
+        "storage-v2",
+        "storage-v2-float",
+        "storage-v3-float",
         "foreign",
         "wrong-version",
         "malformed",
@@ -127,7 +156,7 @@ def test_every_writer_guard_rejects_marker_mutations(store, tmp_path, change, gu
                 marker.unlink()
             marker.write_bytes(json_bytes(CURRENT_ROOT_MARKER))
             with store.writer_guard():
-                assert store.storage_version == 2
+                assert store.storage_version == 3
     else:
         with store.writer_guard():
             pass
