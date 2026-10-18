@@ -114,23 +114,55 @@ class FakeClient:
     def response(self, endpoint, params):
         if endpoint in self.responses:
             value = self.responses[endpoint]
-            return value(params) if callable(value) else value
-        defaults = {
-            "/historical/cutoff": CUTOFF,
-            "/series": {"series": SERIES},
-            "/series/SERIES": {"series": SERIES[0]},
-            "/events": {"events": EVENTS, "cursor": ""},
-            "/events/multivariate": {"events": COMBO_EVENTS, "cursor": ""},
-            "/markets": {"markets": [MARKET, COMBO], "cursor": ""},
-            "/historical/markets": {"markets": [HISTORICAL], "cursor": ""},
-            "/markets/MARKET": {"market": MARKET},
-            "/markets/COMBO-MARKET": {"market": COMBO},
-            "/historical/markets/HISTORICAL": {"market": HISTORICAL},
-        }
-        defaults.update(
-            {f"/events/{row['event_ticker']}": {"event": row} for row in [*EVENTS, *COMBO_EVENTS]}
-        )
-        return (200, defaults[endpoint]) if endpoint in defaults else (404, {})
+            result = value(params) if callable(value) else value
+        else:
+            defaults = {
+                "/historical/cutoff": CUTOFF,
+                "/series": {"series": SERIES},
+                "/series/SERIES": {"series": SERIES[0]},
+                "/events": {"events": EVENTS, "cursor": ""},
+                "/events/multivariate": {"events": COMBO_EVENTS, "cursor": ""},
+                "/markets": {"markets": [MARKET, COMBO], "cursor": ""},
+                "/historical/markets": {"markets": [HISTORICAL], "cursor": ""},
+                "/markets/MARKET": {"market": MARKET},
+                "/markets/COMBO-MARKET": {"market": COMBO},
+                "/historical/markets/HISTORICAL": {"market": HISTORICAL},
+            }
+            defaults.update(
+                {f"/events/{row['event_ticker']}": {"event": row} for row in [*EVENTS, *COMBO_EVENTS]}
+            )
+            result = (200, defaults[endpoint]) if endpoint in defaults else (404, {})
+        if endpoint == "/markets" and isinstance(params.get("tickers"), str):
+            status, payload = result
+            rows = payload.get("markets") if isinstance(payload, dict) else None
+            if status == 200 and isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+                requested = params["tickers"].split(",")
+                selected = set(requested)
+                payload = {
+                    **payload,
+                    "markets": [row for row in rows if row.get("ticker") in selected],
+                }
+                for value in requested:
+                    direct = self.responses.get(f"/markets/{value}")
+                    if not isinstance(direct, tuple) or len(direct) != 2:
+                        continue
+                    direct_status, direct_payload = direct
+                    if direct_status == 404:
+                        payload["markets"] = [
+                            row for row in payload["markets"] if row.get("ticker") != value
+                        ]
+                    elif (
+                        direct_status == 200
+                        and isinstance(direct_payload, dict)
+                        and isinstance(direct_payload.get("market"), dict)
+                    ):
+                        replacement = direct_payload["market"]
+                        payload["markets"] = [
+                            row for row in payload["markets"] if row.get("ticker") != value
+                        ]
+                        payload["markets"].append(replacement)
+                result = (status, payload)
+        return result
 
     def get(self, endpoint, params=None, context=None):
         allowance = self.budget.reserve()

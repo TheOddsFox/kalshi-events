@@ -572,11 +572,17 @@ def parent_lookup_tasks(
             and parent not in final_series_members
             and ("series", parent) not in identities.parent_lookups
         )
-    from kalshi_events.capture import task
+    from kalshi_events.capture import ACQUISITION_PROTOCOL, task
+
+    event_params = (
+        {"exclude_markets": "true"}
+        if state.get("acquisition_protocol") == ACQUISITION_PROTOCOL
+        else None
+    )
 
     return [
         *[
-            task(f"/events/{identity}", "events", singular=True)
+            task(f"/events/{identity}", "events", singular=True, params=event_params)
             for identity in sorted(missing_events)
         ],
         *[

@@ -306,7 +306,7 @@ def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(stor
 
         def source(request):
             endpoint = request.url.path.removeprefix("/trade-api/v2")
-            if endpoint == "/markets/MARKET":
+            if endpoint == "/markets":
                 return httpx.Response(200, stream=PartialRead())
             status, payload = FakeClient(actual_store, budget).response(
                 endpoint, dict(request.url.params)

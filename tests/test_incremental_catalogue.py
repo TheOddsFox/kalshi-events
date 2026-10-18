@@ -424,7 +424,7 @@ def test_removed_combo_event_does_not_remain_eligible_from_old_lookup(baseline):
     snapshot.lookups["/events/E2"] = (404, {})
     delta = build_delta(store, snapshot)
     capture_id = delta["capture_id"]
-    assert ("/events/E2", {}) in snapshot.requests
+    assert ("/events/E2", {"exclude_markets": "true"}) in snapshot.requests
     assert "E2" not in keyed(store, capture_id, "current_events", "event_ticker")
     market = keyed(store, capture_id, "current_markets", "market_ticker")["H"]
     assert market["event_ticker"] == "E2"
@@ -539,7 +539,7 @@ def test_hydration_uses_effective_baseline_winner_when_incoming_parent_loses(tmp
     client = controlled_receipt_client(updated, "/markets", lower_page_id, receipt_at)
     delta = capture_at(store, updated, incremental=True, client_factory=client)
     assert delta["complete"]
-    assert ("/events/E1", {}) in updated.requests
+    assert ("/events/E1", {"exclude_markets": "true"}) in updated.requests
     warehouse.build(store, delta["capture_id"])
     winner = keyed(store, delta["capture_id"], "current_markets", "market_ticker")["M1"]
     assert winner["observation_id"] == before["observation_id"]
@@ -610,7 +610,7 @@ def test_reappearing_entity_uses_retained_history_winner_and_hydrates_its_old_pa
     )
     second = capture_at(store, returned, NEXT_TIME, incremental=True, client_factory=client)
     assert second["complete"]
-    assert ("/events/OLD-EVENT", {}) in returned.requests
+    assert ("/events/OLD-EVENT", {"exclude_markets": "true"}) in returned.requests
     assert ("/series/OLD-SERIES", {}) in returned.requests
     warehouse.build(store, second["capture_id"])
     winner = keyed(store, second["capture_id"], "current_markets", "market_ticker")["H"]
@@ -632,7 +632,7 @@ def test_lookup_only_event_and_series_are_hydrated_together_and_leave_with_last_
     )
     snapshot.lookups["/series/LOOKUP-SERIES"] = (200, {"series": {"ticker": "LOOKUP-SERIES"}})
     delta = build_delta(store, snapshot)
-    assert ("/events/LOOKUP-EVENT", {}) in snapshot.requests
+    assert ("/events/LOOKUP-EVENT", {"exclude_markets": "true"}) in snapshot.requests
     assert ("/series/LOOKUP-SERIES", {}) in snapshot.requests
     market = keyed(store, delta["capture_id"], "current_markets", "market_ticker")["H"]
     assert market["usable"] and market["series_ticker"] == "LOOKUP-SERIES"
@@ -997,7 +997,7 @@ def test_new_full_refreshes_parent_seen_only_in_abandoned_generation_before_v2_r
     state = capture_at(store, snapshot, BASE_TIME)
     capture_id = state["capture_id"]
     assert state["complete"]
-    assert ("/events/ABANDONED-PARENT", {}) in snapshot.requests
+    assert ("/events/ABANDONED-PARENT", {"exclude_markets": "true"}) in snapshot.requests
     warehouse.build(store, capture_id)
     publishing.publish(store, capture_id)
     pointer = store.path("current.json").read_bytes()

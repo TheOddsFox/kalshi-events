@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 from itertools import chain
 from typing import Any
 
+import httpx
+
 from kalshi_events import metrics
 from kalshi_events.common import (
     Budget,
@@ -32,7 +34,7 @@ from kalshi_events.common import (
     ticker,
 )
 from kalshi_events.normalize import ParentIndex, records
-from kalshi_events.transport import MAX_CONCURRENT_REQUESTS, PublicClient, read_page
+from kalshi_events.transport import MAX_CONCURRENT_REQUESTS, PublicClient, read_page, source_url
 
 EVENT_PAGE_LIMIT = 200
 MARKET_PAGE_LIMIT = 1000
@@ -40,6 +42,8 @@ CUTOFF_ENDPOINT = "/historical/cutoff"
 HISTORICAL_PREFIX = "/historical/markets"
 JOURNAL_VERSION = 2
 ACQUISITION_PROTOCOL = 3
+MAX_SELECTION_BATCH = 100
+MAX_INITIAL_BATCH_URL_BYTES = 6144
 MAX_JOURNAL_RECORD_BYTES = 16 * 1024**2
 _GENESIS = "0" * 64
 
@@ -229,6 +233,34 @@ def _task_identity(work: dict[str, Any]) -> str:
     )
 
 
+def _market_batch_url_size(values: list[str]) -> int:
+    params = {"limit": MARKET_PAGE_LIMIT, "tickers": ",".join(values)}
+    return len(
+        str(httpx.Request("GET", source_url() + "/markets", params=params).url).encode("ascii")
+    )
+
+
+def _batch_tickers(work: dict[str, Any]) -> list[str] | None:
+    if work.get("endpoint") != "/markets":
+        return None
+    params = work.get("params")
+    if not isinstance(params, dict):
+        raise CatalogueError("invalid selected market batch parameters")
+    if "tickers" not in params:
+        return None
+    value = params.get("tickers")
+    if not isinstance(value, str):
+        raise CatalogueError("invalid selected market batch")
+    values = value.split(",")
+    if len(values) > MAX_SELECTION_BATCH or ",".join(selections(values)) != value:
+        raise CatalogueError("invalid selected market batch")
+    if work.get("singular") or work.get("kind") != "markets" or work.get("requested") is not None:
+        raise CatalogueError("invalid selected market batch traversal")
+    if set(params) != {"limit", "tickers"} or params.get("limit") != MARKET_PAGE_LIMIT:
+        raise CatalogueError("invalid selected market batch parameters")
+    return values
+
+
 def _acquisition_protocol(state: dict[str, Any]) -> int:
     if "acquisition_protocol" not in state:
         return 2
@@ -254,6 +286,8 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         raise CatalogueError("invalid journal capture state")
     _acquisition_protocol(state)
     identities: set[str] = set()
+    batch_values: list[str] = []
+    has_batches = False
     for work in state["tasks"]:
         if not isinstance(work, dict) or set(work) != {
             "endpoint",
@@ -286,7 +320,23 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             or not isinstance(work.get("cutoff_due"), bool)
         ):
             raise CatalogueError("invalid journal traversal state")
+        batch = _batch_tickers(work)
+        if batch is not None:
+            has_batches = True
+            if (
+                _acquisition_protocol(state) != ACQUISITION_PROTOCOL
+                or not isinstance(state.get("selected"), list)
+                or any(not isinstance(value, str) for value in state["selected"])
+                or any(value not in state["selected"] for value in batch)
+            ):
+                raise CatalogueError("selected market batch differs from its capture selection")
+            batch_values.extend(batch)
         identities.add(_task_identity(work))
+    if has_batches and (
+        len(batch_values) != len(set(batch_values))
+        or set(batch_values) != set(state["selected"])
+    ):
+        raise CatalogueError("selected market batches do not partition the capture selection")
     # Reuse legacy sealed-limit validation without serializing runtime metadata.
     if "max_response_bytes" not in state:
         raise CatalogueError("invalid sealed response ceiling")
@@ -347,6 +397,8 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         }[scope]
         if not expected or work["singular"]:
             raise CatalogueError("reconciliation scope does not match its traversal")
+        if _batch_tickers(work) is not None:
+            raise CatalogueError("selected market batches cannot define a reconciliation scope")
     return state
 
 
@@ -461,11 +513,17 @@ def _apply_control_record(
             endpoint = work["endpoint"]
             identity = _task_identity(work)
             expected_prefix = "/events/" if work.get("kind") == "events" else "/series/"
+            expected_params = (
+                {"exclude_markets": "true"}
+                if work.get("kind") == "events"
+                and _acquisition_protocol(genesis) == ACQUISITION_PROTOCOL
+                else {}
+            )
             if (
                 work.get("kind") not in {"events", "series"}
                 or not endpoint.startswith(expected_prefix)
                 or not work["singular"]
-                or work["params"] != {}
+                or work["params"] != expected_params
                 or work["requested"] is not None
                 or not isinstance(work.get("cutoff_due"), bool)
                 or work["cutoff_due"]
@@ -1110,7 +1168,31 @@ def capture_pages(
         )
         if manifest.get("capture_id") != state["capture_id"]:
             raise CatalogueError("raw evidence belongs to another capture")
+        if not _receipt_matches_state_protocol(manifest, state):
+            raise CatalogueError("raw receipt protocol differs from its capture")
         yield manifest, payload
+
+
+def _selected_market_batches(values: list[str]) -> list[list[str]]:
+    batches: list[list[str]] = []
+    current: list[str] = []
+    for value in values:
+        candidate = [*current, value]
+        if (
+            len(candidate) > MAX_SELECTION_BATCH
+            or _market_batch_url_size(candidate) > MAX_INITIAL_BATCH_URL_BYTES
+        ):
+            if not current:
+                raise CatalogueError("selected market ticker exceeds the initial URL limit")
+            batches.append(current)
+            current = [value]
+            if _market_batch_url_size(current) > MAX_INITIAL_BATCH_URL_BYTES:
+                raise CatalogueError("selected market ticker exceeds the initial URL limit")
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
 
 
 def new_capture(
@@ -1171,11 +1253,17 @@ def new_capture(
         ]
     else:
         work += [
-            task(f"/markets/{ticker(value)}", "markets", singular=True, requested=value)
-            for value in selections(selected)
+            task(
+                "/markets",
+                "markets",
+                params={"limit": MARKET_PAGE_LIMIT, "tickers": ",".join(batch)},
+            )
+            for batch in _selected_market_batches(selections(selected))
         ]
     scopes: dict[str, str] = {}
     for index, item in enumerate(work):
+        if selected is not None:
+            continue
         endpoint = item["endpoint"]
         if endpoint == "/series":
             scopes[str(index)] = "series"
@@ -1262,6 +1350,14 @@ def _receipt_matches_context(manifest: dict[str, Any], context: dict[str, Any]) 
     )
 
 
+def _receipt_matches_state_protocol(manifest: dict[str, Any], state: dict[str, Any]) -> bool:
+    protocol = _acquisition_protocol(state)
+    if protocol == 2:
+        return "acquisition_protocol" not in manifest
+    value = manifest.get("acquisition_protocol")
+    return isinstance(value, int) and not isinstance(value, bool) and value == protocol
+
+
 def _record_cutoff(state: dict[str, Any], payload: Any) -> None:
     if (
         not isinstance(payload, dict)
@@ -1293,6 +1389,10 @@ def _apply(
             raise CatalogueError("pagination cursor repeatedly invalidated")
         work.update(cursor="", restarts=work["restarts"] + 1)
         seen.pop(index, None)
+        batch = _batch_tickers(work)
+        if batch is not None:
+            for value in batch:
+                state["coverage"].pop(value, None)
     elif status == 404 and work["singular"] and work["kind"] in {"markets", "events", "series"}:
         work["done"] = True
         if work["kind"] == "markets" and work["requested"]:
@@ -1324,6 +1424,15 @@ def _apply(
             "markets": "market" if work["singular"] else "markets",
         }[work["kind"]]
         rows = records(payload, envelope, singular=work["singular"])
+        batch = _batch_tickers(work)
+        batch_found: set[str] = set()
+        if batch is not None:
+            allowed = set(batch)
+            for row in rows:
+                value = ticker(row.get("ticker"))
+                if value not in allowed:
+                    raise CatalogueError("market batch returned an unrequested ticker")
+                batch_found.add(value)
         if work["singular"]:
             key = "event_ticker" if work["kind"] == "events" else "ticker"
             if rows[0].get(key) != work["endpoint"].rsplit("/", 1)[1]:
@@ -1349,6 +1458,24 @@ def _apply(
                 "status": "found",
                 "error": None,
             }
+        if batch is not None:
+            for value in batch_found:
+                state["coverage"][value] = {
+                    "market_ticker": value,
+                    "status": "found",
+                    "error": None,
+                }
+            if work["done"]:
+                existing = {_task_identity(candidate) for candidate in state["tasks"]}
+                for value in batch:
+                    if state["coverage"].get(value, {}).get("status") == "found":
+                        continue
+                    lookup = task(
+                        f"/markets/{value}", "markets", singular=True, requested=value
+                    )
+                    if _task_identity(lookup) not in existing:
+                        state["tasks"].append(lookup)
+                        existing.add(_task_identity(lookup))
     work["cutoff_due"] = _historical(work["endpoint"]) and not work["done"]
 
 
@@ -1470,7 +1597,12 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
         for identity in sorted(missing):
             path = f"{endpoint}/{ticker(identity)}"
             if path not in existing:
-                state["tasks"].append(task(path, kind, singular=True))
+                params = (
+                    {"exclude_markets": "true"}
+                    if kind == "events" and _acquisition_protocol(state) == ACQUISITION_PROTOCOL
+                    else None
+                )
+                state["tasks"].append(task(path, kind, singular=True, params=params))
     if state.get("task_scopes"):
         from kalshi_events.incremental import parent_lookup_tasks
 
@@ -1570,6 +1702,14 @@ def _run(
                         _consume(store, state, index, relative, seen, identities)
                         continue
                     endpoint, params, _, _ = _plan(work, _phase(work))
+                    batch = _batch_tickers(work)
+                    if (
+                        batch is not None
+                        and _phase(work) == "page"
+                        and not work["cursor"]
+                        and _market_batch_url_size(batch) > MAX_INITIAL_BATCH_URL_BYTES
+                    ):
+                        raise CatalogueError("selected market batch exceeds the initial URL limit")
                     busy.add(index)
                     running[
                         pool.submit(
@@ -1703,6 +1843,8 @@ def _capture_locked(
                     )
                     if manifest.get("capture_id") != state["capture_id"]:
                         raise CatalogueError("raw evidence belongs to another capture")
+                    if not _receipt_matches_state_protocol(manifest, state):
+                        raise CatalogueError("raw receipt protocol differs from its capture")
                     identities.add_page(manifest, payload)
                     identities.processed.add(row["relative"])
             recovered = _recover_receipts(store, state) if resume else {}
