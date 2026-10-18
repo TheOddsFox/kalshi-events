@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -130,9 +130,27 @@ def regular_bytes(path: Path, limit: int = MAX_BUNDLE_BYTES) -> bytes:
     return body
 
 
+def durable_mkdir(path: Path) -> None:
+    """Create missing directories and persist each new entry in its parent."""
+    path = safe_path(path)
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    if not current.is_dir():
+        raise CatalogueError(f"directory path is not a directory: {current}")
+    if current != Path(current.anchor):
+        fsync_directory(current.parent)
+    for directory in reversed(missing):
+        with suppress(FileExistsError):
+            directory.mkdir()
+        fsync_directory(directory.parent)
+
+
 def atomic_bytes(path: Path, body: bytes) -> None:
     path = safe_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent)
     fd, name = tempfile.mkstemp(prefix=".write-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -141,12 +159,7 @@ def atomic_bytes(path: Path, body: bytes) -> None:
             metrics.add("fsync_calls")
             os.fsync(stream.fileno())
         os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            metrics.add("fsync_calls")
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_directory(path.parent)
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -226,7 +239,11 @@ class Store:
         self._storage_reservations = 0
         self._sizes: dict[str, int] = {}
         self._usage = {"retained_bytes": 0, "temporary_bytes": 0, "database_bytes": 0}
-        self.root.mkdir(parents=True, exist_ok=True)
+        if self.root.exists():
+            if not self.root.is_dir():
+                raise CatalogueError("operator root is not a directory")
+        else:
+            durable_mkdir(self.root)
         marker = self.root / "root.json"
         if not marker.exists():
             if any(self.root.iterdir()):
@@ -290,38 +307,49 @@ class Store:
         self._require_writable()
         path = self.path(relative)
         with self._lock:
-            previous = self._sizes.get(str(path), 0)
-        self.check_storage(max(0, len(body) - previous))
-        if relative.startswith("raw/"):
-            with metrics.phase("raw_write"):
-                atomic_bytes(path, body)
-        else:
-            atomic_bytes(path, body)
-        with self._lock:
-            self._record(path, len(body))
+            # The complete replacement exists beside the old file until rename. Serialize
+            # check/write/accounting so concurrent writers cannot spend the same headroom.
+            self.check_storage(len(body))
+            metrics.peak("retained", self._usage["retained_bytes"] + len(body))
+            metrics.peak("temporary", self._usage["temporary_bytes"] + len(body))
+            self._storage_reservations += len(body)
+            try:
+                if relative.startswith("raw/"):
+                    with metrics.phase("raw_write"):
+                        atomic_bytes(path, body)
+                else:
+                    atomic_bytes(path, body)
+            except BaseException:
+                self._record(path, path.stat().st_size if path.is_file() else None)
+                raise
+            else:
+                self._record(path, len(body))
+            finally:
+                self._storage_reservations -= len(body)
 
     def append(self, relative: str, body: bytes) -> None:
         self._require_writable()
         path = self.path(relative)
         with self._lock:
             previous = self._sizes.get(str(path), 0)
-        self.check_storage(len(body))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        created = not path.exists()
-        with path.open("ab") as stream:
-            stream.write(body)
-            stream.flush()
-            metrics.add("fsync_calls")
-            os.fsync(stream.fileno())
-        if created:
-            directory = os.open(path.parent, os.O_RDONLY)
+            self.check_storage(len(body))
+            self._storage_reservations += len(body)
             try:
-                metrics.add("fsync_calls")
-                os.fsync(directory)
+                durable_mkdir(path.parent)
+                created = not path.exists()
+                with path.open("ab") as stream:
+                    stream.write(body)
+                    stream.flush()
+                    metrics.add("fsync_calls")
+                    os.fsync(stream.fileno())
+                if created:
+                    fsync_directory(path.parent)
+                self._record(path, previous + len(body))
+            except BaseException:
+                self._record(path, path.stat().st_size if path.is_file() else None)
+                raise
             finally:
-                os.close(directory)
-        with self._lock:
-            self._record(path, previous + len(body))
+                self._storage_reservations -= len(body)
 
     def remove(self, relative: str) -> None:
         self._require_writable()
@@ -495,7 +523,7 @@ class EvidenceSpool:
     def __init__(self, store: Store, relative: str):
         self.store = store
         self.destination = store.path(relative)
-        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.destination.parent)
         fd, name = tempfile.mkstemp(prefix=".write-body-", dir=self.destination.parent)
         self.path = Path(name)
         self.stream = os.fdopen(fd, "wb")

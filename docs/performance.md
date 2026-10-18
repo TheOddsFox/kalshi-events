@@ -41,6 +41,8 @@ Full v1 output checks compare Parquet bytes, release identity and deterministic 
 
 ## Measured results
 
+These measurements describe the runtime shipped in `9ea9c6bd272624118e2780f1a6dec5708b6e209a`. Subsequent retry, atomic-write accounting and directory-durability fixes add synchronization and change request scheduling; this matrix has not been rerun for those changes.
+
 Measured on 2026-10-18 in Europe/Zurich (2026-10-17 UTC) with Python 3.12.13 on arm64 macOS 27.0.1, the locked dependencies and one local filesystem. Both revisions used eight acquisition workers, four dbt threads and the same limits for each profile. Each comparison used one warm-up and three alternating measured pairs. The baseline is `0f53d0cda7d24c8e5268e90bc0e4f12d3558645a`; the frozen runtime/harness inventory hash is `2801cb946504b835448f838770afeb577ee0c328a9419220f0ee9392ed4b8dc4`. This matrix includes the review fixes and corrected direct-artifact JSON observer. It supersedes the earlier helper-only counts, which omitted two dbt-artifact parses per build. Every writer guard still reads the root marker freshly; exact canonical bytes now validate without reparsing, with the existing JSON fallback for other representations. Raw fixtures, inventories and reports remain outside Git.
 
 Times below are native pipeline medians; percentages compare the two medians. Refresh rows compare a full T1 refresh with a composed T1 refresh from the frozen T0 baseline.

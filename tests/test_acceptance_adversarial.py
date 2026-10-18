@@ -99,7 +99,7 @@ def test_direct_market_lookup_cannot_substitute_another_native_identity(store):
 
 @pytest.mark.parametrize("boundary", ["before_attachment", "before_checkpoint", "tampered_receipt"])
 def test_raw_market_commit_before_pending_checkpoint_is_reused_on_resume(
-    store, monkeypatch, boundary
+    store, monkeypatch, advancing_clock, boundary
 ):
     initial = acquisition.new_capture(store, ["MARKET"])
     _legacy_checkpoint(store, initial)
@@ -137,7 +137,6 @@ def test_raw_market_commit_before_pending_checkpoint_is_reused_on_resume(
 
     monkeypatch.setattr(acquisition, "save", interrupted)
     monkeypatch.setattr(PublicClient, "get", interrupted_receipt)
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
     with pytest.raises(RuntimeError, match="pending checkpoint"):
         acquisition.capture(store, resume=initial["capture_id"], client_factory=factory)
     capture_id = initial["capture_id"]

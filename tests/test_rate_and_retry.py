@@ -11,7 +11,7 @@ from conftest import FakeClient
 
 from kalshi_events.capture import capture
 from kalshi_events.cli import main
-from kalshi_events.common import Budget, CatalogueError, Limits, Store
+from kalshi_events.common import Budget, BudgetExceeded, CatalogueError, Limits, Store
 from kalshi_events.transport import (
     MAX_ATTEMPTS,
     PublicClient,
@@ -19,6 +19,42 @@ from kalshi_events.transport import (
     backoff_seconds,
     retry_after_seconds,
 )
+
+
+class SimulatedClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleepers = 0
+        self.condition = threading.Condition()
+
+    def monotonic(self):
+        with self.condition:
+            return self.now
+
+    def sleep(self, delay):
+        with self.condition:
+            deadline = self.now + delay
+            self.sleepers += 1
+            self.condition.notify_all()
+            assert self.condition.wait_for(lambda: self.now >= deadline, timeout=2)
+
+    def wait_for_sleepers(self, count):
+        with self.condition:
+            assert self.condition.wait_for(lambda: self.sleepers >= count, timeout=2)
+
+    def record_start(self, starts):
+        with self.condition:
+            starts.append(self.now)
+            self.condition.notify_all()
+
+    def wait_for_starts(self, starts, count):
+        with self.condition:
+            assert self.condition.wait_for(lambda: len(starts) >= count, timeout=2)
+
+    def advance(self, value):
+        with self.condition:
+            self.now = value
+            self.condition.notify_all()
 
 
 def test_default_rate_is_ten_per_second_and_nonpositive_rates_are_rejected():
@@ -43,16 +79,112 @@ def test_configured_rate_sets_shared_limiter_spacing(store):
 
 
 def test_one_limiter_paces_every_start_at_its_interval(store, monkeypatch):
-    sleeps = []
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", sleeps.append)
+    clock = {"now": 0.0}
+    store.started = 0.0
+
+    def sleep(delay):
+        clock["now"] += delay
+
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("kalshi_events.transport.time.sleep", sleep)
     limiter = RateLimiter(max_rate=10)
     budget = Budget(store)
+    starts = []
     for _ in range(5):
         limiter.acquire(budget)
+        starts.append(clock["now"])
     # Each start waits for its slot: the k-th start is k intervals after the first.
-    assert len(sleeps) == 4
-    for slot, delay in enumerate(sleeps, start=1):
-        assert 0.1 * slot - 0.05 < delay <= 0.1 * slot + 1e-9
+    assert starts == pytest.approx([0.0, 0.1, 0.2, 0.3, 0.4])
+
+
+def test_waiter_rechecks_shared_delay_added_while_sleeping(store, monkeypatch):
+    clock = SimulatedClock()
+    limiter = RateLimiter(max_rate=10)
+    store.started = 0.0
+    store.limits = Limits(max_duration_seconds=20)
+    budget = Budget(store)
+
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("kalshi_events.transport.time.sleep", clock.sleep)
+    limiter.acquire(budget)
+    starts = []
+
+    def acquire():
+        limiter.acquire(budget)
+        clock.record_start(starts)
+
+    workers = [threading.Thread(target=acquire) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    clock.wait_for_sleepers(2)
+    limiter.defer(5)
+    clock.advance(0.1)
+    clock.wait_for_sleepers(4)
+    clock.advance(5.0)
+    clock.wait_for_sleepers(5)
+    clock.wait_for_starts(starts, 1)
+    clock.advance(5.1)
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+    assert sorted(starts) == pytest.approx([5.0, 5.1])
+
+
+def test_waiter_deadline_includes_a_delay_added_while_sleeping(store, monkeypatch):
+    clock = SimulatedClock()
+    limiter = RateLimiter(max_rate=10)
+    store.started = 0.0
+    store.limits = Limits(max_duration_seconds=2)
+    budget = Budget(store)
+
+    def sleep(delay):
+        clock.advance(clock.monotonic() + delay)
+        limiter.defer(5)
+
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("kalshi_events.transport.time.sleep", sleep)
+    limiter.acquire(budget)
+    with pytest.raises(BudgetExceeded, match="deadline cannot accommodate request spacing"):
+        limiter.acquire(budget)
+
+
+def test_concurrent_waiters_start_at_spaced_slots(store, monkeypatch):
+    clock = SimulatedClock()
+    store.started = 0.0
+    store.limits = Limits(max_duration_seconds=20)
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("kalshi_events.transport.time.sleep", clock.sleep)
+    limiter = RateLimiter(max_rate=10)
+    budget = Budget(store)
+    gate = threading.Barrier(4)
+    starts = []
+    limiter.acquire(budget)
+
+    def acquire():
+        gate.wait()
+        limiter.acquire(budget)
+        clock.record_start(starts)
+
+    workers = [threading.Thread(target=acquire) for _ in range(3)]
+    for worker in workers:
+        worker.start()
+    gate.wait()
+    clock.wait_for_sleepers(3)
+    clock.advance(0.1)
+    clock.wait_for_starts(starts, 1)
+    clock.wait_for_sleepers(5)
+    clock.advance(0.2)
+    clock.wait_for_starts(starts, 2)
+    clock.wait_for_sleepers(6)
+    clock.advance(0.31)
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+    ordered = sorted(starts)
+    assert len(ordered) == 3
+    assert ordered == pytest.approx([0.1, 0.2, 0.31])
 
 
 def test_retry_after_delta_seconds_and_http_date_are_parsed():
@@ -77,8 +209,16 @@ def test_backoff_is_jittered_exponential_capped_and_never_below_retry_after(monk
 
 
 def test_retry_after_is_honored_and_recorded_on_the_attempt_receipt(store, monkeypatch):
+    clock = {"now": 0.0}
     sleeps = []
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", sleeps.append)
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", lambda: clock["now"])
+
+    def sleep(delay):
+        sleeps.append(delay)
+        clock["now"] += delay
+
+    monkeypatch.setattr("kalshi_events.transport.time.sleep", sleep)
+    store.started = 0.0
     monkeypatch.setattr("kalshi_events.transport.random.uniform", lambda low, high: high)
     responses = [
         httpx.Response(
@@ -100,7 +240,13 @@ def test_retry_after_is_honored_and_recorded_on_the_attempt_receipt(store, monke
 
 
 def test_four_attempts_then_bounded_failure(store, monkeypatch):
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
+    clock = {"now": 0.0}
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "kalshi_events.transport.time.sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+    store.started = 0.0
     calls = []
 
     def handler(request):

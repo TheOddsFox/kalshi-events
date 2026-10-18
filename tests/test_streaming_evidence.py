@@ -189,8 +189,7 @@ def test_false_or_missing_content_length_cannot_bypass_decoded_ceiling(tmp_path,
     assert store.usage()["temporary_bytes"] == 0
 
 
-def test_retry_download_accounting_counts_wire_not_expanded_bytes(store, monkeypatch):
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
+def test_retry_download_accounting_counts_wire_not_expanded_bytes(store, advancing_clock):
     busy = gzip.compress(b'{"message":"retry"}', mtime=0)
     ok = gzip.compress(BODY, mtime=0)
     responses = [response(busy, status=503), response(ok)]
@@ -202,8 +201,7 @@ def test_retry_download_accounting_counts_wire_not_expanded_bytes(store, monkeyp
     assert accounting(store)["downloaded_or_reserved_bytes"] == len(busy) + len(ok)
 
 
-def test_partial_gzip_read_accounts_each_attempt_and_cleans_spool(store, monkeypatch):
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
+def test_partial_gzip_read_accounts_each_attempt_and_cleans_spool(store, advancing_clock):
     prefix = gzip.compress(BODY, mtime=0)[:12]
 
     class Interrupted(httpx.SyncByteStream):

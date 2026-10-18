@@ -29,6 +29,7 @@ from kalshi_events.common import (
     atomic_json,
     decode,
     digest,
+    durable_mkdir,
     file_digest,
     fsync_directory,
     fsync_file,
@@ -315,7 +316,8 @@ def _publish(
     warehouse = store.path(f"{build_directory(capture_id, catalogue_version)}/warehouse.duckdb")
     temporary_relative = f"tmp/publish-{uuid.uuid4().hex}"
     temporary = store.path(temporary_relative)
-    temporary.mkdir(parents=True)
+    durable_mkdir(temporary.parent)
+    temporary.mkdir()
     fsync_directory(temporary.parent)
     try:
         with (
@@ -379,7 +381,7 @@ def _publish(
         fsync_directory(temporary)
         verify_release(temporary, store.limits.max_root_bytes)
         destination = store.path(f"releases/{release_id}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(destination.parent)
         fsync_directory(destination.parent.parent)
         if destination.exists():
             existing = verify_release(destination, store.limits.max_root_bytes)

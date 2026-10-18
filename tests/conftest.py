@@ -1,10 +1,35 @@
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 
 import pytest
 
 from kalshi_events.common import Store, digest, json_bytes, now
+
+
+@pytest.fixture
+def advancing_clock(monkeypatch):
+    """Advance mocked waits so limiter rechecks also consume operation deadlines."""
+    clock = [time.monotonic()]
+    waits = []
+    lock = threading.Lock()
+
+    def monotonic():
+        with lock:
+            return clock[0]
+
+    def sleep(delay):
+        assert delay >= 0
+        with lock:
+            clock[0] += delay
+            waits.append(delay)
+
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", monotonic)
+    monkeypatch.setattr("kalshi_events.transport.time.sleep", sleep)
+    return waits
+
 
 SERIES = [
     {

@@ -22,6 +22,8 @@ from kalshi_events.common import (
     atomic_bytes,
     decode,
     digest,
+    durable_mkdir,
+    fsync_directory,
     json_bytes,
     regular_bytes,
     safe_path,
@@ -138,7 +140,7 @@ def export(
     output = safe_path(output)
     if output.exists():
         raise CatalogueError("metadata destination must be new")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(output.parent)
     temporary = Path(tempfile.mkdtemp(prefix=".kalshi-metadata-", dir=output.parent))
     try:
         required = sum(map(len, bodies.values())) + len(manifest_body)
@@ -151,6 +153,7 @@ def export(
         verify(temporary)
         _ = store.remaining
         os.rename(temporary, output)
+        fsync_directory(output.parent)
         if output.is_relative_to(store.root):
             store.sync(str(output.relative_to(store.root)))
     finally:

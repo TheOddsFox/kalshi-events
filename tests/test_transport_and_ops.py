@@ -24,10 +24,11 @@ def test_regular_bytes_does_not_allocate_the_ceiling(tmp_path):
     assert regular_bytes(path, 64 * 1024**3) == b"{}"
 
 
-def test_small_download_allowance_covers_several_responses_and_stops_at_zero(store, monkeypatch):
+def test_small_download_allowance_covers_several_responses_and_stops_at_zero(
+    store, advancing_clock
+):
     from kalshi_events.transport import accounting
 
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
     body = b'{"series":[]}'
     total = len(body) * 3
     bounded = Store(
@@ -65,12 +66,13 @@ def test_small_download_allowance_covers_several_responses_and_stops_at_zero(sto
 
 
 @pytest.mark.parametrize("declared", [False, True])
-def test_remaining_download_ceiling_rejects_oversized_next_response(store, monkeypatch, declared):
+def test_remaining_download_ceiling_rejects_oversized_next_response(
+    store, advancing_clock, declared
+):
     import json
 
     from kalshi_events.transport import accounting
 
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
     body = b'{"series":[]}'
     total = len(body) + 8
     bounded = Store(
@@ -141,8 +143,7 @@ def test_loopback_requires_explicit_opt_in(monkeypatch):
         source_url()
 
 
-def test_streaming_cap_and_retry_attempts_accounted(store, monkeypatch):
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
+def test_streaming_cap_and_retry_attempts_accounted(store, advancing_clock):
     bounded = Store(
         store.root, Limits(max_requests=4, max_response_bytes=32, max_download_bytes=128)
     )
@@ -178,8 +179,7 @@ def test_streaming_cap_and_retry_attempts_accounted(store, monkeypatch):
     assert not isinstance(raised.value, BudgetExceeded)
 
 
-def test_redirect_is_rejected_without_second_host_request(store, monkeypatch):
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
+def test_redirect_is_rejected_without_second_host_request(store, advancing_clock):
     requests = []
 
     def handler(request):
@@ -287,15 +287,13 @@ def test_crashed_attempt_retains_conservative_reservation(store):
     }
 
 
-def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(store, monkeypatch):
+def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(store, advancing_clock):
     import json
 
     from conftest import FakeClient
 
     from kalshi_events.capture import capture, page_receipts, read_capture
     from kalshi_events.transport import accounting
-
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
 
     class PartialRead(httpx.SyncByteStream):
         def __iter__(self):
@@ -332,12 +330,11 @@ def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(stor
     assert accounting(store)["accounting_complete"] is True
 
 
-def test_deadline_cut_retry_keeps_known_retry_fields(store, monkeypatch):
+def test_deadline_cut_retry_keeps_known_retry_fields(store, advancing_clock):
     import json
 
     from kalshi_events.common import digest
 
-    monkeypatch.setattr("kalshi_events.transport.time.sleep", lambda _: None)
     body = b'{"rate":"limited"}'
     short = Store(store.root, Limits(max_requests=4, max_duration_seconds=5))
     with PublicClient(short, Budget(short)) as client:

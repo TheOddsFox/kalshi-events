@@ -196,12 +196,15 @@ class RateLimiter:
         self._next_start = 0.0
 
     def acquire(self, budget: Budget) -> None:
-        with self._lock:
-            current = time.monotonic()
-            start = max(current, self._next_start)
-            self._next_start = start + self.interval
-        wait = start - current
-        if wait > 0:
+        while True:
+            _ = budget.remaining
+            with self._lock:
+                current = time.monotonic()
+                start = max(current, self._next_start)
+                if start <= current:
+                    self._next_start = current + self.interval
+                    return
+                wait = start - current
             if wait >= budget.remaining:
                 raise BudgetExceeded("deadline cannot accommodate request spacing")
             with metrics.phase("rate_wait"):

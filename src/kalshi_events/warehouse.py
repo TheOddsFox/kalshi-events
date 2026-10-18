@@ -38,6 +38,7 @@ from kalshi_events.common import (
     atomic_json,
     decode,
     digest,
+    durable_mkdir,
     file_digest,
     fsync_directory,
     fsync_file,
@@ -451,7 +452,8 @@ def _load_locked(store: Store, capture_id: str) -> dict[str, Any]:
     state = catalogue_capture(store, capture_id)
     relative = f"tmp/load-{uuid.uuid4().hex}"
     directory = store.path(relative)
-    directory.mkdir(parents=True)
+    durable_mkdir(directory.parent)
+    directory.mkdir()
     try:
         verified_pages: dict[str, str] = {}
         observation_count = _land(store, state, directory, verified_pages=verified_pages)
@@ -481,7 +483,8 @@ def dbt(
     store.require_writable()
     runtime_relative = f"tmp/dbt-{uuid.uuid4().hex}"
     runtime = store.path(runtime_relative)
-    runtime.mkdir(parents=True)
+    durable_mkdir(runtime.parent)
+    runtime.mkdir()
     try:
         project = runtime / "project"
         shutil.copytree(Path(str(files("kalshi_events").joinpath("dbt"))), project)
@@ -1087,7 +1090,8 @@ def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
     store.check_deadline()
     staging_relative = f"tmp/build-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
-    staging.mkdir(parents=True)
+    durable_mkdir(staging.parent)
+    staging.mkdir()
     try:
         verified_pages: dict[str, str] = {}
         _land(store, state, staging, verified_pages=verified_pages)
@@ -1177,7 +1181,7 @@ def _install_build(
         raise CatalogueError("catalogue version must be 1 or 2")
     destination_relative = build_directory(capture_id, catalogue_version)
     destination = store.path(destination_relative)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(destination.parent)
     backup_relative = f"tmp/replaced-{capture_id}-v{catalogue_version}"
     backup = store.path(backup_relative)
     if backup.exists():
@@ -1306,7 +1310,8 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
     _recover_build(store, capture_id, 2)
     staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
-    staging.mkdir(parents=True)
+    durable_mkdir(staging.parent)
+    staging.mkdir()
     verified_pages: dict[str, str] = {}
     try:
         source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
@@ -1409,7 +1414,8 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
     )
     staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
-    staging.mkdir(parents=True)
+    durable_mkdir(staging.parent)
+    staging.mkdir()
     verified_pages: dict[str, str] = {}
     try:
         previous_membership = baseline_membership(store, pin)

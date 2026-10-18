@@ -34,6 +34,8 @@ Each capture seals independent encoded and decoded response ceilings at creation
 
 Bodies stream into atomic temporary evidence files while being hashed. Durability order is raw body, usable receipt, durable journal transition, then applied capture state. Failed or partial attempts cannot become usable receipts. Recovery includes partial temporary files and interrupted reservations in storage accounting.
 
+Atomic metadata replacements account for the full temporary replacement while retaining the original allocation. Capacity checks, writes and accounting serialize across workers. Directory creation synchronizes each new entry in its parent before a child can be committed; retries synchronize the nearest existing ancestor's parent again to cover an interrupted prior synchronization. Shared request cooldowns are checked again after every wait, including deferrals received while a worker was already waiting.
+
 ### Journal recovery
 
 New captures use a versioned append-only journal. Records have monotonic sequence numbers and chained integrity checks; an atomic snapshot records its replay offset. Every committed page retains a durable append. Snapshots occur every 100 transitions, at completion and at an orderly budget stop. This amortizes snapshots without removing file or directory synchronization guarantees.

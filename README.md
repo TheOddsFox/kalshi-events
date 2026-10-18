@@ -25,7 +25,7 @@ New roots use storage version 2. Existing roots remain readable; stop writers an
 
 The public transport uses only `https://external-api.kalshi.com/trade-api/v2`. Requests are paced by one shared limiter at 10 requests per second by default. Set `--max-rate` to a positive number to change that rate; zero or negative values are rejected. All five traversals (series, ordinary events, multivariate events, live markets and historical markets) run concurrently under that one limiter. Events and multivariate events use pages of 200; live and historical markets use pages of 1000.
 
-Each attempt writes its raw HTTP response bytes and per-attempt accounting before its page is applied. A request that fails with 429, 500, 502, 503 or 504 is retried up to four attempts in total, with equal-jitter exponential backoff capped at 30 seconds. A `Retry-After` header, as delta-seconds or an HTTP date, is always honored and recorded on the attempt receipt. Resume recovers verified completed receipts without reissuing their requests.
+Each attempt writes its raw HTTP response bytes and per-attempt accounting before its page is applied. A request that fails with 429, 500, 502, 503 or 504 is retried up to four attempts in total, with equal-jitter exponential backoff capped at 30 seconds. A `Retry-After` header, as delta-seconds or an HTTP date, is always honored and recorded on the attempt receipt. Workers recheck shared cooldowns after waiting, so a later deferral also delays workers already waiting for a request slot. Resume recovers verified completed receipts without reissuing their requests.
 
 Capture stops at its request, download, response, duration or storage allowance and reports `complete: false` with exit code 3. Completed raw evidence is kept, and the capture resumes from there. Invalidated cursors restart their traversal. Each historical read is preceded by a cutoff read that is recorded as its own receipt. Missing parents are retained as unresolved relationships and are never derived from ticker prefixes.
 
@@ -112,6 +112,10 @@ Refresh and export print one JSON result with `output`, `manifest_sha256`, `sour
 ## Resources and recovery
 
 Defaults: 25,000 requests, 4 GiB downloaded, 384 MiB per response, four hours, 64 GiB retained root, 8 GiB temporary files and 2 GiB database including WAL. Every invocation accepts the corresponding `--max-…` flags, plus `--max-rate` for the request pace. The DuckDB and dbt build runs with 4 threads and a 4 GB memory limit. Storage counters are updated incrementally, with one full reconcile at the start and one at the end of each invocation. Exhausted storage requires relief before another run.
+
+Atomic state and receipt replacements require room for the complete new temporary file alongside the original. Metadata writes serialize capacity checks, writes and accounting, preventing concurrent workers from spending the same headroom. Newly created evidence, build and publication directories synchronize their parent entries before durable progress; retrying an interrupted directory creation repeats the uncertain parent synchronization.
+
+Known storage limitation: dlt landing measures its workspace and database after `pipeline.run()` returns. It can exceed the selected root, temporary or database allowance before reporting exhaustion. Those settings currently provide post-load detection for this phase, not a hard write quota. Hard enforcement requires a validated storage boundary; file rotation and periodic checks do not establish that guarantee.
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events status

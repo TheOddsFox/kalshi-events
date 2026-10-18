@@ -20,6 +20,7 @@ from kalshi_events.common import (
     CatalogueError,
     Store,
     decode,
+    durable_mkdir,
     fsync_directory,
     interrupt_at_deadline,
     json_bytes,
@@ -1131,7 +1132,7 @@ def _finish_retirement_plan(store: Store) -> None:
             if child.is_symlink() or not child.is_dir():
                 raise CatalogueError("retirement tombstone is not a directory")
 
-    trash.mkdir(exist_ok=True)
+    durable_mkdir(trash)
     for index, entry in enumerate(entries):
         source = store.path(entry["source"])
         target = store.path(entry["target"])
@@ -1239,7 +1240,7 @@ def _prune_locked(
         raise CatalogueError("cannot prune before the requested release is current")
     _finish_retirement_plan(store)
     trash = store.path("prune-trash")
-    trash.mkdir(exist_ok=True)
+    durable_mkdir(trash)
 
     pointer_manifests: list[dict[str, Any]] = []
     for version, pointer_name in ((1, "current.json"), (2, "current-v2.json")):
@@ -1523,7 +1524,7 @@ def _discard_locked(store: Store, capture_id: str) -> dict[str, Any]:
     if capture_id in protected:
         raise CatalogueError("incomplete capture is reachable from a published release")
     trash = store.path("prune-trash")
-    trash.mkdir(exist_ok=True)
+    durable_mkdir(trash)
     raw_dirs = []
     for manifest_path in store.path("raw").glob("*/manifest.json"):
         manifest = decode(regular_bytes(manifest_path, 1024**2))
