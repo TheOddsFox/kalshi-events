@@ -49,7 +49,9 @@ Full v1 output checks compare Parquet bytes, release identity and deterministic 
 
 ## Current changes: contended measurements against 21edf14
 
-The current implementation was compared with `21edf14a486addfa743c524a645857ed711b640f` on 2026-10-18 using Python 3.12.13, dlt 1.31.0, PyArrow 26.0.0, DuckDB 1.5.6 and dbt-core 1.12.5 on arm64 macOS 27.0.1. Each reported comparison uses one warm-up and three alternating measured pairs with the same fixtures, limits, interpreter and filesystem. The runtime inventory SHA-256 is `57279c7f7612bea9690cb1fff7dd34cdbbc656584c89e47c3acff5b447dbaa08`.
+The implementation at `522af66a877fb75a1c61757ec1af0067a83f653e` was compared with `21edf14a486addfa743c524a645857ed711b640f` on 2026-10-18 using Python 3.12.13, dlt 1.31.0, PyArrow 26.0.0, DuckDB 1.5.6 and dbt-core 1.12.5 on arm64 macOS 27.0.1. Each reported comparison uses one warm-up and three alternating measured pairs with the same fixtures, limits, interpreter and filesystem. The runtime inventory SHA-256 is `57279c7f7612bea9690cb1fff7dd34cdbbc656584c89e47c3acff5b447dbaa08`.
+
+A subsequent review fix preserves authoritative absent coverage after a batch cursor reset when retained observations have unavailable parents. The matrix below was not rerun for that fix; its runtime inventory describes `522af66`, not later revisions. Clean timing targets remain open.
 
 **These are contended observations, not validated timing targets.** Unrelated CPU-heavy jobs were active on the host. The operator selected finishing the PR with these results and leaving clean timing targets open. For example, scale landing ranges from 12.53–20.48 s on the reference and 8.74–38.21 s on the candidate. Do not infer a causal speedup or regression from those medians alone.
 

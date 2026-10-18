@@ -1618,7 +1618,11 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
     if state["selected"] is not None:
         for selected in state["selected"]:
             parent = markets.get(selected)
-            if parent and (parent not in events or events[parent] not in series):
+            if (
+                state["coverage"].get(selected, {}).get("status") == "found"
+                and parent
+                and (parent not in events or events[parent] not in series)
+            ):
                 state["coverage"][selected] = {
                     "market_ticker": selected,
                     "status": "unresolved",
