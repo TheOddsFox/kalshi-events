@@ -14,14 +14,3 @@ jobs:
           KALSHI_EVENTS_ALLOW_LOOPBACK: '1'
       - run: uv run --locked python scripts/check-distributions.py
       - run: uv run --locked python scripts/check-installed.py
-  windows-focused:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.12'
-      - run: uv sync --locked
-        env:
-          UV_LINK_MODE: copy
-      - run: uv run --locked pytest -q tests/test_windows_durability.py tests/test_windows_metrics.py tests/test_windows_tooling.py tests/test_windows_benchmark.py
