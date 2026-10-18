@@ -695,7 +695,7 @@ dev = [
 requires-dist = [
     { name = "dbt-core", specifier = ">=1.10" },
     { name = "dbt-duckdb", specifier = ">=1.9" },
-    { name = "dlt", extras = ["duckdb", "parquet"], specifier = ">=1.10" },
+    { name = "dlt", extras = ["duckdb", "parquet"], specifier = ">=1.31" },
     { name = "filelock", specifier = ">=3.15" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pyarrow", specifier = ">=17" },
