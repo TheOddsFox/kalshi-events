@@ -19,7 +19,7 @@ uv run --locked python scripts/check-distributions.py
 uv run --locked python scripts/check-installed.py
 ```
 
-Stop on any failure and retain the failing log. These are workstation instructions, not checks claimed as passed. The native smoke tests intentionally fail if the required elevation or NTFS environment is unavailable. The full gate retains lock/environment checks, lint, formatting, packaged dbt parsing, all offline tests and distribution builds. The separate installed check still installs a checksummed wheel into a fresh environment and runs outside the checkout. POSIX users keep the existing shell entry points.
+Stop on any failure and retain the failing log. These are workstation instructions, not checks claimed as passed. The native smoke tests intentionally fail if the required elevation or NTFS environment is unavailable. The full gate retains lock/environment checks, lint, formatting, packaged dbt parsing, all offline tests and distribution builds. The separate installed check still installs a checksummed wheel into a fresh environment and runs outside the checkout. POSIX users keep the existing repository-managed shell entry points unchanged; native Windows uses the separate Python entry point.
 
 Use a new operator root for rollout. Existing storage v1/v2 roots still require explicit `upgrade-root` under the writer lock; Windows support adds no new storage or catalogue version. Keep retained evidence and verified publications intact on failure. Run the recovery/fault-injection suite before live acquisition. The existing hard dlt storage-quota limitation remains open.
 
@@ -41,7 +41,7 @@ git archive --format=zip --output="$bench\baseline.zip" $base
 git archive --format=zip --output="$bench\candidate.zip" $candidate
 Expand-Archive "$bench\baseline.zip" "$bench\baseline"
 Expand-Archive "$bench\candidate.zip" "$bench\candidate"
-git diff --binary --output="$bench\windows.patch" "$windowsCommit^" $windowsCommit -- src scripts/check-installed.py scripts/verify scripts/verify-fast scripts/verify.py
+git diff --binary --output="$bench\windows.patch" "$windowsCommit^" $windowsCommit -- src scripts/check-installed.py scripts/verify.py
 git -C "$bench\baseline" apply --check "$bench\windows.patch"
 # Inspect windows.patch before applying; it must contain only portability changes.
 git -C "$bench\baseline" apply "$bench\windows.patch"
