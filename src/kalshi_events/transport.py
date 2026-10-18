@@ -12,7 +12,7 @@ import time
 import uuid
 import zlib
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -137,7 +137,7 @@ def read_page(
     status = manifest.get("status")
     if isinstance(status, bool) or not isinstance(status, int):
         raise CatalogueError("invalid raw evidence status")
-    body_path = store.path(str(Path(relative).parent / "body.bin"))
+    body_path = store.path((PurePosixPath(relative).parent / "body.bin").as_posix())
     body = regular_bytes(body_path, limit)
     metrics.add("raw_body_reads")
     metrics.add("raw_body_read_bytes", len(body))
@@ -173,7 +173,7 @@ def read_page(
         raise CatalogueError("decoded response exceeds byte ceiling")
     if inventory is not None:
         inventory[relative] = digest(manifest_body)
-        inventory[str(body_path.relative_to(store.root))] = actual_encoded_sha
+        inventory[body_path.relative_to(store.root).as_posix()] = actual_encoded_sha
     should_decode = (
         status == 200
         and decode_json

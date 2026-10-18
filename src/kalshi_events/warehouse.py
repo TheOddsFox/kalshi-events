@@ -19,11 +19,13 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from importlib.resources import files
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import dlt
 import duckdb
+import pyarrow as pa
+from dlt.common.data_types.type_helpers import coerce_value, py_type_to_sc_type
 
 from kalshi_events import metrics
 from kalshi_events.capture import (
@@ -60,10 +62,72 @@ RELATIONS = {
 }
 DBT_MEMORY_LIMIT = "4GB"
 DBT_THREADS = 4
+_LANDING_COLUMNS = (
+    "observation_id",
+    "capture_id",
+    "entity_kind",
+    "entity_ticker",
+    "received_at",
+    "provider_updated_at",
+    "source_endpoint",
+    "source_kind",
+    "payload_json",
+    "event_ticker",
+    "series_ticker",
+    "task_scope",
+    "task_generation",
+)
+_LANDING_SCHEMA = pa.schema(
+    pa.field(
+        name,
+        pa.string(),
+        nullable=name in {"provider_updated_at", "event_ticker", "series_ticker", "task_scope"},
+    )
+    for name in _LANDING_COLUMNS
+)
+_LANDING_BATCH_ROWS = 4096
+_LANDING_BATCH_BYTES = 8 * 1024 * 1024
+
+
+def _landing_arrow_batches(rows):
+    batch: list[dict[str, Any]] = []
+    batch_bytes = 0
+    for row in rows:
+        row_bytes = sum(len(value.encode("utf-8")) for value in row.values() if value is not None)
+        if batch and (
+            len(batch) >= _LANDING_BATCH_ROWS or batch_bytes + row_bytes > _LANDING_BATCH_BYTES
+        ):
+            yield pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+            batch = []
+            batch_bytes = 0
+        batch.append(row)
+        batch_bytes += row_bytes
+        if len(batch) >= _LANDING_BATCH_ROWS or batch_bytes >= _LANDING_BATCH_BYTES:
+            yield pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+            batch = []
+            batch_bytes = 0
+    if batch:
+        yield pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+
+
+def _legacy_landing_text(value: Any) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return None
+    return coerce_value("text", py_type_to_sc_type(type(value)), value)
 
 
 def build_directory(capture_id: str, catalogue_version: int = 1) -> str:
     return f"builds-v2/{capture_id}" if catalogue_version == 2 else f"builds/{capture_id}"
+
+
+def _dbt_executable(python_executable: str, *, windows: bool = os.name == "nt") -> Path:
+    return Path(python_executable).parent / ("dbt.exe" if windows else "dbt")
+
+
+def _receipt_body_path(relative: str) -> str:
+    return (PurePosixPath(relative).parent / "body.bin").as_posix()
 
 
 @dataclass(frozen=True)
@@ -177,7 +241,7 @@ def _operation_evidence(
         relative = row.get("relative")
         if not isinstance(relative, str):
             raise CatalogueError("invalid operation-local capture receipt inventory")
-        expected.update({relative, str(Path(relative).parent / "body.bin")})
+        expected.update({relative, _receipt_body_path(relative)})
     if verified_pages is not None and set(verified_pages) != expected:
         raise CatalogueError("verified evidence inventory does not match the capture journal")
     checkpoints = _checkpoint_inventory(store, state)
@@ -250,7 +314,7 @@ def _validate_operation_evidence(
         relative = row.get("relative")
         if not isinstance(relative, str):
             raise CatalogueError("invalid operation-local capture receipt inventory")
-        expected.update({relative, str(Path(relative).parent / "body.bin")})
+        expected.update({relative, _receipt_body_path(relative)})
     if proof.verified_pages is not None and set(proof.verified_pages) != expected:
         raise CatalogueError("operation evidence receipts do not match the capture journal")
     if proof.evidence != {**checkpoints, **(proof.verified_pages or {})}:
@@ -307,7 +371,7 @@ def evidence_inventory(
         expected = set()
         for row in rows:
             relative = row["relative"]
-            expected.update({relative, str(Path(relative).parent / "body.bin")})
+            expected.update({relative, _receipt_body_path(relative)})
         if set(verified_pages) != expected:
             raise CatalogueError("verified evidence inventory does not match the capture journal")
         return {**result, **verified_pages}
@@ -315,7 +379,7 @@ def evidence_inventory(
         store.check_deadline()
         relative = row["relative"]
         result[relative] = file_digest(store.path(relative), store.limits.max_root_bytes)[0]
-        body = str(Path(relative).parent / "body.bin")
+        body = _receipt_body_path(relative)
         result[body] = file_digest(store.path(body), store.limits.max_root_bytes)[0]
     return result
 
@@ -372,7 +436,7 @@ def _land_rows(
                 store.check_deadline()
                 observation_count += 1
                 kind = row["entity_kind"]
-                yield {
+                values = {
                     "observation_id": row["observation_id"],
                     "capture_id": capture_id,
                     "entity_kind": kind,
@@ -387,52 +451,55 @@ def _land_rows(
                     "task_scope": manifest.get("task_scope"),
                     "task_generation": str(manifest.get("task_generation", "")),
                 }
+                yield {key: _legacy_landing_text(value) for key, value in values.items()}
 
-    stream = rows()
-    first = next(stream, None)
     database = directory / "warehouse.duckdb"
-    try:
-        pipeline = dlt.pipeline(
-            pipeline_name="kalshi_catalogue",
-            pipelines_dir=str(directory / "landing"),
-            destination=dlt.destinations.duckdb(str(database)),
-            dataset_name="landing",
-        )
-        if first is not None:
-            columns = {
-                key: {
-                    "data_type": "text",
-                    "nullable": key
-                    in {
-                        "provider_updated_at",
-                        "event_ticker",
-                        "series_ticker",
-                        "task_scope",
-                    },
-                }
-                for key in first
-            }
-            pipeline.run(
-                dlt.resource(
-                    itertools.chain([first], stream),
-                    name="observations",
-                    primary_key="observation_id",
-                    columns=columns,
-                    write_disposition="merge",
-                ),
-                loader_file_format="parquet",
+    batches = iter(_landing_arrow_batches(rows()))
+    first = next(batches, None)
+    if first is None:
+        with duckdb.connect(str(database)) as connection:
+            connection.execute("create schema if not exists landing")
+            connection.execute(
+                "create table if not exists landing.observations (observation_id varchar, capture_id varchar, entity_kind varchar, entity_ticker varchar, received_at varchar, provider_updated_at varchar, source_endpoint varchar, source_kind varchar, payload_json varchar, event_ticker varchar, series_ticker varchar, task_scope varchar, task_generation varchar)"
             )
-        else:
-            with duckdb.connect(str(database)) as connection:
-                connection.execute("create schema if not exists landing")
-                connection.execute(
-                    "create table if not exists landing.observations (observation_id varchar, capture_id varchar, entity_kind varchar, entity_ticker varchar, received_at varchar, provider_updated_at varchar, source_endpoint varchar, source_kind varchar, payload_json varchar, event_ticker varchar, series_ticker varchar, task_scope varchar, task_generation varchar)"
+    else:
+        try:
+            with dlt.config.values(
+                {
+                    # dlt resolves the extractor writer inside these source/resource sections.
+                    "kalshi_catalogue.sources.kalshi_catalogue.kalshi_catalogue.data_writer.buffer_max_items": 1,
+                    "kalshi_catalogue.normalize.data_writer.buffer_max_items": 1,
+                    "kalshi_catalogue.normalize.parquet_normalizer.add_dlt_load_id": True,
+                    "kalshi_catalogue.normalize.parquet_normalizer.add_dlt_id": True,
+                }
+            ):
+                pipeline = dlt.pipeline(
+                    pipeline_name="kalshi_catalogue",
+                    pipelines_dir=str(directory / "landing"),
+                    destination=dlt.destinations.duckdb(str(database)),
+                    dataset_name="landing",
                 )
-    except Exception as exc:
-        budget = _as_budget(exc)
-        if budget is None:
-            raise
-        raise budget from exc
+                pipeline.run(
+                    dlt.resource(
+                        itertools.chain([first], batches),
+                        name="observations",
+                        primary_key="observation_id",
+                        columns={
+                            field.name: {
+                                "data_type": "text",
+                                "nullable": field.nullable,
+                            }
+                            for field in _LANDING_SCHEMA
+                        },
+                        write_disposition="merge",
+                    ),
+                    loader_file_format="parquet",
+                )
+        except Exception as exc:
+            budget = _as_budget(exc)
+            if budget is None:
+                raise
+            raise budget from exc
     store.sync(str(directory.relative_to(store.root)))
     store.check_storage()
     return observation_count
@@ -506,7 +573,7 @@ def dbt(
             }
         }
         atomic_json(runtime / "profiles.yml", profiles)
-        executable = str(Path(sys.executable).parent / "dbt")
+        executable = str(_dbt_executable(sys.executable))
         if not Path(executable).is_file():
             raise CatalogueError("dbt must be installed alongside the producer executable")
         environment = {
@@ -1551,7 +1618,7 @@ def certified(
     required = {f"{base}/state.json", f"{base}/pages.jsonl"}
     for row in rows:
         relative = row["relative"]
-        required.update({relative, str(Path(relative).parent / "body.bin")})
+        required.update({relative, _receipt_body_path(relative)})
     expected_files = receipt.get("evidence")
     if not isinstance(expected_files, dict) or set(expected_files) != required:
         raise CatalogueError("build evidence inventory does not match the capture journal")
@@ -1660,9 +1727,7 @@ def _reuse_certified(
     expected_pages = proof.verified_pages or {}
     cutoff_paths = set(cached.cutoff_rows) if cutoff_sink is not None else set()
     cutoff_files = {
-        path
-        for relative in cutoff_paths
-        for path in (relative, str(Path(relative).parent / "body.bin"))
+        path for relative in cutoff_paths for path in (relative, _receipt_body_path(relative))
     }
     cutoff_inventory: dict[str, str] = {}
     for relative, checksum in expected_pages.items():

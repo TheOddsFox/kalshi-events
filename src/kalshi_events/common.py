@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -23,10 +24,12 @@ from filelock import FileLock, Timeout
 
 from kalshi_events import metrics
 
+_WINDOWS = os.name == "nt"
 MAX_BUNDLE_BYTES = 128 * 1024**2
 TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
-CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
+CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 3}
+PREVIOUS_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
 
 
 class CatalogueError(RuntimeError):
@@ -57,6 +60,21 @@ def json_bytes(value: Any) -> bytes:
 
 def _reject(value: Any) -> Any:
     raise TypeError(f"cannot encode {type(value).__name__}")
+
+
+def _root_storage_version(marker: Any) -> int:
+    if marker == OWNER_MARKER:
+        return 1
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != {"owner", "storage_version"}
+        or marker.get("owner") != OWNER_MARKER["owner"]
+        or isinstance(marker.get("storage_version"), bool)
+        or not isinstance(marker.get("storage_version"), int)
+        or marker["storage_version"] not in {2, 3}
+    ):
+        raise CatalogueError("operator root belongs to another application")
+    return marker["storage_version"]
 
 
 CANONICAL_CURRENT_ROOT_MARKER_BYTES = json_bytes(CURRENT_ROOT_MARKER)
@@ -109,11 +127,29 @@ def selections(values: list[str]) -> list[str]:
     return [ticker(v) for v in values]
 
 
+def path_is_link(path: Path) -> bool:
+    """Include junctions and other Windows reparse points in the no-alias boundary."""
+    try:
+        value = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
 def safe_path(path: Path) -> Path:
     path = path.absolute()
+    if _WINDOWS:
+        from kalshi_events._windows import validate_path
+
+        try:
+            validate_path(path)
+        except OSError as exc:
+            raise CatalogueError(str(exc)) from exc
     for part in (path, *path.parents):
-        if part.is_symlink():
-            raise CatalogueError(f"symlink is forbidden: {part}")
+        if path_is_link(part):
+            raise CatalogueError(f"symlink or reparse point is forbidden: {part}")
     return path.resolve()
 
 
@@ -140,7 +176,7 @@ def durable_mkdir(path: Path) -> None:
         current = current.parent
     if not current.is_dir():
         raise CatalogueError(f"directory path is not a directory: {current}")
-    if current != Path(current.anchor):
+    if _WINDOWS or current != Path(current.anchor):
         fsync_directory(current.parent)
     for directory in reversed(missing):
         with suppress(FileExistsError):
@@ -173,7 +209,7 @@ def fsync_file(path: Path) -> None:
     path = safe_path(path)
     if not path.is_file():
         raise CatalogueError("cannot sync a missing or nonregular file")
-    with path.open("rb") as stream:
+    with path.open("r+b" if _WINDOWS else "rb") as stream:
         metrics.add("fsync_calls")
         os.fsync(stream.fileno())
 
@@ -183,6 +219,20 @@ def fsync_directory(path: Path) -> None:
     path = safe_path(path)
     if not path.is_dir():
         raise CatalogueError("cannot sync a missing directory")
+    if _WINDOWS:
+        from kalshi_events._windows import flush_directory
+
+        metrics.add("fsync_calls")
+        metrics.add("volume_flush_calls")
+        try:
+            with metrics.phase("volume_flush"):
+                flush_directory(path)
+        except OSError as exc:
+            raise CatalogueError(
+                "Windows writes require an elevated Administrator terminal on local NTFS; "
+                f"volume durability barrier failed: {exc}"
+            ) from exc
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         metrics.add("fsync_calls")
@@ -250,9 +300,7 @@ class Store:
                 raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
             atomic_json(marker, CURRENT_ROOT_MARKER)
         marker_value = decode(regular_bytes(marker))
-        if marker_value not in (OWNER_MARKER, CURRENT_ROOT_MARKER):
-            raise CatalogueError("operator root belongs to another application")
-        self.storage_version = 1 if marker_value == OWNER_MARKER else 2
+        self.storage_version = _root_storage_version(marker_value)
         self.reconcile()
 
     @property
@@ -363,6 +411,8 @@ class Store:
     def lock(self, *, allow_legacy: bool = False) -> Any:
         if not allow_legacy:
             self._require_writable()
+        if _WINDOWS:
+            fsync_directory(self.root)
         lock = FileLock(str(self.path("writer.lock")), timeout=0)
         try:
             acquisition = lock.acquire()
@@ -426,13 +476,12 @@ class Store:
         if not lock.is_locked or str(lock.lock_file) != expected_lock:
             raise CatalogueError("root upgrade requires the writer lock")
         current = decode(regular_bytes(self.path("root.json"), 1024**2))
-        if current == CURRENT_ROOT_MARKER:
-            self.storage_version = 2
+        version = _root_storage_version(current)
+        if version == 3:
+            self.storage_version = version
             return
-        if current != OWNER_MARKER:
-            raise CatalogueError("operator root belongs to another application")
         atomic_json(self.path("root.json"), CURRENT_ROOT_MARKER)
-        self.storage_version = 2
+        self.storage_version = 3
 
     def reserve_storage(self, amount: int) -> None:
         with self._lock:
@@ -451,24 +500,25 @@ class Store:
         return EvidenceSpool(self, relative)
 
     def require_writable(self) -> None:
-        if self.storage_version != 2:
+        if self.storage_version != 3:
             raise CatalogueError("operator root requires explicit upgrade-root before writing")
 
     def _refresh_storage_version(self, *, allow_legacy: bool = False) -> None:
         marker_bytes = regular_bytes(self.path("root.json"))
         if marker_bytes == CANONICAL_CURRENT_ROOT_MARKER_BYTES:
-            self.storage_version = 2
+            self.storage_version = 3
             return
         marker = decode(marker_bytes)
-        if marker == CURRENT_ROOT_MARKER:
-            self.storage_version = 2
+        version = _root_storage_version(marker)
+        if version in {2, 3}:
+            self.storage_version = version
+            if version == 2 and not allow_legacy:
+                raise CatalogueError("operator root requires explicit upgrade-root before writing")
             return
-        if marker == OWNER_MARKER:
-            self.storage_version = 1
-            if allow_legacy:
-                return
-            raise CatalogueError("operator root requires explicit upgrade-root before writing")
-        raise CatalogueError("operator root belongs to another application")
+        self.storage_version = version
+        if allow_legacy:
+            return
+        raise CatalogueError("operator root requires explicit upgrade-root before writing")
 
     def _require_writable(self) -> None:
         self.require_writable()
@@ -484,12 +534,16 @@ class Store:
             for base, dirs, files in os.walk(path, followlinks=False):
                 for name in dirs:
                     child = Path(base) / name
-                    if child.is_symlink():
-                        raise CatalogueError(f"symlink inside operator root: {child}")
+                    if path_is_link(child):
+                        raise CatalogueError(
+                            f"symlink or reparse point inside operator root: {child}"
+                        )
                 for name in files:
                     child = Path(base) / name
-                    if child.is_symlink():
-                        raise CatalogueError(f"symlink inside operator root: {child}")
+                    if path_is_link(child):
+                        raise CatalogueError(
+                            f"symlink or reparse point inside operator root: {child}"
+                        )
                     present[str(child)] = child.stat().st_size
         with self._lock:
             for key in [k for k in self._sizes if k == prefix or k.startswith(prefix + os.sep)]:
@@ -555,12 +609,7 @@ class EvidenceSpool:
             os.replace(self.path, self.destination)
             self.store._record(self.path, None)
             self.store._record(self.destination, self.size)
-            directory = os.open(self.destination.parent, os.O_RDONLY)
-            try:
-                metrics.add("fsync_calls")
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            fsync_directory(self.destination.parent)
 
     def abort(self) -> None:
         if not self.closed:

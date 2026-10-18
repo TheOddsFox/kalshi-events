@@ -493,7 +493,7 @@ def test_all_retirement_entries_are_validated_before_the_first_deletion(recovery
         shutil.copytree(raw, second_path)
     else:
         second_path = raw
-    second = str(second_path.relative_to(root))
+    second = second_path.relative_to(root).as_posix()
     entries = [
         {"source": first, "target": f"prune-trash/{uuid.uuid4().hex}-captures-{Path(first).name}"},
         {"source": second, "target": f"prune-trash/{uuid.uuid4().hex}-raw-{second_path.name}"},
@@ -588,7 +588,7 @@ def test_discard_plan_rejects_valid_artifacts_outside_its_incomplete_capture(
     raw_by_capture = {}
     for path in (root / "raw").glob("*/manifest.json"):
         raw_by_capture.setdefault(json.loads(path.read_bytes())["capture_id"], []).append(
-            str(path.parent.relative_to(root))
+            path.parent.relative_to(root).as_posix()
         )
     victim_sources = [f"captures/{victim}", *raw_by_capture[victim]]
     assert raw_by_capture[victim]
@@ -626,7 +626,7 @@ def test_discard_plan_rejects_a_completed_unprotected_capture(recovery_root):
     victim = captures["obsolete"]
     assert acquisition.read_capture(store, victim)["complete"]
     raw_sources = [
-        str(path.parent.relative_to(root))
+        path.parent.relative_to(root).as_posix()
         for path in (root / "raw").glob("*/manifest.json")
         if json.loads(path.read_bytes()).get("capture_id") == victim
     ]
@@ -819,7 +819,7 @@ def test_pointer_directory_sync_failure_never_prunes_reachable_evidence(recovery
     replaced = False
     failed = False
     replace = os.replace
-    fsync = os.fsync
+    fsync = common.fsync_directory
 
     def observed_replace(source, destination, *args, **kwargs):
         nonlocal replaced
@@ -828,15 +828,15 @@ def test_pointer_directory_sync_failure_never_prunes_reachable_evidence(recovery
             replaced = True
         return result
 
-    def failed_sync(descriptor):
+    def failed_sync(path):
         nonlocal failed
-        if replaced and not failed:
+        if replaced and path == root and not failed:
             failed = True
             raise OSError("injected pointer directory sync failure")
-        return fsync(descriptor)
+        return fsync(path)
 
     monkeypatch.setattr(os, "replace", observed_replace)
-    monkeypatch.setattr(os, "fsync", failed_sync)
+    monkeypatch.setattr(common, "fsync_directory", failed_sync)
     with pytest.raises(OSError, match="injected pointer directory sync failure"):
         publishing.publish(Store(root), captures["candidate"], catalogue_version=2)
     assert replaced and failed

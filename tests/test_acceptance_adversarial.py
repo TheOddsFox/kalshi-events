@@ -16,6 +16,15 @@ from kalshi_events.transport import PublicClient
 def _legacy_checkpoint(store, state):
     logical = dict(state)
     logical.pop("journal_version")
+    logical.pop("acquisition_protocol", None)
+    if logical.get("selected") is not None:
+        logical["tasks"] = [
+            acquisition.task("/historical/cutoff", None, singular=True),
+            *[
+                acquisition.task(f"/markets/{value}", "markets", singular=True, requested=value)
+                for value in logical["selected"]
+            ],
+        ]
     store.remove(f"captures/{state['capture_id']}/pages.jsonl")
     store.write(f"captures/{state['capture_id']}/state.json", logical)
     return logical
@@ -84,7 +93,7 @@ def test_cursor_failure_stays_incomplete_and_cannot_export(store, tmp_path, fail
 
 
 def test_direct_market_lookup_cannot_substitute_another_native_identity(store):
-    with pytest.raises(CatalogueError, match="different native identity"):
+    with pytest.raises(CatalogueError, match="different native identity|unrequested ticker"):
         acquisition.capture(
             store,
             selected=["MARKET"],

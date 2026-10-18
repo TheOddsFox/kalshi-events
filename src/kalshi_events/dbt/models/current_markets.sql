@@ -13,6 +13,9 @@ latest as (
     from {{ ref('observation_history') }} h
     join eligible e on e.market_ticker = h.entity_ticker
     where h.entity_kind = 'markets' and h.source_kind = 'direct'
+    {% if var('incremental_update', false) %}
+      and h.entity_ticker in (select market_ticker from {{ source('landing', 'affected_markets') }})
+    {% endif %}
     qualify row_number() over (
         partition by h.entity_ticker order by h.received_at desc, h.observation_id desc
     ) = 1
@@ -39,9 +42,6 @@ projected as (
     left join {{ ref('current_series') }} s on e.series_ticker = s.series_ticker
 )
 select * from projected
-{% if var('incremental_update', false) %}
-where market_ticker in (select market_ticker from {{ source('landing', 'affected_markets') }})
-{% endif %}
 {% else %}
 with latest as (
     select * from {{ ref('observation_history') }}

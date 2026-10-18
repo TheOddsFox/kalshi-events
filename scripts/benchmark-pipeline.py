@@ -24,7 +24,14 @@ from urllib.parse import parse_qs
 FIXED_TIME = "2026-01-01T00:00:00Z"
 FIXED_ROOT_ID = "b" * 32
 PAGE_SIZE = 200
+HISTORY_STRESS_COUNT = 250_000
+HISTORY_STRESS_IDENTITIES = 10_000
+HISTORY_STRESS_PASSES = HISTORY_STRESS_COUNT // HISTORY_STRESS_IDENTITIES
+SELECTED_PROFILES = {"selected-stress", "selected-single", "selected-fallback"}
+TARGETED_PROFILES = {"targeted", *SELECTED_PROFILES}
+COMPOSED_REFRESH_PROFILES = {"no-change", "sparse-change", "all-change"}
 _request_id = contextvars.ContextVar("fixture_request_id")
+_page_request = contextvars.ContextVar("benchmark_page_request", default=None)
 _inside_page_read = contextvars.ContextVar("benchmark_inside_page_read", default=False)
 
 
@@ -100,7 +107,7 @@ def _instrument_baseline(metrics: Any, modules: list[Any]) -> None:
                     result = __original(*args, **kwargs)
                 if __name == "read_page":
                     store, relative = args[:2]
-                    body_path = store.path(str(Path(relative).parent / "body.bin"))
+                    body_path = store.path((Path(relative).parent / "body.bin").as_posix())
                     metrics.add("raw_body_reads")
                     metrics.add("raw_body_read_bytes", body_path.stat().st_size)
                     if result[0].get("status") == 200:
@@ -208,6 +215,40 @@ def _instrument_warehouse_json_loads(warehouse: Any, metrics: Any) -> None:
     warehouse.json = _JsonLoadsObserver(warehouse.json, metrics)
 
 
+def _instrument_dlt_trace(warehouse: Any, timings: dict[str, float]) -> None:
+    """Collect dlt extract/normalize/load spans without changing pipeline arguments or results."""
+    original_factory = warehouse.dlt.pipeline
+
+    def pipeline_factory(*args: Any, **kwargs: Any) -> Any:
+        pipeline = original_factory(*args, **kwargs)
+        original_run = pipeline.run
+
+        def run(*run_args: Any, **run_kwargs: Any) -> Any:
+            try:
+                return original_run(*run_args, **run_kwargs)
+            finally:
+                trace = getattr(pipeline, "last_trace", None)
+                for span in getattr(trace, "steps", ()) or ():
+                    step = getattr(span, "step", None)
+                    if step not in {"extract", "normalize", "load"}:
+                        continue
+                    started = getattr(span, "started_at", None)
+                    finished = getattr(span, "finished_at", None)
+                    if started is None or finished is None:
+                        continue
+                    try:
+                        elapsed = (finished - started).total_seconds()
+                    except (AttributeError, TypeError):
+                        continue
+                    if elapsed >= 0:
+                        timings[step] = timings.get(step, 0.0) + elapsed
+
+        pipeline.run = run
+        return pipeline
+
+    warehouse.dlt.pipeline = pipeline_factory
+
+
 def _instrument_current_raw_file_reads(metrics: Any, modules: list[Any]) -> None:
     """Classify hash-only raw body reads without changing native recorder behavior."""
     expanded = list(modules)
@@ -255,6 +296,50 @@ def _timed_write(function: Any, metrics: Any) -> Any:
     return wrapped
 
 
+def _freeze_legacy_acquisition(profile: str, scenario: str, capture: Any) -> bool:
+    """Keep pre-existing byte-identity profiles on request protocol 2."""
+    frozen = profile in {
+        "full",
+        "targeted",
+        "resume",
+        "baseline-setup",
+        "baseline-v2-setup",
+        "no-change",
+        "sparse-change",
+        "all-change",
+        "history-sparse",
+    }
+    if frozen:
+        initialize = capture._initialize_v2
+
+        def initialize_legacy(store, state):
+            selected = state.get("selected")
+            if selected is not None:
+                tasks = []
+                for work in state["tasks"]:
+                    if work["endpoint"] == "/markets" and isinstance(
+                        work["params"].get("tickers"), str
+                    ):
+                        tasks.extend(
+                            capture.task(
+                                f"/markets/{capture.ticker(value)}",
+                                "markets",
+                                singular=True,
+                                requested=value,
+                            )
+                            for value in selected
+                        )
+                    else:
+                        tasks.append(work)
+                state["tasks"] = tasks
+                state["task_scopes"] = {}
+            state.pop("acquisition_protocol", None)
+            return initialize(store, state)
+
+        capture._initialize_v2 = initialize_legacy
+    return frozen
+
+
 class FixtureClient:
     """Deterministic full and metadata-update snapshots for offline profiles."""
 
@@ -282,6 +367,35 @@ class FixtureClient:
                 "cursor": "",
             }
         if endpoint == "/markets":
+            if "tickers" in params:
+                requested = params["tickers"].split(",")
+                indexes = [
+                    int(ticker.removeprefix("MKT-"))
+                    for ticker in requested
+                    if ticker.startswith("MKT-")
+                    and ticker.removeprefix("MKT-").isdigit()
+                    and int(ticker.removeprefix("MKT-")) < self.markets
+                ]
+                start = int(params.get("cursor", "0"))
+                page = indexes[start : start + PAGE_SIZE]
+                stop = start + len(page)
+                return 200, {
+                    "markets": [self._market(index) for index in page],
+                    "cursor": str(stop) if stop < len(indexes) else "",
+                }
+            if (
+                self.scenario == "history-sparse"
+                and self.stage == "baseline"
+                and "mve_filter" not in params
+                and "min_updated_ts" not in params
+            ):
+                start = int(params.get("cursor", "0"))
+                stop = min(start + PAGE_SIZE, HISTORY_STRESS_COUNT)
+                rows = [self._history_stress_market(index) for index in range(start, stop)]
+                return 200, {
+                    "markets": rows,
+                    "cursor": str(stop) if stop < HISTORY_STRESS_COUNT else "",
+                }
             if params.get("mve_filter") == "only":
                 indexes = [i for i in range(self.markets) if self._is_combo(i)]
             elif params.get("mve_filter") == "exclude":
@@ -291,6 +405,8 @@ class FixtureClient:
                         indexes = []
                     elif self.scenario == "sparse-change":
                         indexes = [i for i in indexes if i == 0]
+                    elif self.scenario == "history-sparse":
+                        indexes = [i for i in indexes if i % 100 == 0]
             else:
                 indexes = list(range(self.markets))
             start = int(params.get("cursor", "0"))
@@ -303,7 +419,9 @@ class FixtureClient:
             }
         if endpoint == "/historical/markets":
             rows = []
-            if self.scenario != "full":
+            if self.scenario == "history-sparse":
+                rows = [self._historical_market(1)]
+            elif self.scenario != "full":
                 rows = [
                     {
                         "ticker": "HIST-000001",
@@ -348,13 +466,34 @@ class FixtureClient:
     def _is_combo(index: int) -> bool:
         return index > 1 and index % 1000 == 1
 
+    @staticmethod
+    def _historical_market(index: int) -> dict[str, Any]:
+        return {
+            "ticker": f"HIST-{index:06d}",
+            "event_ticker": "EVENT",
+            "status": "finalized",
+            "result": "yes" if index % 2 == 0 else "no",
+            "settlement_ts": (
+                "2025-12-01T00:00:00Z" if index % 2 == 0 else "2025-12-01T01:00:00+01:00"
+            ),
+            "settlement_value_dollars": "1.000000000000000001" if index % 2 == 0 else "0.000",
+        }
+
+    def _history_stress_market(self, index: int) -> dict[str, Any]:
+        """Repeat 10k ordinary native identities to stress retained observation history."""
+        return self._market(index % min(self.markets, HISTORY_STRESS_IDENTITIES))
+
     def _market(self, index: int) -> dict[str, Any]:
         ticker = f"MKT-{index:06d}"
         combo = self._is_combo(index)
         changed = (
             self.stage == "refresh"
             and self.scenario != "no-change"
-            and (self.scenario == "all-change" or index == 0)
+            and (
+                self.scenario == "all-change"
+                or index == 0
+                or (self.scenario == "history-sparse" and index % 100 == 0)
+            )
         )
         row = {
             "ticker": ticker,
@@ -378,6 +517,331 @@ class FixtureClient:
         return row
 
 
+def selected_stress_tickers() -> list[str]:
+    """A stable selection set with shared parents and lookup edge cases."""
+    return [*(f"S{i:03d}" for i in range(96)), "HIST", "MISS", "ORPHAN", "MKT-" + "X" * 252]
+
+
+def _selected_profile_tickers(profile: str) -> list[str]:
+    if profile == "selected-single":
+        return ["S000"]
+    if profile == "selected-fallback":
+        return ["HIST", "MISS"]
+    return selected_stress_tickers()
+
+
+def _benchmark_page_uuid(
+    profile: str,
+    endpoint: str,
+    params: dict[str, Any] | None,
+    capture_id: str,
+    context_request_id: str,
+) -> str:
+    """Stabilize new selected fixture receipts without changing the journal request identity."""
+    if profile in SELECTED_PROFILES and endpoint == "/historical/cutoff":
+        return context_request_id
+    if profile not in (SELECTED_PROFILES | COMPOSED_REFRESH_PROFILES):
+        return context_request_id
+    if profile in COMPOSED_REFRESH_PROFILES:
+        # These legacy composed profiles can issue the same endpoint/params more
+        # than once in a capture. Preserve request-level uniqueness while using
+        # a transport-valid UUID width; the journal keeps the full context ID.
+        return context_request_id[:32]
+    identity = json.dumps(
+        [capture_id, endpoint, params or {}], sort_keys=True, separators=(",", ":")
+    ).encode()
+    digest_value = hashlib.sha256(identity).hexdigest()
+    return digest_value
+
+
+def _receipt_uuid_format(profile: str) -> str:
+    if profile in SELECTED_PROFILES:
+        return "sha256-canonical-request-64-hex"
+    if profile in COMPOSED_REFRESH_PROFILES:
+        return "context-request-id-32-hex"
+    return "context-request-id-64-hex"
+
+
+def _selected_stress_fixture_sha256(tickers: list[str] | None = None) -> str:
+    fixture = SelectedStressFixtureClient()
+    tickers = selected_stress_tickers() if tickers is None else tickers
+    digest = hashlib.sha256()
+    for ticker in tickers:
+        for endpoint in (f"/markets/{ticker}", f"/historical/markets/{ticker}"):
+            status, payload = fixture.response(endpoint, {})
+            digest.update(
+                json.dumps(
+                    [endpoint, status, payload], sort_keys=True, separators=(",", ":")
+                ).encode()
+            )
+    for endpoint in (
+        "/historical/cutoff",
+        "/events/EVENT",
+        "/events/HIST-EVENT",
+        "/events/ORPHAN-EVENT",
+        "/series/SERIES",
+    ):
+        status, payload = fixture.response(endpoint, {})
+        digest.update(
+            json.dumps([endpoint, status, payload], sort_keys=True, separators=(",", ":")).encode()
+        )
+    for endpoint, params in (
+        ("/markets", {"tickers": ",".join(tickers), "limit": "1000"}),
+        ("/events/EVENT", {"exclude_markets": "true"}),
+    ):
+        status, payload = fixture.response(endpoint, params)
+        digest.update(
+            json.dumps(
+                [endpoint, params, status, payload], sort_keys=True, separators=(",", ":")
+            ).encode()
+        )
+    return digest.hexdigest()
+
+
+class SelectedStressFixtureClient:
+    """Targeted acquisition fixture; deliberately excludes unrelated child rows from output."""
+
+    def __init__(self) -> None:
+        self.tickers = selected_stress_tickers()
+        self.children = [{"ticker": f"NOISE-{i:05d}", "event_ticker": "EVENT"} for i in range(2000)]
+        self.fallback_request_count = 0
+
+    @staticmethod
+    def _market(ticker: str, event: str = "EVENT") -> dict[str, Any]:
+        return {
+            "ticker": ticker,
+            "event_ticker": event,
+            "status": "active",
+            "title": f"Fixture {ticker}",
+            "created_time": "2025-01-01T00:00:00Z",
+            "updated_time": "2025-01-02T01:00:00+01:00",
+            "close_time": None,
+            "expiration_time": "2026-01-01T00:00:00.000Z",
+            "last_price_dollars": "0.125",
+        }
+
+    def response(self, endpoint: str, params: dict[str, Any]) -> tuple[int, Any]:
+        if endpoint in {
+            "/markets/HIST",
+            "/historical/markets/HIST",
+            "/markets/MISS",
+            "/historical/markets/MISS",
+        }:
+            self.fallback_request_count += 1
+        if endpoint == "/historical/cutoff":
+            return 200, {
+                "market_settled_ts": "2025-12-01T00:00:00Z",
+                "trades_created_ts": "2025-12-15T00:00:00Z",
+            }
+        if endpoint == "/markets/HIST":
+            return 404, {}
+        if endpoint == "/historical/markets/HIST":
+            return 200, {
+                "market": {
+                    **self._market("HIST", "HIST-EVENT"),
+                    "status": "finalized",
+                    "result": "yes",
+                    "settlement_ts": "2025-12-01T00:00:00-05:00",
+                    "settlement_value_dollars": "1.000000000000000001",
+                }
+            }
+        if endpoint in {"/markets/MISS", "/historical/markets/MISS"}:
+            return 404, {}
+        if endpoint == "/events/EVENT":
+            event = {
+                "event_ticker": "EVENT",
+                "series_ticker": "SERIES",
+                "markets": self.children,
+            }
+            if params.get("exclude_markets") == "true":
+                event.pop("markets")
+            return 200, {"event": event}
+        if endpoint == "/events/HIST-EVENT":
+            return 200, {"event": {"event_ticker": "HIST-EVENT", "series_ticker": "SERIES"}}
+        if endpoint == "/events/ORPHAN-EVENT":
+            return 404, {}
+        if endpoint == "/series/SERIES":
+            return 200, {"series": {"ticker": "SERIES", "title": "Fixture contracts"}}
+        if endpoint == "/markets" and "tickers" in params:
+            requested = params["tickers"].split(",")
+            selected = [
+                ticker
+                for ticker in requested
+                if ticker in self.tickers and ticker not in {"HIST", "MISS"}
+            ]
+            start = int(params.get("cursor", "0"))
+            page = selected[start : start + PAGE_SIZE]
+            stop = start + len(page)
+            return 200, {
+                "markets": [
+                    self._market(ticker, "ORPHAN-EVENT" if ticker == "ORPHAN" else "EVENT")
+                    for ticker in page
+                ],
+                "cursor": str(stop) if stop < len(selected) else "",
+            }
+        if endpoint.startswith("/markets/"):
+            ticker = endpoint.removeprefix("/markets/")
+            if ticker == "ORPHAN":
+                return 200, {"market": self._market(ticker, "ORPHAN-EVENT")}
+            if ticker in self.tickers and ticker not in {"HIST", "MISS"}:
+                return 200, {"market": self._market(ticker)}
+        return 404, {}
+
+
+_SOURCE_PROVENANCE_FIELDS = {
+    "capture_id",
+    "page_id",
+    "received_at",
+    "source_endpoint",
+    "payload_sha256",
+    "source_kind",
+    "observation_id",
+}
+
+
+def _selected_relation_semantics(output: Path) -> dict[str, Any]:
+    """Hash native fields, excluding only capture provenance and nested event children."""
+    result = {}
+    for relation in ("markets", "events", "series"):
+        rows = json.loads((output / f"{relation}.json").read_text(encoding="utf-8"))
+        native = []
+        for row in rows:
+            fields = {
+                key: value for key, value in row.items() if key not in _SOURCE_PROVENANCE_FIELDS
+            }
+            if relation == "events":
+                fields.pop("markets", None)
+                payload = fields.get("payload_json")
+                if isinstance(payload, str):
+                    decoded = json.loads(payload)
+                    if isinstance(decoded, dict):
+                        decoded.pop("markets", None)
+                        fields["payload_json"] = json.dumps(
+                            decoded, sort_keys=True, separators=(",", ":")
+                        )
+            native.append(fields)
+        canonical = sorted(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in native)
+        result[relation] = {
+            "rows": len(native),
+            "sha256": hashlib.sha256("\n".join(canonical).encode()).hexdigest(),
+        }
+    return result
+
+
+def _selected_provenance_is_valid(
+    store: Any, state: dict[str, Any], output: Path, selected: list[str]
+) -> bool:
+    """Verify exported row lineage and request scope against hash-verified raw receipts."""
+    from kalshi_events import capture, normalize
+
+    pages = list(capture.capture_pages(store, state))
+    raw_observations = list(normalize.observations(pages))
+    raw_by_identity: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    requested: set[str] = set()
+    for manifest, _payload in pages:
+        endpoint = manifest.get("endpoint", "")
+        params = manifest.get("params", {})
+        if endpoint == "/markets" and isinstance(params.get("tickers"), str):
+            requested.update(params["tickers"].split(","))
+        elif endpoint.startswith("/markets/"):
+            requested.add(endpoint.removeprefix("/markets/"))
+        for obs in raw_observations:
+            if obs.get("page_id") != manifest.get("page_id"):
+                continue
+            identity = obs.get("market_ticker", obs.get("event_ticker", obs.get("series_ticker")))
+            if identity is not None:
+                key = (obs["entity_kind"], identity, obs["payload_json"])
+                raw_by_identity.setdefault(key, []).append(obs)
+        # read_page, reached through capture_pages, checks the raw JSON pointer's source hash.
+        if not isinstance(manifest.get("sha256"), str) or len(manifest["sha256"]) != 64:
+            return False
+    if state.get("selected") != selected or requested != set(selected):
+        return False
+    for relation, kind, identity_key in (
+        ("markets", "markets", "market_ticker"),
+        ("events", "events", "event_ticker"),
+        ("series", "series", "series_ticker"),
+    ):
+        rows = json.loads((output / f"{relation}.json").read_text(encoding="utf-8"))
+        for row in rows:
+            key = (kind, row.get(identity_key), row.get("payload_json"))
+            candidates = raw_by_identity.get(key, [])
+            if not any(
+                all(row.get(field) == source.get(field) for field in _SOURCE_PROVENANCE_FIELDS)
+                and row.get("observation_id") == source.get("observation_id")
+                for source in candidates
+            ):
+                return False
+    coverage = _selected_coverage(output)
+    if [row.get("market_ticker") for row in coverage] != selected:
+        return False
+    market_rows = json.loads((output / "markets.json").read_text(encoding="utf-8"))
+    return {row.get("market_ticker") for row in market_rows} == {
+        row.get("market_ticker") for row in coverage if row.get("status") == "found"
+    }
+
+
+def _selected_coverage(output: Path) -> list[dict[str, Any]]:
+    return json.loads((output / "coverage.json").read_text(encoding="utf-8"))
+
+
+def _direct_v2_setup_build(warehouse: Any, store: Any, capture_id: str) -> Any:
+    """Create a v2 baseline directly; this profile measures v2 setup only."""
+    return warehouse.build_v2_full(store, capture_id)
+
+
+def _selected_comparison(reference: dict[str, Any], candidate: dict[str, Any]) -> dict[str, bool]:
+    def valid_semantics(value: Any) -> bool:
+        if not isinstance(value, dict) or set(value) != {"markets", "events", "series"}:
+            return False
+        return all(
+            isinstance(relation, dict)
+            and isinstance(relation.get("rows"), int)
+            and isinstance(relation.get("sha256"), str)
+            and len(relation["sha256"]) == 64
+            and all(char in "0123456789abcdef" for char in relation["sha256"])
+            for relation in value.values()
+        )
+
+    def valid_coverage(value: Any, tickers: Any) -> bool:
+        return (
+            isinstance(value, list)
+            and isinstance(tickers, list)
+            and len(value) == len(tickers)
+            and all(
+                isinstance(row, dict)
+                and row.get("market_ticker") == ticker
+                and row.get("status") in {"found", "absent", "unresolved"}
+                for row, ticker in zip(value, tickers, strict=True)
+            )
+        )
+
+    reference_tickers = reference.get("selected_tickers")
+    candidate_tickers = candidate.get("selected_tickers")
+    reference_semantics = reference.get("selected_semantics")
+    candidate_semantics = candidate.get("selected_semantics")
+    reference_coverage = reference.get("selected_coverage")
+    candidate_coverage = candidate.get("selected_coverage")
+    shapes_valid = (
+        valid_semantics(reference_semantics)
+        and valid_semantics(candidate_semantics)
+        and valid_coverage(reference_coverage, reference_tickers)
+        and valid_coverage(candidate_coverage, candidate_tickers)
+    )
+    return {
+        "selection_match": (
+            isinstance(reference_tickers, list)
+            and isinstance(candidate_tickers, list)
+            and bool(reference_tickers)
+            and reference_tickers == candidate_tickers
+        ),
+        "semantics_match": shapes_valid and reference_semantics == candidate_semantics,
+        "coverage_match": shapes_valid and reference_coverage == candidate_coverage,
+        "provenance_match": reference.get("selected_provenance_valid") is True
+        and candidate.get("selected_provenance_valid") is True,
+    }
+
+
 def _worker(
     source_root: Path,
     root: Path,
@@ -394,6 +858,8 @@ def _worker(
     from kalshi_events import capture, common, metadata, normalize, publish, transport, warehouse
     from kalshi_events.common import Limits, Store
 
+    frozen_acquisition = _freeze_legacy_acquisition(profile, scenario, capture)
+
     legacy_metrics = False
     try:
         from kalshi_events import metrics
@@ -408,10 +874,14 @@ def _worker(
             metrics, [common, capture, metadata, normalize, transport, warehouse, publish]
         )
     _instrument_warehouse_json_loads(warehouse, metrics)
+    dlt_phase_seconds: dict[str, float] = {}
+    _instrument_dlt_trace(warehouse, dlt_phase_seconds)
     capture.capture = _timed_function(capture.capture, metrics, "capture")
 
     # Each independent process gets deterministic, noncolliding capture identities.
-    seed = 1 if profile in {"full", "targeted", "resume", "baseline-setup"} else 2
+    seed = (
+        1 if profile in {"full", "targeted", "resume", "baseline-setup", "baseline-v2-setup"} else 2
+    )
     sequence = {"value": seed - 1}
 
     def next_capture_id():
@@ -423,12 +893,25 @@ def _worker(
     os.environ["KALSHI_EVENTS_API_URL"] = "http://127.0.0.1/trade-api/v2"
     import httpx
 
-    transport.uuid = SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=_request_id.get()))
+    receipt_profile = scenario if profile == "baseline-setup" else profile
+
+    def page_uuid():
+        request = _page_request.get()
+        if request is None:
+            return SimpleNamespace(hex=_request_id.get())
+        endpoint, params, capture_id = request
+        return SimpleNamespace(
+            hex=_benchmark_page_uuid(
+                receipt_profile, endpoint, params, capture_id, _request_id.get()
+            )
+        )
+
+    transport.uuid = SimpleNamespace(uuid4=page_uuid)
     capture_time = (
         "2026-01-01T00:00:00Z"
-        if profile == "baseline-setup"
+        if profile in {"baseline-setup", "baseline-v2-setup"}
         else "2026-01-02T00:00:00Z"
-        if profile in {"no-change", "sparse-change", "all-change"}
+        if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}
         else FIXED_TIME
     )
     capture.now = lambda: capture_time
@@ -436,13 +919,25 @@ def _worker(
     common.now = lambda: capture_time
     warehouse.now = lambda: capture_time
     publish.now = lambda: capture_time
-    fixture_stage = "baseline" if profile == "baseline-setup" else "refresh"
+    fixture_stage = "baseline" if profile in {"baseline-setup", "baseline-v2-setup"} else "refresh"
     fixture_scenario = (
         scenario
-        if profile in {"baseline-setup", "no-change", "sparse-change", "all-change"}
+        if profile
+        in {
+            "baseline-setup",
+            "baseline-v2-setup",
+            "no-change",
+            "sparse-change",
+            "all-change",
+            "history-sparse",
+        }
         else "full"
     )
-    fixture = FixtureClient(markets, fixture_scenario, fixture_stage)
+    fixture = (
+        SelectedStressFixtureClient()
+        if profile in SELECTED_PROFILES
+        else FixtureClient(markets, fixture_scenario, fixture_stage)
+    )
 
     def handler(request):
         params = {key: values[-1] for key, values in parse_qs(request.url.query.decode()).items()}
@@ -466,12 +961,14 @@ def _worker(
 
         def get(endpoint, params=None, context=None):
             token = _request_id.set(context["request_id"])
+            page_token = _page_request.set((endpoint, dict(params or {}), context["capture_id"]))
             recorder_token = metrics._active.set(measured) if legacy_metrics else None
             try:
                 return original_get(endpoint, params, context)
             finally:
                 if legacy_metrics:
                     metrics._active.reset(recorder_token)
+                _page_request.reset(page_token)
                 _request_id.reset(token)
 
         client.get = get
@@ -479,7 +976,16 @@ def _worker(
 
     download_limit = (
         4 * 1024**3
-        if profile in {"baseline-setup", "no-change", "sparse-change", "all-change"}
+        if profile
+        in {
+            "baseline-setup",
+            "baseline-v2-setup",
+            "no-change",
+            "sparse-change",
+            "all-change",
+            "history-sparse",
+            *SELECTED_PROFILES,
+        }
         else 2 * 1024**3
     )
     limits = Limits(max_rate=1000, max_requests=10000, max_download_bytes=download_limit)
@@ -498,7 +1004,15 @@ def _worker(
                     Store(root, limits), state["capture_id"], catalogue_version=2
                 )
             output = Path(release["output"])
-        elif profile in {"no-change", "sparse-change", "all-change"}:
+        elif profile == "baseline-v2-setup":
+            store = Store(root, limits)
+            _seed_incremental_root(store)
+            state = capture.capture(store, client_factory=client_factory)
+            _require_complete(state, profile)
+            _direct_v2_setup_build(warehouse, store, state["capture_id"])
+            release = publish.publish(Store(root, limits), state["capture_id"], catalogue_version=2)
+            output = Path(release["output"])
+        elif profile in {"no-change", "sparse-change", "all-change", "history-sparse"}:
             store = Store(root, limits)
             if refresh_mode == "incremental":
                 state = capture.capture(store, client_factory=client_factory, incremental=True)
@@ -526,17 +1040,21 @@ def _worker(
             release = publish.publish(Store(root, limits), state["capture_id"])
             output = Path(release["output"])
         else:
-            selected = ["MKT-000000"] if profile == "targeted" else None
+            selected = (
+                _selected_profile_tickers(profile)
+                if profile in SELECTED_PROFILES
+                else (["MKT-000000"] if profile == "targeted" else None)
+            )
             state = capture.capture(
                 Store(root, limits), client_factory=client_factory, selected=selected
             )
-            if profile == "targeted":
+            if profile in TARGETED_PROFILES:
                 from kalshi_events import metadata
 
                 output = result_path.with_suffix(".metadata")
                 release = metadata.export(
                     Store(root, limits),
-                    ["MKT-000000"],
+                    selected,
                     output,
                     capture_id=state["capture_id"],
                 )
@@ -547,6 +1065,7 @@ def _worker(
                 output = Path(release["output"])
 
         result = measured.report() if measured else {"version": 0}
+        result["dlt_phase_seconds"] = dlt_phase_seconds
         result["pipeline_elapsed_seconds"] = result.pop("elapsed_seconds", None)
         result["worker_inclusive_seconds"] = result["pipeline_elapsed_seconds"]
         result["timing_semantics"] = (
@@ -563,18 +1082,29 @@ def _worker(
             capture_id=state["capture_id"],
             baseline_capture_id=baseline_capture_id,
             observations=(
-                3
+                len(_selected_profile_tickers(profile))
+                if profile in SELECTED_PROFILES
+                else 3
                 if profile == "targeted"
                 else markets
                 + (
                     4
-                    if profile in {"no-change", "sparse-change", "all-change", "baseline-setup"}
+                    if profile
+                    in {
+                        "no-change",
+                        "sparse-change",
+                        "all-change",
+                        "history-sparse",
+                        "baseline-setup",
+                    }
                     else 3
                 )
             ),
             profile=profile,
+            receipt_uuid_format=_receipt_uuid_format(receipt_profile),
+            acquisition_protocol="legacy-frozen-v2" if frozen_acquisition else "current",
             refresh_mode=refresh_mode
-            if profile in {"no-change", "sparse-change", "all-change"}
+            if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}
             else None,
             release_id=release.get("source_release_id"),
         )
@@ -592,7 +1122,7 @@ def _worker(
             for path in sorted(output.iterdir())
             if path.is_file()
         }
-        if profile == "targeted"
+        if profile in TARGETED_PROFILES
         else {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(output.glob("*.parquet"))
@@ -601,11 +1131,11 @@ def _worker(
     result["artifact_sha256"] = files
     result["consumer_output_bytes"] = (
         sum(path.stat().st_size for path in output.iterdir() if path.is_file())
-        if profile == "targeted"
+        if profile in TARGETED_PROFILES
         else None
     )
-    if profile == "targeted":
-        metadata_manifest = json.loads((output / "manifest.json").read_text())
+    if profile in TARGETED_PROFILES:
+        metadata_manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
         metadata_inventory = metadata_manifest["files"]
         assert set(metadata_inventory) == {
             "coverage.json",
@@ -615,6 +1145,36 @@ def _worker(
         }
         result["metadata_source_release_id"] = metadata_manifest["source_release_id"]
         result["metadata_inventory"] = metadata_inventory
+        if profile in SELECTED_PROFILES:
+            metadata.verify(output)
+            coverage = json.loads((output / "coverage.json").read_text(encoding="utf-8"))
+            selected_tickers = _selected_profile_tickers(profile)
+            expected = {
+                "selected-stress": (100, 98, {"found", "absent", "unresolved"}),
+                "selected-single": (1, 1, {"found"}),
+                "selected-fallback": (2, 1, {"found", "absent"}),
+            }[profile]
+            coverage_count, found_count, statuses = expected
+            assert len(coverage) == coverage_count
+            assert {row["status"] for row in coverage} == statuses
+            assert sum(row["status"] == "found" for row in coverage) == found_count
+            assert (
+                len(json.loads((output / "markets.json").read_text(encoding="utf-8")))
+                == found_count
+            )
+            result["selected_semantics"] = _selected_relation_semantics(output)
+            result["selected_coverage"] = _selected_coverage(output)
+            result["selected_provenance_valid"] = _selected_provenance_is_valid(
+                Store(root, limits), state, output, selected_tickers
+            )
+            assert result["selected_provenance_valid"], "selected metadata provenance is invalid"
+            result["selected_tickers"] = selected_tickers
+            result["selected_fallback_request_count"] = fixture.fallback_request_count
+    if profile == "baseline-v2-setup":
+        result["lineage"] = _assert_lineage_manifest(
+            output, None, "full", root, state["capture_id"]
+        )
+        result["lineage_valid"] = True
     manifest_path = output / "manifest.json"
     result["release_manifest_sha256"] = (
         hashlib.sha256(manifest_path.read_bytes()).hexdigest() if manifest_path.is_file() else None
@@ -627,7 +1187,7 @@ def _worker(
             result.get("release_id"),
             result.get("release_manifest_sha256"),
         )
-        if profile != "targeted"
+        if profile not in TARGETED_PROFILES
         else None
     )
     result["fixture_timestamps_frozen"] = {
@@ -637,7 +1197,7 @@ def _worker(
         "warehouse": capture_time,
         "publish": capture_time,
     }
-    if profile in {"no-change", "sparse-change", "all-change"}:
+    if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}:
         result["semantic_relations"] = _semantic_relation_hashes(
             root, state["capture_id"], catalogue_version=2 if refresh_mode == "incremental" else 1
         )
@@ -645,6 +1205,7 @@ def _worker(
             result["lineage"] = _assert_lineage_manifest(
                 output, baseline_capture_id, refresh_mode, root, state["capture_id"]
             )
+            result["lineage_valid"] = True
             result["observation_counts"] = _assert_history_composition(
                 root, output, profile, markets
             )
@@ -669,7 +1230,7 @@ def _worker(
         with verification_context as verified:
             verify_store = Store(root, limits)
             capture.complete_capture(verify_store, state["capture_id"])
-            if profile == "targeted":
+            if profile in TARGETED_PROFILES:
                 from kalshi_events import metadata
 
                 metadata.verify(output)
@@ -701,11 +1262,14 @@ def _seed_incremental_root(store: Any) -> None:
 
 
 def _publication_pointer_name(profile: str, refresh_mode: str) -> str:
+    if profile == "baseline-v2-setup":
+        return "current-v2.json"
     incremental_publication = profile in {
         "baseline-setup",
         "no-change",
         "sparse-change",
         "all-change",
+        "history-sparse",
     }
     return (
         "current-v2.json"
@@ -718,7 +1282,7 @@ def _publication_pointer_sha256(
     root: Path, name: str, release_id: str | None, manifest_sha256: str | None
 ) -> str:
     pointer_path = root / name
-    pointer = json.loads(pointer_path.read_text())
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     assert pointer.get("source_release_id") == release_id, (
         "publication pointer selects another release"
     )
@@ -768,7 +1332,7 @@ def _assert_lineage_manifest(
     root: Path,
     capture_id: str,
 ) -> dict[str, Any]:
-    manifest = json.loads((output / "manifest.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     lineage_fields = {
         "root_id",
         "baseline_release_id",
@@ -785,23 +1349,27 @@ def _assert_lineage_manifest(
     assert len(membership) == 64 and all(c in "0123456789abcdef" for c in membership)
     root_id = manifest["root_id"]
     assert len(root_id) == 32 and all(c in "0123456789abcdef" for c in root_id)
+    assert root_id == FIXED_ROOT_ID, "v2 manifest root identity differs from the seeded root"
     warehouse_sha256 = manifest["warehouse_sha256"]
     assert len(warehouse_sha256) == 64 and all(c in "0123456789abcdef" for c in warehouse_sha256)
-    build_receipt = json.loads((root / "builds-v2" / capture_id / "build.json").read_text())
+    build_receipt = json.loads(
+        (root / "builds-v2" / capture_id / "build.json").read_text(encoding="utf-8")
+    )
     assert warehouse_sha256 == build_receipt.get("warehouse_sha256"), (
         "v2 manifest warehouse checksum differs from the certified build receipt"
     )
-    for field in ("baseline_release_id", "baseline_manifest_sha256"):
-        value = manifest[field]
-        if refresh_mode == "incremental":
-            assert isinstance(value, str) and len(value) == 64
-            assert all(c in "0123456789abcdef" for c in value)
     if refresh_mode == "incremental":
         assert manifest["delta_depth"] == 1
         assert manifest["baseline_capture_id"] == baseline_capture_id
+        for field in ("baseline_release_id", "baseline_manifest_sha256"):
+            value = manifest[field]
+            assert isinstance(value, str) and len(value) == 64
+            assert all(c in "0123456789abcdef" for c in value)
     else:
         assert manifest["delta_depth"] == 0
         assert manifest["baseline_capture_id"] is None
+        assert manifest["baseline_release_id"] is None
+        assert manifest["baseline_manifest_sha256"] is None
     return {
         "lineage_field_count": len(lineage_fields),
         "membership_sha256": membership,
@@ -816,12 +1384,79 @@ def _assert_lineage_manifest(
     }
 
 
+def _logical_lineage_match(reference: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    fields = (
+        "root_id",
+        "baseline_release_id",
+        "baseline_manifest_sha256",
+        "baseline_capture_id",
+        "previous_watermark",
+        "watermark_started_at",
+        "delta_depth",
+        "membership_sha256",
+    )
+    left = reference.get("lineage")
+    right = candidate.get("lineage")
+    return (
+        isinstance(left, dict)
+        and isinstance(right, dict)
+        and set(fields).issubset(left)
+        and set(fields).issubset(right)
+        and isinstance(left.get("warehouse_sha256"), str)
+        and len(left["warehouse_sha256"]) == 64
+        and isinstance(right.get("warehouse_sha256"), str)
+        and len(right["warehouse_sha256"]) == 64
+        and all(left.get(field) == right.get(field) for field in fields)
+        and reference.get("lineage_valid") is True
+        and candidate.get("lineage_valid") is True
+    )
+
+
+def _upgrade_baseline_clone(source_root: Path, root: Path) -> tuple[float, dict[str, Any]]:
+    """Upgrade a copied v2 baseline using the candidate checkout, outside timed refresh work."""
+    code = """
+import json, sys
+from pathlib import Path
+from kalshi_events.common import Store
+store = Store(Path(sys.argv[1]))
+before = store.storage_version
+identity = json.loads((store.root / "root-id.json").read_text(encoding="utf-8"))
+with store.lock(allow_legacy=True) as lock:
+    store.upgrade_root(lock)
+after_identity = json.loads((store.root / "root-id.json").read_text(encoding="utf-8"))
+print(json.dumps({"storage_version_before": before, "storage_version_after": store.storage_version, "root_id_before": identity["root_id"], "root_id_after": after_identity["root_id"]}))
+"""
+    environment = os.environ.copy()
+    source_path = str(source_root / "src")
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_path + os.pathsep + existing_pythonpath if existing_pythonpath else source_path
+    )
+    started = time.perf_counter()
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(root)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    elapsed = round(time.perf_counter() - started, 6)
+    upgrade = json.loads(completed.stdout)
+    assert upgrade == {
+        "storage_version_before": 2,
+        "storage_version_after": 3,
+        "root_id_before": FIXED_ROOT_ID,
+        "root_id_after": FIXED_ROOT_ID,
+    }, f"candidate baseline clone did not upgrade v2 to v3: {upgrade}"
+    return elapsed, upgrade
+
+
 def _assert_history_composition(
     root: Path, output: Path, profile: str, markets: int
-) -> dict[str, int]:
+) -> dict[str, Any]:
     import duckdb
 
-    manifest = json.loads((output / "manifest.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     baseline_id = manifest.get("baseline_release_id")
     assert isinstance(baseline_id, str)
     baseline_file = root / f"releases/{baseline_id}/observation_history.parquet"
@@ -836,28 +1471,69 @@ def _assert_history_composition(
         baseline_rows = connection.execute(
             "select count(*) from read_parquet(?)", [str(baseline_file)]
         ).fetchone()[0]
+        affected_market_count = connection.execute(
+            "select count(distinct entity_ticker) from read_parquet(?) "
+            "where capture_id = ? and entity_kind = 'markets'",
+            [str(current_file), manifest["capture_id"]],
+        ).fetchone()[0]
         total_rows = connection.execute(
             "select count(*) from read_parquet(?)", [str(current_file)]
         ).fetchone()[0]
         new_rows = connection.execute(
             "select count(*) from read_parquet(?) where capture_id = ?",
-            [str(current_file), json.loads((output / "manifest.json").read_text())["capture_id"]],
+            [
+                str(current_file),
+                json.loads((output / "manifest.json").read_text(encoding="utf-8"))["capture_id"],
+            ],
         ).fetchone()[0]
     finally:
         connection.close()
     assert missing == 0, "composed history dropped or altered baseline observations"
+    affected_projection_count = None
+    if profile == "history-sparse":
+        assert baseline_rows >= HISTORY_STRESS_COUNT, (
+            f"expected at least {HISTORY_STRESS_COUNT} retained baseline observations, "
+            f"found {baseline_rows}"
+        )
+        database = root / "builds-v2" / manifest["capture_id"] / "warehouse.duckdb"
+        with duckdb.connect(str(database), read_only=True) as warehouse_connection:
+            affected_projection_count = warehouse_connection.execute(
+                "select count(*) from landing.affected_markets"
+            ).fetchone()[0]
+        assert affected_projection_count / markets <= 0.02, (
+            "history-sparse refresh must affect no more than 2% of market identities, "
+            f"found {affected_projection_count}/{markets} in landing.affected_markets"
+        )
     combo_count = sum(FixtureClient._is_combo(index) for index in range(markets))
     event_updates = 0 if profile == "no-change" else 1
     market_updates = (
-        0 if profile == "no-change" else 1 if profile == "sparse-change" else markets - combo_count
+        0
+        if profile == "no-change"
+        else 1
+        if profile == "sparse-change"
+        else sum(
+            not FixtureClient._is_combo(index) and index % 100 == 0 for index in range(markets)
+        )
+        if profile == "history-sparse"
+        else markets - combo_count
     )
-    expected_new = 3 + combo_count + event_updates + market_updates
+    history_updates = 1 if profile == "history-sparse" else 0
+    baseline_relations = 2 if profile == "history-sparse" else 3
+    expected_new = (
+        baseline_relations + combo_count + event_updates + market_updates + history_updates
+    )
     assert new_rows == expected_new, f"expected {expected_new} T1 observations, found {new_rows}"
     assert total_rows == baseline_rows + new_rows
     return {
         "baseline_observations": baseline_rows,
         "new_t1_observations": new_rows,
         "total_observations": total_rows,
+        "affected_market_identities": affected_market_count,
+        "affected_market_ratio": affected_market_count / markets,
+        "affected_projection_markets": affected_projection_count,
+        "affected_projection_ratio": (
+            affected_projection_count / markets if affected_projection_count is not None else None
+        ),
     }
 
 
@@ -878,10 +1554,11 @@ def _assert_incremental_provenance(
             row[0]: {"capture_id": row[1], "received_at": str(row[2])}
             for row in connection.execute(
                 "select market_ticker, capture_id, received_at from main.current_markets "
-                "where market_ticker in ('MKT-000000', 'MKT-000001')"
+                "where market_ticker in ('MKT-000000', 'MKT-000001', 'MKT-000002')"
             ).fetchall()
         }
     assertions = {}
+    carried_ticker = "MKT-000002" if profile == "history-sparse" else "MKT-000001"
     with duckdb.connect(str(database), read_only=True) as connection:
         event_row = connection.execute(
             "select capture_id, received_at from main.current_events where event_ticker='EVENT'"
@@ -898,8 +1575,8 @@ def _assert_incremental_provenance(
             "capture_id": event_row[0],
             "received_at": str(event_row[1]),
         }
-    if markets > 1:
-        carried = rows["MKT-000001"]
+    if markets > 2:
+        carried = rows[carried_ticker]
         if profile == "all-change":
             expected_id = capture_id
             expected_prefix = "2026-01-02"
@@ -909,7 +1586,10 @@ def _assert_incremental_provenance(
         assert carried["capture_id"] == expected_id and carried["received_at"].startswith(
             expected_prefix
         )
-        assertions["unchanged_market_source"] = carried
+        assertions["unchanged_market_source"] = {
+            "market_ticker": carried_ticker,
+            **carried,
+        }
     if profile != "no-change" and refresh_mode == "incremental":
         refreshed = rows["MKT-000000"]
         assert refreshed["capture_id"] == capture_id
@@ -972,13 +1652,17 @@ def _prepare_incremental_baseline(
             markets,
             "baseline-setup",
             scenario,
-            "incremental" if role == "candidate" else "full",
+            _paired_refresh_mode(scenario, role),
         ),
         check=True,
         env=os.environ.copy(),
     )
     setup_seconds = round(time.perf_counter() - started, 6)
-    return root, json.loads(result_path.read_text()), setup_seconds
+    return root, json.loads(result_path.read_text(encoding="utf-8")), setup_seconds
+
+
+def _paired_refresh_mode(profile: str, role: str) -> str:
+    return "incremental" if role == "candidate" or profile == "history-sparse" else "full"
 
 
 def _run_one(
@@ -997,8 +1681,14 @@ def _run_one(
     result_path = report_dir / f"run-{label}-{pair}.json"
     setup_result = None
     setup_seconds = None
-    scenario = profile if profile in {"no-change", "sparse-change", "all-change"} else "full"
-    refresh_mode = "incremental" if role == "candidate" else "full"
+    baseline_upgrade_seconds = None
+    baseline_upgrade = None
+    scenario = (
+        profile
+        if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}
+        else "full"
+    )
+    refresh_mode = _paired_refresh_mode(profile, role)
     if scenario != "full":
         if prepared_baseline is None:
             baseline_root, setup_result, setup_seconds = _prepare_incremental_baseline(
@@ -1011,6 +1701,8 @@ def _run_one(
         clone_started = time.perf_counter()
         shutil.copytree(baseline_root, root)
         baseline_clone_seconds = round(time.perf_counter() - clone_started, 6)
+        if profile == "history-sparse" and role == "candidate":
+            baseline_upgrade_seconds, baseline_upgrade = _upgrade_baseline_clone(source_root, root)
         baseline_capture_id = setup_result["capture_id"]
     else:
         baseline_root = None
@@ -1032,17 +1724,20 @@ def _run_one(
         check=True,
         env=os.environ.copy(),
     )
-    result = json.loads(result_path.read_text())
+    result = json.loads(result_path.read_text(encoding="utf-8"))
     result["worker_wall_seconds"] = round(time.perf_counter() - started, 6)
     result["role"] = role
     if setup_result is not None:
         result["baseline_setup_seconds"] = setup_seconds
         result["baseline_clone_seconds"] = baseline_clone_seconds
         result["baseline_setup_metrics"] = setup_result
+    if profile == "history-sparse":
+        result["baseline_upgrade_seconds"] = baseline_upgrade_seconds
+        result["baseline_upgrade"] = baseline_upgrade
     shutil.rmtree(root)
     if baseline_root is not None and (scenario == "full" or remove_baseline):
         shutil.rmtree(baseline_root)
-    if result.get("profile") == "targeted":
+    if result.get("profile") in TARGETED_PROFILES:
         shutil.rmtree(result_path.with_suffix(".metadata"), ignore_errors=True)
     return result
 
@@ -1136,19 +1831,34 @@ def _environment(source_root: Path, limits: Any, data_root: Path | None = None) 
         filesystem_device = (data_root or source_root).stat().st_dev
     except OSError:
         filesystem_device = None
+    source_files = {
+        path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted((source_root / "src/kalshi_events").rglob("*"))
+        if path.is_file() and path.suffix in {".py", ".sql", ".yml"}
+    }
+    windows = platform.system() == "Windows"
     return {
         "platform": platform.platform(),
         "python": sys.version,
         "python_executable": sys.executable,
         "packages": packages,
         "filesystem_device": filesystem_device,
+        "durability_requirement": (
+            "elevated-local-NTFS-volume-flush" if windows else "POSIX-file-and-directory-fsync"
+        ),
+        "child_peak_rss_available": not windows,
+        "runtime_source_sha256": source_files,
         "limits": vars(limits) if limits is not None else None,
     }
 
 
 def _fixture_sha256(markets: int, profile: str = "full") -> str:
     digest = hashlib.sha256()
-    scenario = profile if profile in {"no-change", "sparse-change", "all-change"} else "full"
+    scenario = (
+        profile
+        if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}
+        else "full"
+    )
     digest.update(
         json.dumps(
             {
@@ -1163,12 +1873,14 @@ def _fixture_sha256(markets: int, profile: str = "full") -> str:
     for stage in ("baseline", "refresh"):
         fixture = FixtureClient(markets, scenario, stage)
         digest.update(json.dumps(fixture._event(), sort_keys=True, separators=(",", ":")).encode())
-        for endpoint, params in (
+        source_requests = [
             ("/historical/cutoff", {}),
             ("/series", {}),
             ("/events/multivariate", {}),
-            ("/historical/markets", {}),
-        ):
+        ]
+        if scenario != "history-sparse":
+            source_requests.append(("/historical/markets", {}))
+        for endpoint, params in source_requests:
             digest.update(
                 json.dumps(
                     [endpoint, fixture.response(endpoint, params)],
@@ -1176,10 +1888,45 @@ def _fixture_sha256(markets: int, profile: str = "full") -> str:
                     separators=(",", ":"),
                 ).encode()
             )
-        for index in range(markets):
-            digest.update(
-                json.dumps(fixture._market(index), sort_keys=True, separators=(",", ":")).encode()
-            )
+        if scenario == "history-sparse":
+            cursor = ""
+            while True:
+                params = {"cursor": cursor} if cursor else {}
+                endpoint = "/historical/markets"
+                payload = fixture.response(endpoint, params)
+                digest.update(
+                    json.dumps(
+                        [endpoint, params, payload], sort_keys=True, separators=(",", ":")
+                    ).encode()
+                )
+                next_cursor = payload[1].get("cursor", "")
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+        if scenario == "history-sparse" and stage == "baseline":
+            cursor = ""
+            while True:
+                params = {"limit": 1000}
+                if cursor:
+                    params["cursor"] = cursor
+                payload = fixture.response("/markets", params)
+                digest.update(
+                    json.dumps(
+                        ["/markets", params, payload],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                )
+                cursor = payload[1].get("cursor", "")
+                if not cursor:
+                    break
+        else:
+            for index in range(markets):
+                digest.update(
+                    json.dumps(
+                        fixture._market(index), sort_keys=True, separators=(",", ":")
+                    ).encode()
+                )
     return digest.hexdigest()
 
 
@@ -1214,9 +1961,19 @@ def _correctness_gate(
     *,
     incremental: bool,
     identity_stability: dict[str, bool],
+    selected_stress: bool = False,
+    v2_output: bool = False,
 ) -> dict[str, Any]:
     required = (
-        ("semantics_match",)
+        ("selection_match", "semantics_match", "coverage_match", "provenance_match")
+        if selected_stress
+        else (
+            ("semantics_match", "artifact_bytes_match", "release_id_match", "lineage_match")
+            if incremental
+            else ("artifact_bytes_match", "release_id_match", "lineage_match")
+        )
+        if v2_output
+        else ("semantics_match",)
         if incremental
         else (
             "artifact_bytes_match",
@@ -1232,25 +1989,37 @@ def _correctness_gate(
         "passed": not failed_pairs and all(identity_stability.values()),
         "failed_pairs": failed_pairs,
         "identity_stability": identity_stability,
-        "basis": "semantic current relations" if incremental else "artifact file checksums",
+        "basis": (
+            "selected native relations, coverage, and provenance; incidental observation history excluded"
+            if selected_stress
+            else "public outputs and logical v2 lineage; physical warehouse checksum hints are validated per build"
+            if v2_output
+            else "semantic current relations"
+            if incremental
+            else "artifact file checksums"
+        ),
     }
 
 
 def _identity_stability(
-    results: dict[str, list[dict[str, Any]]], *, incremental: bool
+    results: dict[str, list[dict[str, Any]]],
+    *,
+    incremental: bool,
+    v2_physical_hint: bool = False,
 ) -> dict[str, bool]:
     stability: dict[str, bool] = {}
     for label, runs in results.items():
         candidate_incremental = incremental and label == "compare"
+        use_v2_identity = v2_physical_hint or candidate_incremental
         fields = (
             ("release_id", "artifact_sha256")
-            if candidate_incremental
+            if use_v2_identity
             else ("release_id", "release_manifest_sha256", "publication_pointer_sha256")
         )
         stable = all(
             all(run.get(field) == runs[0].get(field) for run in runs[1:]) for field in fields
         )
-        if candidate_incremental and runs:
+        if use_v2_identity and runs:
             stable = stable and all(
                 all(
                     run.get("lineage", {}).get(field) == runs[0].get("lineage", {}).get(field)
@@ -1266,6 +2035,11 @@ def _identity_stability(
                     )
                 )
                 and len(run.get("lineage", {}).get("warehouse_sha256", "")) == 64
+                and (
+                    run.get("lineage_valid") is True
+                    if v2_physical_hint
+                    else run.get("lineage_valid", True) is True
+                )
                 for run in runs
             )
         stability[label] = stable
@@ -1280,7 +2054,19 @@ def main() -> int:
     parser.add_argument("--compare-revision", default=None)
     parser.add_argument(
         "--profile",
-        choices=("full", "targeted", "resume", "no-change", "sparse-change", "all-change"),
+        choices=(
+            "full",
+            "targeted",
+            "selected-stress",
+            "selected-single",
+            "selected-fallback",
+            "resume",
+            "baseline-v2-setup",
+            "no-change",
+            "sparse-change",
+            "all-change",
+            "history-sparse",
+        ),
         default="full",
     )
     parser.add_argument("--sample-storage", action="store_true")
@@ -1301,18 +2087,23 @@ def main() -> int:
         choices=(
             "full",
             "targeted",
+            "selected-stress",
+            "selected-single",
+            "selected-fallback",
             "resume",
             "baseline-setup",
+            "baseline-v2-setup",
             "no-change",
             "sparse-change",
             "all-change",
+            "history-sparse",
         ),
         default="full",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--scenario",
-        choices=("full", "no-change", "sparse-change", "all-change"),
+        choices=("full", "no-change", "sparse-change", "all-change", "history-sparse"),
         default="full",
         help=argparse.SUPPRESS,
     )
@@ -1345,10 +2136,25 @@ def main() -> int:
         return 0
     if args.runs < 1 or args.warmups < 0:
         parser.error("--runs must be positive and --warmups nonnegative")
-    markets = args.markets if args.markets is not None else (249997 if args.scale else 197)
+    markets = (
+        args.markets
+        if args.markets is not None
+        else (
+            HISTORY_STRESS_IDENTITIES
+            if args.profile == "history-sparse"
+            else 249997
+            if args.scale
+            else 197
+        )
+    )
     if markets < 1:
         parser.error("--markets must be positive")
-    incremental_profile = args.profile in {"no-change", "sparse-change", "all-change"}
+    incremental_profile = args.profile in {
+        "no-change",
+        "sparse-change",
+        "all-change",
+        "history-sparse",
+    }
     if incremental_profile and not args.compare_root:
         parser.error(
             "incremental refresh profiles require --compare-root for reference/candidate comparison"
@@ -1372,11 +2178,23 @@ def main() -> int:
     prepared_baselines: dict[str, tuple[Path, dict[str, Any], float]] = {}
     if incremental_profile:
         scenario = args.profile
-        for label, root in roots:
-            role = "candidate" if label == "compare" else "reference"
-            prepared_baselines[label] = _prepare_incremental_baseline(
-                root, report_dir, f"{label}-shared", 0, markets, scenario, role
+        if args.profile == "history-sparse":
+            baseline = _prepare_incremental_baseline(
+                args.source_root.resolve(),
+                report_dir,
+                "shared-reference",
+                0,
+                markets,
+                scenario,
+                "reference",
             )
+            prepared_baselines = {label: baseline for label, _ in roots}
+        else:
+            for label, root in roots:
+                role = "candidate" if label == "compare" else "reference"
+                prepared_baselines[label] = _prepare_incremental_baseline(
+                    root, report_dir, f"{label}-shared", 0, markets, scenario, role
+                )
     for label, root in roots:
         for warmup in range(args.warmups):
             role = "candidate" if label == "compare" else "reference"
@@ -1410,8 +2228,28 @@ def main() -> int:
     summary = {
         "fixture": {
             "markets": markets,
+            "receipt_uuid_format": _receipt_uuid_format(args.profile),
             "observations_expected": (
-                3 if args.profile == "targeted" else markets + (4 if incremental_profile else 3)
+                len(_selected_profile_tickers(args.profile))
+                if args.profile in SELECTED_PROFILES
+                else 3
+                if args.profile == "targeted"
+                else markets + (4 if incremental_profile else 3)
+            ),
+            "selected_tickers": _selected_profile_tickers(args.profile)
+            if args.profile in SELECTED_PROFILES
+            else None,
+            "retained_baseline_history_observations": (
+                HISTORY_STRESS_COUNT if args.profile == "history-sparse" else 0
+            ),
+            "refresh_history_observations": 1 if args.profile == "history-sparse" else 0,
+            "history_passes_per_market": (
+                HISTORY_STRESS_PASSES if args.profile == "history-sparse" else 0
+            ),
+            "history_stress_shape": (
+                "25 observations per ordinary market identity at baseline; refresh changes about 1% of keys"
+                if args.profile == "history-sparse"
+                else None
             ),
             "page_size": PAGE_SIZE,
             "full_scope_market_pages": (markets + PAGE_SIZE - 1) // PAGE_SIZE,
@@ -1425,6 +2263,16 @@ def main() -> int:
                         1
                         if args.profile == "sparse-change"
                         else (
+                            sum(
+                                not FixtureClient._is_combo(i) and i % 100 == 0
+                                for i in range(markets)
+                            )
+                            + PAGE_SIZE
+                            - 1
+                        )
+                        // PAGE_SIZE
+                        if args.profile == "history-sparse"
+                        else (
                             markets
                             - sum(FixtureClient._is_combo(i) for i in range(markets))
                             + PAGE_SIZE
@@ -1436,7 +2284,11 @@ def main() -> int:
                 if incremental_profile
                 else None
             ),
-            "fixture_sha256": _fixture_sha256(markets, args.profile),
+            "fixture_sha256": (
+                _selected_stress_fixture_sha256(_selected_profile_tickers(args.profile))
+                if args.profile in SELECTED_PROFILES
+                else _fixture_sha256(markets, args.profile)
+            ),
         },
         "environment": _environment(args.source_root.resolve(), None),
         "source_revisions": {
@@ -1458,6 +2310,8 @@ def main() -> int:
             "hashes": "Instrumented common.digest/file_digest calls, including normalize/metadata aliases, plus explicitly counted transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hashing.",
             "hash_bytes": "Bytes counted by instrumented common.digest/file_digest and explicit transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hash bytes.",
             "fsync_calls": "Python-level explicit fsync calls observed or inferred by the legacy observer; excludes DuckDB/C++ internal syncs.",
+            "volume_flush_calls": "Native Windows whole-volume durability barriers, also counted in fsync_calls; includes unrelated writes flushed by the OS.",
+            "volume_flush": "Time spent in native Windows volume validation/open/flush/close barriers; included in pipeline work.",
             "encoded_hashing": "Hash time for encoded HTTP entity bodies; legacy observer also classifies transport.digest calls here.",
             "metadata_scans": "Filesystem inventory walk/reconcile calls; metadata JSON parsing is counted separately.",
             "metadata_scan": "Elapsed time in filesystem inventory walk/reconcile operations, excluding metadata JSON decoding.",
@@ -1469,11 +2323,16 @@ def main() -> int:
                 "setup_metrics": setup_result,
                 "shared_across_warmups_and_pairs": True,
             }
-            for label, (_, setup_result, setup_seconds) in prepared_baselines.items()
+            for label, (_, setup_result, setup_seconds) in (
+                {"shared_reference": next(iter(prepared_baselines.values()))}.items()
+                if args.profile == "history-sparse"
+                else prepared_baselines.items()
+            )
         },
     }
     if len(results) == 2:
         reference, candidate = results.values()
+        v2_physical_hint = args.profile in {"baseline-v2-setup", "history-sparse"}
         summary["comparison_roles"] = {
             "reference": str(args.source_root.resolve()),
             "candidate": str(args.compare_root.resolve()),
@@ -1487,48 +2346,78 @@ def main() -> int:
                     / reference[index]["pipeline_elapsed_seconds"],
                     4,
                 ),
-                "semantics_match": (
-                    reference[index].get("semantic_relations")
-                    == candidate[index].get("semantic_relations")
-                    if incremental_profile
+                **(
+                    _selected_comparison(reference[index], candidate[index])
+                    if args.profile in SELECTED_PROFILES
+                    else {
+                        "semantics_match": (
+                            reference[index].get("semantic_relations")
+                            == candidate[index].get("semantic_relations")
+                            if incremental_profile
+                            else None
+                        ),
+                        "native_match": None,
+                        "coverage_match": None,
+                        "provenance_match": None,
+                    }
+                ),
+                "selected_fallback_request_counts": (
+                    {
+                        "reference": reference[index].get("selected_fallback_request_count"),
+                        "candidate": candidate[index].get("selected_fallback_request_count"),
+                    }
+                    if args.profile in SELECTED_PROFILES
+                    else None
+                ),
+                "lineage_match": (
+                    _logical_lineage_match(reference[index], candidate[index])
+                    if v2_physical_hint
                     else None
                 ),
                 "artifact_bytes_match": (
                     reference[index].get("artifact_sha256")
                     == candidate[index].get("artifact_sha256")
-                    if not incremental_profile
+                    if not incremental_profile or v2_physical_hint
                     else None
                 ),
                 "release_id_match": (
                     reference[index].get("release_id") == candidate[index].get("release_id")
-                    if not incremental_profile
+                    if not incremental_profile or v2_physical_hint
                     else None
                 ),
                 "release_manifest_match": (
                     reference[index].get("release_manifest_sha256")
                     == candidate[index].get("release_manifest_sha256")
-                    if not incremental_profile
+                    if not incremental_profile and not v2_physical_hint
                     else None
                 ),
                 "publication_pointer_match": (
                     reference[index].get("publication_pointer_sha256")
                     == candidate[index].get("publication_pointer_sha256")
-                    if not incremental_profile
+                    if not incremental_profile and not v2_physical_hint
                     else None
                 ),
                 "timing_scope": (
-                    "native worker pipeline timing: reference full T1 acquisition/build/publication vs candidate baseline-plus-delta T1 refresh; baseline setup, worker startup, standalone verification, and post-run diagnostics excluded"
+                    "native worker pipeline timing: both roles perform the same baseline-plus-delta T1 refresh; the candidate uses a copied v2 baseline upgraded to storage v3 before the timed interval; baseline setup, copy/upgrade, worker startup, verification, and diagnostics excluded"
+                    if args.profile == "history-sparse"
+                    else "native worker pipeline timing: reference full T1 acquisition/build/publication vs candidate baseline-plus-delta T1 refresh; baseline setup, worker startup, standalone verification, and post-run diagnostics excluded"
                     if incremental_profile
                     else "native worker pipeline timing; worker startup, standalone verification, and output checksums excluded"
                 ),
             }
             for index in range(args.runs)
         ]
-        identity_stability = _identity_stability(results, incremental=incremental_profile)
+        identity_stability = _identity_stability(
+            results,
+            incremental=incremental_profile,
+            v2_physical_hint=args.profile in {"baseline-v2-setup", "history-sparse"},
+        )
         summary["correctness_gate"] = _correctness_gate(
             summary["paired_comparisons"],
             incremental=incremental_profile,
             identity_stability=identity_stability,
+            selected_stress=args.profile in SELECTED_PROFILES,
+            v2_output=args.profile in {"baseline-v2-setup", "history-sparse"},
         )
     if args.sample_storage:
         summary["untimed_storage_samples"] = {

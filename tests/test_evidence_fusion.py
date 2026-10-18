@@ -243,6 +243,7 @@ def test_transient_parent_information_does_not_extend_capture_state_contract(sto
     assert set(persisted) == {
         "version",
         "journal_version",
+        "acquisition_protocol",
         "capture_id",
         "selected",
         "started_at",
@@ -258,6 +259,7 @@ def test_transient_parent_information_does_not_extend_capture_state_contract(sto
         "coverage",
         "error",
     }
+    assert persisted["acquisition_protocol"] == 3
     assert persisted["incremental"] is False
     assert persisted["task_scopes"] == {
         "1": "series",

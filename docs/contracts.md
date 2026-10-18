@@ -16,9 +16,9 @@ These are separate compatibility boundaries for compressed receipts, journal rec
 
 ### Operator roots and rollback
 
-The legacy root marker is exactly `{"owner":"oddsfox.kalshi.events.v1"}`. New operator roots use `{"owner":"oddsfox.kalshi.events.v1","storage_version":2}` in `root.json`. The changed marker makes existing binaries, which require exact equality with the legacy marker, reject an upgraded root before writing.
+The legacy root marker is exactly `{"owner":"oddsfox.kalshi.events.v1"}`; storage version 2 adds `"storage_version":2`. New operator roots use `{"owner":"oddsfox.kalshi.events.v1","storage_version":3}` in `root.json`. Older binaries reject the upgraded marker before writing. Storage version, journal version, acquisition protocol and catalogue version are separate boundaries.
 
-Updated binaries read legacy roots and their existing artifacts. Creating new-format artifacts in a legacy root requires the explicit `upgrade-root` command. Upgrade takes the canonical writer lock, checks the marker again under that lock, and atomically replaces only `root.json`; it does not rewrite evidence, captures, journals, builds or publications. An incomplete legacy capture may resume using its original checkpoint protocol. Upgrading its root must not switch that capture to a new journal protocol partway through recovery.
+Updated binaries read version 1 and 2 roots and their existing artifacts. Writing to either requires the explicit `upgrade-root` command. Upgrade takes the canonical writer lock, checks the marker again under that lock, and atomically replaces only `root.json`; it does not rewrite evidence, captures, journals, builds, publications or the logical root identity. Every writer rechecks the marker after locking. An incomplete older capture resumes using its original acquisition and checkpoint protocols, including original parameters on parent tasks discovered after upgrade.
 
 The first v2 catalogue operation creates `root-id.json`, a stable logical root identity used by composed lineage. A whole-root copy retains that identity; copying unrelated composed artifacts into another root does not establish valid ancestry. The storage marker itself remains unchanged.
 
@@ -36,11 +36,17 @@ Bodies stream into atomic temporary evidence files while being hashed. Durabilit
 
 Atomic metadata replacements account for the full temporary replacement while retaining the original allocation. Capacity checks, writes and accounting serialize across workers. Directory creation synchronizes each new entry in its parent before a child can be committed; retries synchronize the nearest existing ancestor's parent again to cover an interrupted prior synchronization. Shared request cooldowns are checked again after every wait, including deferrals received while a worker was already waiting.
 
+On native Windows, writers require an elevated Administrator terminal on a fixed local NTFS drive. Every directory synchronization barrier resolves and validates the volume afresh, opens its volume GUID with write access and flushes it with `FlushFileBuffers`. Handles are closed after success or failure. Permission, filesystem, flush and close errors prevent successful progression; no weaker fallback is provided. Windows directory creation and writer-lock acquisition preflight this barrier before modifying the namespace. Existing file synchronization and raw → receipt → journal ordering remain in place. POSIX directory synchronization is unchanged. Volume flushing can include unrelated application writes, so its latency must be included in Windows comparisons.
+
+Windows paths reject UNC/device namespaces, reserved or ambiguous components, alternate data streams, symlinks, junctions and other reparse points. Persisted receipt and evidence inventory paths use forward slashes on every platform. Platform support does not change storage, catalogue or metadata versions. See [native Windows validation](windows.md) for the unverified execution gates and benchmark-reference preparation.
+
 ### Journal recovery
 
 New captures use a versioned append-only journal. Records have monotonic sequence numbers and chained integrity checks; an atomic snapshot records its replay offset. Every committed page retains a durable append. Snapshots occur every 100 transitions, at completion and at an orderly budget stop. This amortizes snapshots without removing file or directory synchronization guarantees.
 
 The journal covers all recovery-relevant state: sealed settings, pagination cursors and loop detection, cursor resets and generations, historical-cutoff phases, discovered parent tasks, coverage and completion. Replay after the snapshot offset is idempotent. A committed raw receipt orphaned before its transition is recovered without repeating its request.
+
+New captures seal `acquisition_protocol: 3` in their journal state. An absent field selects the original acquisition behavior; unknown values and booleans are invalid. Genesis, snapshots, control transitions and receipt recovery bind the chosen protocol. This does not change journal framing version 2.
 
 Only an incomplete trailing record lacking its commit delimiter may be discarded. Interior corruption, invalid checksums, missing sequences and contradictory transitions fail closed. Legacy captures retain their original checkpoint and page-journal protocol, including after a root upgrade.
 
@@ -49,6 +55,22 @@ The v2 snapshot remains `captures/<capture_id>/state.json`. Its envelope contain
 `pages.jsonl` records contain `version`, `capture_id`, `seq`, `prev`, `op`, `payload` and `sha256`. Each checksum covers canonical JSON excluding its own `sha256` field. The first `start` record has sequence 1 and a previous checksum of 64 zeroes. Page and bounded control transitions increment the transition count; checkpoint records do not. Readers validate the complete chain and snapshot anchor before accepting recovered state, then apply only the suffix after the snapshot. A valid genesis permits recovery when the first snapshot was never written. An existing invalid snapshot is rejected.
 
 Read-only inspection never repairs evidence. Resume takes the canonical writer lock before truncating an undelimited trailing record and syncs the truncation. Never edit a journal or snapshot by hand; preserve the root and investigate a committed-record integrity error instead of discarding it.
+
+### Selected acquisition and parent hydration
+
+Protocol 3 partitions selected market tickers deterministically into live `/markets` requests with at most 100 tickers and 6,144 bytes in the encoded initial URL. The initial-URL bound excludes subsequently supplied pagination cursors; existing cursor and response ceilings still apply. These tasks do not enumerate a reconciliation scope. Every returned ticker must belong to its requested batch.
+
+Coverage accumulates across a batch's pages and resets when its pagination generation restarts. Only the final generation determines omissions. Its terminal page durably creates deduplicated singular live lookups for missing tickers. A live 404 then schedules the existing historical lookup; authoritative historical absence establishes absent coverage. List omission and collection errors never establish absence. Earlier-generation observations remain evidence and history. Parent hydration can downgrade a currently found selection to unresolved; it preserves definitive absent coverage established by the live/historical 404 chain, even when retained observations have unavailable parents.
+
+New protocol-3 event-parent lookups request `exclude_markets=true`, preserving native event definitions and series relationships while omitting incidental child markets. Existing receipts, including embedded child observations, remain readable and unchanged. Direct market traversals still establish full catalogue coverage. Batching changes source endpoints, receipt and observation identities for newly acquired selections; provenance always names the actual request rather than a synthetic individual lookup. Metadata output preserves the operator's selection order.
+
+### Landing and incremental query work
+
+Landing uses the existing dlt Parquet/DuckDB merge keyed by observation identity, with explicitly typed Arrow tables. Application batches flush at 4,096 rows or 8 MiB of logical UTF-8 field data; an oversized observation is emitted alone. The byte target is soft for that singleton, not a new evidence rejection threshold or hard memory quota. Scoped dlt lineage generation preserves compatibility with existing dictionary-created warehouses, and extraction/normalization buffers flush each yielded batch. Configuration is restored after success or failure.
+
+The 13 logical landing columns retain text types and nullability. Provider timestamp conversion retains the dictionary loader's logical results; complex values remain in the complete native payload with a null projected timestamp. Physical database bytes and dlt internal identifiers are not public release identities. The documented dlt post-load storage-quota limitation remains.
+
+Incremental current-entity winner windows restrict their input to affected keys while reading all history for each key. Required-parent membership, dependency discovery, full integrity tests and complete exports remain unchanged. Full-mode query branches retain their existing behavior.
 
 ### Catalogue versions and selection
 

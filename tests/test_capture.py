@@ -7,7 +7,7 @@ from conftest import EVENTS, HISTORICAL, MARKET, FakeClient
 
 from kalshi_events import capture as acquisition
 from kalshi_events.cli import main
-from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store
+from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store, digest, json_bytes
 from kalshi_events.normalize import project_pages
 
 
@@ -15,6 +15,15 @@ def _legacy_checkpoint(store, state):
     """Convert a pristine v2 genesis into a v1 fixture for legacy resume tests."""
     logical = dict(state)
     logical.pop("journal_version")
+    logical.pop("acquisition_protocol", None)
+    if logical.get("selected") is not None:
+        logical["tasks"] = [
+            acquisition.task("/historical/cutoff", None, singular=True),
+            *[
+                acquisition.task(f"/markets/{value}", "markets", singular=True, requested=value)
+                for value in logical["selected"]
+            ],
+        ]
     store.remove(f"captures/{state['capture_id']}/pages.jsonl")
     store.write(f"captures/{state['capture_id']}/state.json", logical)
     return logical
@@ -54,6 +63,58 @@ def test_journal_control_size_does_not_scale_with_cursor_history(store):
     assert record["op"] == "control"
     assert "seen_cursors" not in record["payload"]
     assert len(json.dumps(record).encode()) < 2048
+
+
+def test_acquisition_protocol_is_sealed_and_legacy_missing_protocol_keeps_request_identity(store):
+    state = acquisition.new_capture(store, ["MARKET"])
+    assert state["acquisition_protocol"] == 3
+    context = acquisition._request_context(state, 0)
+    assert context["acquisition_protocol"] == 3
+
+    state.pop("acquisition_protocol")
+    request_key = [state["capture_id"], 0, "page", "", 0]
+    legacy = acquisition._request_context(state, 0)
+    assert "acquisition_protocol" not in legacy
+    assert legacy["request_id"] == digest(json_bytes(request_key))
+
+    for invalid in (True, False, 2, 4, 3.0, "3"):
+        state["acquisition_protocol"] = invalid
+        with pytest.raises(CatalogueError, match="unsupported acquisition protocol"):
+            acquisition._request_context(state, 0)
+
+
+def test_completed_capture_reads_do_not_depend_on_current_source_origin(
+    store, factory, monkeypatch
+):
+    state = acquisition.capture(store, selected=["MARKET"], client_factory=factory)
+    monkeypatch.setenv("KALSHI_EVENTS_API_URL", "https://invalid.example/?unexpected=1")
+
+    restored = acquisition.read_capture(store, state["capture_id"])
+    assert restored["complete"]
+    assert len(list(acquisition.capture_pages(store, restored))) == state["requests"]
+
+
+def test_capture_pages_rejects_receipt_protocol_change_with_retained_snapshot(store, factory):
+    state = acquisition.capture(store, selected=["MARKET"], client_factory=factory)
+    rows = acquisition.page_receipts(store, state)
+    relative = rows[0]["relative"]
+    manifest_path = store.path(relative)
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["acquisition_protocol"] = 2
+    manifest_path.write_bytes(json_bytes(manifest))
+
+    replay_state = acquisition._CaptureState(state)
+    replay_state.page_rows = rows
+    with pytest.raises(CatalogueError, match="receipt protocol"):
+        list(acquisition.capture_pages(store, replay_state))
+    with pytest.raises(CatalogueError, match="traversal|protocol"):
+        acquisition.complete_capture(store, state["capture_id"])
+
+
+def test_legacy_capture_rejects_receipt_with_new_protocol_field():
+    legacy = {"version": 1, "capture_id": "legacy-capture"}
+    unexpected = {"capture_id": "legacy-capture", "acquisition_protocol": 3}
+    assert acquisition._receipt_matches_state_protocol(unexpected, legacy) is False
 
 
 def test_checkpoint_stays_small_while_pages_go_to_journal(store, factory):
@@ -128,6 +189,7 @@ def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
     relative = f"captures/{state['capture_id']}/state.json"
     legacy = dict(state)
     legacy.pop("journal_version")
+    legacy.pop("acquisition_protocol", None)
     del legacy["max_response_bytes"]
     store.write(relative, legacy)
     with pytest.raises(CatalogueError, match="pre-1.0 captures are not readable"):
@@ -228,8 +290,8 @@ def test_targeted_absence_checks_historical_and_never_reuses_previous(store, fac
     )
     assert first["coverage"]["MARKET"]["status"] == "found"
     assert second["coverage"]["MARKET"]["status"] == "absent"
-    # Cutoff, live lookup, historical cutoff, historical lookup.
-    assert second["requests"] == 4
+    # Cutoff, batch page, live fallback, historical cutoff, historical lookup.
+    assert second["requests"] == 5
 
 
 def test_sealed_response_ceiling_governs_later_reads(store, factory):

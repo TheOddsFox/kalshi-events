@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -95,6 +96,361 @@ def test_structural_fixture_covers_pagination_combo_legs_and_native_decimals():
     assert combos[0]["volume_fp"] == "12.3456789"
 
 
+def test_selected_stress_fixture_covers_lookup_edges_without_changing_frozen_full_fixture():
+    tickers = benchmark.selected_stress_tickers()
+    fixture = benchmark.SelectedStressFixtureClient()
+    assert len(tickers) == len(set(tickers)) == 100
+    assert len(tickers[-1]) == 256
+    assert (
+        benchmark._selected_stress_fixture_sha256() == benchmark._selected_stress_fixture_sha256()
+    )
+
+    assert fixture.response("/markets/S000", {})[0] == 200
+    assert fixture.response("/markets/HIST", {})[0] == 404
+    assert fixture.response("/historical/markets/HIST", {})[0] == 200
+    assert fixture.response("/markets/MISS", {})[0] == 404
+    assert fixture.response("/historical/markets/MISS", {})[0] == 404
+    assert fixture.response("/markets/ORPHAN", {})[0] == 200
+    assert fixture.response("/events/ORPHAN-EVENT", {})[0] == 404
+    event = fixture.response("/events/EVENT", {})[1]["event"]
+    assert len(event["markets"]) == 2000
+    market = fixture.response("/markets/S000", {})[1]["market"]
+    assert market["close_time"] is None
+    assert market["updated_time"].endswith("+01:00")
+
+
+def test_selected_single_and_fallback_profiles_have_stable_fixture_identities():
+    single = benchmark._selected_profile_tickers("selected-single")
+    fallback = benchmark._selected_profile_tickers("selected-fallback")
+    assert single == ["S000"]
+    assert fallback == ["HIST", "MISS"]
+    assert benchmark._selected_stress_fixture_sha256(
+        single
+    ) == benchmark._selected_stress_fixture_sha256(single)
+    assert benchmark._selected_stress_fixture_sha256(
+        fallback
+    ) == benchmark._selected_stress_fixture_sha256(fallback)
+    assert benchmark._selected_stress_fixture_sha256(
+        single
+    ) != benchmark._selected_stress_fixture_sha256(fallback)
+
+    fixture = benchmark.SelectedStressFixtureClient()
+    for endpoint in (
+        "/markets/HIST",
+        "/historical/markets/HIST",
+        "/markets/MISS",
+        "/historical/markets/MISS",
+    ):
+        fixture.response(endpoint, {})
+    assert fixture.fallback_request_count == 4
+
+
+def test_selected_fixture_page_uuid_is_request_canonical_and_cutoff_stays_context_bound():
+    params = {"tickers": "HIST,MISS", "limit": 1000}
+    first = benchmark._benchmark_page_uuid(
+        "selected-stress", "/markets", params, "capture-a", "task-request-a"
+    )
+    reordered_task = benchmark._benchmark_page_uuid(
+        "selected-stress", "/markets", params, "capture-a", "task-request-b"
+    )
+    assert first == reordered_task
+    assert first != benchmark._benchmark_page_uuid(
+        "selected-stress", "/markets", params, "capture-b", "task-request-a"
+    )
+    assert (
+        benchmark._benchmark_page_uuid(
+            "selected-stress", "/historical/cutoff", {}, "capture-a", "cutoff-context"
+        )
+        == "cutoff-context"
+    )
+    assert (
+        benchmark._benchmark_page_uuid(
+            "targeted", "/markets/MKT-000000", {}, "capture-a", "legacy-context"
+        )
+        == "legacy-context"
+    )
+
+
+def test_composed_refresh_fixture_uses_context_uuid32_for_every_receipt():
+    for endpoint, params in (
+        ("/historical/cutoff", {}),
+        ("/markets", {"mve_filter": "exclude", "min_updated_ts": "1"}),
+    ):
+        first = benchmark._benchmark_page_uuid("no-change", endpoint, params, "capture-a", "a" * 64)
+        distinct_request = benchmark._benchmark_page_uuid(
+            "no-change", endpoint, params, "capture-a", "b" * 64
+        )
+        assert first != distinct_request
+        assert len(first) == 32
+        assert all(char in "0123456789abcdef" for char in first)
+    assert (
+        benchmark._benchmark_page_uuid(
+            "full", "/markets", {}, "capture-a", "original-frozen-context"
+        )
+        == "original-frozen-context"
+    )
+    assert benchmark._receipt_uuid_format("no-change") == "context-request-id-32-hex"
+    assert benchmark._receipt_uuid_format("full") == "context-request-id-64-hex"
+
+
+def test_selected_stress_batch_and_parent_filter_are_exact_and_paginated():
+    fixture = benchmark.SelectedStressFixtureClient()
+    selected = benchmark.selected_stress_tickers()
+    status, first = fixture.response("/markets", {"tickers": ",".join(selected), "limit": "1000"})
+    assert status == 200
+    assert first["cursor"] == ""
+    assert [row["ticker"] for row in first["markets"]] == [
+        *[f"S{i:03d}" for i in range(96)],
+        "ORPHAN",
+        selected[-1],
+    ]
+    assert len(fixture.response("/events/EVENT", {})[1]["event"]["markets"]) == 2000
+    filtered = fixture.response("/events/EVENT", {"exclude_markets": "true"})[1]["event"]
+    assert "markets" not in filtered
+
+
+def test_selected_native_semantics_ignore_only_capture_provenance(tmp_path: Path):
+    rows = {
+        "markets": [
+            {
+                "market_ticker": "MKT-1",
+                "title": "Native title",
+                "payload_json": '{"ticker":"MKT-1","title":"Native title"}',
+                "capture_id": "a",
+                "page_id": "b",
+                "received_at": "time-a",
+                "source_endpoint": "/markets/MKT-1",
+                "payload_sha256": "c",
+                "source_kind": "direct",
+                "observation_id": "d",
+            }
+        ],
+        "events": [],
+        "series": [],
+    }
+    for relation, values in rows.items():
+        (tmp_path / f"{relation}.json").write_text(json.dumps(values))
+    reference = benchmark._selected_relation_semantics(tmp_path)
+    rows["markets"][0].update(capture_id="new-capture", page_id="new-page", received_at="time-b")
+    (tmp_path / "markets.json").write_text(json.dumps(rows["markets"]))
+    candidate = benchmark._selected_relation_semantics(tmp_path)
+    assert reference == candidate
+
+    rows["markets"][0]["title"] = "Tampered native title"
+    rows["markets"][0]["payload_json"] = '{"ticker":"MKT-1","title":"Tampered native title"}'
+    (tmp_path / "markets.json").write_text(json.dumps(rows["markets"]))
+    assert benchmark._selected_relation_semantics(tmp_path) != reference
+
+
+def test_selected_event_semantics_ignore_only_nested_child_markets(tmp_path: Path):
+    native = {
+        "event_ticker": "EVENT",
+        "series_ticker": "SERIES",
+        "title": "Native event title",
+        "markets": [{"ticker": "NOISE-1"}],
+    }
+    row = {
+        **native,
+        "payload_json": json.dumps(native),
+        "capture_id": "capture-a",
+        "page_id": "page-a",
+        "received_at": "2026-01-01T00:00:00Z",
+        "source_endpoint": "/events/EVENT",
+        "payload_sha256": "a" * 64,
+        "source_kind": "direct",
+        "observation_id": "b" * 64,
+    }
+    for relation in ("markets", "series"):
+        (tmp_path / f"{relation}.json").write_text("[]")
+    (tmp_path / "events.json").write_text(json.dumps([row]))
+    reference = benchmark._selected_relation_semantics(tmp_path)
+
+    native["markets"] = [{"ticker": "NOISE-2"}, {"ticker": "NOISE-3"}]
+    row["markets"] = native["markets"]
+    row["payload_json"] = json.dumps(native)
+    row["capture_id"] = "capture-b"
+    row["page_id"] = "page-b"
+    row["received_at"] = "2026-01-02T00:00:00Z"
+    row["source_endpoint"] = "/events/EVENT?exclude_markets=true"
+    row["payload_sha256"] = "c" * 64
+    row["observation_id"] = "d" * 64
+    (tmp_path / "events.json").write_text(json.dumps([row]))
+    assert benchmark._selected_relation_semantics(tmp_path) == reference
+
+    native["title"] = "Tampered event title"
+    row["title"] = native["title"]
+    row["payload_json"] = json.dumps(native)
+    (tmp_path / "events.json").write_text(json.dumps([row]))
+    assert benchmark._selected_relation_semantics(tmp_path) != reference
+
+
+def test_selected_comparison_rejects_native_coverage_or_provenance_mismatch():
+    reference = {
+        "selected_tickers": ["MKT-1"],
+        "selected_semantics": {
+            relation: {"rows": 0, "sha256": f"{index:x}" * 64}
+            for index, relation in enumerate(("markets", "events", "series"), start=1)
+        },
+        "selected_coverage": [{"market_ticker": "MKT-1", "status": "found"}],
+        "selected_provenance_valid": True,
+    }
+    candidate = json.loads(json.dumps(reference))
+    assert all(benchmark._selected_comparison(reference, candidate).values())
+    for key, value in (
+        ("selected_semantics", {"markets": {"sha256": "tampered"}}),
+        ("selected_coverage", [{"market_ticker": "MKT-1", "status": "absent"}]),
+        ("selected_provenance_valid", False),
+        ("selected_tickers", None),
+        ("selected_semantics", None),
+    ):
+        modified = {**candidate, key: value}
+        assert not all(benchmark._selected_comparison(reference, modified).values())
+
+
+def test_selected_comparison_fails_closed_when_both_evidence_payloads_are_missing():
+    incomplete = {"selected_provenance_valid": True}
+    assert not all(benchmark._selected_comparison(incomplete, incomplete).values())
+
+
+def test_selected_raw_receipt_provenance_tampering_fails(tmp_path: Path, monkeypatch):
+    from kalshi_events import capture, normalize
+
+    manifest = {
+        "capture_id": "a" * 32,
+        "page_id": "b" * 32,
+        "received_at": "2026-01-01T00:00:00Z",
+        "endpoint": "/markets/A",
+        "params": {},
+        "sha256": "c" * 64,
+        "entity_kind": "markets",
+        "singular": True,
+        "status": 200,
+    }
+    payload = {
+        "market": {
+            "ticker": "A",
+            "event_ticker": "E",
+            "status": "active",
+            "title": "Native",
+        }
+    }
+    monkeypatch.setattr(capture, "capture_pages", lambda _store, _state: [(manifest, payload)])
+    row = next(normalize.observations([(manifest, payload)]))
+    row["entity_kind"] = "markets"
+    for relation, rows in (
+        ("markets", [row]),
+        ("events", []),
+        ("series", []),
+        ("coverage", [{"market_ticker": "A", "status": "found"}]),
+    ):
+        (tmp_path / f"{relation}.json").write_text(json.dumps(rows))
+    state = {"selected": ["A"]}
+    assert benchmark._selected_provenance_is_valid(object(), state, tmp_path, ["A"])
+
+    tampered = dict(row, payload_sha256="d" * 64)
+    (tmp_path / "markets.json").write_text(json.dumps([tampered]))
+    assert not benchmark._selected_provenance_is_valid(object(), state, tmp_path, ["A"])
+
+
+def test_history_stress_fixture_is_broad_and_refreshes_about_one_percent():
+    fixture = benchmark.FixtureClient(
+        benchmark.HISTORY_STRESS_IDENTITIES, "history-sparse", "baseline"
+    )
+    history = benchmark.FixtureClient._historical_market(249_999)
+    assert benchmark.HISTORY_STRESS_COUNT == 250_000
+    assert benchmark.HISTORY_STRESS_IDENTITIES == 10_000
+    assert benchmark.HISTORY_STRESS_PASSES == 25
+    assert history["ticker"] == "HIST-249999"
+    assert history["settlement_ts"].endswith("+01:00")
+
+    status, first = fixture.response("/markets", {"limit": "1000"})
+    _, repeated = fixture.response(
+        "/markets", {"limit": "1000", "cursor": str(benchmark.HISTORY_STRESS_IDENTITIES)}
+    )
+    assert status == 200
+    assert len(first["markets"]) == len(repeated["markets"]) == benchmark.PAGE_SIZE
+    assert first["markets"][0] == repeated["markets"][0]
+    assert len(fixture.response("/historical/markets", {})[1]["markets"]) == 1
+
+    refresh = benchmark.FixtureClient(1000, "history-sparse", "refresh")
+    assert len(refresh.response("/historical/markets", {})[1]["markets"]) == 1
+
+    selected = refresh.response("/markets", {"mve_filter": "exclude", "min_updated_ts": "1"})[1][
+        "markets"
+    ]
+    assert len(selected) == 10
+    assert [row["ticker"] for row in selected[:3]] == [
+        "MKT-000000",
+        "MKT-000100",
+        "MKT-000200",
+    ]
+
+
+def test_existing_byte_identity_profiles_freeze_legacy_acquisition_protocol():
+    class Capture:
+        def _initialize_v2(self, _store, state):
+            return state
+
+    capture = Capture()
+    assert benchmark._freeze_legacy_acquisition("full", "full", capture)
+    state = {"acquisition_protocol": 3}
+    assert capture._initialize_v2(None, state) == {}
+
+    current = Capture()
+    assert not benchmark._freeze_legacy_acquisition("selected-stress", "full", current)
+    assert benchmark._freeze_legacy_acquisition("history-sparse", "history-sparse", current)
+    assert benchmark._freeze_legacy_acquisition("baseline-v2-setup", "full", Capture())
+    baseline = Capture()
+    assert benchmark._freeze_legacy_acquisition("baseline-setup", "history-sparse", baseline)
+
+
+def test_legacy_targeted_freeze_restores_original_singular_task_plan():
+    class Capture:
+        @staticmethod
+        def task(endpoint, kind, *, singular=False, requested=None):
+            return {
+                "endpoint": endpoint,
+                "kind": kind,
+                "singular": singular,
+                "requested": requested,
+                "params": {},
+            }
+
+        @staticmethod
+        def ticker(value):
+            return value
+
+        @staticmethod
+        def _initialize_v2(_store, state):
+            return state
+
+    capture = Capture()
+    assert benchmark._freeze_legacy_acquisition("targeted", "full", capture)
+    state = {
+        "acquisition_protocol": 3,
+        "selected": ["A", "B"],
+        "task_scopes": {"1": "selected"},
+        "tasks": [
+            Capture.task("/historical/cutoff", None),
+            {
+                "endpoint": "/markets",
+                "kind": "markets",
+                "singular": False,
+                "requested": None,
+                "params": {"tickers": "A,B", "limit": 1000},
+            },
+        ],
+    }
+    initialized = capture._initialize_v2(None, state)
+    assert "acquisition_protocol" not in initialized
+    assert initialized["task_scopes"] == {}
+    assert [(task["endpoint"], task["requested"]) for task in initialized["tasks"]] == [
+        ("/historical/cutoff", None),
+        ("/markets/A", "A"),
+        ("/markets/B", "B"),
+    ]
+
+
 def test_incremental_fixture_honors_update_and_reconciliation_filters():
     no_change = benchmark.FixtureClient(1203, "no-change", "refresh")
     sparse = benchmark.FixtureClient(1203, "sparse-change", "refresh")
@@ -149,12 +505,90 @@ def test_incremental_identity_stability_allows_physical_warehouse_hint_variance(
             "release_manifest_sha256": str(index),
             "publication_pointer_sha256": str(index),
             "lineage": {**lineage, "warehouse_sha256": f"{index:x}" * 64},
+            "lineage_valid": True,
         }
         for index in (1, 2, 3)
     ]
     assert benchmark._identity_stability({"compare": runs}, incremental=True) == {"compare": True}
     runs[1]["lineage"]["root_id"] = "f" * 32
     assert benchmark._identity_stability({"compare": runs}, incremental=True) == {"compare": False}
+
+
+def test_v2_identity_stability_ignores_only_physical_hints_and_requires_public_outputs():
+    lineage = {
+        "root_id": benchmark.FIXED_ROOT_ID,
+        "baseline_release_id": None,
+        "baseline_manifest_sha256": None,
+        "baseline_capture_id": None,
+        "previous_watermark": None,
+        "watermark_started_at": "2026-01-01T00:00:00Z",
+        "delta_depth": 0,
+        "membership_sha256": "c" * 64,
+    }
+    runs = [
+        {
+            "release_id": "d" * 64,
+            "artifact_sha256": {"markets.parquet": "e" * 64},
+            "release_manifest_sha256": f"manifest-{index}",
+            "publication_pointer_sha256": f"pointer-{index}",
+            "lineage": {**lineage, "warehouse_sha256": f"{index:x}" * 64},
+            "lineage_valid": True,
+        }
+        for index in (1, 2, 3)
+    ]
+    assert benchmark._identity_stability(
+        {"source": runs}, incremental=False, v2_physical_hint=True
+    ) == {"source": True}
+    runs[1]["artifact_sha256"]["markets.parquet"] = "f" * 64
+    assert benchmark._identity_stability(
+        {"source": runs}, incremental=False, v2_physical_hint=True
+    ) == {"source": False}
+
+
+def test_v2_gate_requires_public_parity_and_logical_lineage():
+    pair = {
+        "pair": 0,
+        "artifact_bytes_match": True,
+        "release_id_match": True,
+        "lineage_match": False,
+    }
+    gate = benchmark._correctness_gate(
+        [pair],
+        incremental=False,
+        identity_stability={"source": True},
+        v2_output=True,
+    )
+    assert gate["passed"] is False
+    assert gate["failed_pairs"] == [0]
+
+    assert not benchmark._logical_lineage_match(
+        {"lineage": {}}, {"lineage": {}, "lineage_valid": True}
+    )
+
+
+def test_selected_correctness_gate_requires_nonempty_selection_identity():
+    pair = {
+        "pair": 0,
+        "selection_match": False,
+        "semantics_match": True,
+        "coverage_match": True,
+        "provenance_match": True,
+    }
+    gate = benchmark._correctness_gate(
+        [pair],
+        incremental=False,
+        identity_stability={"source": True},
+        selected_stress=True,
+    )
+    assert gate["passed"] is False
+    assert gate["failed_pairs"] == [0]
+
+
+def test_history_sparse_refresh_is_incremental_for_both_roles():
+    assert benchmark._paired_refresh_mode("history-sparse", "reference") == "incremental"
+    assert benchmark._paired_refresh_mode("history-sparse", "candidate") == "incremental"
+    assert benchmark._paired_refresh_mode("sparse-change", "reference") == "full"
+    assert benchmark._paired_refresh_mode("sparse-change", "candidate") == "incremental"
 
 
 def test_incremental_root_seed_uses_writer_guard_and_fixed_identity():
@@ -187,6 +621,7 @@ def test_incremental_root_seed_uses_writer_guard_and_fixed_identity():
         ("full", "incremental", "current.json"),
         ("targeted", "incremental", "current.json"),
         ("baseline-setup", "incremental", "current-v2.json"),
+        ("baseline-v2-setup", "full", "current-v2.json"),
         ("baseline-setup", "full", "current.json"),
         ("resume", "incremental", "current.json"),
         ("no-change", "incremental", "current-v2.json"),
@@ -195,6 +630,19 @@ def test_incremental_root_seed_uses_writer_guard_and_fixed_identity():
 )
 def test_publication_pointer_follows_published_contract(profile, refresh_mode, expected):
     assert benchmark._publication_pointer_name(profile, refresh_mode) == expected
+
+
+def test_baseline_v2_setup_calls_only_direct_v2_build():
+    calls = []
+
+    class Warehouse:
+        @staticmethod
+        def build_v2_full(store, capture_id):
+            calls.append((store, capture_id))
+            return "v2-build"
+
+    assert benchmark._direct_v2_setup_build(Warehouse, "store", "capture") == "v2-build"
+    assert calls == [("store", "capture")]
 
 
 def test_publication_pointer_observer_checks_release_and_manifest(tmp_path: Path):
@@ -249,6 +697,43 @@ def test_legacy_observer_counts_imported_normalize_digest_alias():
     assert normalize.digest(body) == hashlib.sha256(body).hexdigest()
     assert metrics.counters["hashes"] == 1
     assert metrics.counters["hash_bytes"] == len(body)
+
+
+def test_dlt_trace_observer_reports_only_extract_normalize_and_load_phases():
+    start = datetime(2026, 1, 1)
+
+    class Pipeline:
+        def __init__(self):
+            self.last_trace = SimpleNamespace(
+                steps=[
+                    SimpleNamespace(
+                        step=name,
+                        started_at=start,
+                        finished_at=start + timedelta(seconds=seconds),
+                    )
+                    for name, seconds in (
+                        ("extract", 1.25),
+                        ("normalize", 2.5),
+                        ("load", 0.75),
+                        ("run", 4.5),
+                    )
+                ]
+            )
+            self.calls = 0
+
+        def run(self, data, **kwargs):
+            self.calls += 1
+            return data, kwargs
+
+    pipeline = Pipeline()
+    warehouse = SimpleNamespace(dlt=SimpleNamespace(pipeline=lambda **_kwargs: pipeline))
+    timings = {}
+    benchmark._instrument_dlt_trace(warehouse, timings)
+    result = warehouse.dlt.pipeline().run("data", loader_file_format="parquet")
+
+    assert result == ("data", {"loader_file_format": "parquet"})
+    assert pipeline.calls == 1
+    assert timings == {"extract": 1.25, "normalize": 2.5, "load": 0.75}
 
 
 def test_warehouse_json_proxy_counts_two_direct_artifact_parses_locally():

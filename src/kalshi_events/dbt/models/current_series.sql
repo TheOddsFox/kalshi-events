@@ -33,14 +33,14 @@ latest as (
     from {{ ref('observation_history') }} h
     join eligible e on e.series_ticker = h.entity_ticker
     where h.entity_kind = 'series'
+    {% if var('incremental_update', false) %}
+      and h.entity_ticker in (select series_ticker from {{ source('landing', 'affected_series') }})
+    {% endif %}
     qualify row_number() over (
         partition by h.entity_ticker order by h.received_at desc, h.observation_id desc
     ) = 1
 )
 select * from latest
-{% if var('incremental_update', false) %}
-where series_ticker in (select series_ticker from {{ source('landing', 'affected_series') }})
-{% endif %}
 {% else %}
 select entity_ticker as series_ticker, observation_id, capture_id, received_at,
        provider_updated_at, source_endpoint, payload_json
