@@ -12,18 +12,24 @@ Use one locked environment and two immutable source archives. Keep both archives
 uv sync --locked
 bench_dir=$(mktemp -d /tmp/kalshi-events-benchmark-XXXXXX)
 mkdir "$bench_dir/baseline" "$bench_dir/candidate"
-git archive 0f53d0cda7d24c8e5268e90bc0e4f12d3558645a | tar -x -C "$bench_dir/baseline"
+git archive 21edf14a486addfa743c524a645857ed711b640f | tar -x -C "$bench_dir/baseline"
 git archive HEAD | tar -x -C "$bench_dir/candidate"
 uv run --locked python scripts/benchmark-pipeline.py \
   --source-root "$bench_dir/baseline" \
   --compare-root "$bench_dir/candidate" \
-  --source-revision 0f53d0cda7d24c8e5268e90bc0e4f12d3558645a \
+  --source-revision 21edf14a486addfa743c524a645857ed711b640f \
   --compare-revision "$(git rev-parse HEAD)" \
   --profile full --warmups 1 --runs 3 \
   --report-dir "$bench_dir/full-small"
 ```
 
 Repeat with a new report directory and `--scale` for approximately 250,000 observations. Use `--profile targeted` for metadata acquisition/export and `--profile resume` for an orderly request-budget stop followed by recovery. Each profile requires a new report directory. `--sample-storage` adds an untimed run that samples actual on-disk usage; its observed peaks are lower bounds between samples.
+
+Existing full, targeted and resume profiles retain their original request protocol and frozen receipt identities. They compare the same evidence through the dictionary and Arrow loaders. Existing composed-refresh profiles retain their workload definitions and request protocol; the mock receipt-ID correction described below applies to that family. `--profile selected-stress` instead compares changed acquisition requests: 100 ordered selections share parents, with live, historical, absent and unresolved cases, a maximum-length ticker, and a parent containing 2,000 unrelated child markets. Native values and coverage must agree; each side's actual receipt provenance is independently validated. Only incidental child arrays in parent-event payloads are excluded from that native comparison. Receipt and release identities are expected to differ.
+
+Use `--profile selected-single` for one present selection and `--profile selected-fallback` for a historical plus an absent selection. These exercise the new acquisition protocol, unlike the frozen `targeted` profile. Reports separate singular fallback calls from the initial batch request.
+
+`--profile history-sparse` retains at least 250,000 observations over 10,000 market identities, then refreshes approximately 1% of keys. Repeated baseline pagination is intentional history stress, not an estimate of exchange behavior. Complete reconciliation membership stays stable. Both revisions run an incremental refresh from clones of the same certified reference baseline; the candidate clone's explicit root upgrade is measured outside refresh timing. The benchmark checks the actual affected-market table, carried timestamps and provenance, retained history and public output bytes. `--profile baseline-v2-setup` separately measures direct v2-only bootstrap; it does not replace the existing setup profile that publishes both versions.
 
 Refresh comparisons use `--profile no-change`, `sparse-change` or `all-change`. Each revision prepares one T0 baseline, freezes its root identity and physical database bytes, then clones that seed for every warm-up and measured run. Each run measures T1 acquisition/build/publication in a fresh process. The reference performs a full v1 refresh; the candidate performs a composed v2 refresh. Reports separate the shared baseline setup and per-run clone costs. Both sides use the same 4 GiB download allowance, sufficient for the extra concurrent reconciliation traversal. Frozen full, targeted and resume profiles retain their original 2 GiB allowance. The fixture rate is explicitly 1,000 requests/second on both sides; it is not a live rate recommendation.
 
@@ -33,13 +39,91 @@ Trading values stay fixed in refresh fixtures. Current relation comparison exclu
 
 `pipeline_elapsed_seconds` measures native capture/build/publication after imports, excluding separately prepared baseline setup, output comparison and standalone verification. `worker_wall_seconds` includes process startup and post-run checks. Phase timings are inclusive and can overlap; do not add them. Compare medians of at least three paired runs after one warm-up, and inspect individual pairs for variance.
 
+`dlt_phase_seconds` records dlt's own extract, normalize and load trace spans after the existing `pipeline.run()` call. Those spans are nested within landing and are not additional pipeline time. Observation production, evidence checks, synchronization and storage checks remain part of the landing measurement. The observer does not change production configuration or execution.
+
 Reports include fixture/revision identities, package versions, interpreter, filesystem device, limits, requests, bytes, reads, JSON decodes, hashing, synchronization, store-accounted peaks and separate parent/child peak RSS. Hash counters cover instrumented `digest`/`file_digest` helpers, including normalization and metadata aliases, plus explicitly instrumented transport and journal hashes. Uninstrumented lineage and membership hashes and third-party internals are outside those totals; available hashing phases are reported separately. Instrumentation is enabled on both revisions, so timings include recorder overhead. Store-accounted retained bytes include all files under the operator root; temporary bytes are a subset. Child RSS is the operating system's child-process high-water measurement, not simultaneous combined memory. Synchronization counters cover instrumented Python calls (inferred for archived code), including attempted failed calls in updated code; DuckDB/C++ internal synchronization is outside those counters.
 
 The benchmark JSON total covers first-party in-process parsing through `common.decode` and the warehouse's direct dbt-artifact `json.loads` calls. The artifact counter is a subset of that total; do not add it again. Third-party and subprocess JSON parsing is outside this counter. Raw-body parses and other metadata/journal/artifact parses are reported separately. `metadata_scan` and `metadata_scans` measure storage inventory walks/reconciliations, separately from JSON parsing. Standalone capture/release or metadata verification has its own measurements and is excluded from pipeline counters. Archived code lacks some native phase hooks; unavailable phases are marked explicitly instead of reported as zero-cost work. Identity fixtures do not measure gzip decompression performance.
 
 Full v1 output checks compare Parquet bytes, release identity and deterministic manifest/pointer identities. Composed runs also require stable Parquet/release identities from the frozen baseline; their manifest and pointer bytes may vary with the certified physical warehouse hash hint. Targeted checks compare the complete metadata bundle and independently verify it. Mutation between commands must still fail fresh evidence verification; operation-local reuse is not a persistent trust cache.
 
-## Measured results
+## Current changes: contended measurements against 21edf14
+
+The current implementation was compared with `21edf14a486addfa743c524a645857ed711b640f` on 2026-10-18 using Python 3.12.13, dlt 1.31.0, PyArrow 26.0.0, DuckDB 1.5.6 and dbt-core 1.12.5 on arm64 macOS 27.0.1. Each reported comparison uses one warm-up and three alternating measured pairs with the same fixtures, limits, interpreter and filesystem. The runtime inventory SHA-256 is `57279c7f7612bea9690cb1fff7dd34cdbbc656584c89e47c3acff5b447dbaa08`.
+
+**These are contended observations, not validated timing targets.** Unrelated CPU-heavy jobs were active on the host. The operator selected finishing the PR with these results and leaving clean timing targets open. For example, scale landing ranges from 12.53–20.48 s on the reference and 8.74–38.21 s on the candidate. Do not infer a causal speedup or regression from those medians alone.
+
+All 12 profile correctness gates pass across three measured pairs, including identity stability within each revision. The timing table reports medians, not promises. The three small refresh profiles compare a reference full refresh with a candidate composed refresh; only history-sparse compares incremental refresh with incremental refresh from the same baseline.
+
+| Operation | Reference | Candidate | Observed change |
+|---|---:|---:|---:|
+| Full, 200 observations | 5.782 s | 3.828 s | -33.8% |
+| Full, 250,000 observations | 32.259 s | 38.057 s | +18.0% |
+| Frozen targeted metadata | 34.280 ms | 35.578 ms | +3.8% |
+| Stop and resume, 200 observations | 3.888 s | 4.676 s | +20.3% |
+| Mixed 100-selection metadata | 625.702 ms | 96.710 ms | -84.5% |
+| One present selection | 62.976 ms | 44.466 ms | -29.4% |
+| Historical and absent selections | 78.519 ms | 67.177 ms | -14.4% |
+| No-change refresh | 2.416 s | 2.800 s | +15.9% |
+| Sparse-change refresh | 2.485 s | 2.835 s | +14.1% |
+| All-change refresh | 4.350 s | 4.861 s | +11.7% |
+| Direct v2-only baseline setup | 3.008 s | 3.854 s | +28.1% |
+| History-heavy sparse incremental refresh | 24.752 s | 23.463 s | -5.2% |
+
+The above-10% increases in scale, resume, small refreshes and direct v2 setup remain unresolved timing results. Phase inspection found increases spread across capture, extraction, projection and dbt rather than a single isolated regression. Scale pair times vary from 31.97–45.46 s on the reference and 33.32–87.59 s on the candidate; unrelated CPU-heavy work was confirmed on the host. This investigation does not establish that contention explains each increase. Rerun the affected profiles on a quiet machine before accepting their performance.
+
+The 100-selection mixed fixture uses 109 total requests on the reference and 12 on the candidate, with identical native definitions and ordered coverage and independently verified actual provenance. Encoded bytes fall from 123,329 to 26,362. A separate regression test proves 100 short present selections use one market-list request instead of 100 individual market requests, excluding unchanged parent/cutoff work; 100 maximum-length selections exercise URL-bounded partitioning. The one-selection fixture uses four requests on both revisions, with 96,481 versus 484 encoded bytes because the parent omits its 2,000 irrelevant child markets.
+
+Historical/missing-only selection uses **one additional batch request**: ten total requests versus nine, including four singular live/historical calls on both sides. List omission still cannot certify absence. Its observed total time must not hide that extra request cost at the normal 10 requests/second limit.
+
+The existing no-change, sparse-change and all-change fixture family now uses valid 32-character raw receipt directory IDs, including its baseline setup. The archived harness's 64-character mock IDs were rejected by `21edf14`'s prune validator. This correction preserves requests, payloads and limits, uses the same deterministic generator on both revisions, and does not bypass pruning. Reports identify the corrected format. Full, targeted and resume frozen identities remain unchanged.
+
+Scale phase medians below are inclusive and overlap. The complete pipeline median is 32.259 s versus 38.057 s, an observed 18.0% increase. Arrow normalization is lower in this run, but extraction and total landing are higher; a quiet rerun is needed to distinguish implementation effects from host contention. Both the 25% multi-selection target and the 20% landing target remain open as clean performance gates.
+
+| Scale measurement | Reference | Candidate |
+|---|---:|---:|
+| Requests | 1,256 | 1,256 |
+| Encoded / decoded bytes | 94,555,150 / 94,555,150 | 94,555,150 / 94,555,150 |
+| Raw body reads / JSON decodes | 5,024 / 2,514 | 5,024 / 2,514 |
+| Total counted first-party JSON decodes | 8,841 | 8,841 |
+| Instrumented hashes / Python sync calls | 519,101 / 15,194 | 519,101 / 15,194 |
+| Instrumented hash bytes | 1,509,931,361 | 1,516,223,341 |
+| Storage inventory scans | 15 | 15 |
+| Capture | 12.2566 s | 14.4016 s |
+| Parent hydration, nested | 0.1369 s | 0.2499 s |
+| Raw writes, nested | 1.6136 s | 1.8952 s |
+| Rate waits, nested | 0.0170 s | 0.0217 s |
+| Landing | 12.6704 s | 15.8557 s |
+| dlt extract / normalize / load, nested | 8.0845 / 3.2185 / 1.6242 s | 13.4991 / 0.4921 / 2.2436 s |
+| dbt | 4.7160 s | 6.4661 s |
+| Encoded hashing | 0.1994 s | 0.2826 s |
+| Helper hashing | 1.1167 s | 1.5656 s |
+| JSON parsing | 0.8704 s | 1.7144 s |
+| Storage metadata scans | 0.3019 s | 0.3552 s |
+| Complete Parquet export | 0.3856 s | 0.4310 s |
+| In-pipeline verification | 0.1506 s | 0.1695 s |
+| Pointer promotion | 0.0009 s | 0.0008 s |
+| Pruning | 0.8009 s | 0.9492 s |
+| Standalone verification, excluded above | 1.2239 s | 1.3816 s |
+
+No retries occurred; identity encoding was used, so gzip decompression was not measured. Arrow changes dlt's internal path rather than reducing these first-party JSON passes. Full integrity checks, dependency discovery, retained-history certification and complete exports still scan substantial data.
+
+| Scale high-water measurement | Reference | Candidate |
+|---|---:|---:|
+| Parent RSS, maximum across runs | 1329.0 MiB | 1403.7 MiB |
+| Child RSS, maximum across runs | 1340.9 MiB | 1367.7 MiB |
+| Store-accounted retained, median | 471.1 MiB | 474.0 MiB |
+| Store-accounted temporary, median | 189.8 MiB | 191.2 MiB |
+| Untimed sampled actual retained, lower bound | 327.9 MiB | 327.6 MiB |
+| Untimed sampled actual temporary, lower bound | 188.7 MiB | 188.4 MiB |
+
+The equal-work history-sparse comparison starts from the same certified, checkpointed baseline with 250,004 observations over 10,000 market identities. Each refresh adds 113 observations and affects 110 market keys (1.1%), leaving 250,117 observations. Every measured pair preserves exact public Parquet bytes, release identity, logical lineage and carried T0/refreshed T1 timestamps. Both sides make eight requests and receive 45,477 encoded bytes. Baseline cloning and the candidate's explicit root upgrade are outside refresh timing.
+
+Its median current-projection phase is **3.801 s versus 5.758 s**, so this run does not demonstrate a projection-time gain despite the narrower window inputs verified by the query-plan tests. Baseline verification is 7.414 s versus 6.379 s, lineage verification 8.173 s versus 6.643 s, pruning 4.565 s versus 4.257 s, and export 0.192 s versus 0.154 s. These inclusive phases overlap. The total observed 5.2% reduction cannot be attributed to the SQL change from these contended measurements. Retained-evidence certification and complete exports remain material costs.
+
+Reservations are separate allowances, not additional disk consumption. The Arrow batch limits do not establish a global RSS limit or a hard dlt write quota. Generated roots, profiles, inventories and reports remain outside Git and distributions.
+
+## Earlier measured results
 
 These measurements describe the runtime shipped in `9ea9c6bd272624118e2780f1a6dec5708b6e209a`. Subsequent retry, atomic-write accounting and directory-durability fixes add synchronization and change request scheduling; this matrix has not been rerun for those changes.
 

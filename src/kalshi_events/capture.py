@@ -265,7 +265,11 @@ def _acquisition_protocol(state: dict[str, Any]) -> int:
     if "acquisition_protocol" not in state:
         return 2
     protocol = state["acquisition_protocol"]
-    if isinstance(protocol, bool) or not isinstance(protocol, int) or protocol != ACQUISITION_PROTOCOL:
+    if (
+        isinstance(protocol, bool)
+        or not isinstance(protocol, int)
+        or protocol != ACQUISITION_PROTOCOL
+    ):
         raise CatalogueError("unsupported acquisition protocol")
     return protocol
 
@@ -333,8 +337,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             batch_values.extend(batch)
         identities.add(_task_identity(work))
     if has_batches and (
-        len(batch_values) != len(set(batch_values))
-        or set(batch_values) != set(state["selected"])
+        len(batch_values) != len(set(batch_values)) or set(batch_values) != set(state["selected"])
     ):
         raise CatalogueError("selected market batches do not partition the capture selection")
     # Reuse legacy sealed-limit validation without serializing runtime metadata.
@@ -1470,9 +1473,7 @@ def _apply(
                 for value in batch:
                     if state["coverage"].get(value, {}).get("status") == "found":
                         continue
-                    lookup = task(
-                        f"/markets/{value}", "markets", singular=True, requested=value
-                    )
+                    lookup = task(f"/markets/{value}", "markets", singular=True, requested=value)
                     if _task_identity(lookup) not in existing:
                         state["tasks"].append(lookup)
                         existing.add(_task_identity(lookup))
@@ -1529,9 +1530,8 @@ def _consume(
         state.get("max_decoded_response_bytes", state["max_response_bytes"]),
     )
     context = _request_context(state, index)
-    if (
-        manifest.get("request_id") != context["request_id"]
-        or not _receipt_matches_context(manifest, context)
+    if manifest.get("request_id") != context["request_id"] or not _receipt_matches_context(
+        manifest, context
     ):
         raise CatalogueError("raw receipt does not match its traversal")
     if _phase(work) == "cutoff":

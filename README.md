@@ -19,7 +19,7 @@ uv run kalshi-events --root /absolute/operator/kalshi-events current
 
 The operator root is the persistent directory passed with `--root`, or `KALSHI_EVENTS_ROOT`, or `data`. It holds raw evidence, captures, builds, releases and the versioned publication pointers. Only one writer may hold the canonical root at a time. Symlinked roots, files and destinations are refused.
 
-New roots use storage version 2. Existing roots remain readable; stop writers and explicitly run `kalshi-events --root /absolute/operator/kalshi-events upgrade-root` before further writes. Upgrade changes only the marker under the writer lock. Existing incomplete captures retain their original checkpoint protocol. Older binaries refuse an upgraded root; binary rollback requires a separate legacy root and retained verified v1 publication. Never downgrade the marker.
+New roots use storage version 3. Existing version 1 and 2 roots remain readable; stop writers and explicitly run `kalshi-events --root /absolute/operator/kalshi-events upgrade-root` before further writes. Upgrade changes only the marker under the writer lock. Existing incomplete captures retain their original acquisition and checkpoint protocols. Older binaries refuse an upgraded root, including after waiting for its writer lock; binary rollback requires a separate legacy root and retained verified v1 publication. Never downgrade the marker. Storage version 3 does not introduce a third catalogue format.
 
 ## Capture
 
@@ -62,7 +62,7 @@ The release contains `series.parquet`, `events.parquet`, `markets.parquet`, `rel
 
 ## Opt-in incremental refresh
 
-A full capture remains the default. To create a version 2 baseline from a complete full capture, first build it normally, then publish it with the version selector. Version 2 uses a separate `builds-v2` warehouse and `current-v2.json`; version 1 uses `builds` and `current.json`.
+A full capture remains the default. To create a version 2 baseline from a complete full capture, publish it with the version selector; this builds the version 2 warehouse when needed. A preceding version 1 build/publication is necessary only when both publication tracks are wanted. Version 2 uses a separate `builds-v2` warehouse and `current-v2.json`; version 1 uses `builds` and `current.json`.
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events publish \
@@ -94,7 +94,9 @@ Discard refuses complete captures and captures referenced by a publication or de
 
 ## Targeted metadata handoff
 
-Select 1–100 distinct explicit market tickers. Direct lookups check the historical endpoint when a live lookup is absent, then fetch the native authoritative event and series. A completed selection can be absent or unresolved; its coverage remains visible and no stale record is substituted.
+Select 1–100 distinct explicit market tickers. New captures query bounded batches of selected live market tickers. An omitted ticker receives an authoritative individual live lookup followed by a historical lookup when necessary; list omission alone never proves absence. Event and series parents remain authoritative individual lookups. A completed selection can be absent or unresolved; its coverage remains visible and no stale record is substituted.
+
+Batches contain at most 100 tickers and 6,144 encoded initial URL bytes, with pagination handled separately. New event-parent lookups use `exclude_markets=true` to avoid downloading unrelated children. Direct market coverage is unchanged; new captures no longer acquire those incidental child references through parent hydration. Older captures retain their original requests when resumed. Newly batched observations retain the actual list-request provenance and therefore have different receipt identities from individual requests.
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events metadata refresh \
@@ -165,3 +167,5 @@ python /absolute/kalshi-market-data/scripts/check-handoff.py \
 ```
 
 This harness uses a synthetic loopback exchange, proves capture through publication and metadata transfer, exercises all market-data feeds and intervals, checks persistent refresh/replay/recovery, and performs no live acquisition.
+
+For acquisition protocol 3, its synthetic exchange must honor `/markets?tickers=...` and singular-event `exclude_markets=true`. Older consumer fixtures ignore these filters and return unrequested markets, which the producer correctly rejects. The installed handoff for this change passed with a private fixture copy implementing those two filters; the consumer repository and installed applications were unchanged.

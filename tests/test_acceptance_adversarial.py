@@ -21,9 +21,7 @@ def _legacy_checkpoint(store, state):
         logical["tasks"] = [
             acquisition.task("/historical/cutoff", None, singular=True),
             *[
-                acquisition.task(
-                    f"/markets/{value}", "markets", singular=True, requested=value
-                )
+                acquisition.task(f"/markets/{value}", "markets", singular=True, requested=value)
                 for value in logical["selected"]
             ],
         ]

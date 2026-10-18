@@ -129,13 +129,20 @@ class FakeClient:
                 "/historical/markets/HISTORICAL": {"market": HISTORICAL},
             }
             defaults.update(
-                {f"/events/{row['event_ticker']}": {"event": row} for row in [*EVENTS, *COMBO_EVENTS]}
+                {
+                    f"/events/{row['event_ticker']}": {"event": row}
+                    for row in [*EVENTS, *COMBO_EVENTS]
+                }
             )
             result = (200, defaults[endpoint]) if endpoint in defaults else (404, {})
         if endpoint == "/markets" and isinstance(params.get("tickers"), str):
             status, payload = result
             rows = payload.get("markets") if isinstance(payload, dict) else None
-            if status == 200 and isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+            if (
+                status == 200
+                and isinstance(rows, list)
+                and all(isinstance(row, dict) for row in rows)
+            ):
                 requested = params["tickers"].split(",")
                 selected = set(requested)
                 payload = {

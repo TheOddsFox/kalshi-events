@@ -90,6 +90,9 @@ class Snapshot:
                 rows = self.market_updates
             else:
                 rows = [*self.live, *self.combos]
+            if "tickers" in params:
+                selected = set(params["tickers"].split(","))
+                rows = [row for row in rows if row["ticker"] in selected]
             return 200, {"markets": rows, "cursor": ""}
         if endpoint == "/historical/markets":
             return 200, {"markets": self.history, "cursor": ""}

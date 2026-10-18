@@ -20,9 +20,7 @@ def _legacy_checkpoint(store, state):
         logical["tasks"] = [
             acquisition.task("/historical/cutoff", None, singular=True),
             *[
-                acquisition.task(
-                    f"/markets/{value}", "markets", singular=True, requested=value
-                )
+                acquisition.task(f"/markets/{value}", "markets", singular=True, requested=value)
                 for value in logical["selected"]
             ],
         ]
@@ -85,7 +83,9 @@ def test_acquisition_protocol_is_sealed_and_legacy_missing_protocol_keeps_reques
             acquisition._request_context(state, 0)
 
 
-def test_completed_capture_reads_do_not_depend_on_current_source_origin(store, factory, monkeypatch):
+def test_completed_capture_reads_do_not_depend_on_current_source_origin(
+    store, factory, monkeypatch
+):
     state = acquisition.capture(store, selected=["MARKET"], client_factory=factory)
     monkeypatch.setenv("KALSHI_EVENTS_API_URL", "https://invalid.example/?unexpected=1")
 
