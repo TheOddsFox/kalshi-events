@@ -19,7 +19,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from importlib.resources import files
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import dlt
@@ -120,6 +120,14 @@ def _legacy_landing_text(value: Any) -> str | None:
 
 def build_directory(capture_id: str, catalogue_version: int = 1) -> str:
     return f"builds-v2/{capture_id}" if catalogue_version == 2 else f"builds/{capture_id}"
+
+
+def _dbt_executable(python_executable: str, *, windows: bool = os.name == "nt") -> Path:
+    return Path(python_executable).parent / ("dbt.exe" if windows else "dbt")
+
+
+def _receipt_body_path(relative: str) -> str:
+    return (PurePosixPath(relative).parent / "body.bin").as_posix()
 
 
 @dataclass(frozen=True)
@@ -233,7 +241,7 @@ def _operation_evidence(
         relative = row.get("relative")
         if not isinstance(relative, str):
             raise CatalogueError("invalid operation-local capture receipt inventory")
-        expected.update({relative, str(Path(relative).parent / "body.bin")})
+        expected.update({relative, _receipt_body_path(relative)})
     if verified_pages is not None and set(verified_pages) != expected:
         raise CatalogueError("verified evidence inventory does not match the capture journal")
     checkpoints = _checkpoint_inventory(store, state)
@@ -306,7 +314,7 @@ def _validate_operation_evidence(
         relative = row.get("relative")
         if not isinstance(relative, str):
             raise CatalogueError("invalid operation-local capture receipt inventory")
-        expected.update({relative, str(Path(relative).parent / "body.bin")})
+        expected.update({relative, _receipt_body_path(relative)})
     if proof.verified_pages is not None and set(proof.verified_pages) != expected:
         raise CatalogueError("operation evidence receipts do not match the capture journal")
     if proof.evidence != {**checkpoints, **(proof.verified_pages or {})}:
@@ -363,7 +371,7 @@ def evidence_inventory(
         expected = set()
         for row in rows:
             relative = row["relative"]
-            expected.update({relative, str(Path(relative).parent / "body.bin")})
+            expected.update({relative, _receipt_body_path(relative)})
         if set(verified_pages) != expected:
             raise CatalogueError("verified evidence inventory does not match the capture journal")
         return {**result, **verified_pages}
@@ -371,7 +379,7 @@ def evidence_inventory(
         store.check_deadline()
         relative = row["relative"]
         result[relative] = file_digest(store.path(relative), store.limits.max_root_bytes)[0]
-        body = str(Path(relative).parent / "body.bin")
+        body = _receipt_body_path(relative)
         result[body] = file_digest(store.path(body), store.limits.max_root_bytes)[0]
     return result
 
@@ -565,7 +573,7 @@ def dbt(
             }
         }
         atomic_json(runtime / "profiles.yml", profiles)
-        executable = str(Path(sys.executable).parent / "dbt")
+        executable = str(_dbt_executable(sys.executable))
         if not Path(executable).is_file():
             raise CatalogueError("dbt must be installed alongside the producer executable")
         environment = {
@@ -1610,7 +1618,7 @@ def certified(
     required = {f"{base}/state.json", f"{base}/pages.jsonl"}
     for row in rows:
         relative = row["relative"]
-        required.update({relative, str(Path(relative).parent / "body.bin")})
+        required.update({relative, _receipt_body_path(relative)})
     expected_files = receipt.get("evidence")
     if not isinstance(expected_files, dict) or set(expected_files) != required:
         raise CatalogueError("build evidence inventory does not match the capture journal")
@@ -1719,9 +1727,7 @@ def _reuse_certified(
     expected_pages = proof.verified_pages or {}
     cutoff_paths = set(cached.cutoff_rows) if cutoff_sink is not None else set()
     cutoff_files = {
-        path
-        for relative in cutoff_paths
-        for path in (relative, str(Path(relative).parent / "body.bin"))
+        path for relative in cutoff_paths for path in (relative, _receipt_body_path(relative))
     }
     cutoff_inventory: dict[str, str] = {}
     for relative, checksum in expected_pages.items():

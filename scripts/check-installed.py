@@ -11,6 +11,12 @@ import tempfile
 from pathlib import Path
 
 
+def venv_executable(venv: Path, command: str, *, windows: bool = os.name == "nt") -> Path:
+    directory = "Scripts" if windows else "bin"
+    executable = f"{command}.exe" if windows else command
+    return venv / directory / executable
+
+
 def main():
     if not __debug__:
         raise SystemExit("installed acceptance requires assertions")
@@ -50,7 +56,7 @@ def main():
         requirement.write_text(
             f"oddsfox-kalshi-events @ {wheels[0].as_uri()} --hash=sha256:{hashlib.sha256(wheels[0].read_bytes()).hexdigest()}\n"
         )
-        python = venv / "bin" / "python"
+        python = venv_executable(venv, "python")
         subprocess.run(
             [
                 uv,
@@ -78,7 +84,7 @@ def main():
             check=True,
         )
         subprocess.run(
-            [str(venv / "bin" / "kalshi-events"), "dbt", "--", "parse"],
+            [str(venv_executable(venv, "kalshi-events")), "dbt", "--", "parse"],
             cwd=directory,
             env=environment,
             check=True,

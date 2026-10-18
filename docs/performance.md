@@ -8,6 +8,8 @@ The frozen full fixture contains 197 markets and three parent observations. The 
 
 Use one locked environment and two immutable source archives. Keep both archives and all generated roots/reports on the same filesystem, outside Git. Do not run another benchmark or test suite concurrently.
 
+For native Windows Python use the [Windows handoff](windows.md). Both source archives need the same compatibility patch: unmodified `21edf14` imports Unix-only `resource` and uses POSIX directory synchronization. Windows volume-wide flushing is required and remains inside the timed work; do not compare it with a POSIX baseline or omit synchronization to produce a timing result.
+
 ```sh
 uv sync --locked
 bench_dir=$(mktemp -d /tmp/kalshi-events-benchmark-XXXXXX)
@@ -43,6 +45,8 @@ Trading values stay fixed in refresh fixtures. Current relation comparison exclu
 
 Reports include fixture/revision identities, package versions, interpreter, filesystem device, limits, requests, bytes, reads, JSON decodes, hashing, synchronization, store-accounted peaks and separate parent/child peak RSS. Hash counters cover instrumented `digest`/`file_digest` helpers, including normalization and metadata aliases, plus explicitly instrumented transport and journal hashes. Uninstrumented lineage and membership hashes and third-party internals are outside those totals; available hashing phases are reported separately. Instrumentation is enabled on both revisions, so timings include recorder overhead. Store-accounted retained bytes include all files under the operator root; temporary bytes are a subset. Child RSS is the operating system's child-process high-water measurement, not simultaneous combined memory. Synchronization counters cover instrumented Python calls (inferred for archived code), including attempted failed calls in updated code; DuckDB/C++ internal synchronization is outside those counters.
 
+Native Windows reports self lifetime peak working-set bytes from `K32GetProcessMemoryInfo` and `children: null`: child peak RSS is unavailable, not zero. `volume_flush_calls` counts volume-wide barriers separately, in addition to `fsync_calls`; `volume_flush` measures their elapsed time. Reports also record the platform durability requirement and SHA-256 inventories of actual Python/dbt source files, including compatibility changes. JSON metadata is read as UTF-8 on every platform.
+
 The benchmark JSON total covers first-party in-process parsing through `common.decode` and the warehouse's direct dbt-artifact `json.loads` calls. The artifact counter is a subset of that total; do not add it again. Third-party and subprocess JSON parsing is outside this counter. Raw-body parses and other metadata/journal/artifact parses are reported separately. `metadata_scan` and `metadata_scans` measure storage inventory walks/reconciliations, separately from JSON parsing. Standalone capture/release or metadata verification has its own measurements and is excluded from pipeline counters. Archived code lacks some native phase hooks; unavailable phases are marked explicitly instead of reported as zero-cost work. Identity fixtures do not measure gzip decompression performance.
 
 Full v1 output checks compare Parquet bytes, release identity and deterministic manifest/pointer identities. Composed runs also require stable Parquet/release identities from the frozen baseline; their manifest and pointer bytes may vary with the certified physical warehouse hash hint. Targeted checks compare the complete metadata bundle and independently verify it. Mutation between commands must still fail fresh evidence verification; operation-local reuse is not a persistent trust cache.
@@ -50,6 +54,8 @@ Full v1 output checks compare Parquet bytes, release identity and deterministic 
 ## Current changes: contended measurements against 21edf14
 
 The implementation at `522af66a877fb75a1c61757ec1af0067a83f653e` was compared with `21edf14a486addfa743c524a645857ed711b640f` on 2026-10-18 using Python 3.12.13, dlt 1.31.0, PyArrow 26.0.0, DuckDB 1.5.6 and dbt-core 1.12.5 on arm64 macOS 27.0.1. Each reported comparison uses one warm-up and three alternating measured pairs with the same fixtures, limits, interpreter and filesystem. The runtime inventory SHA-256 is `57279c7f7612bea9690cb1fff7dd34cdbbc656584c89e47c3acff5b447dbaa08`.
+
+Native Windows compatibility was added after this matrix; no measurements or full runs were repeated locally for it. Windows full validation, recovery checks and clean paired comparisons are deferred to the elevated local-NTFS workstation.
 
 A subsequent review fix preserves authoritative absent coverage after a batch cursor reset when retained observations have unavailable parents. The matrix below was not rerun for that fix; its runtime inventory describes `522af66`, not later revisions. Clean timing targets remain open.
 

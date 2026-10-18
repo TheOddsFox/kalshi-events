@@ -136,6 +136,8 @@ Tests use synthetic source responses. Loopback HTTP is available only with both 
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion. Both installed wheels and source checkouts include dbt resources; runtime data, credentials, local Pad state and warehouse files are excluded from distributions.
 
+Native Windows Python 3.12 uses `python scripts/verify.py --fast` or `python scripts/verify.py`. Windows writers require an **elevated Administrator terminal and a fixed local NTFS drive**. Directory durability uses volume-wide flushing at the existing barriers; this can flush other applications' writes and materially affect timings. Unsupported drives, reparse points and insufficient permissions fail closed. See the [Windows setup and validation handoff](docs/windows.md); native execution and clean performance targets remain unverified.
+
 ## Offline benchmarking
 
 See [performance measurements](docs/performance.md) for frozen fixtures, paired baseline comparisons, resource counters, standalone verification and the costs that remain after incremental acquisition. Benchmark roots and reports stay outside Git and distributions. Offline results do not establish live catalogue duration or a higher supported public request rate.

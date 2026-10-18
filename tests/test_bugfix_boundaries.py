@@ -19,7 +19,7 @@ def test_failed_directory_sync_after_replace_accounts_installed_bytes(
     store, monkeypatch, replacement
 ):
     store.write_bytes("item", b"old bytes")
-    original_sync = common.os.fsync
+    original_sync = common.fsync_directory
     original_replace = common.os.replace
     installed = False
 
@@ -28,14 +28,14 @@ def test_failed_directory_sync_after_replace_accounts_installed_bytes(
         original_replace(source, destination)
         installed = True
 
-    def fail_directory_sync(descriptor):
-        if installed and stat.S_ISDIR(common.os.fstat(descriptor).st_mode):
+    def fail_directory_sync(path):
+        if installed:
             raise OSError("replacement directory sync failed")
-        return original_sync(descriptor)
+        return original_sync(path)
 
     with monkeypatch.context() as failure:
         failure.setattr(common.os, "replace", replace_and_record)
-        failure.setattr(common.os, "fsync", fail_directory_sync)
+        failure.setattr(common, "fsync_directory", fail_directory_sync)
         with pytest.raises(OSError, match="replacement directory sync failed"):
             store.write_bytes("item", replacement)
 
@@ -96,6 +96,7 @@ def test_capture_journals_only_receipts_with_durable_files_and_raw_directory_ent
 ):
     store = Store(tmp_path / "root", Limits(max_rate=1_000_000))
     original_sync = common.os.fsync
+    original_directory_sync = common.fsync_directory
     original_append = Store.append
     durable_files = set()
     durable_pages = set()
@@ -106,14 +107,17 @@ def test_capture_journals_only_receipts_with_durable_files_and_raw_directory_ent
         original_sync(descriptor)
         descriptor_stat = common.os.fstat(descriptor)
         identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
-        raw = store.root / "raw"
         with guard:
             if stat.S_ISREG(descriptor_stat.st_mode):
                 durable_files.add(identity)
-            elif raw.exists():
-                raw_stat = raw.stat()
-                if identity == (raw_stat.st_dev, raw_stat.st_ino):
-                    durable_pages.update(path for path in raw.iterdir() if path.is_dir())
+
+    def sync_directory_and_record(path):
+        result = original_directory_sync(path)
+        raw = store.root / "raw"
+        if path == raw:
+            with guard:
+                durable_pages.update(page for page in raw.iterdir() if page.is_dir())
+        return result
 
     def append_after_evidence(actual_store, relative, body):
         record = json.loads(body)
@@ -141,6 +145,7 @@ def test_capture_journals_only_receipts_with_durable_files_and_raw_directory_ent
         return client
 
     monkeypatch.setattr(common.os, "fsync", sync_and_record)
+    monkeypatch.setattr(common, "fsync_directory", sync_directory_and_record)
     monkeypatch.setattr(Store, "append", append_after_evidence)
     state = capture(store, client_factory=client_factory)
 

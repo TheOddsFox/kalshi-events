@@ -107,7 +107,7 @@ def _instrument_baseline(metrics: Any, modules: list[Any]) -> None:
                     result = __original(*args, **kwargs)
                 if __name == "read_page":
                     store, relative = args[:2]
-                    body_path = store.path(str(Path(relative).parent / "body.bin"))
+                    body_path = store.path((Path(relative).parent / "body.bin").as_posix())
                     metrics.add("raw_body_reads")
                     metrics.add("raw_body_read_bytes", body_path.stat().st_size)
                     if result[0].get("status") == 200:
@@ -703,7 +703,7 @@ def _selected_relation_semantics(output: Path) -> dict[str, Any]:
     """Hash native fields, excluding only capture provenance and nested event children."""
     result = {}
     for relation in ("markets", "events", "series"):
-        rows = json.loads((output / f"{relation}.json").read_text())
+        rows = json.loads((output / f"{relation}.json").read_text(encoding="utf-8"))
         native = []
         for row in rows:
             fields = {
@@ -762,7 +762,7 @@ def _selected_provenance_is_valid(
         ("events", "events", "event_ticker"),
         ("series", "series", "series_ticker"),
     ):
-        rows = json.loads((output / f"{relation}.json").read_text())
+        rows = json.loads((output / f"{relation}.json").read_text(encoding="utf-8"))
         for row in rows:
             key = (kind, row.get(identity_key), row.get("payload_json"))
             candidates = raw_by_identity.get(key, [])
@@ -775,14 +775,14 @@ def _selected_provenance_is_valid(
     coverage = _selected_coverage(output)
     if [row.get("market_ticker") for row in coverage] != selected:
         return False
-    market_rows = json.loads((output / "markets.json").read_text())
+    market_rows = json.loads((output / "markets.json").read_text(encoding="utf-8"))
     return {row.get("market_ticker") for row in market_rows} == {
         row.get("market_ticker") for row in coverage if row.get("status") == "found"
     }
 
 
 def _selected_coverage(output: Path) -> list[dict[str, Any]]:
-    return json.loads((output / "coverage.json").read_text())
+    return json.loads((output / "coverage.json").read_text(encoding="utf-8"))
 
 
 def _direct_v2_setup_build(warehouse: Any, store: Any, capture_id: str) -> Any:
@@ -1135,7 +1135,7 @@ def _worker(
         else None
     )
     if profile in TARGETED_PROFILES:
-        metadata_manifest = json.loads((output / "manifest.json").read_text())
+        metadata_manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
         metadata_inventory = metadata_manifest["files"]
         assert set(metadata_inventory) == {
             "coverage.json",
@@ -1147,7 +1147,7 @@ def _worker(
         result["metadata_inventory"] = metadata_inventory
         if profile in SELECTED_PROFILES:
             metadata.verify(output)
-            coverage = json.loads((output / "coverage.json").read_text())
+            coverage = json.loads((output / "coverage.json").read_text(encoding="utf-8"))
             selected_tickers = _selected_profile_tickers(profile)
             expected = {
                 "selected-stress": (100, 98, {"found", "absent", "unresolved"}),
@@ -1158,7 +1158,10 @@ def _worker(
             assert len(coverage) == coverage_count
             assert {row["status"] for row in coverage} == statuses
             assert sum(row["status"] == "found" for row in coverage) == found_count
-            assert len(json.loads((output / "markets.json").read_text())) == found_count
+            assert (
+                len(json.loads((output / "markets.json").read_text(encoding="utf-8")))
+                == found_count
+            )
             result["selected_semantics"] = _selected_relation_semantics(output)
             result["selected_coverage"] = _selected_coverage(output)
             result["selected_provenance_valid"] = _selected_provenance_is_valid(
@@ -1279,7 +1282,7 @@ def _publication_pointer_sha256(
     root: Path, name: str, release_id: str | None, manifest_sha256: str | None
 ) -> str:
     pointer_path = root / name
-    pointer = json.loads(pointer_path.read_text())
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     assert pointer.get("source_release_id") == release_id, (
         "publication pointer selects another release"
     )
@@ -1329,7 +1332,7 @@ def _assert_lineage_manifest(
     root: Path,
     capture_id: str,
 ) -> dict[str, Any]:
-    manifest = json.loads((output / "manifest.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     lineage_fields = {
         "root_id",
         "baseline_release_id",
@@ -1349,7 +1352,9 @@ def _assert_lineage_manifest(
     assert root_id == FIXED_ROOT_ID, "v2 manifest root identity differs from the seeded root"
     warehouse_sha256 = manifest["warehouse_sha256"]
     assert len(warehouse_sha256) == 64 and all(c in "0123456789abcdef" for c in warehouse_sha256)
-    build_receipt = json.loads((root / "builds-v2" / capture_id / "build.json").read_text())
+    build_receipt = json.loads(
+        (root / "builds-v2" / capture_id / "build.json").read_text(encoding="utf-8")
+    )
     assert warehouse_sha256 == build_receipt.get("warehouse_sha256"), (
         "v2 manifest warehouse checksum differs from the certified build receipt"
     )
@@ -1415,10 +1420,10 @@ from pathlib import Path
 from kalshi_events.common import Store
 store = Store(Path(sys.argv[1]))
 before = store.storage_version
-identity = json.loads((store.root / "root-id.json").read_text())
+identity = json.loads((store.root / "root-id.json").read_text(encoding="utf-8"))
 with store.lock(allow_legacy=True) as lock:
     store.upgrade_root(lock)
-after_identity = json.loads((store.root / "root-id.json").read_text())
+after_identity = json.loads((store.root / "root-id.json").read_text(encoding="utf-8"))
 print(json.dumps({"storage_version_before": before, "storage_version_after": store.storage_version, "root_id_before": identity["root_id"], "root_id_after": after_identity["root_id"]}))
 """
     environment = os.environ.copy()
@@ -1451,7 +1456,7 @@ def _assert_history_composition(
 ) -> dict[str, Any]:
     import duckdb
 
-    manifest = json.loads((output / "manifest.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     baseline_id = manifest.get("baseline_release_id")
     assert isinstance(baseline_id, str)
     baseline_file = root / f"releases/{baseline_id}/observation_history.parquet"
@@ -1476,7 +1481,10 @@ def _assert_history_composition(
         ).fetchone()[0]
         new_rows = connection.execute(
             "select count(*) from read_parquet(?) where capture_id = ?",
-            [str(current_file), json.loads((output / "manifest.json").read_text())["capture_id"]],
+            [
+                str(current_file),
+                json.loads((output / "manifest.json").read_text(encoding="utf-8"))["capture_id"],
+            ],
         ).fetchone()[0]
     finally:
         connection.close()
@@ -1650,7 +1658,7 @@ def _prepare_incremental_baseline(
         env=os.environ.copy(),
     )
     setup_seconds = round(time.perf_counter() - started, 6)
-    return root, json.loads(result_path.read_text()), setup_seconds
+    return root, json.loads(result_path.read_text(encoding="utf-8")), setup_seconds
 
 
 def _paired_refresh_mode(profile: str, role: str) -> str:
@@ -1716,7 +1724,7 @@ def _run_one(
         check=True,
         env=os.environ.copy(),
     )
-    result = json.loads(result_path.read_text())
+    result = json.loads(result_path.read_text(encoding="utf-8"))
     result["worker_wall_seconds"] = round(time.perf_counter() - started, 6)
     result["role"] = role
     if setup_result is not None:
@@ -1823,12 +1831,23 @@ def _environment(source_root: Path, limits: Any, data_root: Path | None = None) 
         filesystem_device = (data_root or source_root).stat().st_dev
     except OSError:
         filesystem_device = None
+    source_files = {
+        path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted((source_root / "src/kalshi_events").rglob("*"))
+        if path.is_file() and path.suffix in {".py", ".sql", ".yml"}
+    }
+    windows = platform.system() == "Windows"
     return {
         "platform": platform.platform(),
         "python": sys.version,
         "python_executable": sys.executable,
         "packages": packages,
         "filesystem_device": filesystem_device,
+        "durability_requirement": (
+            "elevated-local-NTFS-volume-flush" if windows else "POSIX-file-and-directory-fsync"
+        ),
+        "child_peak_rss_available": not windows,
+        "runtime_source_sha256": source_files,
         "limits": vars(limits) if limits is not None else None,
     }
 
@@ -2291,6 +2310,8 @@ def main() -> int:
             "hashes": "Instrumented common.digest/file_digest calls, including normalize/metadata aliases, plus explicitly counted transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hashing.",
             "hash_bytes": "Bytes counted by instrumented common.digest/file_digest and explicit transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hash bytes.",
             "fsync_calls": "Python-level explicit fsync calls observed or inferred by the legacy observer; excludes DuckDB/C++ internal syncs.",
+            "volume_flush_calls": "Native Windows whole-volume durability barriers, also counted in fsync_calls; includes unrelated writes flushed by the OS.",
+            "volume_flush": "Time spent in native Windows volume validation/open/flush/close barriers; included in pipeline work.",
             "encoded_hashing": "Hash time for encoded HTTP entity bodies; legacy observer also classifies transport.digest calls here.",
             "metadata_scans": "Filesystem inventory walk/reconcile calls; metadata JSON parsing is counted separately.",
             "metadata_scan": "Elapsed time in filesystem inventory walk/reconcile operations, excluding metadata JSON decoding.",

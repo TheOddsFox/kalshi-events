@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import httpx
 import pytest
@@ -258,10 +259,14 @@ def test_cli_new_metadata_syntax_and_validation(tmp_path, capsys):
 def test_dbt_uses_its_installed_environment_not_ambient_path(store, tmp_path, monkeypatch):
     from kalshi_events.warehouse import dbt
 
-    fake = tmp_path / "dbt"
     marker = tmp_path / "ambient-was-invoked"
-    fake.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\nexit 77\n")
-    fake.chmod(0o755)
+    if os.name == "nt":
+        fake = tmp_path / "dbt.cmd"
+        fake.write_text(f'@echo off\necho invoked>"{marker}"\nexit /b 77\n')
+    else:
+        fake = tmp_path / "dbt"
+        fake.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\nexit 77\n")
+        fake.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
     assert dbt(store, ["parse"]).returncode == 0
     assert not marker.exists()

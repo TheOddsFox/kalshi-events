@@ -25,6 +25,7 @@ from kalshi_events.common import (
     interrupt_at_deadline,
     json_bytes,
     now,
+    path_is_link,
     regular_bytes,
 )
 
@@ -867,7 +868,7 @@ def _validate_retirement_artifact(store: Store, path: Path, root: str, identity:
     """Bind a source or tombstone directory to its canonical artifact identity."""
     if not path.exists():
         return None
-    if path.is_symlink() or not path.is_dir():
+    if path_is_link(path) or not path.is_dir():
         raise CatalogueError("retirement plan artifact is not a canonical directory")
     if root == "captures":
         value = decode(regular_bytes(path / "state.json", store.limits.max_root_bytes))
@@ -1068,7 +1069,7 @@ def _finish_retirement_plan(store: Store) -> None:
     captures_root = store.path("captures")
     discarded_capture = plan.get("capture_id") if plan.get("kind") == "discard" else None
     for path in sorted(captures_root.iterdir()) if captures_root.exists() else []:
-        if not path.is_dir() or path.is_symlink():
+        if not path.is_dir() or path_is_link(path):
             continue
         pending = read_capture(store, path.name)
         if pending.get("complete"):
@@ -1123,19 +1124,19 @@ def _finish_retirement_plan(store: Store) -> None:
             if target.exists():
                 raise CatalogueError("prune plan source and tombstone both exist")
         elif target.exists():
-            if not started or target.is_symlink() or not target.is_dir():
+            if not started or path_is_link(target) or not target.is_dir():
                 raise CatalogueError("untracked prune tombstone; refusing cleanup")
         elif not started:
             raise CatalogueError("untracked missing prune source; refusing cleanup")
 
-    if trash.is_symlink() or (trash.exists() and not trash.is_dir()):
+    if path_is_link(trash) or (trash.exists() and not trash.is_dir()):
         raise CatalogueError("prune-trash is not a canonical directory")
     if trash.exists():
         for child in trash.iterdir():
             relative = f"prune-trash/{child.name}"
             if relative not in targets:
                 raise CatalogueError("unplanned prune-trash contents; refusing broad cleanup")
-            if child.is_symlink() or not child.is_dir():
+            if path_is_link(child) or not child.is_dir():
                 raise CatalogueError("retirement tombstone is not a directory")
 
     durable_mkdir(trash)
@@ -1180,9 +1181,9 @@ def _finish_retirement_plan(store: Store) -> None:
             fsync_directory(source.parent)
             fsync_directory(trash)
         if target.exists():
-            if target.is_symlink():
+            if path_is_link(target):
                 raise CatalogueError("retirement tombstone became a symlink")
-            if target.is_dir() and not target.is_symlink():
+            if target.is_dir() and not path_is_link(target):
                 shutil.rmtree(target)
             else:
                 target.unlink()
@@ -1281,7 +1282,7 @@ def _prune_locked(
     captures_dir = store.path("captures")
     capture_states: dict[str, dict[str, Any]] = {}
     for path in sorted(captures_dir.iterdir()) if captures_dir.exists() else []:
-        if not path.is_dir() or path.is_symlink():
+        if not path.is_dir() or path_is_link(path):
             continue
         cached = next(
             (
@@ -1336,7 +1337,7 @@ def _prune_locked(
             continue
         if (
             not directory.is_dir()
-            or directory.is_symlink()
+            or path_is_link(directory)
             or not (directory / "manifest.json").is_file()
         ):
             continue
@@ -1396,7 +1397,7 @@ def _prune_locked(
         for path in sorted(base.iterdir()) if base.exists() else []:
             if (
                 path.is_dir()
-                and not path.is_symlink()
+                and not path_is_link(path)
                 and path.name in capture_states
                 and path.name not in keep_captures
             ):
@@ -1407,7 +1408,7 @@ def _prune_locked(
     for path in sorted(releases_dir.iterdir()) if releases_dir.exists() else []:
         if (
             path.is_dir()
-            and not path.is_symlink()
+            and not path_is_link(path)
             and path.name not in keep_releases
             and (path / "manifest.json").is_file()
         ):
@@ -1492,7 +1493,7 @@ def _discard_locked(store: Store, capture_id: str) -> dict[str, Any]:
 
     captures = store.path("captures")
     for path in sorted(captures.iterdir()) if captures.exists() else []:
-        if path.name == capture_id or not path.is_dir() or path.is_symlink():
+        if path.name == capture_id or not path.is_dir() or path_is_link(path):
             continue
         descendant = read_capture(store, path.name)
         pin = descendant.get("baseline")
@@ -1511,7 +1512,7 @@ def _discard_locked(store: Store, capture_id: str) -> dict[str, Any]:
 
     releases = store.path("releases")
     for path in sorted(releases.iterdir()) if releases.exists() else []:
-        if path.name in release_ids or not path.is_dir() or path.is_symlink():
+        if path.name in release_ids or not path.is_dir() or path_is_link(path):
             continue
         if not (path / "manifest.json").is_file():
             continue

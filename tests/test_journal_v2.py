@@ -618,7 +618,7 @@ def test_native_validation_failure_never_commits_or_applies_the_page(store, monk
         for path in store.path("raw").glob("*/manifest.json")
         if json.loads(path.read_text())["endpoint"] == "/markets"
     )
-    relative = str(bad_receipt.relative_to(store.root))
+    relative = bad_receipt.relative_to(store.root).as_posix()
     state = acquisition.read_capture(store, identity)
     assert relative not in {row["relative"] for row in acquisition.page_receipts(store, state)}
     assert next(work for work in state["tasks"] if work["endpoint"] == "/markets")["done"] is False

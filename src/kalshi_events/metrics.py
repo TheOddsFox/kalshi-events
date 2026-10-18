@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import contextvars
+import ctypes
 import json
 import os
-import resource
 import sys
 import threading
 import time
@@ -14,9 +14,50 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, TextIO
 
+if sys.platform != "win32":
+    import resource
+
 _active: contextvars.ContextVar[Metrics | None] = contextvars.ContextVar(
     "kalshi_events_metrics", default=None
 )
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("PageFaultCount", ctypes.c_uint32),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def _windows_peak_rss_bytes(kernel32: Any | None = None) -> int:
+    if kernel32 is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    current_process = kernel32.GetCurrentProcess
+    current_process.argtypes = []
+    current_process.restype = ctypes.c_void_p
+    get_memory_info = kernel32.K32GetProcessMemoryInfo
+    get_memory_info.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_ProcessMemoryCounters),
+        ctypes.c_uint32,
+    ]
+    get_memory_info.restype = ctypes.c_int
+
+    counters = _ProcessMemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    if not get_memory_info(current_process(), ctypes.byref(counters), counters.cb):
+        error = ctypes.get_last_error()
+        raise OSError(error, "K32GetProcessMemoryInfo failed")
+    return int(counters.PeakWorkingSetSize)
 
 
 class Metrics:
@@ -40,16 +81,24 @@ class Metrics:
             value = resource.getrusage(who).ru_maxrss
             return int(value if sys.platform == "darwin" else value * 1024)
 
+        if sys.platform == "win32":
+            peak_rss_bytes: dict[str, int | None] = {
+                "self": _windows_peak_rss_bytes(),
+                "children": None,
+            }
+        else:
+            peak_rss_bytes = {
+                "self": peak_rss(resource.RUSAGE_SELF),
+                "children": peak_rss(resource.RUSAGE_CHILDREN),
+            }
+
         return {
             "version": 1,
             "elapsed_seconds": round(time.perf_counter() - self.started, 6),
             "phases_seconds": {key: round(value, 6) for key, value in sorted(self.timings.items())},
             "counters": dict(sorted(self.counters.items())),
             "store_accounted_high_water_bytes": dict(sorted(self.high_water.items())),
-            "peak_rss_bytes": {
-                "self": peak_rss(resource.RUSAGE_SELF),
-                "children": peak_rss(resource.RUSAGE_CHILDREN),
-            },
+            "peak_rss_bytes": peak_rss_bytes,
         }
 
 
@@ -94,11 +143,13 @@ def reserve_report(path: str | os.PathLike[str]) -> TextIO:
     """Validate and exclusively reserve the out-of-band report before pipeline work starts."""
     from pathlib import Path
 
-    destination = Path(path).absolute()
-    if any(part.is_symlink() for part in (destination, *destination.parents)):
-        raise OSError("metrics report path cannot contain symlinks")
+    from kalshi_events.common import CatalogueError, safe_path
+
+    try:
+        destination = safe_path(Path(path))
+    except CatalogueError as exc:
+        raise OSError("metrics report path cannot contain symlinks or reparse points") from exc
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination = destination.resolve()
     return destination.open("x", encoding="utf-8")
 
 

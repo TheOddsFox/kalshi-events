@@ -29,6 +29,7 @@ from kalshi_events.common import (
     digest,
     json_bytes,
     now,
+    path_is_link,
     regular_bytes,
     selections,
     ticker,
@@ -609,7 +610,7 @@ def _journal_records(
     path = store.path(f"captures/{capture_id}/pages.jsonl")
     if not path.exists():
         return iter(()), {"valid_end": 0, "torn": False}
-    if path.is_symlink() or not path.is_file():
+    if path_is_link(path) or not path.is_file():
         raise CatalogueError("journal is not a regular file")
     total = path.stat().st_size
     if total > store.limits.max_root_bytes:
@@ -1636,7 +1637,7 @@ def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
     logged = {row["relative"] for row in page_receipts(store, state)}
     recovered: dict[str, str] = {}
     for path in store.path("raw").glob("*/manifest.json"):
-        relative = str(path.relative_to(store.root))
+        relative = path.relative_to(store.root).as_posix()
         if relative in logged:
             continue
         manifest = decode(regular_bytes(path, 1024**2))

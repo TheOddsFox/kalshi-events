@@ -1,7 +1,4 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-git diff --check
-env UV_LINK_MODE=copy uv run --locked ruff check .
-env UV_LINK_MODE=copy uv run --locked ruff format --check .
-env UV_LINK_MODE=copy KALSHI_EVENTS_API_URL=http://127.0.0.1:9/trade-api/v2 KALSHI_EVENTS_ALLOW_LOOPBACK=1 uv run --locked pytest -q
+exec python3 scripts/verify.py --fast
