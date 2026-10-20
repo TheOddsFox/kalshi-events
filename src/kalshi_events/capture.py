@@ -322,9 +322,22 @@ def _validate_series_task_plan(state: dict[str, Any]) -> None:
     """Validate the fixed scoped traversals plus only authoritative event hydration tasks."""
     scope = validate_series_scope(state.get("scope"))
     series = scope["series_ticker"]
-    if state.get("selected") is not None or state.get("incremental") is True:
+    if state.get("selected") is not None:
         raise CatalogueError("scoped captures must use the full series acquisition plan")
-    if any(key in state for key in ("baseline", "query_from", "watermark_started_at")):
+    if state.get("incremental") is True:
+        pin = state.get("baseline")
+        if (
+            not isinstance(pin, dict)
+            or pin.get("catalogue_version") != 2
+            or pin.get("release_contract") != "oddsfox.kalshi.series.v1"
+            or validate_series_scope(pin.get("series_scope")) != scope
+            or pin.get("root_id") != state.get("root_id")
+            or "query_from" in state
+            or not isinstance(state.get("watermark_started_at"), str)
+            or not isinstance(state.get("previous_watermark"), str)
+        ):
+            raise CatalogueError("invalid scoped incremental baseline")
+    elif any(key in state for key in ("baseline", "query_from", "watermark_started_at")):
         raise CatalogueError("scoped series capture has unsupported incremental settings")
     expected = _series_tasks(series)
     tasks = state["tasks"]
@@ -471,6 +484,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         raise CatalogueError("invalid sealed response settings")
     if state.get("incremental", False):
         pin = state.get("baseline")
+        is_scoped = _acquisition_protocol(state) == SCOPED_ACQUISITION_PROTOCOL
         if (
             not isinstance(pin, dict)
             or pin.get("catalogue_version") not in {1, 2}
@@ -479,8 +493,13 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
                 for key in ("source_release_id", "manifest_sha256", "capture_id", "root_id")
             )
             or not isinstance(state.get("task_scopes"), dict)
-            or not isinstance(state.get("query_from"), int)
-            or isinstance(state.get("query_from"), bool)
+            or (
+                not is_scoped
+                and (
+                    not isinstance(state.get("query_from"), int)
+                    or isinstance(state.get("query_from"), bool)
+                )
+            )
         ):
             raise CatalogueError("invalid sealed incremental baseline")
     scopes = state.get("task_scopes", {})
@@ -1360,8 +1379,8 @@ def new_capture(
     if incremental and selected:
         raise CatalogueError("incremental capture cannot be combined with market selection")
     scope = store.scope
-    if scope is not None and (selected is not None or incremental):
-        raise CatalogueError("scoped captures currently require a full series acquisition")
+    if scope is not None and selected is not None:
+        raise CatalogueError("scoped captures require the full series acquisition plan")
     started_at = now()
     pin = None
     if incremental:
@@ -1526,9 +1545,14 @@ def _receipt_matches_context(manifest: dict[str, Any], context: dict[str, Any]) 
     )
     if not protocol_matches:
         return False
-    return manifest.get("series_scope") == context.get("series_scope") and (
-        ("series_scope" in manifest) == ("series_scope" in context)
-    )
+    if ("series_scope" in manifest) != ("series_scope" in context):
+        return False
+    if "series_scope" in context:
+        try:
+            return validate_series_scope(manifest.get("series_scope")) == context["series_scope"]
+        except CatalogueError:
+            return False
+    return True
 
 
 def _receipt_matches_state_protocol(manifest: dict[str, Any], state: dict[str, Any]) -> bool:
@@ -1538,9 +1562,17 @@ def _receipt_matches_state_protocol(manifest: dict[str, Any], state: dict[str, A
     value = manifest.get("acquisition_protocol")
     if not isinstance(value, int) or isinstance(value, bool) or value != protocol:
         return False
-    return manifest.get("series_scope") == state.get("scope") and (
-        ("series_scope" in manifest) == (protocol == SCOPED_ACQUISITION_PROTOCOL)
-    )
+    has_scope = "series_scope" in manifest
+    if has_scope != (protocol == SCOPED_ACQUISITION_PROTOCOL):
+        return False
+    if protocol == SCOPED_ACQUISITION_PROTOCOL:
+        try:
+            return validate_series_scope(manifest.get("series_scope")) == validate_series_scope(
+                state.get("scope")
+            )
+        except CatalogueError:
+            return False
+    return not has_scope
 
 
 def _record_cutoff(state: dict[str, Any], payload: Any) -> None:
@@ -1772,10 +1804,7 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
     series = identities.series
     markets = {identity: value[2] for identity, value in identities.markets.items()}
     existing = {work["endpoint"] for work in state["tasks"]}
-    if state.get("incremental"):
-        missing_events = set()
-        missing_series = set()
-    elif _acquisition_protocol(state) == SCOPED_ACQUISITION_PROTOCOL:
+    if _acquisition_protocol(state) == SCOPED_ACQUISITION_PROTOCOL:
         final_event_members: set[str] = set()
         current_market_members: set[str] = set()
         for index, scope in state["task_scopes"].items():
@@ -1798,6 +1827,9 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
             and ("events", event_ticker) not in identities.parent_lookups
         }
         missing_series = set()
+    elif state.get("incremental"):
+        missing_events = set()
+        missing_series = set()
     else:
         missing_events = set(markets.values()) - events.keys()
         missing_series = {value for value in events.values() if value} - series.keys()
@@ -1816,7 +1848,10 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
                     else None
                 )
                 state["tasks"].append(task(path, kind, singular=True, params=params))
-    if state.get("task_scopes") and _acquisition_protocol(state) != SCOPED_ACQUISITION_PROTOCOL:
+    if state.get("task_scopes") and (
+        _acquisition_protocol(state) != SCOPED_ACQUISITION_PROTOCOL
+        or state.get("incremental") is True
+    ):
         from kalshi_events.incremental import parent_lookup_tasks
 
         existing_identities = {_task_identity(work) for work in state["tasks"]}
@@ -2194,6 +2229,7 @@ def _completed(store: Store, *, catalogue: bool | None) -> list[tuple[str, str]]
             if (
                 state["complete"]
                 and not state.get("incremental")
+                and state.get("scope") is None
                 and (catalogue is None or (state["selected"] is None) == catalogue)
             ):
                 found.append((state["completed_at"], state["capture_id"]))

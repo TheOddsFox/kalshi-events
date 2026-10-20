@@ -1344,8 +1344,10 @@ def _parent_closure_is_fresh(
         [sorted(active_markets)],
     ).fetchall()
     required_events = {parent for _, parent in rows if parent}
+    scoped = state.get("scope") is not None
     for event in required_events - listed_events:
-        if ("events", event) not in index.parent_lookups:
+        outcome = index.parent_lookups.get(("events", event))
+        if outcome is None or (scoped and outcome[0] != 200):
             raise CatalogueError(
                 "full capture lacks fresh parent evidence for final membership; capture a new full baseline"
             )
@@ -1366,14 +1368,12 @@ def _parent_closure_is_fresh(
         [sorted(active_events)],
     ).fetchall()
     for _, parent in event_rows:
-        if (
-            parent
-            and parent not in listed_series
-            and ("series", parent) not in index.parent_lookups
-        ):
-            raise CatalogueError(
-                "full capture lacks fresh series evidence for final membership; capture a new full baseline"
-            )
+        if parent and parent not in listed_series:
+            outcome = index.parent_lookups.get(("series", parent))
+            if outcome is None or (scoped and outcome[0] != 200):
+                raise CatalogueError(
+                    "full capture lacks fresh series evidence for final membership; capture a new full baseline"
+                )
 
 
 def _build_scope_fields(state: dict[str, Any]) -> dict[str, Any]:
@@ -1540,6 +1540,8 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
                 connection,
                 previous_membership=previous_membership,
             )
+            if state.get("scope") is not None:
+                _parent_closure_is_fresh(connection, state, index)
             _affected_keys(connection, state, changes)
             _delete_affected(connection)
         dbt(

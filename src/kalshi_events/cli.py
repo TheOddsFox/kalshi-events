@@ -87,6 +87,19 @@ def parser() -> argparse.ArgumentParser:
         if name == "export":
             action.add_argument("--capture-id")
         _limits(action)
+    series = commands.add_parser("series", help="operate on one dedicated series catalogue")
+    series_actions = series.add_subparsers(dest="series_action", required=True)
+    refresh_action = series_actions.add_parser("refresh")
+    refresh_action.add_argument("--series-ticker")
+    refresh_action.add_argument("--full", action="store_true")
+    refresh_action.add_argument("--capture-id")
+    refresh_action.add_argument("--compression", choices=("identity", "gzip"), default=None)
+    for name in ("current", "replay", "rebuild"):
+        action = series_actions.add_parser(name)
+        if name == "replay":
+            action.add_argument("--capture-id")
+    for action in series_actions.choices.values():
+        _limits(action)
     return cli
 
 
@@ -102,6 +115,27 @@ def _limits(command: argparse.ArgumentParser) -> None:
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     limits = Limits(**{field: getattr(args, field) for field in Limits.__dataclass_fields__})
+    if args.command == "series":
+        root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
+        if args.series_action != "refresh" and not _has_operator_marker(root):
+            raise CatalogueError("series commands require an existing scoped operator root")
+        if (
+            args.series_action == "refresh"
+            and not _has_operator_marker(root)
+            and args.series_ticker is None
+        ):
+            raise CatalogueError("a new series root requires --series-ticker")
+        store = Store(
+            root,
+            limits,
+            series_ticker=(args.series_ticker if args.series_action == "refresh" else None),
+        )
+        try:
+            if store.scope is None:
+                raise CatalogueError("series command requires a scoped operator root")
+            return _run_series(store, args)
+        finally:
+            store.reconcile()
     if args.command == "metadata" and args.metadata_action == "verify":
         return metadata.verify(args.output)
     if args.command == "verify":
@@ -122,6 +156,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
+    if store.scope is not None and args.command not in {"status", "discard"}:
+        raise CatalogueError("catalogue commands cannot operate on a scoped series root")
     if args.command == "current":
         return publish.current(store, catalogue_version=args.catalogue_version)
     if args.command == "status":
@@ -189,6 +225,22 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
     raise CatalogueError("unknown command")
 
 
+def _run_series(store: Store, args: argparse.Namespace) -> dict[str, Any]:
+    if args.series_action == "current":
+        result = publish.current(store, catalogue_version=2)
+    elif args.series_action == "replay":
+        result = recovery.replay(store, args.capture_id, catalogue_version=2)
+    elif args.series_action == "rebuild":
+        result = recovery.rebuild(store, catalogue_version=2)
+    else:
+        raise CatalogueError("series refresh must use the refresh workflow")
+    return {**result, "series_scope": store.scope}
+
+
+def _has_operator_marker(root: Path) -> bool:
+    return root.is_dir() and (root / "root.json").is_file()
+
+
 def _status(store: Store) -> dict[str, Any]:
     captures = []
     if store.path("captures").exists():
@@ -210,22 +262,34 @@ def _status(store: Store) -> dict[str, Any]:
                     },
                 }
             )
-    return {
+    result = {
         "root": str(store.root),
         "captures": captures,
         "accounting": accounting(store),
-        "current": publish.current(store) if store.path("current.json").exists() else None,
+        "current": (
+            publish.current(store)
+            if store.scope is None and store.path("current.json").exists()
+            else None
+        ),
         "current_v2": (
             publish.current(store, catalogue_version=2)
-            if store.path("current-v2.json").exists()
+            if store.scope is None and store.path("current-v2.json").exists()
             else None
         ),
     }
+    if store.scope is not None:
+        result["series_scope"] = store.scope
+        result["current_series"] = (
+            publish.current(store, catalogue_version=2)
+            if store.path("current-series.json").exists()
+            else None
+        )
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if args.command == "refresh":
+    if args.command == "refresh" or (args.command == "series" and args.series_action == "refresh"):
         return _refresh_main(args)
     try:
         if args.metrics_file is None:
@@ -268,6 +332,9 @@ def _refresh_main(args: argparse.Namespace) -> int:
     """Keep refresh failures in its single machine-readable result."""
     result = refresh.result_template()
     result["capture_id"] = args.capture_id
+    series_command = args.command == "series"
+    if series_command:
+        result["series_scope"] = None
     exit_code = 1
     report_stream = None
     measured = None
@@ -276,6 +343,8 @@ def _refresh_main(args: argparse.Namespace) -> int:
             raise CatalogueError("--full and --capture-id cannot be used together")
         limits = Limits(**{field: getattr(args, field) for field in Limits.__dataclass_fields__})
         root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
+        if series_command and not _has_operator_marker(root) and args.series_ticker is None:
+            raise CatalogueError("a new series root requires --series-ticker")
         if args.metrics_file is not None:
             metrics_path = safe_path(args.metrics_file)
             if metrics_path.is_relative_to(root):
@@ -285,7 +354,17 @@ def _refresh_main(args: argparse.Namespace) -> int:
             report_stream = metrics.reserve_report(metrics_path)
         context = metrics.collect() if report_stream is not None else nullcontext(None)
         with context as measured:
-            store = Store(root, limits)
+            store = Store(
+                root,
+                limits,
+                series_ticker=(args.series_ticker if series_command else None),
+            )
+            if not series_command and store.scope is not None:
+                raise CatalogueError("catalogue commands cannot operate on a scoped series root")
+            if series_command:
+                if store.scope is None:
+                    raise CatalogueError("series refresh requires a scoped operator root")
+                result["series_scope"] = store.scope
             with store.lock():
                 result, exit_code = refresh.run(
                     store,
@@ -293,6 +372,8 @@ def _refresh_main(args: argparse.Namespace) -> int:
                     capture_id=args.capture_id,
                     compression=args.compression,
                 )
+                if series_command:
+                    result["series_scope"] = store.scope
                 try:
                     store.reconcile()
                 except Exception as exc:

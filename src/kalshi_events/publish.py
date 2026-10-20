@@ -43,6 +43,7 @@ from kalshi_events.warehouse import RELATIONS, build_directory, certified
 
 CONTRACT = "oddsfox.kalshi.catalogue.v1"
 CONTRACT_V2 = "oddsfox.kalshi.catalogue.v2"
+SERIES_CONTRACT = "oddsfox.kalshi.series.v1"
 FILES = {name + ".parquet" for name in (*RELATIONS, "coverage")}
 ORDER_KEYS = {
     "series": "series_ticker",
@@ -87,13 +88,14 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
         not in (
             CONTRACT,
             CONTRACT_V2,
+            SERIES_CONTRACT,
         )
         or not isinstance(manifest.get("files"), dict)
         or set(manifest["files"]) != FILES
     ):
         raise CatalogueError("invalid catalogue contract or relation inventory")
-    if manifest["contract"] == CONTRACT_V2:
-        _validate_v2_manifest(manifest)
+    if manifest["contract"] in {CONTRACT_V2, SERIES_CONTRACT}:
+        _validate_v2_manifest(manifest, series=manifest["contract"] == SERIES_CONTRACT)
     if {p.name for p in directory.iterdir()} != FILES | {"manifest.json"}:
         raise CatalogueError("release contains unexpected or missing files")
     actual = inventory(directory, FILES, limit)
@@ -106,12 +108,16 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
             _ = pq.ParquetFile(directory / name).schema
         except Exception as exc:
             raise CatalogueError("invalid Parquet release relation") from exc
-    if manifest["contract"] == CONTRACT_V2:
-        _validate_v2_coverage(directory / "coverage.parquet", manifest)
+    if manifest["contract"] in {CONTRACT_V2, SERIES_CONTRACT}:
+        _validate_v2_coverage(
+            directory / "coverage.parquet",
+            manifest,
+            series=manifest["contract"] == SERIES_CONTRACT,
+        )
     return manifest
 
 
-def _validate_v2_manifest(manifest: dict[str, Any]) -> None:
+def _validate_v2_manifest(manifest: dict[str, Any], *, series: bool = False) -> None:
     if any(name not in manifest for name in V2_LINEAGE_FIELDS):
         raise CatalogueError("invalid catalogue-v2 lineage fields")
     if not _hex_id(manifest.get("root_id"), 32) or not _hex_id(manifest.get("capture_id"), 32):
@@ -121,6 +127,25 @@ def _validate_v2_manifest(manifest: dict[str, Any]) -> None:
         raise CatalogueError("invalid catalogue-v2 delta depth")
     if not _hex_id(manifest.get("membership_sha256"), 64):
         raise CatalogueError("invalid catalogue-v2 membership fingerprint")
+    if series:
+        from kalshi_events.common import validate_series_scope
+
+        scope = validate_series_scope(manifest.get("series_scope"))
+        if (
+            manifest.get("coverage_scope") != "series"
+            or manifest.get("include_multivariate") is not False
+            or not isinstance(manifest.get("series_ticker"), str)
+            or scope != validate_series_scope(
+                {
+                    "kind": "series",
+                    "series_ticker": manifest.get("series_ticker"),
+                    "include_multivariate": manifest.get("include_multivariate"),
+                }
+            )
+        ):
+            raise CatalogueError("invalid series release scope")
+    elif manifest.get("coverage_scope") != "catalogue":
+        raise CatalogueError("invalid catalogue-v2 coverage scope")
     if "warehouse_sha256" in manifest and not _hex_id(manifest["warehouse_sha256"], 64):
         raise CatalogueError("invalid catalogue-v2 warehouse checksum")
     baseline_id = manifest.get("baseline_release_id")
@@ -152,9 +177,12 @@ def _validate_v2_manifest(manifest: dict[str, Any]) -> None:
             raise CatalogueError("catalogue-v2 watermark moves backwards")
 
 
-def _validate_v2_coverage(path: Path, manifest: dict[str, Any]) -> None:
+def _validate_v2_coverage(path: Path, manifest: dict[str, Any], *, series: bool = False) -> None:
     fields = ("capture_id", *V2_LINEAGE_FIELDS)
     expected = {name: manifest.get(name) for name in fields}
+    if series:
+        fields = (*fields, "coverage_scope", "series_ticker", "include_multivariate")
+        expected.update({name: manifest.get(name) for name in fields if name not in expected})
     try:
         parquet = pq.ParquetFile(
             path,
@@ -209,6 +237,9 @@ def _validate_v2_coverage(path: Path, manifest: dict[str, Any]) -> None:
             elif isinstance(value, int) and not isinstance(value, bool):
                 if not pa.types.is_int64(field_type):
                     raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+            elif isinstance(value, bool):
+                if not pa.types.is_boolean(field_type):
+                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
             else:
                 raise CatalogueError("invalid catalogue-v2 manifest lineage value")
         table = parquet.read(columns=list(fields))
@@ -253,6 +284,7 @@ def publish(
 ) -> dict[str, Any]:
     if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2):
         raise CatalogueError("catalogue version must be 1 or 2")
+    _profile(store, catalogue_version)
     with store.writer_guard():
         return _publish(store, capture_id, catalogue_version)
 
@@ -277,8 +309,12 @@ def _publish(
 
     incremental.finish_pending_retirement(store)
     explicit_capture_id = bool(capture_id)
+    if store.scope is not None and not explicit_capture_id:
+        raise CatalogueError("series publication requires an explicit capture ID")
     capture_id = capture_id or latest_catalogue_capture(store)
     state = _complete_capture(store, capture_id)
+    if state.get("scope") != store.scope:
+        raise CatalogueError("capture scope does not match the publication root")
     if catalogue_version == 1 and state.get("incremental") is True:
         raise CatalogueError("incremental captures can only publish as catalogue version 2")
     if catalogue_version == 2 and state.get("incremental") is True and not explicit_capture_id:
@@ -310,7 +346,8 @@ def _publish(
         _page_rows=rows,
         _context=_context,
     )
-    if receipt["scope"] != "catalogue":
+    expected_build_scope = "series" if store.scope is not None else "catalogue"
+    if receipt["scope"] != expected_build_scope:
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
     store.check_deadline()
     warehouse = store.path(f"{build_directory(capture_id, catalogue_version)}/warehouse.duckdb")
@@ -343,7 +380,7 @@ def _publish(
                     raise BudgetExceeded("operation deadline exhausted") from exc
         coverage_row = {
             "capture_id": state["capture_id"],
-            "coverage_scope": "catalogue",
+            "coverage_scope": "series" if store.scope is not None else "catalogue",
             "started_at": state["started_at"],
             "completed_at": state["completed_at"],
             "atomic_snapshot": False,
@@ -355,7 +392,9 @@ def _publish(
             from kalshi_events import incremental
 
             release_metadata = incremental.release_fields(store, state)
-            coverage_row.update(release_metadata)
+            coverage_row.update(
+                {key: value for key, value in release_metadata.items() if key != "series_scope"}
+            )
         coverage = [coverage_row]
         store.check_deadline()
         pq.write_table(pa.Table.from_pylist(coverage), temporary / "coverage.parquet")
@@ -367,14 +406,16 @@ def _publish(
         evidence = inventory(temporary, FILES, store.limits.max_root_bytes)
         release_id = digest(json_bytes(evidence).rstrip(b"\n"))
         manifest = {
-            "contract": CONTRACT_V2 if catalogue_version == 2 else CONTRACT,
+            "contract": _profile(store, catalogue_version)[1],
             "source_release_id": release_id,
             "capture_id": state["capture_id"],
             "received_at": now(),
-            "coverage_scope": "catalogue",
+            "coverage_scope": "series" if store.scope is not None else "catalogue",
             "files": evidence,
         }
         manifest.update(release_metadata)
+        if store.scope is not None:
+            manifest["series_scope"] = dict(store.scope)
         if catalogue_version == 2:
             manifest["warehouse_sha256"] = receipt["warehouse_sha256"]
         atomic_json(temporary / "manifest.json", manifest)
@@ -405,7 +446,7 @@ def _publish(
         store.sync(temporary_relative)
         store.sync(f"releases/{release_id}")
         store.check_deadline()
-        pointer_name = "current-v2.json" if catalogue_version == 2 else "current.json"
+        pointer_name = _profile(store, catalogue_version)[0]
         # A delta may be retried after pointer promotion and before pruning completed.
         already_current = False
         if catalogue_version == 2 and store.path(pointer_name).exists():
@@ -435,11 +476,11 @@ def _publish(
                     },
                 )
         # Pruning runs only after the promoted pointer re-verifies end to end.
-        promoted = (
-            current(store)
-            if catalogue_version == 1
-            else current(store, catalogue_version=catalogue_version)
-        )
+            promoted = (
+                current(store)
+                if catalogue_version == 1
+                else current(store, catalogue_version=catalogue_version)
+            )
         if promoted["capture_id"] != capture_id:
             raise CatalogueError("promoted release does not belong to the published capture")
         with metrics.phase("pruning"):
@@ -474,8 +515,7 @@ def prune_superseded(
 def current(store: Store, *, catalogue_version: int = 1) -> dict[str, Any]:
     if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2):
         raise CatalogueError("catalogue version must be 1 or 2")
-    pointer_name = "current-v2.json" if catalogue_version == 2 else "current.json"
-    expected_contract = CONTRACT_V2 if catalogue_version == 2 else CONTRACT
+    pointer_name, expected_contract = _profile(store, catalogue_version)[:2]
     pointer = decode(regular_bytes(store.path(pointer_name), 1024**2))
     if not isinstance(pointer, dict):
         raise CatalogueError("invalid current release pointer")
@@ -493,4 +533,18 @@ def current(store: Store, *, catalogue_version: int = 1) -> dict[str, Any]:
 
         if manifest["root_id"] != root_id(store):
             raise CatalogueError("v2 release belongs to a different logical operator root")
+        if store.scope is not None and manifest.get("series_scope") != store.scope:
+            raise CatalogueError("series release belongs to a different operator scope")
     return {"output": str(directory), **manifest}
+
+
+def _profile(store: Store, catalogue_version: int) -> tuple[str, str]:
+    if store.scope is not None:
+        if catalogue_version != 2:
+            raise CatalogueError("series roots support only the series publication contract")
+        return "current-series.json", SERIES_CONTRACT
+    if catalogue_version == 1:
+        return "current.json", CONTRACT
+    if catalogue_version == 2:
+        return "current-v2.json", CONTRACT_V2
+    raise CatalogueError("catalogue version must be 1 or 2")

@@ -27,10 +27,26 @@ from kalshi_events.common import (
     now,
     path_is_link,
     regular_bytes,
+    validate_series_scope,
 )
 
 MAX_DELTAS = 8
 OVERLAP = timedelta(minutes=5)
+SERIES_CONTRACT = "oddsfox.kalshi.series.v1"
+CATALOGUE_V2_CONTRACT = "oddsfox.kalshi.catalogue.v2"
+
+
+def pointer_profile(store: Store) -> tuple[str, int, str]:
+    """Return the sole publication pointer and contract for this operator root."""
+    if store.scope is not None:
+        return "current-series.json", 2, SERIES_CONTRACT
+    return "current-v2.json", 2, CATALOGUE_V2_CONTRACT
+
+
+def publication_pointers(store: Store) -> tuple[tuple[int, str], ...]:
+    if store.scope is not None:
+        return ((2, "current-series.json"),)
+    return ((1, "current.json"), (2, "current-v2.json"))
 
 
 def _utc(value: Any, label: str) -> datetime:
@@ -83,8 +99,22 @@ def baseline(
     from kalshi_events import publish
 
     identity = root_id(store, create=create_root_id)
-    v2_pointer = store.path("current-v2.json")
-    if v2_pointer.exists():
+    if store.scope is not None:
+        pointer_name, version, contract = pointer_profile(store)
+        if not store.path(pointer_name).exists():
+            raise CatalogueError("series refresh requires a verified series baseline")
+        current = publish.current(store, catalogue_version=2)
+        if (
+            current.get("root_id") != identity
+            or current.get("contract") != contract
+            or current.get("series_scope") != store.scope
+        ):
+            raise CatalogueError("series baseline belongs to a different root or scope")
+        depth = current.get("delta_depth")
+        if isinstance(depth, bool) or not isinstance(depth, int) or not 0 <= depth <= MAX_DELTAS:
+            raise CatalogueError("invalid series baseline delta depth")
+        watermark = _utc(current.get("watermark_started_at"), "published watermark")
+    elif store.path("current-v2.json").exists():
         current = publish.current(store, catalogue_version=2)
         if current.get("root_id") != identity:
             raise CatalogueError("v2 baseline belongs to a different logical operator root")
@@ -93,6 +123,7 @@ def baseline(
             raise CatalogueError("invalid v2 baseline delta depth")
         watermark = _utc(current.get("watermark_started_at"), "published watermark")
         version = 2
+        contract = CATALOGUE_V2_CONTRACT
     else:
         if store.path("current.json").exists():
             current = publish.current(store, catalogue_version=1)
@@ -104,6 +135,7 @@ def baseline(
         watermark = _utc(state.get("started_at"), "baseline capture start")
         depth = 0
         version = 1
+        contract = "oddsfox.kalshi.catalogue.v1"
     if depth >= MAX_DELTAS:
         raise CatalogueError("eight deltas already depend on this baseline; publish a full rebase")
     started_at = started_at or now()
@@ -111,7 +143,9 @@ def baseline(
     if sealed_start < watermark:
         raise CatalogueError("incremental capture start precedes the published watermark")
     overlap_start = watermark - OVERLAP
-    pointer_name = "current-v2.json" if version == 2 else "current.json"
+    pointer_name = pointer_profile(store)[0] if store.scope is not None else (
+        "current-v2.json" if version == 2 else "current.json"
+    )
     pointer = decode(regular_bytes(store.path(pointer_name), 1024**2))
     if pointer.get("source_release_id") != current["source_release_id"]:
         raise CatalogueError("publication pointer changed while pinning incremental baseline")
@@ -127,8 +161,14 @@ def baseline(
         },
         "watermark_started_at": sealed_start.isoformat().replace("+00:00", "Z"),
         "previous_watermark": watermark.isoformat().replace("+00:00", "Z"),
-        "query_from": int(overlap_start.timestamp()),
     }
+    if store.scope is not None:
+        result["baseline"].update(
+            release_contract=contract,
+            series_scope=dict(store.scope),
+        )
+    else:
+        result["query_from"] = int(overlap_start.timestamp())
     verify_pin(store, result)
     return result
 
@@ -140,6 +180,11 @@ def verify_pin(store: Store, state: dict[str, Any]) -> dict[str, Any]:
     pin = state.get("baseline")
     if not isinstance(pin, dict) or pin.get("root_id") != root_id(store):
         raise CatalogueError("incremental baseline root identity mismatch")
+    pin_scope = None
+    if store.scope is not None:
+        pin_scope = validate_series_scope(pin.get("series_scope"))
+        if pin_scope != store.scope:
+            raise CatalogueError("pinned series baseline belongs to a different contract or scope")
     version = pin.get("catalogue_version")
     release_id = pin.get("source_release_id")
     if not isinstance(release_id, str) or len(release_id) != 64:
@@ -154,6 +199,17 @@ def verify_pin(store: Store, state: dict[str, Any]) -> dict[str, Any]:
         or current.get("root_id", pin.get("root_id")) != pin.get("root_id")
     ):
         raise CatalogueError("pinned incremental baseline publication changed")
+    if store.scope is not None:
+        if (
+            pin.get("catalogue_version") != 2
+            or pin.get("release_contract") != SERIES_CONTRACT
+            or pin_scope != store.scope
+            or current.get("contract") != SERIES_CONTRACT
+            or current.get("series_scope") != store.scope
+        ):
+            raise CatalogueError("pinned series baseline belongs to a different contract or scope")
+    elif pin.get("release_contract") == SERIES_CONTRACT or current.get("contract") == SERIES_CONTRACT:
+        raise CatalogueError("series publication cannot be used as a catalogue baseline")
     expected_depth = 0 if version == 1 else current.get("delta_depth")
     if pin.get("delta_depth") != expected_depth:
         raise CatalogueError("incremental baseline depth differs from its pinned publication")
@@ -163,6 +219,7 @@ def verify_pin(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             release_id,
             manifest_sha256=pin["manifest_sha256"],
             expected_root=pin["root_id"],
+            expected_scope=store.scope,
         )
         if pin["capture_id"] not in ancestors:
             raise CatalogueError("pinned v2 release ancestry omits its capture")
@@ -475,12 +532,17 @@ def parent_lookup_tasks(
             identities._baseline_snapshot = cache
         snapshot = cache[1]
         base = snapshot["membership"]
-        effective = {scope: set(values) for scope, values in base.items()}
-        for scope, values in scope_values.items():
-            if scope in {"events_live", "markets_live"}:
-                effective.setdefault(scope, set()).update(values)
-            else:
-                effective[scope] = set(values)
+        if state.get("scope") is not None:
+            effective = {scope: set(values) for scope, values in scope_values.items()}
+            for scope in base:
+                effective.setdefault(scope, set())
+        else:
+            effective = {scope: set(values) for scope, values in base.items()}
+            for scope, values in scope_values.items():
+                if scope in {"events_live", "markets_live"}:
+                    effective.setdefault(scope, set()).update(values)
+                else:
+                    effective[scope] = set(values)
         baseline_markets = snapshot["markets"]
         baseline_events = snapshot["events"]
     else:
@@ -536,6 +598,22 @@ def parent_lookup_tasks(
         and parent not in series_members
         and ("series", parent) not in identities.parent_lookups
     }
+    if state.get("scope") is not None:
+        for winner in market_winners.values():
+            parent = winner[2]
+            outcome = identities.parent_lookups.get(("events", parent)) if parent else None
+            if parent and parent not in event_members and outcome is not None and outcome[0] != 200:
+                raise CatalogueError("series market winner lacks an authoritative event parent")
+        for event, parent in event_parents.items():
+            outcome = identities.parent_lookups.get(("series", parent)) if parent else None
+            if (
+                event in active_events
+                and parent
+                and parent not in series_members
+                and outcome is not None
+                and outcome[0] != 200
+            ):
+                raise CatalogueError("series event winner lacks an authoritative series parent")
     if not state.get("incremental"):
         final_market_members = set().union(
             final_scope_values.get("markets_live", set()),
@@ -575,11 +653,12 @@ def parent_lookup_tasks(
             and parent not in final_series_members
             and ("series", parent) not in identities.parent_lookups
         )
-    from kalshi_events.capture import ACQUISITION_PROTOCOL, task
+    from kalshi_events.capture import ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL, task
 
     event_params = (
         {"exclude_markets": "true"}
-        if state.get("acquisition_protocol") == ACQUISITION_PROTOCOL
+        if state.get("acquisition_protocol")
+        in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
         else None
     )
 
@@ -602,16 +681,26 @@ def verify_predecessor(store: Store, state: dict[str, Any]) -> None:
     pin = state.get("baseline")
     if not isinstance(pin, dict):
         raise CatalogueError("incremental capture lacks a baseline pin")
-    effective_version = 2 if store.path("current-v2.json").exists() else 1
+    pointer_name, effective_version, expected_contract = pointer_profile(store)
+    if store.scope is None:
+        effective_version = 2 if store.path("current-v2.json").exists() else 1
+        pointer_name = "current-v2.json" if effective_version == 2 else "current.json"
+        expected_contract = CATALOGUE_V2_CONTRACT if effective_version == 2 else "oddsfox.kalshi.catalogue.v1"
+    elif not store.path(pointer_name).exists():
+        raise CatalogueError("series predecessor pointer is missing")
     if effective_version != pin.get("catalogue_version"):
-        raise CatalogueError("stale incremental baseline; a newer catalogue predecessor exists")
+        raise CatalogueError(
+            "stale incremental baseline; a newer "
+            f"{'scoped' if store.scope is not None else 'catalogue'} predecessor exists"
+        )
     current = publish.current(store, catalogue_version=effective_version)
-    pointer_name = "current-v2.json" if effective_version == 2 else "current.json"
     pointer = decode(regular_bytes(store.path(pointer_name), 1024**2))
     if (
         current.get("source_release_id") != pin.get("source_release_id")
         or pointer.get("manifest_sha256") != pin.get("manifest_sha256")
         or current.get("capture_id") != pin.get("capture_id")
+        or current.get("contract") != expected_contract
+        or (store.scope is not None and current.get("series_scope") != store.scope)
         or (effective_version == 2 and current.get("root_id") != pin.get("root_id"))
     ):
         raise CatalogueError("stale incremental baseline; publish from the current predecessor")
@@ -621,7 +710,10 @@ def verify_full_rebase(store: Store, state: dict[str, Any]) -> None:
     """Reject a full-v2 publication that would reset an existing lineage unsafely."""
     from kalshi_events import publish
 
-    pointer_path = store.path("current-v2.json")
+    pointer_name, _version, _contract = pointer_profile(store)
+    if store.scope is None:
+        pointer_name = "current-v2.json"
+    pointer_path = store.path(pointer_name)
     if not pointer_path.exists():
         return
     current = publish.current(store, catalogue_version=2)
@@ -646,11 +738,18 @@ def verify_full_rebase(store: Store, state: dict[str, Any]) -> None:
         if manifest.get("source_release_id") != release_id:
             raise CatalogueError("v2 ancestry has a mismatched release identity")
         if manifest.get("contract") == "oddsfox.kalshi.catalogue.v1":
+            if store.scope is not None:
+                raise CatalogueError("series lineage cannot use a catalogue-v1 baseline")
             if manifest.get("capture_id") == candidate_id:
                 raise CatalogueError("cannot republish an ancestor full capture as a new rebase")
             break
-        if manifest.get("root_id") != root:
-            raise CatalogueError("v2 ancestry crosses roots or has a mismatched release identity")
+        expected_contract = SERIES_CONTRACT if store.scope is not None else CATALOGUE_V2_CONTRACT
+        if manifest.get("contract") != expected_contract:
+            raise CatalogueError("publication ancestry crosses contracts or scopes")
+        if manifest.get("root_id") != root or (
+            store.scope is not None and manifest.get("series_scope") != store.scope
+        ):
+            raise CatalogueError("v2 ancestry crosses roots or has a mismatched series scope")
         if manifest.get("capture_id") == candidate_id and not idempotent_current:
             raise CatalogueError("cannot republish an ancestor full capture as a new rebase")
         parent_id = manifest.get("baseline_release_id")
@@ -699,9 +798,19 @@ def release_fields(store: Store, state: dict[str, Any]) -> dict[str, Any]:
     common = {
         "membership_sha256": membership_fingerprint(store, state["capture_id"]),
     }
+    series_fields = (
+        {
+            "coverage_scope": "series",
+            "series_ticker": store.scope["series_ticker"],
+            "include_multivariate": False,
+        }
+        if store.scope is not None
+        else {}
+    )
     if not state.get("incremental"):
         return {
             **common,
+            **series_fields,
             "root_id": identity,
             "baseline_release_id": None,
             "baseline_manifest_sha256": None,
@@ -713,6 +822,7 @@ def release_fields(store: Store, state: dict[str, Any]) -> dict[str, Any]:
     verify_pin(store, state)
     return {
         **common,
+        **series_fields,
         "root_id": identity,
         "baseline_release_id": state["baseline"]["source_release_id"],
         "baseline_manifest_sha256": state["baseline"]["manifest_sha256"],
@@ -729,6 +839,7 @@ def _lineage_impl(
     *,
     manifest_sha256: str | None = None,
     expected_root: str | None = None,
+    expected_scope: dict[str, Any] | None = None,
     _context: Any = None,
 ) -> tuple[set[str], set[str], datetime | None]:
     from kalshi_events import publish
@@ -738,6 +849,8 @@ def _lineage_impl(
     evidence: dict[str, tuple[int, dict[str, Any]]] = {}
     capture_states: dict[str, dict[str, Any]] = {}
     root = expected_root
+    scope = store.scope if expected_scope is None and store.scope is not None else expected_scope
+    expected_contract = SERIES_CONTRACT if scope is not None else None
     baseline_started: datetime | None = None
     child_depth: int | None = None
     while release_id:
@@ -755,7 +868,10 @@ def _lineage_impl(
         if not isinstance(capture_id, str):
             raise CatalogueError("release ancestry lacks a capture identity")
         captures.add(capture_id)
-        if manifest.get("contract") == "oddsfox.kalshi.catalogue.v1":
+        contract = manifest.get("contract")
+        if contract == "oddsfox.kalshi.catalogue.v1":
+            if scope is not None:
+                raise CatalogueError("series ancestry cannot contain a catalogue release")
             if child_depth not in {None, 1}:
                 raise CatalogueError("v2 lineage depth does not match its v1 bootstrap")
             from kalshi_events.capture import read_capture
@@ -768,8 +884,13 @@ def _lineage_impl(
             baseline_started = _utc(baseline_state.get("started_at"), "v1 baseline start")
             evidence[capture_id] = (1, manifest)
             break
-        if manifest.get("contract") != "oddsfox.kalshi.catalogue.v2":
+        if contract not in {CATALOGUE_V2_CONTRACT, SERIES_CONTRACT}:
             raise CatalogueError("unsupported release in ancestry")
+        if scope is not None:
+            if contract != expected_contract or manifest.get("series_scope") != scope:
+                raise CatalogueError("series ancestry crosses release contracts or scopes")
+        elif contract == SERIES_CONTRACT:
+            raise CatalogueError("series ancestry cannot be used as a catalogue release")
         evidence[capture_id] = (2, manifest)
         manifest_root = manifest.get("root_id")
         if not isinstance(manifest_root, str) or (root and manifest_root != root):
@@ -793,6 +914,8 @@ def _lineage_impl(
             baseline_state = (
                 cached.proof.state if cached is not None else read_capture(store, capture_id)
             )
+            if scope is not None and baseline_state.get("scope") != scope:
+                raise CatalogueError("series baseline capture scope differs from its release")
             capture_states[capture_id] = baseline_state
             baseline_started = _utc(baseline_state.get("started_at"), "full baseline start")
             break
@@ -854,6 +977,7 @@ def _lineage(
     *,
     manifest_sha256: str | None = None,
     expected_root: str | None = None,
+    expected_scope: dict[str, Any] | None = None,
     _context: Any = None,
 ) -> tuple[set[str], set[str], datetime | None]:
     with metrics.phase("lineage_verification"):
@@ -862,6 +986,7 @@ def _lineage(
             release_id,
             manifest_sha256=manifest_sha256,
             expected_root=expected_root,
+            expected_scope=expected_scope,
             _context=_context,
         )
 
@@ -1058,7 +1183,7 @@ def _finish_retirement_plan(store: Store) -> None:
 
     protected_captures: set[str] = set()
     protected_releases: set[str] = set()
-    for version, pointer_name in ((1, "current.json"), (2, "current-v2.json")):
+    for version, pointer_name in publication_pointers(store):
         if store.path(pointer_name).exists():
             current = publish.current(store, catalogue_version=version)
             release_ids, capture_ids, _ = _lineage(
@@ -1252,7 +1377,7 @@ def _prune_locked(
     durable_mkdir(trash)
 
     pointer_manifests: list[dict[str, Any]] = []
-    for version, pointer_name in ((1, "current.json"), (2, "current-v2.json")):
+    for version, pointer_name in publication_pointers(store):
         if store.path(pointer_name).exists():
             pointer_manifests.append(publish.current(store, catalogue_version=version))
 
@@ -1260,7 +1385,7 @@ def _prune_locked(
     keep_captures: set[str] = {state["capture_id"]}
     full_cutoffs: list[datetime] = []
     for manifest in pointer_manifests:
-        version = 2 if manifest.get("contract") == "oddsfox.kalshi.catalogue.v2" else 1
+        version = 2 if manifest.get("contract") in {CATALOGUE_V2_CONTRACT, SERIES_CONTRACT} else 1
         ids, captures, baseline_started = _lineage(
             store,
             manifest["source_release_id"],
@@ -1349,7 +1474,7 @@ def _prune_locked(
                 store,
                 directory.name,
                 expected_root=manifest.get("root_id")
-                if manifest.get("contract") == "oddsfox.kalshi.catalogue.v2"
+                if manifest.get("contract") in {CATALOGUE_V2_CONTRACT, SERIES_CONTRACT}
                 else None,
                 _context=context,
             )
@@ -1482,7 +1607,7 @@ def _discard_locked(store: Store, capture_id: str) -> dict[str, Any]:
 
     protected: set[str] = set()
     release_ids: set[str] = set()
-    for version, pointer_name in ((1, "current.json"), (2, "current-v2.json")):
+    for version, pointer_name in publication_pointers(store):
         if store.path(pointer_name).exists():
             current = publish.current(store, catalogue_version=version)
             ids, captures, _ = _lineage(
@@ -1519,7 +1644,7 @@ def _discard_locked(store: Store, capture_id: str) -> dict[str, Any]:
         if not (path / "manifest.json").is_file():
             continue
         manifest = publish.verify_release(path, store.limits.max_root_bytes)
-        if manifest.get("contract") == "oddsfox.kalshi.catalogue.v2":
+        if manifest.get("contract") in {CATALOGUE_V2_CONTRACT, SERIES_CONTRACT}:
             _, ancestors, _ = _lineage(
                 store,
                 path.name,

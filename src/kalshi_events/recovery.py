@@ -19,9 +19,13 @@ def replay(
 ) -> dict[str, Any]:
     if catalogue_version not in {1, 2} or isinstance(catalogue_version, bool):
         raise CatalogueError("catalogue version must be 1 or 2")
+    if store.scope is not None and catalogue_version != 2:
+        raise CatalogueError("series roots support only series-v2 warehouse replay")
     with store.writer_guard():
         capture_id = capture_id or current(store, catalogue_version=catalogue_version)["capture_id"]
         state = read_capture(store, capture_id)
+        if state.get("scope") != store.scope:
+            raise CatalogueError("capture scope does not match the operator root")
         if state.get("incremental") is True and catalogue_version != 2:
             raise CatalogueError("incremental captures require catalogue version 2")
         if catalogue_version == 2 and state.get("incremental") is not True:

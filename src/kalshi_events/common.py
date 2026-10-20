@@ -110,6 +110,32 @@ def _root_storage_version(marker: Any) -> int:
     raise CatalogueError("operator root belongs to another application")
 
 
+def _initialize_root_marker(root: Path, marker: Path, value: dict[str, Any]) -> None:
+    """Install a new root marker under the canonical lock without replacing one."""
+    # Check before FileLock opens writer.lock: it may truncate an unrelated file in an
+    # unowned, nonempty directory. A competing initializer may leave its lock visible here;
+    # the second initializer then fails closed instead of racing the marker installation.
+    if any(root.iterdir()):
+        raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
+    if _WINDOWS:
+        fsync_directory(root)
+    lock = FileLock(str(root / "writer.lock"), timeout=0)
+    try:
+        lock.acquire()
+    except Timeout as exc:
+        raise CatalogueError("another writer is initializing the operator root") from exc
+    try:
+        # If another initializer completed before this lock was acquired, leave its marker
+        # untouched. The Store constructor validates it immediately after this helper.
+        if marker.exists():
+            return
+        if any(entry.name != "writer.lock" for entry in root.iterdir()):
+            raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
+        atomic_json(marker, value)
+    finally:
+        lock.release()
+
+
 CANONICAL_CURRENT_ROOT_MARKER_BYTES = json_bytes(CURRENT_ROOT_MARKER)
 
 
@@ -336,14 +362,12 @@ class Store:
             durable_mkdir(self.root)
         marker = self.root / "root.json"
         if not marker.exists():
-            if any(self.root.iterdir()):
-                raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
             initial_marker = (
                 series_root_marker(requested_scope)
                 if requested_scope is not None
                 else CURRENT_ROOT_MARKER
             )
-            atomic_json(marker, initial_marker)
+            _initialize_root_marker(self.root, marker, initial_marker)
         marker_value = decode(regular_bytes(marker))
         self.storage_version = _root_storage_version(marker_value)
         self._scope = (

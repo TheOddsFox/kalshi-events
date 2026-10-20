@@ -75,6 +75,8 @@ def export(
     capture_id: str | None = None,
     max_output_bytes: int = MAX_BUNDLE_BYTES,
 ) -> dict[str, Any]:
+    if store.scope is not None:
+        raise CatalogueError("metadata v1 export is not supported for scoped series roots")
     selected = selections(selected)
     if isinstance(max_output_bytes, bool) or not 0 < max_output_bytes <= MAX_BUNDLE_BYTES:
         raise CatalogueError("metadata output ceiling must be between 1 and 128 MiB")
@@ -174,6 +176,8 @@ def export(
 def refresh(
     store: Store, selected: list[str], output: Path, *, max_output_bytes: int = MAX_BUNDLE_BYTES
 ) -> dict[str, Any]:
+    if store.scope is not None:
+        raise CatalogueError("metadata v1 refresh is not supported for scoped series roots")
     state = capture(store, selected=selections(selected))
     if not state["complete"]:
         message = "targeted metadata acquisition incomplete: " + (state["error"] or "unknown error")

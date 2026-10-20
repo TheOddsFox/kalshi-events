@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from kalshi_events import capture, publish
+from kalshi_events import capture, metrics, publish
 from kalshi_events.common import BudgetExceeded, CatalogueError, Store
 
 
@@ -36,6 +36,8 @@ def run(
 ) -> tuple[dict[str, Any], int]:
     """Run refresh while the caller holds the canonical root writer lock."""
     result = result_template()
+    if store.scope is not None:
+        result["series_scope"] = dict(store.scope)
     try:
         if full and capture_id is not None:
             raise CatalogueError("--full and --capture-id cannot be used together")
@@ -53,17 +55,24 @@ def run(
                 raise CatalogueError("resume compression differs from capture")
             incremental_mode = state.get("incremental") is True
         elif incremental_mode:
-            if not (store.path("current-v2.json").exists() or store.path("current.json").exists()):
+            if store.scope is not None:
+                pointer = "current-series.json"
+                if not store.path(pointer).exists():
+                    raise CatalogueError("series refresh requires a verified series baseline")
+            elif not (
+                store.path("current-v2.json").exists() or store.path("current.json").exists()
+            ):
                 raise CatalogueError("incremental refresh requires a verified v1 or v2 publication")
 
         result["stage"] = "capture"
-        state = capture.capture(
-            store,
-            resume=capture_id,
-            compression=compression,
-            incremental=incremental_mode if capture_id is None else False,
-            _on_capture_id=lambda value: _remember_id(result, value, on_capture_id),
-        )
+        with metrics.phase("capture"):
+            state = capture.capture(
+                store,
+                resume=capture_id,
+                compression=compression,
+                incremental=incremental_mode if capture_id is None else False,
+                _on_capture_id=lambda value: _remember_id(result, value, on_capture_id),
+            )
         result["capture_id"] = state.get("capture_id", result["capture_id"])
         result["capture_complete"] = state.get("complete") is True
         result["requests"] = state.get("requests")
@@ -92,7 +101,8 @@ def run(
     except Exception as exc:
         message = str(exc)
         if "deltas already depend on this baseline" in message:
-            message = f"{message}; run refresh --full"
+            command = "series refresh --full" if store.scope is not None else "refresh --full"
+            message = f"{message}; run {command}"
         result["error"] = message
         if result["stage"] == "publication":
             result["publication_state"] = "unknown"
