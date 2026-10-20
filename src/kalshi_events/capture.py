@@ -49,6 +49,12 @@ MAX_SELECTION_BATCH = 100
 MAX_INITIAL_BATCH_URL_BYTES = 6144
 MAX_JOURNAL_RECORD_BYTES = 16 * 1024**2
 _GENESIS = "0" * 64
+_SERIES_TASK_SCOPES = {
+    "1": "series",
+    "2": "events_live",
+    "3": "markets_live",
+    "4": "markets_history",
+}
 
 
 def _is_sha256(value: Any) -> bool:
@@ -286,6 +292,71 @@ def _acquisition_protocol(state: dict[str, Any]) -> int:
     return protocol
 
 
+def _series_tasks(series: str) -> list[dict[str, Any]]:
+    return [
+        task(CUTOFF_ENDPOINT, None, singular=True),
+        task(f"/series/{series}", "series", singular=True),
+        task(
+            "/events",
+            "events",
+            params={
+                "series_ticker": series,
+                "with_nested_markets": "false",
+                "limit": EVENT_PAGE_LIMIT,
+            },
+        ),
+        task(
+            "/markets",
+            "markets",
+            params={"series_ticker": series, "mve_filter": "exclude", "limit": MARKET_PAGE_LIMIT},
+        ),
+        task(
+            HISTORICAL_PREFIX,
+            "markets",
+            params={"series_ticker": series, "mve_filter": "exclude", "limit": MARKET_PAGE_LIMIT},
+        ),
+    ]
+
+
+def _validate_series_task_plan(state: dict[str, Any]) -> None:
+    """Validate the fixed scoped traversals plus only authoritative event hydration tasks."""
+    scope = validate_series_scope(state.get("scope"))
+    series = scope["series_ticker"]
+    if state.get("selected") is not None or state.get("incremental") is True:
+        raise CatalogueError("scoped captures must use the full series acquisition plan")
+    if any(key in state for key in ("baseline", "query_from", "watermark_started_at")):
+        raise CatalogueError("scoped series capture has unsupported incremental settings")
+    expected = _series_tasks(series)
+    tasks = state["tasks"]
+    if len(tasks) < len(expected):
+        raise CatalogueError("scoped capture is missing a required series traversal")
+    for actual, sealed in zip(tasks[: len(expected)], expected, strict=True):
+        if any(
+            actual.get(key) != sealed[key]
+            for key in ("endpoint", "kind", "singular", "params", "requested")
+        ):
+            raise CatalogueError("scoped capture traversal differs from its sealed series plan")
+    if state.get("task_scopes") != _SERIES_TASK_SCOPES:
+        raise CatalogueError("scoped capture has invalid reconciliation scopes")
+    parent_tickers: set[str] = set()
+    for work in tasks[len(expected) :]:
+        endpoint = work.get("endpoint", "")
+        prefix = "/events/"
+        if (
+            work.get("kind") != "events"
+            or not work.get("singular")
+            or work.get("params") != {"exclude_markets": "true"}
+            or work.get("requested") is not None
+            or not endpoint.startswith(prefix)
+            or work.get("cutoff_due")
+        ):
+            raise CatalogueError("scoped capture contains a non-parent traversal")
+        parent = ticker(endpoint[len(prefix) :])
+        if parent in parent_tickers:
+            raise CatalogueError("scoped capture duplicates a parent lookup")
+        parent_tickers.add(parent)
+
+
 def _validate_capture_root_scope(store: Store, state: dict[str, Any]) -> None:
     scope = state.get("scope")
     if scope is not None:
@@ -381,6 +452,8 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         len(batch_values) != len(set(batch_values)) or set(batch_values) != set(state["selected"])
     ):
         raise CatalogueError("selected market batches do not partition the capture selection")
+    if protocol == SCOPED_ACQUISITION_PROTOCOL:
+        _validate_series_task_plan(state)
     # Reuse legacy sealed-limit validation without serializing runtime metadata.
     if "max_response_bytes" not in state:
         raise CatalogueError("invalid sealed response ceiling")
@@ -432,14 +505,24 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         work = state["tasks"][int(key)]
         endpoint = work["endpoint"]
         expected = {
-            "series": endpoint == "/series",
+            "series": endpoint
+            == (
+                f"/series/{state['scope']['series_ticker']}"
+                if protocol == SCOPED_ACQUISITION_PROTOCOL
+                else "/series"
+            ),
             "events_live": endpoint == "/events",
             "events_combo": endpoint == "/events/multivariate",
             "markets_live": endpoint == "/markets" and work["params"].get("mve_filter") != "only",
             "markets_combo": endpoint == "/markets" and work["params"].get("mve_filter") == "only",
             "markets_history": endpoint == "/historical/markets",
         }[scope]
-        if not expected or work["singular"]:
+        singular_series = (
+            protocol == SCOPED_ACQUISITION_PROTOCOL
+            and scope == "series"
+            and work["singular"]
+        )
+        if not expected or (work["singular"] and not singular_series):
             raise CatalogueError("reconciliation scope does not match its traversal")
         if _batch_tickers(work) is not None:
             raise CatalogueError("selected market batches cannot define a reconciliation scope")
@@ -475,6 +558,8 @@ def _validate_control_transition(
     task_map = {_task_identity(work): work for work in candidate["tasks"] if isinstance(work, dict)}
     if len(task_map) != len(candidate["tasks"]) or not set(known_tasks).issubset(task_map):
         raise CatalogueError("journal control removed or duplicated a traversal")
+    if _acquisition_protocol(candidate) == SCOPED_ACQUISITION_PROTOCOL:
+        _validate_series_task_plan(candidate)
     for identity, old in known_tasks.items():
         new = task_map[identity]
         for key in ("endpoint", "kind", "singular", "params", "requested"):
@@ -1272,18 +1357,29 @@ def new_capture(
 ) -> dict[str, Any]:
     if compression not in {"identity", "gzip"}:
         raise CatalogueError("compression must be identity or gzip")
-    if store.scope is not None:
-        raise CatalogueError("series acquisition planning is not available yet")
     if incremental and selected:
         raise CatalogueError("incremental capture cannot be combined with market selection")
+    scope = store.scope
+    if scope is not None and (selected is not None or incremental):
+        raise CatalogueError("scoped captures currently require a full series acquisition")
     started_at = now()
     pin = None
     if incremental:
         from kalshi_events.incremental import baseline
 
         pin = baseline(store, started_at=started_at)
-    work = [task("/historical/cutoff", None, singular=True)]
-    if incremental:
+    if scope is not None:
+        from kalshi_events.incremental import root_id
+
+        logical_root_id = root_id(store, create=True)
+        series = scope["series_ticker"]
+        work = _series_tasks(series)
+        scopes = dict(_SERIES_TASK_SCOPES)
+        protocol = SCOPED_ACQUISITION_PROTOCOL
+    else:
+        work = [task("/historical/cutoff", None, singular=True)]
+        protocol = ACQUISITION_PROTOCOL
+    if scope is None and incremental:
         params = {"with_nested_markets": "false", "limit": EVENT_PAGE_LIMIT}
         work += [
             task("/series", "series"),
@@ -1305,7 +1401,7 @@ def new_capture(
             ),
             task("/historical/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
         ]
-    elif selected is None:
+    elif scope is None and selected is None:
         work += [
             task("/series", "series"),
             task(
@@ -1321,7 +1417,7 @@ def new_capture(
             task("/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
             task("/historical/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
         ]
-    else:
+    elif scope is None:
         work += [
             task(
                 "/markets",
@@ -1330,30 +1426,31 @@ def new_capture(
             )
             for batch in _selected_market_batches(selections(selected))
         ]
-    scopes: dict[str, str] = {}
-    for index, item in enumerate(work):
-        if selected is not None:
-            continue
-        endpoint = item["endpoint"]
-        if endpoint == "/series":
-            scopes[str(index)] = "series"
-        elif endpoint == "/events":
-            scopes[str(index)] = "events_live"
-        elif endpoint == "/events/multivariate":
-            scopes[str(index)] = "events_combo"
-        elif endpoint == "/markets":
-            scopes[str(index)] = (
-                "markets_combo" if item["params"].get("mve_filter") == "only" else "markets_live"
-            )
-        elif endpoint == "/historical/markets":
-            scopes[str(index)] = "markets_history"
+    if scope is None:
+        scopes = {}
+        for index, item in enumerate(work):
+            if selected is not None:
+                continue
+            endpoint = item["endpoint"]
+            if endpoint == "/series":
+                scopes[str(index)] = "series"
+            elif endpoint == "/events":
+                scopes[str(index)] = "events_live"
+            elif endpoint == "/events/multivariate":
+                scopes[str(index)] = "events_combo"
+            elif endpoint == "/markets":
+                scopes[str(index)] = (
+                    "markets_combo" if item["params"].get("mve_filter") == "only" else "markets_live"
+                )
+            elif endpoint == "/historical/markets":
+                scopes[str(index)] = "markets_history"
     capture_id = uuid.uuid4().hex
     if _on_capture_id is not None:
         _on_capture_id(capture_id)
     state = {
         "version": 1,
         "journal_version": JOURNAL_VERSION,
-        "acquisition_protocol": ACQUISITION_PROTOCOL,
+        "acquisition_protocol": protocol,
         "capture_id": capture_id,
         "selected": selected,
         "started_at": started_at,
@@ -1370,6 +1467,8 @@ def new_capture(
         "coverage": {},
         "error": None,
     }
+    if scope is not None:
+        state.update(scope=scope, root_id=logical_root_id)
     if pin is not None:
         state.update(pin)
     return _initialize_v2(store, state)
@@ -1470,6 +1569,9 @@ def _apply(
 ) -> None:
     work = state["tasks"][index]
     status = manifest["status"]
+    scoped = _acquisition_protocol(state) == SCOPED_ACQUISITION_PROTOCOL
+    if scoped and status == 404 and work["kind"] == "series":
+        raise CatalogueError("the scoped series definition was not found")
     if status in {400, 410} and work["cursor"]:
         if work["restarts"] >= 3:
             raise CatalogueError("pagination cursor repeatedly invalidated")
@@ -1673,6 +1775,29 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
     if state.get("incremental"):
         missing_events = set()
         missing_series = set()
+    elif _acquisition_protocol(state) == SCOPED_ACQUISITION_PROTOCOL:
+        final_event_members: set[str] = set()
+        current_market_members: set[str] = set()
+        for index, scope in state["task_scopes"].items():
+            work = state["tasks"][int(index)]
+            generation = identities.scope_membership
+            if scope == "events_live":
+                final_event_members.update(generation.get(scope, {}).get(work["restarts"], set()))
+            elif scope in {"markets_live", "markets_history"}:
+                current_market_members.update(
+                    generation.get(scope, {}).get(work["restarts"], set())
+                )
+        missing_events = {
+            event_ticker
+            for market_ticker in current_market_members
+            for market in [identities.markets.get(market_ticker)]
+            if market is not None
+            for event_ticker in [market[2]]
+            if event_ticker
+            and event_ticker not in final_event_members
+            and ("events", event_ticker) not in identities.parent_lookups
+        }
+        missing_series = set()
     else:
         missing_events = set(markets.values()) - events.keys()
         missing_series = {value for value in events.values() if value} - series.keys()
@@ -1685,11 +1810,13 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
             if path not in existing:
                 params = (
                     {"exclude_markets": "true"}
-                    if kind == "events" and _acquisition_protocol(state) == ACQUISITION_PROTOCOL
+                    if kind == "events"
+                    and _acquisition_protocol(state)
+                    in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
                     else None
                 )
                 state["tasks"].append(task(path, kind, singular=True, params=params))
-    if state.get("task_scopes"):
+    if state.get("task_scopes") and _acquisition_protocol(state) != SCOPED_ACQUISITION_PROTOCOL:
         from kalshi_events.incremental import parent_lookup_tasks
 
         existing_identities = {_task_identity(work) for work in state["tasks"]}
@@ -1701,6 +1828,39 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
         if state.get("journal_version") != JOURNAL_VERSION:
             save(store, state)
         return True
+    if _acquisition_protocol(state) == SCOPED_ACQUISITION_PROTOCOL:
+        scope = validate_series_scope(state["scope"])
+        series_ticker = scope["series_ticker"]
+        if series_ticker not in identities.series:
+            raise CatalogueError("scoped series definition is missing")
+        final_event_members: set[str] = set()
+        current_market_members: set[str] = set()
+        for index, membership_scope in state.get("task_scopes", {}).items():
+            work = state["tasks"][int(index)]
+            if membership_scope == "events_live":
+                final_event_members.update(
+                    identities.scope_membership.get(membership_scope, {}).get(
+                        work["restarts"], set()
+                    )
+                )
+            elif membership_scope in {"markets_live", "markets_history"}:
+                current_market_members.update(
+                    identities.scope_membership.get(membership_scope, {}).get(
+                        work["restarts"], set()
+                    )
+                )
+        for market_ticker in current_market_members:
+            market = identities.markets.get(market_ticker)
+            event_ticker = market[2] if market is not None else None
+            event = identities.events.get(event_ticker) if event_ticker is not None else None
+            lookup = identities.parent_lookups.get(("events", event_ticker))
+            event_is_authoritative = event_ticker in final_event_members or (
+                lookup is not None and lookup[0] == 200
+            )
+            if event is None or event[2] != series_ticker or not event_is_authoritative:
+                raise CatalogueError(
+                    f"market {market_ticker} lacks an authoritative in-scope event definition"
+                )
     if state["selected"] is not None:
         for selected in state["selected"]:
             parent = markets.get(selected)

@@ -69,10 +69,37 @@ def test_scoped_capture_requires_same_root_identity(tmp_path):
             )
 
 
-def test_catalogue_capture_creation_fails_closed_on_scoped_root(tmp_path):
+def test_scoped_capture_seals_protocol_scope_and_exact_series_tasks(tmp_path):
     store = Store(tmp_path / "scoped", series_ticker="KXCPI")
-    with (
-        store.lock(),
-        pytest.raises(CatalogueError, match="series acquisition planning is not available"),
-    ):
-        capture.new_capture(store, None)
+    with store.lock():
+        state = capture.new_capture(store, None)
+
+    assert state["acquisition_protocol"] == 4
+    assert state["scope"] == series_scope("KXCPI")
+    assert state["root_id"]
+    assert [work["endpoint"] for work in state["tasks"]] == [
+        "/historical/cutoff",
+        "/series/KXCPI",
+        "/events",
+        "/markets",
+        "/historical/markets",
+    ]
+    assert state["tasks"][2]["params"] == {
+        "series_ticker": "KXCPI",
+        "with_nested_markets": "false",
+        "limit": capture.EVENT_PAGE_LIMIT,
+    }
+    assert state["tasks"][3]["params"] == {
+        "series_ticker": "KXCPI",
+        "mve_filter": "exclude",
+        "limit": capture.MARKET_PAGE_LIMIT,
+    }
+    assert state["tasks"][4]["params"] == state["tasks"][3]["params"]
+    assert state["task_scopes"] == {
+        "1": "series",
+        "2": "events_live",
+        "3": "markets_live",
+        "4": "markets_history",
+    }
+    with pytest.raises(CatalogueError, match="full series acquisition"):
+        capture.new_capture(store, ["KXCPI-MARKET"])

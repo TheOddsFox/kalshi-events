@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from typing import Any
 
-from kalshi_events.common import CatalogueError, digest, json_bytes, ticker
+from kalshi_events.common import CatalogueError, digest, json_bytes, ticker, validate_series_scope
 
 ENTITY_KEYS = {"series": "series_ticker", "events": "event_ticker", "markets": "market_ticker"}
 
@@ -84,6 +84,12 @@ class ParentIndex:
 
     def add_page(self, manifest: dict[str, Any], payload: Any) -> None:
         kind = manifest.get("entity_kind")
+        series_scope = manifest.get("series_scope")
+        scoped_series = (
+            validate_series_scope(series_scope)["series_ticker"]
+            if series_scope is not None
+            else None
+        )
         if manifest.get("singular") and kind in {"events", "series"}:
             endpoint = manifest.get("endpoint", "")
             prefix = "/events/" if kind == "events" else "/series/"
@@ -109,13 +115,28 @@ class ParentIndex:
             records(payload, envelope, singular=manifest.get("singular", False))
         ):
             identity, parent = native_identity(kind, native)
+            if scoped_series is not None:
+                if kind == "series" and identity != scoped_series:
+                    raise CatalogueError("series definition differs from the scoped ticker")
+                if kind == "events":
+                    if parent != scoped_series:
+                        raise CatalogueError("event is outside the scoped series")
+                    if native.get("mve_collection_ticker") or native.get("mve_selected_legs"):
+                        raise CatalogueError("series traversal returned a multivariate event")
+                if kind == "markets" and (
+                    native.get("mve_collection_ticker") or native.get("mve_selected_legs")
+                ):
+                    raise CatalogueError("series traversal returned a combo market")
             scope = manifest.get("task_scope")
             generation = manifest.get("task_generation", 0)
             if (
                 isinstance(scope, str)
                 and isinstance(generation, int)
                 and not isinstance(generation, bool)
-                and not manifest.get("singular")
+                and (
+                    not manifest.get("singular")
+                    or (kind == "series" and scope == "series" and identity == scoped_series)
+                )
             ):
                 if (
                     kind == "markets"
@@ -143,6 +164,11 @@ class ParentIndex:
                     for market in records(native, "markets"):
                         if market.get("event_ticker") != identity:
                             raise CatalogueError("nested market parent contradicts event")
+                        if scoped_series is not None and (
+                            market.get("mve_collection_ticker")
+                            or market.get("mve_selected_legs")
+                        ):
+                            raise CatalogueError("series traversal returned a nested combo market")
                         native_identity("markets", market)
             else:
                 self._put(self.markets, identity, winner)
