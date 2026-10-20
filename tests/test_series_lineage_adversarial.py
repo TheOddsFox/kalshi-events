@@ -181,6 +181,33 @@ def test_standalone_series_verification_rejects_manifest_scope_tampering(
         publish.verify_release(directory)
 
 
+@pytest.mark.parametrize(
+    ("contract", "rewrite_scope"),
+    [
+        ("oddsfox.kalshi.catalogue.v1", False),
+        ("oddsfox.kalshi.catalogue.v1", True),
+        ("oddsfox.kalshi.catalogue.v2", True),
+    ],
+)
+def test_standalone_verification_rejects_series_release_downgrade(
+    cloned_chain, series_chain, contract, rewrite_scope
+):
+    release_id = series_chain["publications"][-1]["source_release_id"]
+    directory = cloned_chain.path(f"releases/{release_id}")
+    path = directory / "manifest.json"
+    manifest = json.loads(path.read_bytes())
+    manifest["contract"] = contract
+    if rewrite_scope:
+        manifest["coverage_scope"] = "catalogue"
+        manifest.pop("series_scope", None)
+        manifest.pop("series_ticker", None)
+        manifest.pop("include_multivariate", None)
+    path.write_bytes(json_bytes(manifest))
+
+    with pytest.raises(CatalogueError):
+        publish.verify_release(directory)
+
+
 def test_standalone_series_verification_checks_coverage_scope_after_checksums_are_updated(
     cloned_chain, series_chain
 ):

@@ -63,7 +63,7 @@ V2_LINEAGE_FIELDS = (
     "delta_depth",
     "membership_sha256",
 )
-MAX_V2_COVERAGE_LINEAGE_BYTES = 1024**2
+MAX_COVERAGE_BINDING_BYTES = 1024**2
 
 
 def inventory(directory: Path, names: set[str], limit: int) -> dict[str, dict[str, Any]]:
@@ -94,8 +94,16 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
         or set(manifest["files"]) != FILES
     ):
         raise CatalogueError("invalid catalogue contract or relation inventory")
-    if manifest["contract"] in {CONTRACT_V2, SERIES_CONTRACT}:
-        _validate_v2_manifest(manifest, series=manifest["contract"] == SERIES_CONTRACT)
+    contract = manifest["contract"]
+    series = contract == SERIES_CONTRACT
+    catalogue_v2 = contract in {CONTRACT_V2, SERIES_CONTRACT}
+    expected_scope = "series" if series else "catalogue"
+    if not _hex_id(manifest.get("capture_id"), 32):
+        raise CatalogueError("invalid catalogue capture identity")
+    if manifest.get("coverage_scope") != expected_scope:
+        raise CatalogueError("catalogue contract and coverage scope disagree")
+    if catalogue_v2:
+        _validate_v2_manifest(manifest, series=series)
     if {p.name for p in directory.iterdir()} != FILES | {"manifest.json"}:
         raise CatalogueError("release contains unexpected or missing files")
     actual = inventory(directory, FILES, limit)
@@ -108,12 +116,12 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
             _ = pq.ParquetFile(directory / name).schema
         except Exception as exc:
             raise CatalogueError("invalid Parquet release relation") from exc
-    if manifest["contract"] in {CONTRACT_V2, SERIES_CONTRACT}:
-        _validate_v2_coverage(
-            directory / "coverage.parquet",
-            manifest,
-            series=manifest["contract"] == SERIES_CONTRACT,
-        )
+    _validate_coverage(
+        directory / "coverage.parquet",
+        manifest,
+        catalogue_v2=catalogue_v2,
+        series=series,
+    )
     return manifest
 
 
@@ -178,22 +186,31 @@ def _validate_v2_manifest(manifest: dict[str, Any], *, series: bool = False) -> 
             raise CatalogueError("catalogue-v2 watermark moves backwards")
 
 
-def _validate_v2_coverage(path: Path, manifest: dict[str, Any], *, series: bool = False) -> None:
-    fields = ("capture_id", *V2_LINEAGE_FIELDS)
+def _validate_coverage(
+    path: Path,
+    manifest: dict[str, Any],
+    *,
+    catalogue_v2: bool = False,
+    series: bool = False,
+) -> None:
+    fields = ("capture_id", "coverage_scope")
     expected = {name: manifest.get(name) for name in fields}
+    if catalogue_v2:
+        fields = (*fields, *V2_LINEAGE_FIELDS)
+        expected.update({name: manifest.get(name) for name in V2_LINEAGE_FIELDS})
     if series:
-        fields = (*fields, "coverage_scope", "series_ticker", "include_multivariate")
+        fields = (*fields, "series_ticker", "include_multivariate")
         expected.update({name: manifest.get(name) for name in fields if name not in expected})
     try:
         parquet = pq.ParquetFile(
             path,
-            thrift_string_size_limit=MAX_V2_COVERAGE_LINEAGE_BYTES,
+            thrift_string_size_limit=MAX_COVERAGE_BINDING_BYTES,
             thrift_container_size_limit=10_000,
         )
         metadata = parquet.metadata
         schema = parquet.schema_arrow
         if metadata.num_rows != 1 or metadata.num_row_groups != 1:
-            raise CatalogueError("catalogue-v2 coverage must contain exactly one row")
+            raise CatalogueError("release coverage must contain exactly one row")
         scalar_types = (
             pa.types.is_string,
             pa.types.is_large_string,
@@ -204,15 +221,15 @@ def _validate_v2_coverage(path: Path, manifest: dict[str, Any], *, series: bool 
         if metadata.num_columns != len(schema) or any(
             not any(is_type(field.type) for is_type in scalar_types) for field in schema
         ):
-            raise CatalogueError("catalogue-v2 coverage must use flat primitive columns")
+            raise CatalogueError("release coverage must use flat primitive columns")
         indices = {name: schema.get_field_index(name) for name in fields}
         if any(index < 0 for index in indices.values()):
-            raise CatalogueError("catalogue-v2 coverage is missing lineage columns")
+            raise CatalogueError("release coverage is missing binding columns")
         if any(
             metadata.row_group(0).column(index).path_in_schema != name
             for name, index in indices.items()
         ):
-            raise CatalogueError("catalogue-v2 coverage lineage columns are not flat")
+            raise CatalogueError("release coverage binding columns are not flat")
         selected_columns = [metadata.row_group(0).column(index) for index in indices.values()]
         compressed_sizes = [column.total_compressed_size for column in selected_columns]
         uncompressed_sizes = [column.total_uncompressed_size for column in selected_columns]
@@ -221,41 +238,41 @@ def _validate_v2_coverage(path: Path, manifest: dict[str, Any], *, series: bool 
                 isinstance(size, bool)
                 or not isinstance(size, int)
                 or size < 0
-                or size > MAX_V2_COVERAGE_LINEAGE_BYTES
+                or size > MAX_COVERAGE_BINDING_BYTES
                 for size in (*compressed_sizes, *uncompressed_sizes)
             )
-            or sum(uncompressed_sizes) > MAX_V2_COVERAGE_LINEAGE_BYTES
+            or sum(uncompressed_sizes) > MAX_COVERAGE_BINDING_BYTES
         ):
-            raise CatalogueError("catalogue-v2 coverage lineage columns exceed the size limit")
+            raise CatalogueError("release coverage binding columns exceed the size limit")
         for name, value in expected.items():
             field_type = schema.field(name).type
             if value is None:
                 if not (pa.types.is_null(field_type) or pa.types.is_string(field_type)):
-                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+                    raise CatalogueError("release coverage binding column type mismatch")
             elif isinstance(value, str):
                 if not (pa.types.is_string(field_type) or pa.types.is_large_string(field_type)):
-                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+                    raise CatalogueError("release coverage binding column type mismatch")
             elif isinstance(value, int) and not isinstance(value, bool):
                 if not pa.types.is_int64(field_type):
-                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+                    raise CatalogueError("release coverage binding column type mismatch")
             elif isinstance(value, bool):
                 if not pa.types.is_boolean(field_type):
-                    raise CatalogueError("catalogue-v2 coverage lineage column type mismatch")
+                    raise CatalogueError("release coverage binding column type mismatch")
             else:
-                raise CatalogueError("invalid catalogue-v2 manifest lineage value")
+                raise CatalogueError("invalid release manifest binding value")
         table = parquet.read(columns=list(fields))
         if table.num_rows != 1:
-            raise CatalogueError("catalogue-v2 coverage must contain exactly one row")
+            raise CatalogueError("release coverage must contain exactly one row")
         row = table.to_pylist()[0]
     except CatalogueError:
         raise
     except Exception as exc:
-        raise CatalogueError("invalid catalogue-v2 coverage lineage") from exc
+        raise CatalogueError("invalid release coverage binding") from exc
 
     for name, value in expected.items():
         actual = row.get(name)
         if type(actual) is not type(value) or actual != value:
-            raise CatalogueError(f"catalogue-v2 coverage lineage mismatch: {name}")
+            raise CatalogueError(f"release coverage binding mismatch: {name}")
 
 
 def _hex_id(value: Any, size: int) -> bool:
