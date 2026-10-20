@@ -165,8 +165,7 @@ class ParentIndex:
                         if market.get("event_ticker") != identity:
                             raise CatalogueError("nested market parent contradicts event")
                         if scoped_series is not None and (
-                            market.get("mve_collection_ticker")
-                            or market.get("mve_selected_legs")
+                            market.get("mve_collection_ticker") or market.get("mve_selected_legs")
                         ):
                             raise CatalogueError("series traversal returned a nested combo market")
                         native_identity("markets", market)

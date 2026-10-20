@@ -78,7 +78,9 @@ def test_scoped_full_build_is_certified_as_internal_v2_with_exact_values(tmp_pat
             [MARKET["ticker"]],
         ).fetchone()[0]
         assert '"floor_strike":"3.123456789123456789"' in payload
-        assert connection.execute("select count(*) from main.observation_history").fetchone()[0] == 3
+        assert (
+            connection.execute("select count(*) from main.observation_history").fetchone()[0] == 3
+        )
 
 
 def test_scoped_empty_capture_builds_valid_empty_v2_warehouse(tmp_path):

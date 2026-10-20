@@ -165,7 +165,9 @@ def test_event_from_abandoned_cursor_generation_needs_a_fresh_parent_lookup(tmp_
     state = capture.read_capture(store, capture_ids[0])
     assert state["complete"] is False
     assert state["tasks"][2]["restarts"] == 1
-    assert any(work["endpoint"] == "/events/KXCPI-26JAN" and work["done"] for work in state["tasks"])
+    assert any(
+        work["endpoint"] == "/events/KXCPI-26JAN" and work["done"] for work in state["tasks"]
+    )
 
 
 def test_scoped_event_payload_rejects_nested_combo_markets(tmp_path):

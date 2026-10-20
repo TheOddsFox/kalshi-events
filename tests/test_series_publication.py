@@ -63,12 +63,16 @@ def test_series_baseline_delta_removal_and_reappearance(tmp_path):
     assert store.path("current-series.json").is_file()
     assert not store.path("current-v2.json").exists()
     assert not store.path("current.json").exists()
-    assert publish.current(store, catalogue_version=2)["source_release_id"] == first_release[
-        "source_release_id"
-    ]
-    assert pq.read_table(
-        store.path(f"releases/{first_release['source_release_id']}/coverage.parquet")
-    ).to_pylist()[0]["coverage_scope"] == "series"
+    assert (
+        publish.current(store, catalogue_version=2)["source_release_id"]
+        == first_release["source_release_id"]
+    )
+    assert (
+        pq.read_table(
+            store.path(f"releases/{first_release['source_release_id']}/coverage.parquet")
+        ).to_pylist()[0]["coverage_scope"]
+        == "series"
+    )
 
     removed = _capture(store, events=[], markets=[], incremental_mode=True)
     assert removed["complete"] is True
@@ -84,7 +88,9 @@ def test_series_baseline_delta_removal_and_reappearance(tmp_path):
     ) as connection:
         assert connection.execute("select count(*) from main.current_events").fetchone()[0] == 0
         assert connection.execute("select count(*) from main.current_markets").fetchone()[0] == 0
-        assert connection.execute("select count(*) from main.observation_history").fetchone()[0] == 4
+        assert (
+            connection.execute("select count(*) from main.observation_history").fetchone()[0] == 4
+        )
 
     reappeared = _capture(store, events=[EVENT], markets=[MARKET], incremental_mode=True)
     third_release = publish.publish(store, reappeared["capture_id"], catalogue_version=2)
@@ -94,7 +100,9 @@ def test_series_baseline_delta_removal_and_reappearance(tmp_path):
     ) as connection:
         assert connection.execute("select count(*) from main.current_events").fetchone()[0] == 1
         assert connection.execute("select count(*) from main.current_markets").fetchone()[0] == 1
-        assert connection.execute("select count(*) from main.observation_history").fetchone()[0] == 7
+        assert (
+            connection.execute("select count(*) from main.observation_history").fetchone()[0] == 7
+        )
 
 
 def test_series_baseline_does_not_fall_back_to_catalogue_pointer(tmp_path):

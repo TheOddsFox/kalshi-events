@@ -537,9 +537,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             "markets_history": endpoint == "/historical/markets",
         }[scope]
         singular_series = (
-            protocol == SCOPED_ACQUISITION_PROTOCOL
-            and scope == "series"
-            and work["singular"]
+            protocol == SCOPED_ACQUISITION_PROTOCOL and scope == "series" and work["singular"]
         )
         if not expected or (work["singular"] and not singular_series):
             raise CatalogueError("reconciliation scope does not match its traversal")
@@ -1459,7 +1457,9 @@ def new_capture(
                 scopes[str(index)] = "events_combo"
             elif endpoint == "/markets":
                 scopes[str(index)] = (
-                    "markets_combo" if item["params"].get("mve_filter") == "only" else "markets_live"
+                    "markets_combo"
+                    if item["params"].get("mve_filter") == "only"
+                    else "markets_live"
                 )
             elif endpoint == "/historical/markets":
                 scopes[str(index)] = "markets_history"

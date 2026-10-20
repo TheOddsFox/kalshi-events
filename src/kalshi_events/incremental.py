@@ -63,9 +63,7 @@ def _utc(value: Any, label: str) -> datetime:
 
 def root_id(store: Store, *, create: bool = False) -> str:
     """Read the stable logical root identity, creating it only for v2 work."""
-    if store.storage_version not in {2, 3, 4} or (
-        create and store.storage_version not in {3, 4}
-    ):
+    if store.storage_version not in {2, 3, 4} or (create and store.storage_version not in {3, 4}):
         raise CatalogueError("incremental catalogue work requires an upgraded storage-v3 root")
     if create and not store.writer_locked_by_current_thread:
         raise CatalogueError("root identity creation requires the canonical writer lock")
@@ -143,8 +141,10 @@ def baseline(
     if sealed_start < watermark:
         raise CatalogueError("incremental capture start precedes the published watermark")
     overlap_start = watermark - OVERLAP
-    pointer_name = pointer_profile(store)[0] if store.scope is not None else (
-        "current-v2.json" if version == 2 else "current.json"
+    pointer_name = (
+        pointer_profile(store)[0]
+        if store.scope is not None
+        else ("current-v2.json" if version == 2 else "current.json")
     )
     pointer = decode(regular_bytes(store.path(pointer_name), 1024**2))
     if pointer.get("source_release_id") != current["source_release_id"]:
@@ -208,7 +208,9 @@ def verify_pin(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             or current.get("series_scope") != store.scope
         ):
             raise CatalogueError("pinned series baseline belongs to a different contract or scope")
-    elif pin.get("release_contract") == SERIES_CONTRACT or current.get("contract") == SERIES_CONTRACT:
+    elif (
+        pin.get("release_contract") == SERIES_CONTRACT or current.get("contract") == SERIES_CONTRACT
+    ):
         raise CatalogueError("series publication cannot be used as a catalogue baseline")
     expected_depth = 0 if version == 1 else current.get("delta_depth")
     if pin.get("delta_depth") != expected_depth:
@@ -657,8 +659,7 @@ def parent_lookup_tasks(
 
     event_params = (
         {"exclude_markets": "true"}
-        if state.get("acquisition_protocol")
-        in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
+        if state.get("acquisition_protocol") in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
         else None
     )
 
@@ -685,7 +686,9 @@ def verify_predecessor(store: Store, state: dict[str, Any]) -> None:
     if store.scope is None:
         effective_version = 2 if store.path("current-v2.json").exists() else 1
         pointer_name = "current-v2.json" if effective_version == 2 else "current.json"
-        expected_contract = CATALOGUE_V2_CONTRACT if effective_version == 2 else "oddsfox.kalshi.catalogue.v1"
+        expected_contract = (
+            CATALOGUE_V2_CONTRACT if effective_version == 2 else "oddsfox.kalshi.catalogue.v1"
+        )
     elif not store.path(pointer_name).exists():
         raise CatalogueError("series predecessor pointer is missing")
     if effective_version != pin.get("catalogue_version"):

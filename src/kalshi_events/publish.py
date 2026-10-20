@@ -135,7 +135,8 @@ def _validate_v2_manifest(manifest: dict[str, Any], *, series: bool = False) -> 
             manifest.get("coverage_scope") != "series"
             or manifest.get("include_multivariate") is not False
             or not isinstance(manifest.get("series_ticker"), str)
-            or scope != validate_series_scope(
+            or scope
+            != validate_series_scope(
                 {
                     "kind": "series",
                     "series_ticker": manifest.get("series_ticker"),
@@ -475,7 +476,7 @@ def _publish(
                         "manifest_sha256": digest(regular_bytes(destination / "manifest.json")),
                     },
                 )
-        # Pruning runs only after the promoted pointer re-verifies end to end.
+            # Pruning runs only after the promoted pointer re-verifies end to end.
             promoted = (
                 current(store)
                 if catalogue_version == 1
