@@ -10,7 +10,7 @@ import copy
 import hashlib
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from datetime import datetime, timedelta
@@ -1205,6 +1205,7 @@ def new_capture(
     compression: str = "identity",
     *,
     incremental: bool = False,
+    _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if compression not in {"identity", "gzip"}:
         raise CatalogueError("compression must be identity or gzip")
@@ -1281,11 +1282,14 @@ def new_capture(
             )
         elif endpoint == "/historical/markets":
             scopes[str(index)] = "markets_history"
+    capture_id = uuid.uuid4().hex
+    if _on_capture_id is not None:
+        _on_capture_id(capture_id)
     state = {
         "version": 1,
         "journal_version": JOURNAL_VERSION,
         "acquisition_protocol": ACQUISITION_PROTOCOL,
-        "capture_id": uuid.uuid4().hex,
+        "capture_id": capture_id,
         "selected": selected,
         "started_at": started_at,
         "completed_at": None,
@@ -1771,9 +1775,12 @@ def _capture_locked(
     client_factory: Any = None,
     compression: str | None = None,
     incremental: bool = False,
+    _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     factory = client_factory or PublicClient
     identities = ParentIndex()
+    if resume and _on_capture_id is not None:
+        _on_capture_id(resume)
     state = (
         read_capture(
             store,
@@ -1787,6 +1794,7 @@ def _capture_locked(
             selected,
             compression or "identity",
             incremental=incremental,
+            _on_capture_id=_on_capture_id,
         )
     )
     if resume and incremental and not state.get("incremental"):
@@ -1814,7 +1822,10 @@ def _capture_locked(
         max_decoded_response_bytes=decoded_ceiling,
     )
     if state["complete"]:
-        return {**state, **budget.result(), "budget_exhausted": False}
+        result = {**state, **budget.result(), "budget_exhausted": False}
+        if _on_capture_id is not None:
+            result["_refresh_journal_uncertain"] = bool(getattr(state, "journal_uncertain", False))
+        return result
     if state.get("error"):
         if state.get("journal_version") == JOURNAL_VERSION:
             _commit_control_delta(store, state, {"kind": "clear_error"})
@@ -1869,7 +1880,10 @@ def _capture_locked(
         if not isinstance(exc, BudgetExceeded):
             raise
         budget_exhausted = True
-    return {**state, **budget.result(), "budget_exhausted": budget_exhausted}
+    result = {**state, **budget.result(), "budget_exhausted": budget_exhausted}
+    if _on_capture_id is not None:
+        result["_refresh_journal_uncertain"] = bool(getattr(state, "journal_uncertain", False))
+    return result
 
 
 def capture(
@@ -1880,6 +1894,7 @@ def capture(
     client_factory: Any = None,
     compression: str | None = None,
     incremental: bool = False,
+    _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     with store.writer_guard():
         from kalshi_events.incremental import finish_pending_retirement
@@ -1892,6 +1907,7 @@ def capture(
             client_factory=client_factory,
             compression=compression,
             incremental=incremental,
+            _on_capture_id=_on_capture_id,
         )
 
 

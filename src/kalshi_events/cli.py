@@ -11,11 +11,12 @@ import json
 import os
 import sys
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from kalshi_events import capture as acquisition
-from kalshi_events import metadata, metrics, publish, recovery, warehouse
+from kalshi_events import metadata, metrics, publish, recovery, refresh, warehouse
 from kalshi_events.common import (
     MAX_BUNDLE_BYTES,
     BudgetExceeded,
@@ -42,6 +43,7 @@ def parser() -> argparse.ArgumentParser:
     commands = cli.add_subparsers(dest="command", required=True)
     for name in (
         "capture",
+        "refresh",
         "load",
         "build",
         "publish",
@@ -61,6 +63,10 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--market-ticker", action="append")
             command.add_argument("--compression", choices=("identity", "gzip"), default=None)
             command.add_argument("--incremental", action="store_true")
+        if name == "refresh":
+            command.add_argument("--full", action="store_true")
+            command.add_argument("--capture-id")
+            command.add_argument("--compression", choices=("identity", "gzip"), default=None)
         if name in {"current", "replay", "rebuild", "publish"}:
             command.add_argument("--catalogue-version", type=int, choices=(1, 2), default=1)
         if name == "discard":
@@ -219,6 +225,8 @@ def _status(store: Store) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "refresh":
+        return _refresh_main(args)
     try:
         if args.metrics_file is None:
             result = execute(args)
@@ -254,6 +262,71 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(json_bytes(result).decode().strip())
     return EXIT_INCOMPLETE if result.get("complete") is False else 0
+
+
+def _refresh_main(args: argparse.Namespace) -> int:
+    """Keep refresh failures in its single machine-readable result."""
+    result = refresh.result_template()
+    result["capture_id"] = args.capture_id
+    exit_code = 1
+    report_stream = None
+    measured = None
+    try:
+        if args.full and args.capture_id is not None:
+            raise CatalogueError("--full and --capture-id cannot be used together")
+        limits = Limits(**{field: getattr(args, field) for field in Limits.__dataclass_fields__})
+        root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
+        if args.metrics_file is not None:
+            metrics_path = safe_path(args.metrics_file)
+            if metrics_path.is_relative_to(root):
+                raise CatalogueError("metrics report must be outside the operator root")
+            if metrics_path.exists():
+                raise CatalogueError("metrics report path already exists")
+            report_stream = metrics.reserve_report(metrics_path)
+        context = metrics.collect() if report_stream is not None else nullcontext(None)
+        with context as measured:
+            store = Store(root, limits)
+            with store.lock():
+                result, exit_code = refresh.run(
+                    store,
+                    full=args.full,
+                    capture_id=args.capture_id,
+                    compression=args.compression,
+                )
+                try:
+                    store.reconcile()
+                except Exception as exc:
+                    result["complete"] = False
+                    if result["publication_state"] == "verified":
+                        result["stage"] = "complete"
+                    result["error"] = (
+                        result["error"] or f"final storage reconciliation failed: {exc}"
+                    )
+                    exit_code = EXIT_INCOMPLETE if isinstance(exc, BudgetExceeded) else 1
+    except BudgetExceeded as exc:
+        result["complete"] = False
+        result["error"] = result["error"] or str(exc)
+        exit_code = EXIT_INCOMPLETE
+    except Exception as exc:
+        result["complete"] = False
+        result["error"] = result["error"] or str(exc)
+        exit_code = 1
+    finally:
+        if report_stream is not None:
+            try:
+                metrics.write_report(args.metrics_file, measured, report_stream)
+            except Exception as exc:
+                result["complete"] = False
+                result["error"] = result["error"] or f"metrics report failed: {exc}"
+                exit_code = 1
+            try:
+                report_stream.close()
+            except Exception as exc:
+                result["complete"] = False
+                result["error"] = result["error"] or f"metrics report close failed: {exc}"
+                exit_code = 1
+    print(json_bytes(result).decode().strip())
+    return exit_code
 
 
 def _validate_metrics_output_overlap(args: argparse.Namespace, metrics_path: Path) -> None:
