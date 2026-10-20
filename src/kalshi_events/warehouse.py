@@ -48,6 +48,7 @@ from kalshi_events.common import (
     json_bytes,
     now,
     regular_bytes,
+    validate_series_scope,
 )
 from kalshi_events.normalize import ENTITY_KEYS, ParentIndex, observations
 from kalshi_events.transport import read_page
@@ -820,7 +821,9 @@ def _projection_membership(
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     previous = previous_membership or _read_membership(connection)
     incoming = _capture_membership(state, index)
-    if state.get("incremental"):
+    if state.get("scope") is not None:
+        membership = incoming
+    elif state.get("incremental"):
         membership = {scope: set(values) for scope, values in previous.items()}
         for scope, values in incoming.items():
             if scope in {"events_live", "markets_live"}:
@@ -1147,6 +1150,14 @@ def build(store: Store, capture_id: str) -> dict[str, Any]:
 def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
     """Build a fresh, certified warehouse for one complete catalogue capture."""
     store.require_writable()
+    if store.scope is not None:
+        from kalshi_events.incremental import finish_pending_retirement
+
+        finish_pending_retirement(store)
+        state = catalogue_capture(store, capture_id)
+        if state.get("incremental"):
+            return _build_delta(store, state)
+        return _full_v2_build(store, state, rebuild=False)
     from kalshi_events.incremental import finish_pending_retirement
 
     finish_pending_retirement(store)
@@ -1365,6 +1376,21 @@ def _parent_closure_is_fresh(
             )
 
 
+def _build_scope_fields(state: dict[str, Any]) -> dict[str, Any]:
+    scope = state.get("scope")
+    if scope is None:
+        return {"scope": "catalogue"}
+    validated = validate_series_scope(scope)
+    root_identity = state.get("root_id")
+    if (
+        not isinstance(root_identity, str)
+        or len(root_identity) != 32
+        or any(char not in "0123456789abcdef" for char in root_identity)
+    ):
+        raise CatalogueError("scoped build lacks a logical operator root identity")
+    return {"scope": "series", "series_scope": validated, "root_id": root_identity}
+
+
 def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dict[str, Any]:
     capture_id = state["capture_id"]
     if not state.get("task_scopes") and any(
@@ -1382,7 +1408,7 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
     verified_pages: dict[str, str] = {}
     try:
         source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
-        source_exists = store.path(source_relative).exists()
+        source_exists = store.scope is None and store.path(source_relative).exists()
         if source_exists and not rebuild:
             source_receipt = certified(store, capture_id, catalogue_version=1)
             _copy_closed_database(
@@ -1429,7 +1455,7 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
             "catalogue_version": 2,
             "capture_id": capture_id,
             "built_at": now(),
-            "scope": "catalogue",
+            **_build_scope_fields(state),
             "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
@@ -1538,7 +1564,7 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             "catalogue_version": 2,
             "capture_id": capture_id,
             "built_at": now(),
-            "scope": "catalogue",
+            **_build_scope_fields(state),
             "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
@@ -1569,6 +1595,8 @@ def certified(
 ) -> dict[str, Any]:
     if catalogue_version not in {1, 2}:
         raise CatalogueError("catalogue version must be 1 or 2")
+    if store.scope is not None and catalogue_version != 2:
+        raise CatalogueError("series roots support only internal v2 warehouse builds")
     if _context is not None:
         _check_operation_context(store, _context)
         cached = _context.captures.get((capture_id, catalogue_version))
@@ -1614,6 +1642,12 @@ def certified(
             or rows != expected_rows
         ):
             raise CatalogueError("invalid operation-local capture receipt inventory")
+    if store.scope is not None:
+        expected_scope = _build_scope_fields(state)
+        if any(receipt.get(key) != value for key, value in expected_scope.items()):
+            raise CatalogueError("build receipt scope does not match the operator root")
+    elif receipt.get("scope") == "series":
+        raise CatalogueError("series build receipt cannot be verified from a catalogue root")
     base = f"captures/{capture_id}"
     required = {f"{base}/state.json", f"{base}/pages.jsonl"}
     for row in rows:
