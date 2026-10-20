@@ -672,7 +672,8 @@ def _journal_records(
             with path.open("r+b") as stream:
                 stream.truncate(valid_end)
                 stream.flush()
-                os.fsync(stream.fileno())
+                with metrics.phase("file_sync"):
+                    os.fsync(stream.fileno())
             metrics.add("fsync_calls")
             store.sync(f"captures/{capture_id}/pages.jsonl")
 
@@ -1121,22 +1122,39 @@ def _commit_page_v2(
     request_id: str,
     identities: ParentIndex,
 ) -> tuple[dict[str, Any], Any]:
+    with metrics.thread_cpu_phase("page_processing_cpu"):
+        return _commit_page_v2_measured(store, state, index, relative, request_id, identities)
+
+
+def _commit_page_v2_measured(
+    store: Store,
+    state: _CaptureState,
+    index: int,
+    relative: str,
+    request_id: str,
+    identities: ParentIndex,
+) -> tuple[dict[str, Any], Any]:
     if state.get("complete"):
         raise CatalogueError("capture cannot accept pages after completion")
     if relative in state.processed or request_id in state.request_ids:
         raise CatalogueError("page receipt is already committed")
     candidate = copy.deepcopy(dict(state))
     candidate_seen = copy.deepcopy(state.seen_cursors)
-    manifest, payload = _replay_page(store, candidate, candidate_seen, index, relative, request_id)
+    with metrics.phase("page_validation"):
+        manifest, payload = _replay_page(
+            store, candidate, candidate_seen, index, relative, request_id
+        )
     # Validate native identities before making the receipt durable in the journal.
     # A failed append aborts this operation, so its operation-local index is discarded.
-    identities.add_page(manifest, payload)
+    with metrics.phase("page_application"):
+        identities.add_page(manifest, payload)
     _append_v2_record(
         store,
         state,
         "page",
         {"index": index, "relative": relative, "request_id": request_id},
     )
+    metrics.endpoint_page(manifest["endpoint"])
     _install_page_state(state, candidate, candidate_seen)
     state.page_rows.append({"index": index, "relative": relative})
     state.processed.add(relative)
@@ -1528,28 +1546,31 @@ def _consume(
             state.recent_page = None
         return
     work = state["tasks"][index]
-    manifest, payload = read_page(
-        store,
-        relative,
-        state["max_response_bytes"],
-        state.get("max_decoded_response_bytes", state["max_response_bytes"]),
-    )
+    with metrics.phase("page_validation"), metrics.thread_cpu_phase("page_processing_cpu"):
+        manifest, payload = read_page(
+            store,
+            relative,
+            state["max_response_bytes"],
+            state.get("max_decoded_response_bytes", state["max_response_bytes"]),
+        )
     context = _request_context(state, index)
     if manifest.get("request_id") != context["request_id"] or not _receipt_matches_context(
         manifest, context
     ):
         raise CatalogueError("raw receipt does not match its traversal")
-    if _phase(work) == "cutoff":
-        if manifest["status"] != 200:
-            raise CatalogueError(f"historical cutoff read failed: HTTP {manifest['status']}")
-        _record_cutoff(state, payload)
-        work["cutoff_due"] = False
-    else:
-        identities.add_page(manifest, payload)
-        _apply(state, index, manifest, payload, seen)
+    with metrics.phase("page_application"), metrics.thread_cpu_phase("page_processing_cpu"):
+        if _phase(work) == "cutoff":
+            if manifest["status"] != 200:
+                raise CatalogueError(f"historical cutoff read failed: HTTP {manifest['status']}")
+            _record_cutoff(state, payload)
+            work["cutoff_due"] = False
+        else:
+            identities.add_page(manifest, payload)
+            _apply(state, index, manifest, payload, seen)
     identities.processed.add(relative)
     work["pending"] = None
     save(store, state)
+    metrics.endpoint_page(manifest["endpoint"])
 
 
 def _settle(
@@ -1707,8 +1728,10 @@ def _run(
                     context = _request_context(state, index)
                     relative = recovered.pop(context["request_id"], None)
                     if relative is not None:
+                        endpoint, _, _, _ = _plan(work, _phase(work))
                         _stage(store, state, index, relative, identities)
                         _consume(store, state, index, relative, seen, identities)
+                        metrics.endpoint_page(endpoint, recovered=True)
                         continue
                     endpoint, params, _, _ = _plan(work, _phase(work))
                     batch = _batch_tickers(work)
@@ -1746,7 +1769,8 @@ def _run(
                 state.update(complete=True, completed_at=now(), error=None)
                 save(store, state)
             return
-        finished, _ = wait(running, return_when=FIRST_COMPLETED)
+        with metrics.phase("scheduler_wait"):
+            finished, _ = wait(running, return_when=FIRST_COMPLETED)
         for future in finished:
             index = running.pop(future)
             busy.discard(index)
@@ -1851,17 +1875,25 @@ def _capture_locked(
                 for row in page_receipts(store, state):
                     if row["relative"] in identities.processed:
                         continue
-                    manifest, payload = read_page(
-                        store,
-                        row["relative"],
-                        state["max_response_bytes"],
-                        decoded_ceiling,
-                    )
+                    with (
+                        metrics.phase("page_validation"),
+                        metrics.thread_cpu_phase("page_processing_cpu"),
+                    ):
+                        manifest, payload = read_page(
+                            store,
+                            row["relative"],
+                            state["max_response_bytes"],
+                            decoded_ceiling,
+                        )
                     if manifest.get("capture_id") != state["capture_id"]:
                         raise CatalogueError("raw evidence belongs to another capture")
                     if not _receipt_matches_state_protocol(manifest, state):
                         raise CatalogueError("raw receipt protocol differs from its capture")
-                    identities.add_page(manifest, payload)
+                    with (
+                        metrics.phase("page_application"),
+                        metrics.thread_cpu_phase("page_processing_cpu"),
+                    ):
+                        identities.add_page(manifest, payload)
                     identities.processed.add(row["relative"])
             recovered = _recover_receipts(store, state) if resume else {}
             _run(store, state, client, pool, recovered, seen, budget, identities)

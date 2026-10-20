@@ -193,8 +193,10 @@ def atomic_bytes(path: Path, body: bytes) -> None:
             stream.write(body)
             stream.flush()
             metrics.add("fsync_calls")
-            os.fsync(stream.fileno())
-        os.replace(name, path)
+            with metrics.phase("file_sync"):
+                os.fsync(stream.fileno())
+        with metrics.phase("atomic_replace"):
+            os.replace(name, path)
         fsync_directory(path.parent)
     finally:
         Path(name).unlink(missing_ok=True)
@@ -211,7 +213,8 @@ def fsync_file(path: Path) -> None:
         raise CatalogueError("cannot sync a missing or nonregular file")
     with path.open("r+b" if _WINDOWS else "rb") as stream:
         metrics.add("fsync_calls")
-        os.fsync(stream.fileno())
+        with metrics.phase("file_sync"):
+            os.fsync(stream.fileno())
 
 
 def fsync_directory(path: Path) -> None:
@@ -225,7 +228,7 @@ def fsync_directory(path: Path) -> None:
         metrics.add("fsync_calls")
         metrics.add("volume_flush_calls")
         try:
-            with metrics.phase("volume_flush"):
+            with metrics.phase("directory_sync"), metrics.phase("volume_flush"):
                 flush_directory(path)
         except OSError as exc:
             raise CatalogueError(
@@ -236,7 +239,8 @@ def fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         metrics.add("fsync_calls")
-        os.fsync(descriptor)
+        with metrics.phase("directory_sync"):
+            os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
@@ -349,6 +353,15 @@ class Store:
         self._sync_prefix(self.path(relative))
 
     def write(self, relative: str, value: Any) -> None:
+        if relative.startswith("raw/") and relative.endswith("/manifest.json"):
+            phase = (
+                "receipt_finalization"
+                if isinstance(value, dict) and value.get("accounting_complete") is True
+                else "reservation_write"
+            )
+            with metrics.phase(phase):
+                self.write_bytes(relative, json_bytes(value))
+            return
         self.write_bytes(relative, json_bytes(value))
 
     def write_bytes(self, relative: str, body: bytes) -> None:
@@ -364,6 +377,9 @@ class Store:
             try:
                 if relative.startswith("raw/"):
                     with metrics.phase("raw_write"):
+                        atomic_bytes(path, body)
+                elif relative.endswith("/state.json"):
+                    with metrics.phase("snapshot_replacement"):
                         atomic_bytes(path, body)
                 else:
                     atomic_bytes(path, body)
@@ -386,10 +402,12 @@ class Store:
                 durable_mkdir(path.parent)
                 created = not path.exists()
                 with path.open("ab") as stream:
-                    stream.write(body)
-                    stream.flush()
+                    with metrics.phase("journal_append"):
+                        stream.write(body)
+                        stream.flush()
                     metrics.add("fsync_calls")
-                    os.fsync(stream.fileno())
+                    with metrics.phase("file_sync"):
+                        os.fsync(stream.fileno())
                 if created:
                     fsync_directory(path.parent)
                 self._record(path, previous + len(body))
@@ -591,7 +609,7 @@ class EvidenceSpool:
             if consume_reservation is not None:
                 consume_reservation(len(chunk))
             self.store.check_storage(len(chunk))
-            with metrics.phase("raw_write"):
+            with metrics.phase("raw_write"), metrics.phase("spool_write"):
                 self.stream.write(chunk)
             self.size += len(chunk)
             self.store._record(self.path, self.size)
@@ -602,11 +620,13 @@ class EvidenceSpool:
             raise CatalogueError("evidence spool is already closed")
         self.stream.flush()
         metrics.add("fsync_calls")
-        os.fsync(self.stream.fileno())
+        with metrics.phase("file_sync"):
+            os.fsync(self.stream.fileno())
         self.stream.close()
         self.closed = True
         with self.store._lock:
-            os.replace(self.path, self.destination)
+            with metrics.phase("atomic_replace"):
+                os.replace(self.path, self.destination)
             self.store._record(self.path, None)
             self.store._record(self.destination, self.size)
             fsync_directory(self.destination.parent)

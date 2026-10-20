@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import zlib
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
@@ -308,22 +309,29 @@ class PublicClient:
             status: int | None = None
             retry_after: str | None = None
             committed: dict[str, Any] | None = None
+            observation = metrics.endpoint_attempt(endpoint, self.compression)
+            telemetry = observation.__enter__()
             try:
                 self.store.write(relative, reservation)
                 metrics.add("requests")
                 spool = self.store.spool(f"raw/{attempt_id}/body.bin")
                 with (
                     metrics.phase("request"),
-                    self.client.stream(
+                    metrics.http_request(),
+                    ExitStack() as stack,
+                ):
+                    request = self.client.stream(
                         "GET",
                         self.base_url + endpoint,
                         params=params,
                         timeout=min(30, self.budget.remaining),
-                    ) as response,
-                ):
+                    )
+                    with metrics.phase("http_header_wait"):
+                        response = stack.enter_context(request)
                     status = response.status_code
                     retry_after = response.headers.get("retry-after")
                     encoding = response.headers.get("content-encoding", "identity").strip().lower()
+                    telemetry.response(status, encoding)
                     if encoding not in {"identity", "gzip"}:
                         raise CatalogueError("unsupported response content encoding")
                     if encoding == "gzip" and self.compression != "gzip":
@@ -334,10 +342,17 @@ class PublicClient:
                             raise CatalogueError("invalid response content length")
                         if int(declared) > allowance:
                             raise self._ceiling_error(allowance)
-                    for chunk in response.iter_raw():
+                    iterator = iter(response.iter_raw())
+                    while True:
+                        with metrics.phase("response_iterator_wait"):
+                            try:
+                                chunk = next(iterator)
+                            except StopIteration:
+                                break
                         streamed += len(chunk)
                         downloaded = self.budget.add_download(len(chunk))
                         metrics.add("encoded_bytes", len(chunk))
+                        telemetry.add_bytes(encoded=len(chunk))
                         _ = self.budget.remaining
                         if downloaded > self.budget.limits.max_download_bytes:
                             raise BudgetExceeded("download allowance exhausted")
@@ -348,17 +363,21 @@ class PublicClient:
                             encoded_hash.update(chunk)
                         metrics.add("hash_bytes", len(chunk))
                         if encoding == "gzip":
-                            decoded_size += self._consume_gzip(
+                            decoded_chunk_size = self._consume_gzip(
                                 decoder,
                                 chunk,
                                 decoded_hash,
                                 decoded_size,
+                                telemetry,
                             )
+                            decoded_size += decoded_chunk_size
                             _ = self.budget.remaining
                         else:
                             decoded_size += len(chunk)
+                            telemetry.add_bytes(decoded=len(chunk))
                             if decoded_size > self.budget.max_decoded_response_bytes:
                                 raise CatalogueError("decoded response exceeds byte ceiling")
+                telemetry.finish()
                 if encoding == "gzip" and not decoder.eof:
                     raise CatalogueError("truncated gzip response")
                 _ = self.budget.remaining
@@ -402,6 +421,7 @@ class PublicClient:
                     raise CatalogueError(f"source request failed with HTTP {status}")
                 return relative
             except (httpx.HTTPError, ValueError) as exc:
+                telemetry.finish()
                 delay = None if last else backoff_seconds(attempt, None)
                 self._record_failure(
                     relative,
@@ -416,6 +436,7 @@ class PublicClient:
                     raise CatalogueError("bounded public source request failed") from exc
                 self._pause(delay or 0.0)
             except CatalogueError as exc:
+                telemetry.finish()
                 label = (
                     "budget exhausted" if isinstance(exc, BudgetExceeded) else "rejected response"
                 )
@@ -434,6 +455,7 @@ class PublicClient:
                     )
                 raise
             finally:
+                observation.__exit__(None, None, None)
                 if spool is not None:
                     spool.abort()
                 self.budget.settle(allowance)
@@ -444,6 +466,7 @@ class PublicClient:
         chunk: bytes,
         checksum: Any,
         current_size: int,
+        telemetry: Any = None,
     ) -> int:
         pending = chunk
         emitted = 0
@@ -455,6 +478,8 @@ class PublicClient:
             except zlib.error as exc:
                 raise CatalogueError("invalid gzip response") from exc
             emitted += len(decoded)
+            if telemetry is not None:
+                telemetry.add_bytes(decoded=len(decoded))
             if emitted > self.budget.max_decoded_response_bytes - current_size:
                 raise CatalogueError("decoded response exceeds byte ceiling")
             with metrics.phase("decoded_hashing"):
