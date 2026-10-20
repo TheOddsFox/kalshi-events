@@ -86,6 +86,14 @@ Version 2 verification requires one coverage row whose capture identity and all 
 
 New v2 manifests also record the optional `warehouse_sha256` of the freshly certified, checkpointed database. It is a verification hint outside the release identity and coverage fields. Matching freshly verified database bytes avoid a repeated semantic comparison; a missing or different hash requires schema, row-multiset and membership equivalence against the pinned release. Existing v2 manifests remain valid and immutable. V1 manifests do not gain this field.
 
+### Coordinated refresh results
+
+`refresh [--full | --capture-id ID]` is an additive catalogue-v2 workflow. It uses existing capture/build/publication checkpoints and one operator lock and deadline; it adds no storage, journal, receipt or acquisition format. Default invocation requires a verified baseline, preferring v2 with the existing v1 fallback. Full acquisition and rebasing require explicit `--full`; eight deltas never trigger an automatic rebase. Targeted captures cannot be resumed through this command. Existing capture, publication and metadata commands retain their selection defaults and result schemas.
+
+The new workflow result distinguishes whole-operation `complete`, nullable `capture_complete`, allocated `capture_id`, nullable `resumable`, stage, publication state and acquisition accounting. Stages are `preflight`, `capture`, `publication`, `complete`; publication includes build, export, verification and pruning. Publication state is `not_attempted`, `verified` or `unknown`. Unknown counts remain null with incomplete accounting. An allocated ID does not prove durable genesis. Successful completion includes the verified release identity and output directory. All expected operational failures, including setup and final reconciliation, retain one structured result and the known identity. Argument-parser errors retain normal argparse behavior.
+
+A budget stop returns exit 3 even when acquisition completed. Other invariant/input failures return exit 1. Publication/cleanup failure may follow pointer promotion and reports unknown state rather than promising rollback; retrying the same explicit ID follows existing recovery. The v1 pointer remains untouched. No new workflow command performs live tuning, changes rates automatically, or weakens evidence verification.
+
 ### Incremental acquisition and freshness
 
 Each incremental capture seals a UTC start watermark before its first request. Its ordinary-event and supported non-combo market metadata queries begin at the previous published watermark minus a fixed 300-second overlap. Series, combo events, combo markets and historical markets are fully reconciled on every composed refresh. The watermark advances to the sealed start only after verified publication. Resume retains the original baseline, watermark and query window even if another publication appears.

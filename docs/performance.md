@@ -51,6 +51,38 @@ The benchmark JSON total covers first-party in-process parsing through `common.d
 
 Full v1 output checks compare Parquet bytes, release identity and deterministic manifest/pointer identities. Composed runs also require stable Parquet/release identities from the frozen baseline; their manifest and pointer bytes may vary with the certified physical warehouse hash hint. Targeted checks compare the complete metadata bundle and independently verify it. Mutation between commands must still fail fresh evidence verification; operation-local reuse is not a persistent trust cache.
 
+## Acquisition diagnostics and coordinated refresh
+
+The additive `refresh` workflow uses existing capture and v2 publication routines. It removes the need to manually coordinate stages and avoids creating a redundant v1 baseline build. Default invocation uses incremental acquisition only after a verified baseline exists; `refresh --full` explicitly establishes or rebases that baseline. This workflow does not establish a faster initial full crawl. Targeted `metadata refresh` remains preferable when only selected market definitions are required.
+
+Opt-in metrics retain their existing version and fields and add bounded endpoint-family aggregates. Singular ticker paths become placeholders; reports contain no unbounded request traces or native payloads. Acquisition counters distinguish attempts and HTTP statuses, requested/observed encoding, bytes, committed pages and recovered pages. Latency aggregates retain count, total and maximum rather than individual request records.
+
+Header and response-iterator waits measure time observed by the client, including connection and scheduling effects. Iterator advancement is timed separately from hashing, decompression and spool writing. The existing inclusive request phase remains available. Additional phases separate rate/retry waits, receipt finalization, journal appends, snapshot replacements, validation/application, scheduler waits, spool writes and file/directory synchronization. Main-thread page-processing CPU uses a thread CPU clock; peak concurrent requests is reported separately. Failed operations remain counted and timed. Synchronization timings cover instrumented Python operations, not every native library or database flush.
+
+Worker times overlap and phases nest: neither their sum nor HTTP elapsed time alone proves the critical path or provider processing cost. Windows volume barriers retain separate measurements and unavailable child RSS remains null. Metrics stay outside evidence and cannot change raw receipts, release identities or existing command JSON.
+
+The manual `scripts/probe-acquisition.py` runner compares identity and requested gzip serially using fresh roots. Only explicitly supplied rates are tried; the default remains 10 requests/second. Fixed per-sample and aggregate budgets, preserved partial reports and uncertain-accounting stops keep this diagnostic separate from production operation. See README for exact limits. Live source content can differ between samples, so a lower byte count or shorter sample is not an equal-work speedup. Identity fallback is a valid observed result.
+
+Clean full/scale performance targets and actual native Windows recovery remain open.
+
+A manually invoked public probe on 2026-10-20 used the new script at the unchanged 10 requests/second with fresh roots on the MacBook's temporary filesystem. Identity and requested-gzip samples made three and four attempts respectively, all HTTP 200, with no retries or throttling observed. Both stopped at in-flight download reservations before their 12-attempt limit; they were partial captures, not complete catalogues. Aggregate recorded downloads were 716,121 bytes. Gzip was actually served on `/events` and `/markets`; cutoff responses used identity. The samples read different endpoint mixes and are not an equal-work compression or throughput benchmark. They do not measure the external SSD/cable or establish a safe higher public rate. Generated roots, receipts, metrics and reports remain outside Git and distributions.
+
+### Small-fixture diagnostic overhead checks
+
+On 2026-10-20, immutable source archives of `8c13274` and `f2c6a61` were compared with the existing frozen benchmark harness, locked dependencies, one warm-up and three alternating measured pairs on the MacBook temporary filesystem. Both revisions used the same fixture, limits and 1,000-request/second synthetic pace. These are small offline observations, not live or scale performance acceptance. Diagnostics were enabled; this measures their added hooks alongside unchanged pipeline work.
+
+| Fixture | Reference median | Candidate median | Observed change |
+|---|---:|---:|---:|
+| Full, 200 observations | 6.959 s | 7.559 s | +8.6% |
+| Frozen targeted metadata, first matrix | 72.226 ms | 92.661 ms | +28.3% |
+| Frozen targeted metadata, investigation repeat | 58.558 ms | 59.864 ms | +2.2% |
+
+Every measured pair preserved public artifact bytes and release identities; identities were stable within each revision. Full-mode counts remained seven requests, 74 first-party JSON decodes and 146 instrumented sync calls. Targeted counts remained four requests, 33 decodes and 90 sync calls. No verification or synchronization was omitted.
+
+The first targeted result exceeded the 10% investigation threshold. Repeating the same three-pair protocol without overlapping agent checks did not reproduce that median regression: reference run times were 57.936–58.581 ms and candidate times 56.872–86.152 ms. Capture medians were 46.990 versus 49.010 ms and raw-write medians 7.680 versus 8.442 ms. The first matrix varied more widely, including reference runs from 61.284–95.034 ms. These short timings do not establish the cause of the variation or a significant speedup.
+
+The full-small result is also noisy: one 1.15-second compatibility test overlapped part of that matrix, and dbt medians changed from 6.101 to 6.753 seconds despite unchanged dbt/warehouse implementation. Treat its artifact equivalence as correctness evidence and its timing as inconclusive. No agent tests overlapped either targeted matrix; unrelated host activity was not controlled. Long full/scale comparisons and clean timing targets remain deferred to the workstation.
+
 ## Current changes: contended measurements against 21edf14
 
 The implementation at `522af66a877fb75a1c61757ec1af0067a83f653e` was compared with `21edf14a486addfa743c524a645857ed711b640f` on 2026-10-18 using Python 3.12.13, dlt 1.31.0, PyArrow 26.0.0, DuckDB 1.5.6 and dbt-core 1.12.5 on arm64 macOS 27.0.1. Each reported comparison uses one warm-up and three alternating measured pairs with the same fixtures, limits, interpreter and filesystem. The runtime inventory SHA-256 is `57279c7f7612bea9690cb1fff7dd34cdbbc656584c89e47c3acff5b447dbaa08`.
@@ -204,4 +236,4 @@ The parsing gate requires at least 50% fewer counted first-party in-process JSON
 
 Series, combo events, combo markets and historical markets still require full reconciliation during a composed refresh. Publication still exports and checksums every relation, including retained history; independent verification still reads its evidence. These costs can dominate after ordinary metadata acquisition becomes incremental. A chain is limited to eight deltas before a verified full rebase.
 
-Live catalogue duration depends on exchange population, pagination, response size, rate limits, retries, storage and machine resources. No live compression support, higher sustained public throughput or production speedup is established by these offline fixtures. See [format and freshness contracts](contracts.md) for rollout, recovery and carried-value semantics.
+Live catalogue duration depends on exchange population, pagination, response size, rate limits, retries, storage and machine resources. These offline fixtures do not establish live compression support, higher sustained public throughput or production speedup. The separately recorded short probe establishes only the endpoint-specific gzip observations described above. See [format and freshness contracts](contracts.md) for rollout, recovery and carried-value semantics.

@@ -23,7 +23,7 @@ New roots use storage version 3. Existing version 1 and 2 roots remain readable;
 
 ## Capture
 
-The public transport uses only `https://external-api.kalshi.com/trade-api/v2`. Requests are paced by one shared limiter at 10 requests per second by default. Set `--max-rate` to a positive number to change that rate; zero or negative values are rejected. All five traversals (series, ordinary events, multivariate events, live markets and historical markets) run concurrently under that one limiter. Events and multivariate events use pages of 200; live and historical markets use pages of 1000.
+The public transport uses only `https://external-api.kalshi.com/trade-api/v2`. Requests are paced by one shared limiter at 10 requests per second by default. This is a configured client ceiling, not a verified anonymous-provider throughput allowance. Set `--max-rate` to a positive number to change that rate; zero or negative values are rejected. All five traversals (series, ordinary events, multivariate events, live markets and historical markets) run concurrently under that one limiter. Events and multivariate events use pages of 200; live and historical markets use pages of 1000.
 
 Each attempt writes its raw HTTP response bytes and per-attempt accounting before its page is applied. A request that fails with 429, 500, 502, 503 or 504 is retried up to four attempts in total, with equal-jitter exponential backoff capped at 30 seconds. A `Retry-After` header, as delta-seconds or an HTTP date, is always honored and recorded on the attempt receipt. Workers recheck shared cooldowns after waiting, so a later deferral also delays workers already waiting for a request slot. Resume recovers verified completed receipts without reissuing their requests.
 
@@ -48,7 +48,20 @@ uv run kalshi-events --root /absolute/new/probe-root \
   --max-duration-seconds 30 --max-root-bytes 67108864 --max-temp-bytes 33554432
 ```
 
-Inspect the probe's raw receipts: version 2 with `content_encoding: "gzip"` proves compressed evidence was served; version 1 means identity fallback. Compare encoded bytes, request time, rate waits and retry waits in the external metrics report. To investigate a different rate, explicitly repeat with another new root/report and a chosen positive `--max-rate`, keeping other limits fixed. A small probe can expose throttling but cannot establish sustained catalogue throughput. Normal commands and CI never probe or tune automatically; the default remains 10 requests per second. No live compression or higher-rate capability is assumed.
+Inspect the probe's raw receipts: version 2 with `content_encoding: "gzip"` proves compressed evidence was served; version 1 means identity fallback. Compare encoded bytes, request time, rate waits and retry waits in the external metrics report. To investigate a different rate, explicitly repeat with another new root/report and a chosen positive `--max-rate`, keeping other limits fixed. A small probe can expose throttling but cannot establish sustained catalogue throughput. Normal commands and CI never probe or tune automatically; the default remains 10 requests per second. A short 2026-10-20 probe observed gzip on events and markets, with identity fallback on cutoff responses. This does not establish support on every endpoint or sustained higher-rate capability.
+
+### Serial acquisition comparisons
+
+Run the manual probe script from the locked environment with a new destination outside the checkout:
+
+```sh
+uv run --locked python scripts/probe-acquisition.py --output /absolute/new/acquisition-probe
+uv run --locked python scripts/probe-acquisition.py --output /absolute/new/rate-probe --rates 5 10 20
+```
+
+The default compares identity and requested gzip at 10 requests/second. Explicit rates replace that list; at most three distinct finite positive rates up to 20 are accepted. Samples run serially against fresh roots and never build or publish. Each sample allows 12 attempts, 30 seconds and 64 MiB encoded downloads, with independent 32 MiB encoded and 64 MiB decoded response ceilings. The whole run allows 72 attempts, 256 MiB encoded downloads and 180 seconds, plus at most five seconds for termination/reaping. Aggregate retained and temporary allowances are 2 GiB and 1 GiB under existing Store accounting semantics. Remaining allowances can shorten later samples.
+
+The output separates roots, reports and logs and preserves failed evidence. Timeouts or uncertain accounting stop subsequent samples. A request-budget stop with verified accounting is an expected partial sample. Requested gzip may produce identity fallback. The report distinguishes attempts, completed pages, errors/retries, bytes, observed encodings and timing. Samples may retrieve different changing source data; their byte ratios are not controlled compression benchmarks. No rate is selected automatically and no production settings change. Short probes establish capability observations, not sustained full-crawl throughput.
 
 ## Build and publish
 
@@ -91,6 +104,26 @@ uv run kalshi-events --root /absolute/operator/kalshi-events discard --capture-i
 ```
 
 Discard refuses complete captures and captures referenced by a publication or descendant. Subsequent verified publication can prune obsolete dependencies. Missing, cyclic, corrupted or cross-root ancestry prevents composition and publication. Never manually delete pinned captures, raw evidence, builds or releases.
+
+## One-command catalogue refresh
+
+The operator-invoked `refresh` command coordinates capture and verified publication through catalogue v2. Establish a baseline explicitly, then request incremental updates:
+
+```sh
+uv run kalshi-events --root /absolute/operator/kalshi-events refresh --full
+uv run kalshi-events --root /absolute/operator/kalshi-events refresh
+uv run kalshi-events --root /absolute/operator/kalshi-events refresh --capture-id CAPTURE_ID
+```
+
+A new incremental refresh requires an existing verified publication, preferring v2 and otherwise using v1. `--full` explicitly creates a baseline or rebase; after eight deltas the command stops and asks for a full rebase. It never silently starts a full crawl. `--full` and `--capture-id` cannot be combined. Resume retains the exact capture's acquisition settings and predecessor; targeted metadata captures cannot enter this workflow.
+
+One canonical writer lock and one invocation deadline span acquisition, the required v2 build, complete export, independent verification, pointer promotion and pruning. The workflow publishes only `current-v2.json`; the v1 pointer and existing command defaults remain unchanged. Identity compression and 10 requests/second remain defaults. Existing resource flags and `--compression gzip` are supported; size explicit full-run allowances for the entire catalogue rather than assuming the default download allowance will suffice.
+
+The command prints one JSON result. `complete` describes the whole workflow, while `capture_complete` describes acquisition. `capture_id` identifies the exact allocated or resumed capture, and nullable `resumable` distinguishes confirmed durable state from an unknown initialization outcome. `stage` is `preflight`, `capture`, `publication` or `complete`; publication includes build, export and cleanup. `publication_state` is `not_attempted`, `verified` or `unknown`. Unknown acquisition counters are null with `accounting_complete: false`. Successful results include `source_release_id` and `output`.
+
+Exit 0 means verified publication and cleanup completed; exit 3 means a budget stopped the workflow; exit 1 means invalid input or a failed invariant. Resume by the returned capture ID after relieving the exhausted allowance. An allocated ID with unknown resumability is not proof that initialization committed; inspect `status` and preserve the root if initialization failed. Publication can promote its pointer before cleanup fails, so `unknown` must not be interpreted as rollback. Retrying the same ID uses the existing recovery machinery. No separate workflow state file is created.
+
+Incremental refresh retains the freshness and reconciliation limitations above. For 1–100 selected markets, use `metadata refresh` below to avoid a full catalogue traversal.
 
 ## Targeted metadata handoff
 
@@ -146,7 +179,7 @@ See [performance measurements](docs/performance.md) for frozen fixtures, paired 
 
 No capture has completed. The 2026-10-17 probe is not acceptance.
 
-A new capture ran for 20.1 minutes and stored 6.90 GiB (7,409,637,631 bytes) across 7,802 pages. Series finished at 15,187. The other traversals were still returning full pages: 484,600 events, 590,400 multivariate events, 903,000 live markets, and 761,000 historical markets. Sharing 10 requests per second, those four moved at about 42, 34, 22, and 26 minutes per extra million. Disk use was about 21 GiB per hour. The cursors do not report a remainder, so this probe has no end time.
+A new capture ran for 20.1 minutes and stored 6.90 GiB (7,409,637,631 bytes) across 7,802 pages. Series finished at 15,187. The other traversals were still returning full pages: 484,600 events, 590,400 multivariate events, 903,000 live markets, and 761,000 historical markets. Sharing the configured 10 requests per second, those four moved at about 42, 34, 22, and 26 minutes per extra million. Disk use was about 21 GiB per hour. The cursors do not report a remainder, so this probe has no end time.
 
 One page exceeded the old 16 MiB response default. The probe sealed a 256 MiB ceiling and kept receiving pages. The default is now 384 MiB, 1.5 times that ceiling. `max_root_bytes` stays 64 GiB because 1.5 times the 6.90 GiB probe is 10.4 GiB. A finished capture can pass 64 GiB; this probe never reached the end.
 

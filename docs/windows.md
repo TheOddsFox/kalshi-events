@@ -25,6 +25,21 @@ Use a new operator root for rollout. Existing storage v1/v2 roots still require 
 
 Windows metrics report self lifetime peak working-set bytes. Child peak RSS is `null`, because it is not measured; do not treat it as zero or combine it with the parent value. Reports count volume flushes and their elapsed time separately. Native Windows volume-flush timings are not comparable with POSIX timings as an isolated implementation speedup.
 
+## Refresh and short diagnostics
+
+Use the same CLI for native Windows validation, with the accepted elevated local NTFS environment and a fresh operator root:
+
+```powershell
+uv run --locked kalshi-events --root C:\kalshi-data\events refresh --full
+uv run --locked kalshi-events --root C:\kalshi-data\events refresh
+uv run --locked kalshi-events --root C:\kalshi-data\events refresh --capture-id CAPTURE_ID
+uv run --locked python scripts/probe-acquisition.py --output C:\kalshi-probes\new-run
+```
+
+The full baseline can exceed default budgets; explicitly size them before a long run. Resume uses the returned ID, including when acquisition completed but build/publication stopped. Unknown publication state may follow pointer promotion; it does not promise rollback. The workflow never implicitly creates a full baseline or rebases after eight deltas, and it leaves the legacy v1 pointer untouched.
+
+The probe uses the active interpreter without POSIX shell syntax. It creates separate roots/reports/logs, preserves failures and stops on timeout or uncertain accounting. The parent deadline includes child startup, followed by up to five seconds for termination and reaping. All writes retain Windows volume barriers, which can dominate short samples and include unrelated applications' writes. Live probes run only when explicitly invoked; normal verification and CI use offline fixtures. Preserve the report alongside Windows/Python/dependency versions and storage configuration. Actual native execution of these additions remains a workstation acceptance requirement.
+
 ## Prepare a comparable Windows baseline
 
 Unmodified `21edf14` cannot run on native Windows. Apply the **same portability-only source patch** to its archive that the candidate already contains. Do not copy the candidate's acquisition, Arrow landing or affected-key SQL changes into the reference. The compatibility commit is the commit introducing `_windows.py`; inspect the generated patch and require `git apply --check` to succeed before applying it. If later commits change platform behavior, include those reviewed compatibility fixes on both sides too.
