@@ -48,7 +48,7 @@ uv run kalshi-events --root /absolute/new/probe-root \
   --max-duration-seconds 30 --max-root-bytes 67108864 --max-temp-bytes 33554432
 ```
 
-Inspect the probe's raw receipts: version 2 with `content_encoding: "gzip"` proves compressed evidence was served; version 1 means identity fallback. Compare encoded bytes, request time, rate waits and retry waits in the external metrics report. To investigate a different rate, explicitly repeat with another new root/report and a chosen positive `--max-rate`, keeping other limits fixed. A small probe can expose throttling but cannot establish sustained catalogue throughput. Normal commands and CI never probe or tune automatically; the default remains 10 requests per second. A short 2026-10-20 probe observed gzip on events and markets, with identity fallback on cutoff responses. This does not establish support on every endpoint or sustained higher-rate capability.
+Inspect the probe's raw receipts: version 2 with `content_encoding: "gzip"` proves compressed evidence was served; version 1 means identity fallback. Compare encoded bytes, request time, rate waits and retry waits in the external metrics report. To investigate a different rate, explicitly repeat with another new root/report and a chosen positive `--max-rate`, keeping other limits fixed. A small probe can expose throttling but cannot establish sustained catalogue throughput. Normal commands and verification never probe or tune automatically; the default remains 10 requests per second. A short 2026-10-20 probe observed gzip on events and markets, with identity fallback on cutoff responses. This does not establish support on every endpoint or sustained higher-rate capability.
 
 ### Serial acquisition comparisons
 
@@ -215,7 +215,7 @@ A targeted refresh of `KXNHLGOAL-26OCT17DALCHI-CHIRGREENE20-2` returned 4 reques
 
 Native endpoint, cursor and immutable evidence patterns were adapted from `oddsfox-pipeline`'s Kalshi client and `polymarket-events`' bounded catalogue workflow. Neither donor is imported at runtime or altered by this extraction. Provider contracts: [markets](https://docs.kalshi.com/api-reference/market/get-markets), [multivariate events](https://docs.kalshi.com/api-reference/events/get-multivariate-events), [series](https://docs.kalshi.com/api-reference/market/get-series-list), [historical tiers and cutoff](https://docs.kalshi.com/getting_started/historical_data).
 
-After `scripts/verify` builds distributions, run `uv run --locked python scripts/check-distributions.py` and `uv run --locked python scripts/check-installed.py`. CI runs both checks. The installed check creates a separate locked environment, installs the checksummed wheel, verifies its site-packages import origin and parses its packaged dbt project from a temporary working directory.
+After `scripts/verify` builds distributions, run `uv run --locked python scripts/check-distributions.py` and `uv run --locked python scripts/check-installed.py`. GitHub Actions CI is disabled; run these verification commands manually. The installed check creates a separate locked environment, installs the checksummed wheel, verifies its site-packages import origin and parses its packaged dbt project from a temporary working directory.
 
 The consumer repository owns the full installed handoff harness. Given two separate installed wheel environments, run:
 
