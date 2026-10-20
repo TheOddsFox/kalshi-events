@@ -30,6 +30,35 @@ TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
 CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 3}
 PREVIOUS_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
+SCOPED_ROOT_VERSION = 4
+
+
+def series_scope(series_ticker: str) -> dict[str, Any]:
+    return {
+        "kind": "series",
+        "series_ticker": ticker(series_ticker),
+        "include_multivariate": False,
+    }
+
+
+def validate_series_scope(scope: Any) -> dict[str, Any]:
+    if not isinstance(scope, dict) or set(scope) != {
+        "kind",
+        "series_ticker",
+        "include_multivariate",
+    }:
+        raise CatalogueError("invalid operator series scope")
+    if scope.get("kind") != "series" or scope.get("include_multivariate") is not False:
+        raise CatalogueError("invalid operator series scope")
+    return series_scope(scope.get("series_ticker"))
+
+
+def series_root_marker(scope: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "owner": OWNER_MARKER["owner"],
+        "storage_version": SCOPED_ROOT_VERSION,
+        "scope": validate_series_scope(scope),
+    }
 
 
 class CatalogueError(RuntimeError):
@@ -67,14 +96,18 @@ def _root_storage_version(marker: Any) -> int:
         return 1
     if (
         not isinstance(marker, dict)
-        or set(marker) != {"owner", "storage_version"}
         or marker.get("owner") != OWNER_MARKER["owner"]
         or isinstance(marker.get("storage_version"), bool)
         or not isinstance(marker.get("storage_version"), int)
-        or marker["storage_version"] not in {2, 3}
     ):
         raise CatalogueError("operator root belongs to another application")
-    return marker["storage_version"]
+    version = marker["storage_version"]
+    if version in {2, 3} and set(marker) == {"owner", "storage_version"}:
+        return version
+    if version == SCOPED_ROOT_VERSION and set(marker) == {"owner", "storage_version", "scope"}:
+        validate_series_scope(marker["scope"])
+        return version
+    raise CatalogueError("operator root belongs to another application")
 
 
 CANONICAL_CURRENT_ROOT_MARKER_BYTES = json_bytes(CURRENT_ROOT_MARKER)
@@ -281,10 +314,13 @@ class Store:
     invocation start and end; `sync` re-measures one subtree after third-party work.
     """
 
-    def __init__(self, root: Path, limits: Limits | None = None):
+    def __init__(
+        self, root: Path, limits: Limits | None = None, *, series_ticker: str | None = None
+    ):
         self.root = safe_path(root)
         if self.root == Path(self.root.anchor):
             raise CatalogueError("filesystem root cannot be an operator root")
+        requested_scope = series_scope(series_ticker) if series_ticker is not None else None
         self.limits = limits or Limits()
         self.started = time.monotonic()
         self._lock = threading.RLock()
@@ -302,10 +338,24 @@ class Store:
         if not marker.exists():
             if any(self.root.iterdir()):
                 raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
-            atomic_json(marker, CURRENT_ROOT_MARKER)
+            initial_marker = (
+                series_root_marker(requested_scope)
+                if requested_scope is not None
+                else CURRENT_ROOT_MARKER
+            )
+            atomic_json(marker, initial_marker)
         marker_value = decode(regular_bytes(marker))
         self.storage_version = _root_storage_version(marker_value)
+        self._scope = (
+            validate_series_scope(marker_value["scope"]) if self.storage_version == 4 else None
+        )
+        if requested_scope is not None and requested_scope != self._scope:
+            raise CatalogueError("series scope requires a new dedicated operator root")
         self.reconcile()
+
+    @property
+    def scope(self) -> dict[str, Any] | None:
+        return dict(self._scope) if self._scope is not None else None
 
     @property
     def remaining(self) -> float:
@@ -495,6 +545,8 @@ class Store:
             raise CatalogueError("root upgrade requires the writer lock")
         current = decode(regular_bytes(self.path("root.json"), 1024**2))
         version = _root_storage_version(current)
+        if version == SCOPED_ROOT_VERSION:
+            raise CatalogueError("scoped roots cannot be converted with upgrade-root")
         if version == 3:
             self.storage_version = version
             return
@@ -518,17 +570,22 @@ class Store:
         return EvidenceSpool(self, relative)
 
     def require_writable(self) -> None:
-        if self.storage_version != 3:
+        if self.storage_version not in {3, SCOPED_ROOT_VERSION}:
             raise CatalogueError("operator root requires explicit upgrade-root before writing")
 
     def _refresh_storage_version(self, *, allow_legacy: bool = False) -> None:
         marker_bytes = regular_bytes(self.path("root.json"))
         if marker_bytes == CANONICAL_CURRENT_ROOT_MARKER_BYTES:
+            if self._scope is not None:
+                raise CatalogueError("operator root scope changed after opening")
             self.storage_version = 3
             return
         marker = decode(marker_bytes)
         version = _root_storage_version(marker)
-        if version in {2, 3}:
+        scope = validate_series_scope(marker["scope"]) if version == SCOPED_ROOT_VERSION else None
+        if scope != self._scope:
+            raise CatalogueError("operator root scope changed after opening")
+        if version in {2, 3, SCOPED_ROOT_VERSION}:
             self.storage_version = version
             if version == 2 and not allow_legacy:
                 raise CatalogueError("operator root requires explicit upgrade-root before writing")

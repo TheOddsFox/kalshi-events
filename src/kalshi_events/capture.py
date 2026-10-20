@@ -33,6 +33,7 @@ from kalshi_events.common import (
     regular_bytes,
     selections,
     ticker,
+    validate_series_scope,
 )
 from kalshi_events.normalize import ParentIndex, records
 from kalshi_events.transport import MAX_CONCURRENT_REQUESTS, PublicClient, read_page, source_url
@@ -43,6 +44,7 @@ CUTOFF_ENDPOINT = "/historical/cutoff"
 HISTORICAL_PREFIX = "/historical/markets"
 JOURNAL_VERSION = 2
 ACQUISITION_PROTOCOL = 3
+SCOPED_ACQUISITION_PROTOCOL = 4
 MAX_SELECTION_BATCH = 100
 MAX_INITIAL_BATCH_URL_BYTES = 6144
 MAX_JOURNAL_RECORD_BYTES = 16 * 1024**2
@@ -145,6 +147,7 @@ def read_capture(
     if state.get("capture_id") != capture_id or state.get("version") != 1:
         raise CatalogueError("invalid capture state")
     _acquisition_protocol(state)
+    _validate_capture_root_scope(store, state)
     if "max_response_bytes" not in state:
         raise CatalogueError("pre-1.0 captures are not readable; a new operator root is required")
     ceiling = state.get("max_response_bytes")
@@ -264,15 +267,47 @@ def _batch_tickers(work: dict[str, Any]) -> list[str] | None:
 
 def _acquisition_protocol(state: dict[str, Any]) -> int:
     if "acquisition_protocol" not in state:
+        if "scope" in state:
+            raise CatalogueError("scoped capture lacks its acquisition protocol")
         return 2
     protocol = state["acquisition_protocol"]
     if (
         isinstance(protocol, bool)
         or not isinstance(protocol, int)
-        or protocol != ACQUISITION_PROTOCOL
+        or protocol not in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
     ):
         raise CatalogueError("unsupported acquisition protocol")
+    if protocol == SCOPED_ACQUISITION_PROTOCOL:
+        if "scope" not in state:
+            raise CatalogueError("unsupported acquisition protocol without a series scope")
+        validate_series_scope(state.get("scope"))
+    elif "scope" in state:
+        raise CatalogueError("series scope requires acquisition protocol 4")
     return protocol
+
+
+def _validate_capture_root_scope(store: Store, state: dict[str, Any]) -> None:
+    scope = state.get("scope")
+    if scope is not None:
+        scope = validate_series_scope(scope)
+    if scope != store.scope:
+        raise CatalogueError("capture scope does not match the operator root")
+    if scope is not None:
+        root_identity = state.get("root_id")
+        if not _is_root_id(root_identity):
+            raise CatalogueError("scoped capture lacks a logical operator root identity")
+        from kalshi_events.incremental import root_id
+
+        if root_identity != root_id(store):
+            raise CatalogueError("capture belongs to a different logical operator root")
+
+
+def _is_root_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 32
+        and all(char in "0123456789abcdef" for char in value)
+    )
 
 
 def _journal_checksum(record: dict[str, Any]) -> str:
@@ -289,7 +324,11 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         or not isinstance(state.get("coverage"), dict)
     ):
         raise CatalogueError("invalid journal capture state")
-    _acquisition_protocol(state)
+    protocol = _acquisition_protocol(state)
+    if protocol == SCOPED_ACQUISITION_PROTOCOL and (
+        state.get("selected") is not None or not _is_root_id(state.get("root_id"))
+    ):
+        raise CatalogueError("invalid scoped capture settings")
     identities: set[str] = set()
     batch_values: list[str] = []
     has_batches = False
@@ -329,7 +368,8 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         if batch is not None:
             has_batches = True
             if (
-                _acquisition_protocol(state) != ACQUISITION_PROTOCOL
+                _acquisition_protocol(state)
+                not in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
                 or not isinstance(state.get("selected"), list)
                 or any(not isinstance(value, str) for value in state["selected"])
                 or any(value not in state["selected"] for value in batch)
@@ -421,6 +461,7 @@ def _validate_control_transition(
         "compression",
         "journal_version",
         "acquisition_protocol",
+        "scope",
         "incremental",
         "baseline",
         "root_id",
@@ -520,7 +561,8 @@ def _apply_control_record(
             expected_params = (
                 {"exclude_markets": "true"}
                 if work.get("kind") == "events"
-                and _acquisition_protocol(genesis) == ACQUISITION_PROTOCOL
+                and _acquisition_protocol(genesis)
+                in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
                 else {}
             )
             if (
@@ -698,6 +740,7 @@ def _read_v2(
     if set(start_payload) != {"state", "seen_cursors", "state_sha256"}:
         raise CatalogueError("invalid journal genesis fields")
     base = _validate_logical_state(start_payload.get("state"), capture_id)
+    _validate_capture_root_scope(store, base)
     initial_seen = _seen_parse(start_payload.get("seen_cursors"))
     initial_digest = _state_digest(base, initial_seen)
     if start_payload.get("state_sha256") != initial_digest:
@@ -742,6 +785,8 @@ def _read_v2(
             "started_at",
             "selected",
             "acquisition_protocol",
+            "scope",
+            "root_id",
         ):
             if snapshot_state.get(key) != base.get(key):
                 raise CatalogueError("capture snapshot settings differ from journal genesis")
@@ -1227,6 +1272,8 @@ def new_capture(
 ) -> dict[str, Any]:
     if compression not in {"identity", "gzip"}:
         raise CatalogueError("compression must be identity or gzip")
+    if store.scope is not None:
+        raise CatalogueError("series acquisition planning is not available yet")
     if incremental and selected:
         raise CatalogueError("incremental capture cannot be combined with market selection")
     started_at = now()
@@ -1345,18 +1392,22 @@ def _request_context(state: dict[str, Any], index: int) -> dict[str, Any]:
     _, _, kind, singular = _plan(work, phase)
     protocol = _acquisition_protocol(state)
     request_key = [state["capture_id"], index, phase, work["cursor"], work["restarts"]]
+    if protocol == SCOPED_ACQUISITION_PROTOCOL:
+        request_key.append(validate_series_scope(state["scope"]))
     context = {
         "capture_id": state["capture_id"],
         "task_index": index,
         "phase": phase,
         "request_id": digest(json_bytes([*request_key, protocol]))
-        if protocol == ACQUISITION_PROTOCOL
+        if protocol in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
         else digest(json_bytes(request_key)),
         "entity_kind": kind,
         "singular": singular,
     }
-    if protocol == ACQUISITION_PROTOCOL:
+    if protocol in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}:
         context["acquisition_protocol"] = protocol
+    if protocol == SCOPED_ACQUISITION_PROTOCOL:
+        context["series_scope"] = validate_series_scope(state["scope"])
     scope = state.get("task_scopes", {}).get(str(index))
     if scope is not None:
         context.update(task_scope=scope, task_generation=work["restarts"])
@@ -1369,10 +1420,15 @@ def _receipt_matches_context(manifest: dict[str, Any], context: dict[str, Any]) 
     if "acquisition_protocol" not in context:
         return True
     protocol = manifest["acquisition_protocol"]
-    return (
+    protocol_matches = (
         isinstance(protocol, int)
         and not isinstance(protocol, bool)
         and protocol == context["acquisition_protocol"]
+    )
+    if not protocol_matches:
+        return False
+    return manifest.get("series_scope") == context.get("series_scope") and (
+        ("series_scope" in manifest) == ("series_scope" in context)
     )
 
 
@@ -1381,7 +1437,11 @@ def _receipt_matches_state_protocol(manifest: dict[str, Any], state: dict[str, A
     if protocol == 2:
         return "acquisition_protocol" not in manifest
     value = manifest.get("acquisition_protocol")
-    return isinstance(value, int) and not isinstance(value, bool) and value == protocol
+    if not isinstance(value, int) or isinstance(value, bool) or value != protocol:
+        return False
+    return manifest.get("series_scope") == state.get("scope") and (
+        ("series_scope" in manifest) == (protocol == SCOPED_ACQUISITION_PROTOCOL)
+    )
 
 
 def _record_cutoff(state: dict[str, Any], payload: Any) -> None:
