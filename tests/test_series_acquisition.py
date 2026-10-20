@@ -81,7 +81,7 @@ def test_scoped_capture_acquires_live_history_and_authoritative_parents(tmp_path
     ) in requests
     assert (
         "/historical/markets",
-        {"series_ticker": "KXCPI", "mve_filter": "exclude", "limit": 1000},
+        {"series_ticker": "KXCPI", "limit": 1000},
     ) in requests
     assert (
         "/events/KXCPI-25JAN",
@@ -105,6 +105,36 @@ def test_scoped_capture_acquires_live_history_and_authoritative_parents(tmp_path
         "markets_live": {0: {"KXCPI-26JAN-CPI"}},
         "markets_history": {0: {"KXCPI-25JAN-CPI"}},
     }
+
+
+def test_scoped_history_request_avoids_mutually_exclusive_filters(tmp_path):
+    responses = _responses()
+
+    def historical_response(params):
+        # The live historical endpoint rejects combined selectors.
+        if any(key in params for key in ("tickers", "event_ticker", "mve_filter")):
+            return 400, {
+                "error": {
+                    "code": "bad_request",
+                    "message": "bad request",
+                    "details": "tickers, event_ticker, series_ticker, and mve_filter filters are mutually exclusive",
+                }
+            }
+        return 200, {"markets": [HISTORICAL_MARKET], "cursor": ""}
+
+    responses["/historical/markets"] = historical_response
+    store = Store(tmp_path / "series-history-api", series_ticker="KXCPI")
+    result, _clients = _capture(store, responses)
+
+    assert result["complete"] is True
+    requests = [
+        (manifest["endpoint"], manifest["params"])
+        for manifest, _payload in capture.capture_pages(store, result)
+    ]
+    assert (
+        "/historical/markets",
+        {"series_ticker": "KXCPI", "limit": 1000},
+    ) in requests
 
 
 def test_verified_empty_series_scopes_are_complete(tmp_path):

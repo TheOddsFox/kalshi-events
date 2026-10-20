@@ -172,15 +172,21 @@ def test_parent_hydration_uses_observation_winner_instead_of_receipt_iteration_o
                 "2020-01-01T00:00:00Z" if second and not equal_times else "2030-01-01T00:00:00Z"
             )
             receipt["page_id"] = second_page if second else first_page
-            destination = self.store.path(f"raw/{receipt['page_id']}")
-            self.store.path(relative).parent.rename(destination)
-            self.store.sync("raw")
-            relative = str((destination / "manifest.json").relative_to(self.store.root))
+            previous_directory = self.store.path(relative).parent
+            previous_relative = str(previous_directory.relative_to(self.store.root))
+            destination_relative = f"raw/{receipt['page_id']}"
+            destination = self.store.path(destination_relative)
+            previous_directory.rename(destination)
+            self.store.sync(previous_relative)
+            self.store.sync(destination_relative)
+            relative = f"{destination_relative}/manifest.json"
             self.store.write(relative, receipt)
             return relative
 
     state = acquisition.capture(store, client_factory=TimedClient)
     assert state["complete"]
+    accounted_usage = store.usage()
+    assert store.reconcile() == accounted_usage
     assert requested.count("/series/WINNER") == 1
     output = tmp_path / "metadata"
     metadata.export(store, ["MARKET"], output, capture_id=state["capture_id"])

@@ -125,6 +125,32 @@ Exit 0 means verified publication and cleanup completed; exit 3 means a budget s
 
 Incremental refresh retains the freshness and reconciliation limitations above. For 1–100 selected markets, use `metadata refresh` below to avoid a full catalogue traversal.
 
+## Complete ordinary-series ingestion
+
+Use a new dedicated root for one ordinary series, such as `KXCPI`:
+
+```sh
+uv run kalshi-events --root /absolute/operator/kxcpi series refresh --series-ticker KXCPI --full
+uv run kalshi-events --root /absolute/operator/kxcpi series refresh
+uv run kalshi-events --root /absolute/operator/kxcpi series refresh --capture-id CAPTURE_ID
+uv run kalshi-events --root /absolute/operator/kxcpi series current
+uv run kalshi-events --root /absolute/operator/kxcpi series replay --capture-id CAPTURE_ID
+uv run kalshi-events --root /absolute/operator/kxcpi series rebuild
+uv run kalshi-events verify --release /absolute/operator/kxcpi/releases/RELEASE_ID
+```
+
+The first command requires a series ticker and explicit `--full`. The root then fixes that scope permanently; later commands derive it and reject a conflicting ticker. Series roots use storage version 4 and cannot convert populated catalogue roots. Ordinary roots remain version 3. Catalogue and metadata acquisition/export commands reject series roots; `status` and `discard --capture-id ID` remain available.
+
+Every series refresh follows all pages of the series definition, ordinary events, live-tier markets and historical markets, without status or metadata-update filters. It excludes combos and does not acquire candles, trades or order books. Authoritative event definitions establish market membership; unresolved or contradictory parents prevent publication. Earlier cursor generations remain history, while only the final completed generation determines membership.
+
+Refresh copies the certified predecessor warehouse, appends new observations idempotently and reconciles every membership scope. Departed entities leave current output while their observations remain in protected ancestry. Replaying a receipt adds no duplicate; fetching an unchanged object again records its new observation time and provenance. Prices, volume and open interest are observed values, not a trading time series. After eight refresh captures, run `series refresh --full` explicitly to rebase. No automatic rebase occurs.
+
+Series publication uses `oddsfox.kalshi.series.v1` and `current-series.json`, with `coverage_scope: "series"`, the selected `series_ticker` and `include_multivariate: false`. It reuses the internal v2 warehouse machinery without creating catalogue v3 or changing either catalogue pointer. There is no catalogue-v1 baseline fallback. Published ancestry and incomplete captures remain pinned; successful publication after an explicit rebase can prune obsolete unreferenced evidence.
+
+The resource flags, compression choices, global `--metrics-file`, refresh JSON stages, nullable accounting/resumability and exit codes match `refresh` above; series results also include `series_scope`. One lock and deadline span acquisition through cleanup. Resume the exact reported ID after a budget stop, including when acquisition completed but publication did not. Completed resume avoids networking and redundant landing, but freshly verifies publication. `series replay` and `series rebuild` use committed evidence without publishing automatically. If interrupted before the initial root marker was installed, preserve the unowned directory and choose a fresh directory; never edit markers or recovery files by hand.
+
+“Complete” certifies traversals of the declared scope, not every historically existing record or an atomic exchange snapshot. Live/historical handoffs can race with pagination; `atomic_snapshot` remains false. See the [series contract and recovery rules](docs/contracts.md#ordinary-series-releases) and [measured acceptance](docs/performance.md#kxcpi-series-acceptance).
+
 ## Targeted metadata handoff
 
 Select 1–100 distinct explicit market tickers. New captures query bounded batches of selected live market tickers. An omitted ticker receives an authoritative individual live lookup followed by a historical lookup when necessary; list omission alone never proves absence. Event and series parents remain authoritative individual lookups. A completed selection can be absent or unresolved; its coverage remains visible and no stale record is substituted.
@@ -177,7 +203,7 @@ See [performance measurements](docs/performance.md) for frozen fixtures, paired 
 
 ## Live acceptance
 
-No capture has completed. The 2026-10-17 probe is not acceptance.
+No exchange-wide catalogue capture has completed. The 2026-10-17 probe is not acceptance. The separate KXCPI series acceptance is recorded in [performance guidance](docs/performance.md#kxcpi-series-acceptance).
 
 A new capture ran for 20.1 minutes and stored 6.90 GiB (7,409,637,631 bytes) across 7,802 pages. Series finished at 15,187. The other traversals were still returning full pages: 484,600 events, 590,400 multivariate events, 903,000 live markets, and 761,000 historical markets. Sharing the configured 10 requests per second, those four moved at about 42, 34, 22, and 26 minutes per extra million. Disk use was about 21 GiB per hour. The cursors do not report a remainder, so this probe has no end time.
 

@@ -83,6 +83,52 @@ The first targeted result exceeded the 10% investigation threshold. Repeating th
 
 The full-small result is also noisy: one 1.15-second compatibility test overlapped part of that matrix, and dbt medians changed from 6.101 to 6.753 seconds despite unchanged dbt/warehouse implementation. Treat its artifact equivalence as correctness evidence and its timing as inconclusive. No agent tests overlapped either targeted matrix; unrelated host activity was not controlled. Long full/scale comparisons and clean timing targets remain deferred to the workstation.
 
+## KXCPI series acceptance
+
+On 2026-10-20, a supervised MacBook session completed a fresh `KXCPI` baseline, one reconciled refresh and standalone release verification on the external SSD. Python was 3.12.13 on arm64 macOS 27.0.1, with httpx 0.28.1, dlt 1.31.0, DuckDB 1.5.6, PyArrow 26.0.0 and dbt-core 1.12.5. Identity encoding and the default 10 requests/second were retained.
+
+The first baseline attempt stopped before publication: the historical endpoint returned HTTP 400 when `series_ticker` and `mve_filter=exclude` were combined. Its six receipts were all accounting-complete: 140,301 encoded bytes and 151,650 retained bytes. The historical query was corrected to use the series filter alone, retaining strict ordinary-series/combo and authoritative-parent validation. A regression and independent checks passed before continuation. The failed pre-release root and its report remain preserved separately; its sealed earlier task plan is not a recovery input for the final implementation.
+
+Continuation used a fresh root within the **original** 30-minute session, subtracting those attempts, downloads and retained bytes. The supervisor passed remaining allowances into each child and could terminate the process group and reap it within five additional seconds. Limits were 1,000 aggregate attempts, 512 MiB encoded downloads, 32 MiB encoded / 64 MiB decoded per response, 8 GiB aggregate retained-root storage, 4 GiB temporary storage and 2 GiB database storage under existing accounting. No budget was reset. The three successful commands finished at 256.66 seconds from the original session start, including diagnosis, correction and offline checks. A separate retained-ancestry audit finished at 300.34 seconds. No timeout or termination was needed.
+
+The supervisor invoked the active interpreter with `--root ROOT --metrics-file EXTERNAL_FILE series refresh --series-ticker KXCPI --full`, then `series refresh`, then root-independent `verify --release RELEASE_DIRECTORY`, passing the remaining resource flags each time. Roots, metrics, logs and reports are retained outside Git under the operator's `kalshi-events-kxcpi/acceptance-20261020T184727Z` directory. Acquisition totals include the failed attempt: **18 attempts and 2,285,731 encoded bytes**, with confirmed accounting. Each successful capture used six requests and 1,072,715 encoded bytes: one series, one event page, one live-market page, one historical-market page and two cutoff receipts. All successful responses used identity encoding and HTTP 200; no retries or throttling were observed.
+
+| Certified output | Baseline | Refresh |
+|---|---:|---:|
+| Series | 1 | 1 |
+| Ordinary events | 67 | 67 |
+| Current markets | 552 | 552 |
+| Live-tier membership | 59 | 59 |
+| Historical membership | 493 | 493 |
+| Observation history | 620 | 1,240 |
+| Relationships | 619 | 619 |
+| Combo legs | 0 | 0 |
+
+Both releases contain only `KXCPI` events and usable markets. The second capture acquired new observations for the same scope instead of relabeling baseline evidence. Standalone verification accepted refresh release `33e21c1951312b28fac6b3814478e47b47b8292bc57e2b1cb9af5542633baccf`; an additional fresh audit verified its pinned baseline, both captures' six raw pages and the absence of catalogue pointers. The baseline and refresh warehouses remained present and independently certified.
+
+| Measured seconds | Baseline | Refresh |
+|---|---:|---:|
+| Whole invocation, including child startup | 8.849 | 7.641 |
+| Acquisition | 4.183 | 2.830 |
+| Landing | 0.317 | 0.302 |
+| Current-projection preparation | 0.296 | 0.535 |
+| dbt build and integrity checks | 3.377 | 3.090 |
+| Complete export | 0.017 | 0.017 |
+| Release verification hooks | 0.012 | 0.059 |
+| Promotion | 0.004 | 0.003 |
+| Pruning | 0.032 | 0.110 |
+| Client-observed header waits | 4.727 | 4.319 |
+| Response-iterator waits | 3.613 | 1.975 |
+| Rate-limiter waits | 1.037 | 1.044 |
+| File synchronization | 0.011 | 0.011 |
+| Directory synchronization | 0.000264 | 0.000216 |
+
+These phases nest and worker waits overlap; they must not be summed into wall time or labeled server-processing time. Landing, projection preparation and dbt are measured build components, not a separately timed whole-build span. Standalone verification took 0.463 seconds including startup (0.003 seconds in its verification hook). The baseline and refresh recorded 139 and 127 instrumented synchronization calls respectively. Peak HTTP concurrency was five. Store-accounted retained high-water marks were 17,125,554 and 32,468,553 bytes; adding the preserved failed root gives an aggregate observed retained peak of 32,620,203 bytes. Temporary high-water marks were 8,020,580 and 10,901,614 bytes. The two closed databases occupy 7,090,176 and 9,973,760 bytes; these are final sizes, not measured database peaks. The 4 GiB reservation high-water mark is an allowance, not additional disk usage. Self peak RSS was 221,609,984 / 240,336,896 bytes and separate child peak RSS was 276,791,296 / 287,457,280 bytes.
+
+This is one live acceptance sample, not a controlled performance comparison, a durable snapshot of the exchange or an estimate of global crawl duration. Every series refresh still acquires the entire declared scope, exports complete history and runs full verification. Hard dlt quota enforcement remains separate work; actual native Windows execution remains a workstation gate.
+
+Small offline correctness comparisons against `3f1a946` also passed for the frozen full, targeted, resume and direct-v2-baseline profiles: public Parquet/bundle bytes and release identities matched. Full and resume also matched manifest and pointer bytes; targeted matched the complete bundle including its manifest and creates no publication pointer. Direct-v2 setup compared logical lineage but did not compare manifest/pointer bytes containing the physical warehouse hint. Each profile used one pair without warm-up; **no timing claim** follows from those checks. Independent tests additionally compared scoped incremental relations against a full dbt projection over identical retained observations and membership.
+
 ## Current changes: contended measurements against 21edf14
 
 The implementation at `522af66a877fb75a1c61757ec1af0067a83f653e` was compared with `21edf14a486addfa743c524a645857ed711b640f` on 2026-10-18 using Python 3.12.13, dlt 1.31.0, PyArrow 26.0.0, DuckDB 1.5.6 and dbt-core 1.12.5 on arm64 macOS 27.0.1. Each reported comparison uses one warm-up and three alternating measured pairs with the same fixtures, limits, interpreter and filesystem. The runtime inventory SHA-256 is `57279c7f7612bea9690cb1fff7dd34cdbbc656584c89e47c3acff5b447dbaa08`.

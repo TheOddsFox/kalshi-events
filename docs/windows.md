@@ -40,6 +40,24 @@ The full baseline can exceed default budgets; explicitly size them before a long
 
 The probe uses the active interpreter without POSIX shell syntax. It creates separate roots/reports/logs, preserves failures and stops on timeout or uncertain accounting. The parent deadline includes child startup, followed by up to five seconds for termination and reaping. All writes retain Windows volume barriers, which can dominate short samples and include unrelated applications' writes. Live probes run only when explicitly invoked; normal verification and CI use offline fixtures. Preserve the report alongside Windows/Python/dependency versions and storage configuration. Actual native execution of these additions remains a workstation acceptance requirement.
 
+## Dedicated series ingestion
+
+The series commands use the same native executable and path rules. Start in a new directory on the accepted fixed local NTFS drive:
+
+```powershell
+uv run --locked kalshi-events --root C:\kalshi-data\kxcpi series refresh --series-ticker KXCPI --full
+uv run --locked kalshi-events --root C:\kalshi-data\kxcpi series refresh
+uv run --locked kalshi-events --root C:\kalshi-data\kxcpi series refresh --capture-id CAPTURE_ID
+uv run --locked kalshi-events --root C:\kalshi-data\kxcpi series current
+uv run --locked kalshi-events --root C:\kalshi-data\kxcpi series replay --capture-id CAPTURE_ID
+uv run --locked kalshi-events --root C:\kalshi-data\kxcpi series rebuild
+uv run --locked kalshi-events verify --release C:\kalshi-data\kxcpi\releases\RELEASE_ID
+```
+
+These roots use immutable storage-v4 series scope and `current-series.json`; they cannot convert an existing ordinary root. Every refresh reconciles all ordinary series events and live/historical markets, while retaining protected warehouse history. Run `series refresh --full` explicitly after eight refreshes. Preserve returned IDs and unknown publication states exactly as with catalogue refresh. Keep metrics outside the operator root, with `--metrics-file` before `series`. Directory and volume durability requirements are unchanged.
+
+Run the offline `tests/test_series*.py` cases through native Python before live workstation use, followed by the canonical gates above. Mac process-exit tests and mocked Windows paths do not prove physical power-loss recovery on NTFS. Actual native Windows series execution remains an explicit workstation gate, not a result established by the Mac acceptance session.
+
 ## Prepare a comparable Windows baseline
 
 Unmodified `21edf14` cannot run on native Windows. Apply the **same portability-only source patch** to its archive that the candidate already contains. Do not copy the candidate's acquisition, Arrow landing or affected-key SQL changes into the reference. The compatibility commit is the commit introducing `_windows.py`; inspect the generated patch and require `git apply --check` to succeed before applying it. If later commits change platform behavior, include those reviewed compatibility fixes on both sides too.

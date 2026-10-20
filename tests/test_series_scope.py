@@ -94,7 +94,10 @@ def test_scoped_capture_seals_protocol_scope_and_exact_series_tasks(tmp_path):
         "mve_filter": "exclude",
         "limit": capture.MARKET_PAGE_LIMIT,
     }
-    assert state["tasks"][4]["params"] == state["tasks"][3]["params"]
+    assert state["tasks"][4]["params"] == {
+        "series_ticker": "KXCPI",
+        "limit": capture.MARKET_PAGE_LIMIT,
+    }
     assert state["task_scopes"] == {
         "1": "series",
         "2": "events_live",

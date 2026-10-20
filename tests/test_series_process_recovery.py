@@ -106,11 +106,15 @@ root = Path(sys.argv[1])
 ids = json.loads(sys.argv[2])
 action, boundary, request_log, resume = sys.argv[3:7]
 capture.now = transport.now = lambda: '2026-01-06T12:00:00Z'
+# The worker may start a queued request while the main thread journals the previous page.
 capture.MAX_CONCURRENT_REQUESTS = 1
 store = Store(root, Limits(max_rate=100_000, max_response_bytes=1024**2,
                           max_download_bytes=16*1024**2))
 local = threading.local()
 log_lock = threading.Lock()
+inflight_started = threading.Event()
+inflight_release = threading.Event()
+inflight_finished = threading.Event()
 
 class Chunks(httpx.SyncByteStream):
     def __init__(self, body):
@@ -135,6 +139,12 @@ def factory(actual_store, budget):
             stream.write(json_bytes({'request_id': local.request_id, 'endpoint': endpoint}))
             stream.flush()
             os.fsync(stream.fileno())
+        if boundary == 'journal-inflight' and endpoint == '/series/KXCPI':
+            inflight_started.set()
+            try:
+                assert inflight_release.wait(timeout=5), 'journal did not exit during the in-flight request'
+            finally:
+                inflight_finished.set()
         status, payload = source_response(endpoint, dict(request.url.params))
         return httpx.Response(status, stream=Chunks(json_bytes(payload)))
     client.client = httpx.Client(transport=httpx.MockTransport(handler), headers=headers,
@@ -174,7 +184,11 @@ def written(self, relative, value):
 
 def appended(self, relative, body):
     result = append(self, relative, body)
-    if boundary == 'journal' and relative.endswith('/pages.jsonl') and json.loads(body).get('op') == 'page':
+    if (boundary in {'journal', 'journal-inflight'} and relative.endswith('/pages.jsonl')
+            and json.loads(body).get('op') == 'page'):
+        if boundary == 'journal-inflight':
+            assert inflight_started.wait(timeout=5), 'queued request did not reach its durable wire log'
+            assert not inflight_finished.is_set(), 'queued request finished before the journal exit'
         os._exit(86)
     return result
 
@@ -304,7 +318,9 @@ def _assert_scoped_closure(root, identities, *, require_builds=True):
     return current
 
 
-@pytest.mark.parametrize("boundary", ["body", "receipt", "journal", "apply", "snapshot"])
+@pytest.mark.parametrize(
+    "boundary", ["body", "receipt", "journal", "journal-inflight", "apply", "snapshot"]
+)
 def test_scoped_process_exit_capture_resumes_without_repeating_committed_requests(
     recovery_root, tmp_path, boundary
 ):
@@ -329,6 +345,13 @@ def test_scoped_process_exit_capture_resumes_without_repeating_committed_request
         if attempt.get("accounting_complete") is True and attempt.get("status") == 200
     }
     interrupted_ids = {row["request_id"] for row in before_requests} - usable_ids
+    incomplete_reservations = {
+        path: path.read_bytes()
+        for path, attempt in attempts
+        if attempt.get("accounting_complete") is False
+    }
+    incomplete_ids = {json.loads(body)["request_id"] for body in incomplete_reservations.values()}
+    assert interrupted_ids <= incomplete_ids
     assert (root / "current-series.json").read_bytes() == pointer
     _assert_scoped_closure(root, identities)
 
@@ -346,9 +369,21 @@ def test_scoped_process_exit_capture_resumes_without_repeating_committed_request
     assert all(count == (2 if key in interrupted_ids else 1) for key, count in counts.items())
     if boundary == "body":
         assert len(interrupted_ids) == 1
-        assert accounting(Store(root))["accounting_complete"] is False
+        assert len(incomplete_reservations) == 1
+    elif boundary == "journal-inflight":
+        assert len(interrupted_ids) == len(incomplete_reservations) == 1
+        assert len(usable_ids) == 1
+        assert len(before_requests) == 2
+        assert sum(counts.values()) == 7
+    elif boundary in {"journal", "apply"}:
+        assert len(interrupted_ids) <= 1
+        assert len(incomplete_reservations) <= 1
     else:
         assert not interrupted_ids
+        assert not incomplete_reservations
+    if incomplete_reservations:
+        assert all(path.read_bytes() == body for path, body in incomplete_reservations.items())
+        assert accounting(Store(root))["accounting_complete"] is False
     state = capture.complete_capture(Store(root), capture_id)
     pages = list(capture.capture_pages(Store(root), state))
     assert len(pages) == len({manifest["page_id"] for manifest, _ in pages}) == 6

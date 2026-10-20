@@ -313,7 +313,7 @@ def _series_tasks(series: str) -> list[dict[str, Any]]:
         task(
             HISTORICAL_PREFIX,
             "markets",
-            params={"series_ticker": series, "mve_filter": "exclude", "limit": MARKET_PAGE_LIMIT},
+            params={"series_ticker": series, "limit": MARKET_PAGE_LIMIT},
         ),
     ]
 
