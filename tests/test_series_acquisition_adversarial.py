@@ -34,8 +34,8 @@ def _factory(responses=None, *, receipts=None):
     selected = _responses() if responses is None else responses
 
     class Client(FakeClient):
-        def __init__(self, store, budget):
-            super().__init__(store, budget, selected)
+        def __init__(self, store, budget, **options):
+            super().__init__(store, budget, selected, **options)
 
         def get(self, endpoint, params=None, context=None):
             relative = super().get(endpoint, params, context)

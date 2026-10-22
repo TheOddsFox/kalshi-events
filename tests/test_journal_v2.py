@@ -420,13 +420,13 @@ def test_crash_after_each_durable_boundary_recovers_without_duplicate_requests(
 
             fault.setattr(store, "append", appended)
         elif boundary == "apply":
-            original = acquisition._install_page_state
+            original = acquisition._apply_page_change
 
             def applied(*args, **kwargs):
                 original(*args, **kwargs)
                 crash_once()
 
-            fault.setattr(acquisition, "_install_page_state", applied)
+            fault.setattr(acquisition, "_apply_page_change", applied)
         else:
             original = store.write
 

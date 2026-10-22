@@ -106,8 +106,8 @@ root = Path(sys.argv[1])
 ids = json.loads(sys.argv[2])
 action, boundary, request_log, resume = sys.argv[3:7]
 capture.now = transport.now = lambda: '2026-01-06T12:00:00Z'
-# The worker may start a queued request while the main thread journals the previous page.
-capture.MAX_CONCURRENT_REQUESTS = 1
+# The second worker sends its request while the main thread journals the prior page.
+capture.MAX_CONCURRENT_REQUESTS = 2 if boundary == 'journal-inflight' else 1
 store = Store(root, Limits(max_rate=100_000, max_response_bytes=1024**2,
                           max_download_bytes=16*1024**2))
 local = threading.local()
@@ -152,7 +152,7 @@ def factory(actual_store, budget, **options):
     return client
 
 commit, write, append = EvidenceSpool.commit, Store.write, Store.append
-install, rename, replace, remove = capture._install_page_state, os.rename, os.replace, shutil.rmtree
+install, rename, replace, remove = capture._apply_page_change, os.rename, os.replace, shutil.rmtree
 retired = None
 metadata_target = None
 metadata_source = None
@@ -235,7 +235,7 @@ def removed(path, *args, **kwargs):
     return remove(path, *args, **kwargs)
 
 EvidenceSpool.commit, Store.write, Store.append = committed, written, appended
-capture._install_page_state = installed
+capture._apply_page_change = installed
 os.rename = lambda *args, **kwargs: moved(rename, *args, **kwargs)
 os.replace = lambda *args, **kwargs: moved(replace, *args, **kwargs)
 shutil.rmtree = removed
@@ -262,14 +262,24 @@ def certified_series_root(tmp_path_factory):
     publish.publish(Store(root), delta["capture_id"], catalogue_version=2)
     pending = _capture_at(root, 3, incremental_mode=True, max_requests=1)
     assert pending["complete"] is False
+    return root, {
+        "baseline": baseline["capture_id"],
+        "delta": delta["capture_id"],
+        "pending": pending["capture_id"],
+    }
+
+
+@pytest.fixture(scope="module")
+def publication_series_root(certified_series_root, tmp_path_factory):
+    source, certified_ids = certified_series_root
+    root = tmp_path_factory.mktemp("series-publication") / "root"
+    shutil.copytree(source, root)
     obsolete = _capture_at(root, 4)
     warehouse.build_v2_full(Store(root), obsolete["capture_id"])
     candidate = _capture_at(root, 5)
     warehouse.build_v2_full(Store(root), candidate["capture_id"])
     identities = {
-        "baseline": baseline["capture_id"],
-        "delta": delta["capture_id"],
-        "pending": pending["capture_id"],
+        **certified_ids,
         "obsolete": obsolete["capture_id"],
         "candidate": candidate["capture_id"],
     }
@@ -295,12 +305,20 @@ def recovery_root(certified_series_root, tmp_path):
     return root, dict(identities)
 
 
+@pytest.fixture
+def publication_recovery_root(publication_series_root, tmp_path):
+    source, identities = publication_series_root
+    root = tmp_path / "root"
+    shutil.copytree(source, root)
+    return root, dict(identities)
+
+
 def _assert_scoped_closure(root, identities, *, require_builds=True):
     store = Store(root)
     current = publish.current(store, catalogue_version=2)
     assert current["contract"] == "oddsfox.kalshi.series.v1"
     assert current["series_ticker"] == "KXCPI"
-    assert current["capture_id"] in {identities["delta"], identities["candidate"]}
+    assert current["capture_id"] in {identities.get("delta"), identities.get("candidate")}
     assert not store.path("current.json").exists()
     assert not store.path("current-v2.json").exists()
     pending = capture.read_capture(store, identities["pending"])
@@ -422,8 +440,10 @@ def test_scoped_build_process_exit_recovers_delta_replacement_and_pins(recovery_
         "prune-metadata-release",
     ],
 )
-def test_scoped_publication_process_exit_preserves_pending_ancestry(recovery_root, boundary):
-    root, identities = recovery_root
+def test_scoped_publication_process_exit_preserves_pending_ancestry(
+    publication_recovery_root, boundary
+):
+    root, identities = publication_recovery_root
     obsolete_raw = [
         path.parent
         for path in (root / "raw").glob("*/manifest.json")

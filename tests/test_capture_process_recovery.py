@@ -89,7 +89,7 @@ def factory(actual_store, budget, **options):
     return client
 
 commit, write, append = EvidenceSpool.commit, Store.write, Store.append
-install, replace = acquisition._install_page_state, os.replace
+install, replace = acquisition._apply_page_change, os.replace
 
 def committed(spool):
     result = commit(spool)
@@ -126,7 +126,7 @@ def replaced(source, destination, *args, **kwargs):
     return result
 
 EvidenceSpool.commit, Store.write, Store.append = committed, written, appended
-acquisition._install_page_state, os.replace = installed, replaced
+acquisition._apply_page_change, os.replace = installed, replaced
 state = acquisition.capture(store, resume=resume, client_factory=factory)
 assert state['complete']
 if boundary != 'resume':

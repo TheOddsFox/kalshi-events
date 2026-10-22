@@ -139,6 +139,7 @@ class Metrics:
         self.timings: dict[str, float] = defaultdict(float)
         self.counters: dict[str, int] = defaultdict(int)
         self.high_water: dict[str, int] = defaultdict(int)
+        self.peak_submitted_futures = 0
         self.peak_http_concurrency = 0
         self.active_http_requests = 0
         self.endpoint_families: dict[str, dict[str, Any]] = {}
@@ -168,6 +169,7 @@ class Metrics:
             "phases_seconds": {key: round(value, 6) for key, value in sorted(self.timings.items())},
             "counters": dict(sorted(self.counters.items())),
             "store_accounted_high_water_bytes": dict(sorted(self.high_water.items())),
+            "peak_submitted_futures": self.peak_submitted_futures,
             "peak_http_concurrency": self.peak_http_concurrency,
             "peak_rss_bytes": peak_rss_bytes,
             "rate_policy": dict(self.rate_policy) if self.rate_policy is not None else None,
@@ -302,6 +304,13 @@ def peak(name: str, value: int) -> None:
     metrics = _active.get()
     if metrics is not None:
         metrics.peak(name, value)
+
+
+def submitted_futures(value: int) -> None:
+    metrics = _active.get()
+    if metrics is not None:
+        with metrics._lock:
+            metrics.peak_submitted_futures = max(metrics.peak_submitted_futures, value)
 
 
 def reserve_report(path: str | os.PathLike[str]) -> TextIO:

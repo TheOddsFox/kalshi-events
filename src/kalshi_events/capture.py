@@ -10,6 +10,7 @@ import copy
 import hashlib
 import os
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
@@ -87,6 +88,7 @@ class _CaptureState(dict[str, Any]):
         self.recent_page: tuple[str, dict[str, Any], Any] | None = None
         self.verified_journal_sha256: str | None = None
         self.verified_snapshot_sha256: str | None = None
+        self.task_identities = {_task_identity(work) for work in self.get("tasks", [])}
 
 
 def task(
@@ -742,14 +744,16 @@ def _apply_control_record(
             ):
                 raise CatalogueError("invalid hydration coverage entry")
         if replay:
-            candidate = copy.deepcopy(state)
-            candidate["tasks"].extend(copy.deepcopy(additions))
-            candidate["coverage"].update(copy.deepcopy(coverage))
+            with metrics.phase("control_state_copy"):
+                candidate = copy.deepcopy(state)
+                candidate["tasks"].extend(copy.deepcopy(additions))
+                candidate["coverage"].update(copy.deepcopy(coverage))
             _validate_control_transition(genesis, candidate, kind, known_tasks)
             if payload.get("state_sha256") != _state_digest(candidate, seen):
                 raise CatalogueError("hydration control state checksum mismatch")
             state.clear()
             state.update(candidate)
+            _track_added_task_identities(state, additions)
         else:
             for work in additions:
                 known_tasks[_task_identity(work)] = copy.deepcopy(work)
@@ -762,7 +766,8 @@ def _apply_control_record(
         if not _is_sha256(payload.get("state_sha256")):
             raise CatalogueError("invalid completion state checksum")
         if replay:
-            candidate = copy.deepcopy(state)
+            with metrics.phase("control_state_copy"):
+                candidate = copy.deepcopy(state)
             candidate.update(complete=True, completed_at=payload["completed_at"], error=None)
             _validate_control_transition(genesis, candidate, kind, known_tasks)
             if payload.get("state_sha256") != _state_digest(candidate, seen):
@@ -783,7 +788,8 @@ def _apply_control_record(
         ):
             raise CatalogueError("invalid stop reason")
         if replay:
-            candidate = copy.deepcopy(state)
+            with metrics.phase("control_state_copy"):
+                candidate = copy.deepcopy(state)
             candidate["error"] = payload["reason"] if kind == "stop" else None
             _validate_control_transition(genesis, candidate, kind, known_tasks)
             if payload.get("state_sha256") != _state_digest(candidate, seen):
@@ -1111,6 +1117,25 @@ def _replay_page(
     relative: str,
     request_id: str,
 ) -> tuple[dict[str, Any], Any]:
+    with metrics.phase("page_validation"), metrics.phase("transition_prepare"):
+        manifest, payload, change = _read_page_change(
+            store, state, seen, index, relative, request_id
+        )
+    metrics.add("page_transitions_prepared")
+    with metrics.phase("page_application"), metrics.phase("transition_apply"):
+        _apply_page_change(state, seen, index, change)
+    metrics.add("page_transitions_applied")
+    return manifest, payload
+
+
+def _read_page_change(
+    store: Store,
+    state: dict[str, Any],
+    seen: dict[int, set[str]],
+    index: int,
+    relative: str,
+    request_id: str,
+) -> tuple[dict[str, Any], Any, dict[str, Any]]:
     if state.get("complete"):
         raise CatalogueError("journal contains a page after capture completion")
     if not 0 <= index < len(state["tasks"]):
@@ -1130,15 +1155,180 @@ def _replay_page(
         or not _receipt_matches_context(manifest, context)
     ):
         raise CatalogueError("journal receipt does not match its traversal")
+    return manifest, payload, _derive_page_change(state, seen, index, manifest, payload)
+
+
+def _derive_page_change(
+    state: dict[str, Any],
+    seen: dict[int, set[str]],
+    index: int,
+    manifest: dict[str, Any],
+    payload: Any,
+) -> dict[str, Any]:
+    """Validate a receipt and derive only the state changes for its traversal."""
     work = state["tasks"][index]
+    updated = dict(work)
+    change: dict[str, Any] = {
+        "task": updated,
+        "seen_clear": False,
+        "seen_touch": False,
+        "seen_add": None,
+        "coverage_remove": (),
+        "coverage": {},
+        "tasks": [],
+        "cutoff": None,
+    }
     if _phase(work) == "cutoff":
         if manifest.get("status") != 200:
             raise CatalogueError("historical cutoff receipt is invalid")
-        _record_cutoff(state, payload)
-        work["cutoff_due"] = False
+        change["cutoff"] = _validated_cutoff(payload)
+        updated["cutoff_due"] = False
+        return change
+
+    status = manifest["status"]
+    scoped = _is_scoped_capture(state)
+    if scoped and status == 404 and work["kind"] == "series":
+        raise CatalogueError("the scoped series definition was not found")
+    if status in {400, 410} and work["cursor"]:
+        if work["restarts"] >= 3:
+            raise CatalogueError("pagination cursor repeatedly invalidated")
+        updated.update(cursor="", restarts=work["restarts"] + 1)
+        change["seen_clear"] = True
+        batch = _batch_tickers(work)
+        if batch is not None:
+            change["coverage_remove"] = tuple(batch)
+    elif status == 404 and work["singular"] and work["kind"] in {"markets", "events", "series"}:
+        updated["done"] = True
+        if work["kind"] == "markets" and work["requested"]:
+            selected = work["requested"]
+            if work["endpoint"].startswith("/markets/"):
+                change["tasks"].append(
+                    task(
+                        f"/historical/markets/{selected}",
+                        "markets",
+                        singular=True,
+                        requested=selected,
+                    )
+                )
+            else:
+                change["coverage"][selected] = {
+                    "market_ticker": selected,
+                    "status": "absent",
+                    "error": "not returned by live or historical market lookup",
+                }
+    elif status != 200:
+        raise CatalogueError(f"incomplete source traversal: HTTP {status}")
+    elif work["kind"] is None:
+        change["cutoff"] = _validated_cutoff(payload)
+        updated["done"] = True
     else:
-        _apply(state, index, manifest, payload, seen)
-    return manifest, payload
+        envelope = {
+            "series": "series",
+            "events": "event" if work["singular"] else "events",
+            "markets": "market" if work["singular"] else "markets",
+        }[work["kind"]]
+        rows = records(payload, envelope, singular=work["singular"])
+        batch = _batch_tickers(work)
+        batch_found: set[str] = set()
+        if batch is not None:
+            allowed = set(batch)
+            for row in rows:
+                value = ticker(row.get("ticker"))
+                if value not in allowed:
+                    raise CatalogueError("market batch returned an unrequested ticker")
+                batch_found.add(value)
+        if work["singular"]:
+            key = "event_ticker" if work["kind"] == "events" else "ticker"
+            if rows[0].get(key) != work["endpoint"].rsplit("/", 1)[1]:
+                raise CatalogueError("direct lookup returned a different native identity")
+            updated["done"] = True
+        elif work["endpoint"] == "/series":
+            updated["done"] = True
+        else:
+            cursor = payload.get("cursor")
+            if not isinstance(cursor, str) or len(cursor) > 8192:
+                raise CatalogueError("missing or malformed pagination cursor")
+            known = seen.get(index, set())
+            fingerprint = digest(cursor.encode()) if cursor else ""
+            if cursor and (cursor == work["cursor"] or fingerprint in known):
+                raise CatalogueError("pagination cursor repeated without completion")
+            if cursor:
+                change["seen_add"] = fingerprint
+            change["seen_touch"] = True
+            updated["cursor"] = cursor
+            updated["done"] = not cursor
+        if work["kind"] == "markets" and work["requested"]:
+            change["coverage"][work["requested"]] = {
+                "market_ticker": work["requested"],
+                "status": "found",
+                "error": None,
+            }
+        if batch is not None:
+            for value in batch_found:
+                change["coverage"][value] = {
+                    "market_ticker": value,
+                    "status": "found",
+                    "error": None,
+                }
+            if updated["done"]:
+                identities = _task_identity_set(state)
+                added_identities: set[str] = set()
+                for value in batch:
+                    if (
+                        change["coverage"]
+                        .get(value, state["coverage"].get(value, {}))
+                        .get("status")
+                        == "found"
+                    ):
+                        continue
+                    lookup = task(f"/markets/{value}", "markets", singular=True, requested=value)
+                    identity = _task_identity(lookup)
+                    if identity not in identities and identity not in added_identities:
+                        change["tasks"].append(lookup)
+                        added_identities.add(identity)
+    updated["cutoff_due"] = _historical(work["endpoint"]) and not updated["done"]
+    return change
+
+
+def _apply_page_change(
+    state: dict[str, Any], seen: dict[int, set[str]], index: int, change: dict[str, Any]
+) -> None:
+    # Keep the traversal object stable for legacy pending-page consumers.
+    work = state["tasks"][index]
+    work.update(change["task"])
+    if change["seen_clear"]:
+        seen.pop(index, None)
+    elif change["seen_touch"]:
+        known = seen.setdefault(index, set())
+        if change["seen_add"] is not None:
+            known.add(change["seen_add"])
+    for key in change["coverage_remove"]:
+        state["coverage"].pop(key, None)
+    state["coverage"].update(change["coverage"])
+    if change["cutoff"] is not None:
+        state["cutoff"] = change["cutoff"]
+    if change["tasks"]:
+        identities = _task_identity_set(state)
+        for addition in change["tasks"]:
+            state["tasks"].append(addition)
+            identities.add(_task_identity(addition))
+
+
+def _validated_cutoff(payload: Any) -> dict[str, Any]:
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("market_settled_ts"), str)
+        or not isinstance(payload.get("trades_created_ts"), str)
+    ):
+        raise CatalogueError("malformed historical cutoff response")
+    for key in ("market_settled_ts", "trades_created_ts"):
+        try:
+            instant = datetime.fromisoformat(payload[key].replace("Z", "+00:00"))
+            if instant.utcoffset() != timedelta(0):
+                raise ValueError("cutoff must be UTC")
+        except ValueError as exc:
+            raise CatalogueError("malformed UTC historical cutoff") from exc
+    return dict(payload)
 
 
 def _save_v2(store: Store, state: dict[str, Any]) -> None:
@@ -1165,6 +1355,8 @@ def _save_v2(store: Store, state: dict[str, Any]) -> None:
 
 
 def _append_v2_record(store: Store, state: _CaptureState, op: str, payload: dict[str, Any]) -> None:
+    if state.journal_uncertain:
+        raise CatalogueError("cannot append to an uncertain journal")
     head = state.journal_head
     seq = 1 if head is None else head["seq"] + 1
     previous = _GENESIS if head is None else head["sha256"]
@@ -1285,7 +1477,8 @@ def _commit_control(
 def _commit_control_delta(store: Store, state: _CaptureState, delta: dict[str, Any]) -> None:
     if state.get("complete"):
         raise CatalogueError("capture cannot transition after completion")
-    candidate = copy.deepcopy(dict(state))
+    with metrics.phase("control_state_copy"):
+        candidate = copy.deepcopy(dict(state))
     kind = delta["kind"]
     if kind == "hydrate":
         candidate["tasks"].extend(copy.deepcopy(delta["tasks"]))
@@ -1312,6 +1505,8 @@ def _commit_control_delta(store: Store, state: _CaptureState, delta: dict[str, A
     _append_v2_record(store, state, "control", payload)
     state.clear()
     state.update(candidate)
+    if kind == "hydrate":
+        _track_added_task_identities(state, delta["tasks"])
     _after_transition(store, state)
 
 
@@ -1339,39 +1534,49 @@ def _commit_page_v2_measured(
         raise CatalogueError("capture cannot accept pages after completion")
     if relative in state.processed or request_id in state.request_ids:
         raise CatalogueError("page receipt is already committed")
-    candidate = copy.deepcopy(dict(state))
-    candidate_seen = copy.deepcopy(state.seen_cursors)
-    with metrics.phase("page_validation"):
-        manifest, payload = _replay_page(
-            store, candidate, candidate_seen, index, relative, request_id
+    with metrics.phase("page_validation"), metrics.phase("transition_prepare"):
+        manifest, payload, change = _read_page_change(
+            store, state, state.seen_cursors, index, relative, request_id
         )
-    # Validate native identities before making the receipt durable in the journal.
-    # A failed append aborts this operation, so its operation-local index is discarded.
-    with metrics.phase("page_application"):
-        identities.add_page(manifest, payload)
+    metrics.add("page_transitions_prepared")
+    page_index = ParentIndex()
+    with metrics.phase("page_identity_validation"):
+        page_index.add_page(manifest, payload)
     _append_v2_record(
         store,
         state,
         "page",
         {"index": index, "relative": relative, "request_id": request_id},
     )
-    metrics.endpoint_page(manifest["endpoint"])
-    _install_page_state(state, candidate, candidate_seen)
-    state.page_rows.append({"index": index, "relative": relative})
-    state.processed.add(relative)
-    state.request_ids.add(request_id)
-    identities.processed.add(relative)
-    _after_transition(store, state)
+    try:
+        with metrics.phase("page_application"), metrics.phase("transition_apply"):
+            _apply_page_change(state, state.seen_cursors, index, change)
+            with metrics.phase("parent_index_merge"):
+                _merge_parent_index(identities, page_index)
+            state.page_rows.append({"index": index, "relative": relative})
+            state.processed.add(relative)
+            state.request_ids.add(request_id)
+            identities.processed.add(relative)
+            metrics.endpoint_page(manifest["endpoint"])
+            _after_transition(store, state)
+        metrics.add("page_transitions_applied")
+    except BaseException:
+        # The page record is durable; recovery must decide whether it was applied.
+        state.journal_uncertain = True
+        raise
     return manifest, payload
 
 
-def _install_page_state(
-    state: _CaptureState, candidate: dict[str, Any], seen: dict[int, set[str]]
-) -> None:
-    """Apply a validated page candidate after its journal append is durable."""
-    state.clear()
-    state.update(candidate)
-    state.seen_cursors = seen
+def _merge_parent_index(target: ParentIndex, source: ParentIndex) -> None:
+    for name in ("series", "events", "markets"):
+        existing = getattr(target, name)
+        for identity, winner in getattr(source, name).items():
+            ParentIndex._put(existing, identity, winner)
+    target.parent_lookups.update(source.parent_lookups)
+    for scope, generations in source.scope_membership.items():
+        target_generations = target.scope_membership.setdefault(scope, {})
+        for generation, identities in generations.items():
+            target_generations.setdefault(generation, set()).update(identities)
 
 
 def capture_pages(
@@ -1660,20 +1865,18 @@ def _receipt_matches_state_protocol(manifest: dict[str, Any], state: dict[str, A
 
 
 def _record_cutoff(state: dict[str, Any], payload: Any) -> None:
-    if (
-        not isinstance(payload, dict)
-        or not isinstance(payload.get("market_settled_ts"), str)
-        or not isinstance(payload.get("trades_created_ts"), str)
-    ):
-        raise CatalogueError("malformed historical cutoff response")
-    for key in ("market_settled_ts", "trades_created_ts"):
-        try:
-            instant = datetime.fromisoformat(payload[key].replace("Z", "+00:00"))
-            if instant.utcoffset() != timedelta(0):
-                raise ValueError("cutoff must be UTC")
-        except ValueError as exc:
-            raise CatalogueError("malformed UTC historical cutoff") from exc
-    state["cutoff"] = payload
+    state["cutoff"] = _validated_cutoff(payload)
+
+
+def _task_identity_set(state: dict[str, Any]) -> set[str]:
+    if isinstance(state, _CaptureState):
+        return state.task_identities
+    return {_task_identity(work) for work in state["tasks"]}
+
+
+def _track_added_task_identities(state: dict[str, Any], works: list[dict[str, Any]]) -> None:
+    if isinstance(state, _CaptureState) and state.task_identities is not None:
+        state.task_identities.update(_task_identity(work) for work in works)
 
 
 def _apply(
@@ -1683,102 +1886,8 @@ def _apply(
     payload: Any,
     seen: dict[int, set[str]],
 ) -> None:
-    work = state["tasks"][index]
-    status = manifest["status"]
-    scoped = _is_scoped_capture(state)
-    if scoped and status == 404 and work["kind"] == "series":
-        raise CatalogueError("the scoped series definition was not found")
-    if status in {400, 410} and work["cursor"]:
-        if work["restarts"] >= 3:
-            raise CatalogueError("pagination cursor repeatedly invalidated")
-        work.update(cursor="", restarts=work["restarts"] + 1)
-        seen.pop(index, None)
-        batch = _batch_tickers(work)
-        if batch is not None:
-            for value in batch:
-                state["coverage"].pop(value, None)
-    elif status == 404 and work["singular"] and work["kind"] in {"markets", "events", "series"}:
-        work["done"] = True
-        if work["kind"] == "markets" and work["requested"]:
-            selected = work["requested"]
-            if work["endpoint"].startswith("/markets/"):
-                state["tasks"].append(
-                    task(
-                        f"/historical/markets/{selected}",
-                        "markets",
-                        singular=True,
-                        requested=selected,
-                    )
-                )
-            else:
-                state["coverage"][selected] = {
-                    "market_ticker": selected,
-                    "status": "absent",
-                    "error": "not returned by live or historical market lookup",
-                }
-    elif status != 200:
-        raise CatalogueError(f"incomplete source traversal: HTTP {status}")
-    elif work["kind"] is None:
-        _record_cutoff(state, payload)
-        work["done"] = True
-    else:
-        envelope = {
-            "series": "series",
-            "events": "event" if work["singular"] else "events",
-            "markets": "market" if work["singular"] else "markets",
-        }[work["kind"]]
-        rows = records(payload, envelope, singular=work["singular"])
-        batch = _batch_tickers(work)
-        batch_found: set[str] = set()
-        if batch is not None:
-            allowed = set(batch)
-            for row in rows:
-                value = ticker(row.get("ticker"))
-                if value not in allowed:
-                    raise CatalogueError("market batch returned an unrequested ticker")
-                batch_found.add(value)
-        if work["singular"]:
-            key = "event_ticker" if work["kind"] == "events" else "ticker"
-            if rows[0].get(key) != work["endpoint"].rsplit("/", 1)[1]:
-                raise CatalogueError("direct lookup returned a different native identity")
-            work["done"] = True
-        elif work["endpoint"] == "/series":
-            work["done"] = True
-        else:
-            cursor = payload.get("cursor")
-            if not isinstance(cursor, str) or len(cursor) > 8192:
-                raise CatalogueError("missing or malformed pagination cursor")
-            known = seen.setdefault(index, set())
-            fingerprint = digest(cursor.encode()) if cursor else ""
-            if cursor and (cursor == work["cursor"] or fingerprint in known):
-                raise CatalogueError("pagination cursor repeated without completion")
-            if cursor:
-                known.add(fingerprint)
-            work["cursor"] = cursor
-            work["done"] = not cursor
-        if work["kind"] == "markets" and work["requested"]:
-            state["coverage"][work["requested"]] = {
-                "market_ticker": work["requested"],
-                "status": "found",
-                "error": None,
-            }
-        if batch is not None:
-            for value in batch_found:
-                state["coverage"][value] = {
-                    "market_ticker": value,
-                    "status": "found",
-                    "error": None,
-                }
-            if work["done"]:
-                existing = {_task_identity(candidate) for candidate in state["tasks"]}
-                for value in batch:
-                    if state["coverage"].get(value, {}).get("status") == "found":
-                        continue
-                    lookup = task(f"/markets/{value}", "markets", singular=True, requested=value)
-                    if _task_identity(lookup) not in existing:
-                        state["tasks"].append(lookup)
-                        existing.add(_task_identity(lookup))
-    work["cutoff_due"] = _historical(work["endpoint"]) and not work["done"]
+    change = _derive_page_change(state, seen, index, manifest, payload)
+    _apply_page_change(state, seen, index, change)
 
 
 def _stage(
@@ -1875,7 +1984,8 @@ def _settle(
 def _hydrate(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
     with metrics.phase("hydration"):
         if state.get("journal_version") == JOURNAL_VERSION:
-            candidate = copy.deepcopy(dict(state))
+            with metrics.phase("control_state_copy"):
+                candidate = copy.deepcopy(dict(state))
             more = _hydrate_pages(store, candidate, identities)
             if json_bytes(dict(candidate)) != json_bytes(dict(state)):
                 _commit_control(store, state, "hydrate", candidate)
@@ -1935,7 +2045,9 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
                     }
                     else None
                 )
-                state["tasks"].append(task(path, kind, singular=True, params=params))
+                addition = task(path, kind, singular=True, params=params)
+                state["tasks"].append(addition)
+                _track_added_task_identities(state, [addition])
     if state.get("task_scopes") and (
         not _is_scoped_capture(state) or state.get("incremental") is True
     ):
@@ -1946,6 +2058,7 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
             if _task_identity(work) not in existing_identities:
                 state["tasks"].append(work)
                 existing_identities.add(_task_identity(work))
+                _track_added_task_identities(state, [work])
     if any(not work["done"] for work in state["tasks"]):
         if state.get("journal_version") != JOURNAL_VERSION:
             save(store, state)
@@ -2056,54 +2169,80 @@ def _run(
 ) -> None:
     running: dict[Future, int] = {}
     busy: set[int] = set()
+    ready = deque(index for index, work in enumerate(state["tasks"]) if not work["done"])
+    queued = set(ready)
+    metrics.add("tasks_enqueued", len(ready))
     failure: Exception | None = None
+
+    def enqueue(index: int) -> None:
+        if index not in busy and index not in queued and not state["tasks"][index]["done"]:
+            ready.append(index)
+            queued.add(index)
+            metrics.add("tasks_enqueued")
+
+    def enqueue_appended(start: int) -> None:
+        for new_index in range(start, len(state["tasks"])):
+            enqueue(new_index)
+
     while True:
         if failure is None:
             try:
                 _ = budget.remaining
-                index = 0
-                while index < len(state["tasks"]):
-                    work = state["tasks"][index]
-                    if work["done"] or index in busy:
-                        index += 1
-                        continue
-                    context = _request_context(state, index)
-                    relative = recovered.pop(context["request_id"], None)
-                    if relative is not None:
-                        endpoint, _, _, _ = _plan(work, _phase(work))
-                        _stage(store, state, index, relative, identities)
-                        _consume(store, state, index, relative, seen, identities)
-                        metrics.endpoint_page(endpoint, recovered=True)
-                        continue
-                    endpoint, params, _, _ = _plan(work, _phase(work))
-                    batch = _batch_tickers(work)
-                    if (
-                        batch is not None
-                        and _phase(work) == "page"
-                        and not work["cursor"]
-                        and _market_batch_url_size(batch) > MAX_INITIAL_BATCH_URL_BYTES
-                    ):
-                        raise CatalogueError("selected market batch exceeds the initial URL limit")
-                    busy.add(index)
-                    running[
-                        pool.submit(
-                            copy_context().run,
-                            client.get,
-                            endpoint,
-                            params,
-                            context=context,
-                        )
-                    ] = index
-                    index += 1
-            except (CatalogueError, OSError) as exc:
+                while ready and len(running) < MAX_CONCURRENT_REQUESTS and failure is None:
+                    with metrics.phase("scheduler_work"):
+                        index = ready.popleft()
+                        queued.discard(index)
+                        work = state["tasks"][index]
+                        if work["done"] or index in busy:
+                            continue
+                        context = _request_context(state, index)
+                        relative = recovered.pop(context["request_id"], None)
+                        if relative is not None:
+                            endpoint, _, _, _ = _plan(work, _phase(work))
+                            task_count = len(state["tasks"])
+                            _stage(store, state, index, relative, identities)
+                            _consume(store, state, index, relative, seen, identities)
+                            metrics.endpoint_page(endpoint, recovered=True)
+                            enqueue_appended(task_count)
+                            enqueue(index)
+                            continue
+                        endpoint, params, _, _ = _plan(work, _phase(work))
+                        batch = _batch_tickers(work)
+                        if (
+                            batch is not None
+                            and _phase(work) == "page"
+                            and not work["cursor"]
+                            and _market_batch_url_size(batch) > MAX_INITIAL_BATCH_URL_BYTES
+                        ):
+                            raise CatalogueError(
+                                "selected market batch exceeds the initial URL limit"
+                            )
+                        busy.add(index)
+                        running[
+                            pool.submit(
+                                copy_context().run,
+                                client.get,
+                                endpoint,
+                                params,
+                                context=context,
+                            )
+                        ] = index
+                        metrics.add("futures_submitted")
+                        metrics.submitted_futures(len(running))
+            except Exception as exc:
                 failure = exc
         if not running:
             if failure is not None:
                 raise failure
+            if ready:
+                continue
+            task_count = len(state["tasks"])
             if _hydrate(store, state, identities):
+                enqueue_appended(task_count)
                 continue
             if state.get("journal_version") == JOURNAL_VERSION:
-                candidate = copy.deepcopy(dict(state))
+                with metrics.phase("control_state_copy"):
+                    candidate = copy.deepcopy(dict(state))
                 candidate.update(complete=True, completed_at=now(), error=None)
                 _commit_control(store, state, "complete", candidate)
                 _checkpoint_v2(store, state)
@@ -2113,23 +2252,30 @@ def _run(
             return
         with metrics.phase("scheduler_wait"):
             finished, _ = wait(running, return_when=FIRST_COMPLETED)
-        for future in finished:
+        for future in sorted(finished, key=lambda item: running[item]):
             index = running.pop(future)
             busy.discard(index)
+            metrics.add("futures_completed")
             try:
                 relative = future.result()
-            except (CatalogueError, OSError) as exc:
+            except Exception as exc:
                 failure = failure or exc
                 continue
             if isinstance(state, _CaptureState) and state.journal_uncertain:
                 # The durable journal may include a record this process did not apply. Leave
                 # completed receipts orphaned; the next locked resume reconciles them.
                 continue
+            if failure is not None:
+                # Keep the finalized receipt orphaned for locked recovery; never commit pages
+                # after another traversal has made the current state uncertain.
+                continue
             try:
+                task_count = len(state["tasks"])
                 _stage(store, state, index, relative, identities)
-                if failure is None:
-                    _consume(store, state, index, relative, seen, identities)
-            except (CatalogueError, OSError) as exc:
+                _consume(store, state, index, relative, seen, identities)
+                enqueue_appended(task_count)
+                enqueue(index)
+            except Exception as exc:
                 failure = failure or exc
 
 

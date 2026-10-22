@@ -148,7 +148,7 @@ def test_parent_hydration_uses_observation_winner_instead_of_receipt_iteration_o
         }
 
     class TimedClient(FakeClient):
-        def __init__(self, actual_store, budget):
+        def __init__(self, actual_store, budget, **options):
             super().__init__(
                 actual_store,
                 budget,
@@ -159,6 +159,7 @@ def test_parent_hydration_uses_observation_winner_instead_of_receipt_iteration_o
                     "/historical/markets": (200, {"markets": [], "cursor": ""}),
                     "/series/WINNER": (200, {"series": {"ticker": "WINNER"}}),
                 },
+                **options,
             )
 
         def get(self, endpoint, params=None, context=None):
@@ -203,7 +204,7 @@ def test_parent_hydration_does_not_let_newer_nested_market_override_direct_defin
     embedded = {**MARKET, "rules_primary": "embedded summary"}
 
     class ReferencedClient(FakeClient):
-        def __init__(self, actual_store, budget):
+        def __init__(self, actual_store, budget, **options):
             super().__init__(
                 actual_store,
                 budget,
@@ -220,6 +221,7 @@ def test_parent_hydration_does_not_let_newer_nested_market_override_direct_defin
                         {"event": {"event_ticker": "DIRECT", "series_ticker": "SERIES"}},
                     ),
                 },
+                **options,
             )
 
         def get(self, endpoint, params=None, context=None):
