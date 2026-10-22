@@ -340,6 +340,130 @@ def test_logical_lineage_comparison_ignores_but_validates_physical_warehouse_has
     assert not benchmark._logical_lineage_match(reference, candidate)
 
 
+@pytest.mark.parametrize(
+    ("clock_values", "group_survives_kill", "expected_result"),
+    [
+        # The TERM wait deadline expires between its loop check and sleep.
+        ([0.0, 0.1, 3.1], False, True),
+        # The KILL wait deadline expires between its loop check and sleep.
+        ([0.0, 3.1, 3.1, 3.2, 5.2], True, False),
+    ],
+)
+def test_terminate_worker_group_clamps_deadline_crossing_sleep(
+    monkeypatch, clock_values, group_survives_kill, expected_result
+):
+    clock = iter(clock_values)
+
+    def monotonic():
+        return next(clock, 100.0)
+
+    sleeps = []
+    signals = []
+    group_alive = [True]
+
+    class FakeProcess:
+        pid = 123
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return self.returncode
+
+    process = FakeProcess()
+
+    def sleep(duration):
+        sleeps.append(duration)
+        if duration < 0:
+            raise ValueError("sleep length must be non-negative")
+
+    def killpg(_pid, sig):
+        signals.append(sig)
+        if sig == 9 and not group_survives_kill:
+            group_alive[0] = False
+
+    monkeypatch.setattr(benchmark, "time", SimpleNamespace(monotonic=monotonic, sleep=sleep))
+    monkeypatch.setattr(benchmark.os, "killpg", killpg)
+    monkeypatch.setattr(benchmark, "_worker_group_alive", lambda _process: group_alive[0])
+
+    assert benchmark._terminate_worker_group(process, reserve_seconds=5.0) is expected_result
+    assert signals == [15, 9]
+    assert sleeps and all(duration >= 0 for duration in sleeps)
+    assert process.returncode == 0
+
+
+def test_frozen_build_preserves_clone_when_worker_group_cannot_be_reaped(tmp_path, monkeypatch):
+    clone = tmp_path / "frozen-v2-root-reference-pair-0"
+    sentinel = clone / "worker-evidence"
+
+    class FakeProcess:
+        pid = 123
+
+        def communicate(self, timeout):
+            raise subprocess.TimeoutExpired("fake worker", timeout)
+
+    def popen(*_args, **_kwargs):
+        clone.mkdir()
+        sentinel.write_text("still owned by worker")
+        return FakeProcess()
+
+    monkeypatch.setattr(benchmark.subprocess, "Popen", popen)
+    monkeypatch.setattr(benchmark, "_terminate_worker_group", lambda *_args: False)
+    with pytest.raises(benchmark._UnreapedWorkerGroup, match="descendants remain after timeout"):
+        benchmark._run_frozen_v2_build(
+            tmp_path / "source", tmp_path, "reference", "pair-0", tmp_path / "seed", "capture-id"
+        )
+    assert sentinel.read_text() == "still owned by worker"
+
+
+@pytest.mark.parametrize(
+    ("leader_exited", "expected_error"),
+    [
+        (False, "storage sample worker descendants remain alive"),
+        (True, "storage sample worker exited with live descendants"),
+    ],
+)
+def test_storage_sample_does_not_repeat_failed_reaping(
+    tmp_path: Path, monkeypatch, leader_exited, expected_error
+):
+    root = tmp_path / "storage-root-reference"
+    sentinel = root / "worker-evidence"
+    clock = iter([0.0, 176.0])
+    terminations = []
+
+    class FakeProcess:
+        returncode = 0 if leader_exited else None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+    process = FakeProcess()
+
+    def popen(*_args, **_kwargs):
+        root.mkdir()
+        sentinel.write_text("still owned by worker")
+        return process
+
+    def terminate(worker):
+        terminations.append(worker)
+        return False
+
+    monkeypatch.setattr(benchmark.subprocess, "Popen", popen)
+    monkeypatch.setattr(benchmark, "_terminate_worker_group", terminate)
+    monkeypatch.setattr(benchmark, "_worker_group_alive", lambda _process: True)
+    monkeypatch.setattr(benchmark, "time", SimpleNamespace(monotonic=lambda: next(clock, 176.0)))
+    with pytest.raises(benchmark._UnreapedWorkerGroup) as error:
+        benchmark._sampled_storage_run(tmp_path / "source", tmp_path, "reference", 1, "full")
+    assert terminations == [process]
+    assert str(error.value) == expected_error
+    assert sentinel.read_text() == "still owned by worker"
+
+
 @pytest.mark.skipif(
     os.name != "posix", reason="benchmark workers use POSIX process groups on macOS"
 )

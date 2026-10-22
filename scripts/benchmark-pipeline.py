@@ -99,7 +99,7 @@ def _terminate_worker_group(
         process.poll()  # Reap the direct worker before checking for surviving descendants.
         if not _worker_group_alive(process):
             break
-        time.sleep(min(0.05, deadline - time.monotonic()))
+        time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
     if _worker_group_alive(process):
         try:
             if os.name == "posix":
@@ -116,7 +116,7 @@ def _terminate_worker_group(
         process.poll()
         if not _worker_group_alive(process):
             break
-        time.sleep(min(0.05, deadline - time.monotonic()))
+        time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
     if process.poll() is None:
         try:
             process.wait(timeout=max(0.01, deadline - time.monotonic()))
@@ -2456,6 +2456,9 @@ def _sampled_storage_run(
             raise RuntimeError("storage sample worker exited while descendants were still running")
         if worker_error is not None:
             raise worker_error
+    except _UnreapedWorkerGroup:
+        cleanup_safe = False
+        raise
     except BaseException:
         if (
             process is not None
