@@ -13,9 +13,11 @@ def test_protocol_absence_and_catalogue_protocols_remain_compatible():
     assert capture._acquisition_protocol({}) == 2
     assert capture._acquisition_protocol({"acquisition_protocol": 3}) == 3
 
-    for value in (True, False, 2, 5, 3.0, "4"):
+    for value in (True, False, 2, 6, 3.0, "4"):
         with pytest.raises(CatalogueError, match="unsupported acquisition protocol"):
             capture._acquisition_protocol({"acquisition_protocol": value})
+    with pytest.raises(CatalogueError, match="protocol 5"):
+        capture._acquisition_protocol({"acquisition_protocol": 5})
 
 
 def test_protocol_four_requires_an_exact_series_scope():
@@ -31,10 +33,29 @@ def test_protocol_four_requires_an_exact_series_scope():
         with pytest.raises(CatalogueError):
             capture._acquisition_protocol({"acquisition_protocol": 4, "scope": malformed})
 
-    with pytest.raises(CatalogueError, match="requires acquisition protocol 4"):
+    with pytest.raises(CatalogueError, match="requires acquisition protocol 4 or 5"):
         capture._acquisition_protocol({"acquisition_protocol": 3, "scope": scope})
     with pytest.raises(CatalogueError, match="lacks its acquisition protocol"):
         capture._acquisition_protocol({"scope": scope})
+
+
+@pytest.mark.parametrize("scope", [None, {"kind": "series", "series_ticker": "KXCPI"}])
+def test_protocol5_rejects_malformed_optional_scope(scope):
+    from kalshi_events.common import digest, json_bytes
+
+    policies = {
+        "rate_policy": "fixed",
+        "parent_policy": "singular-v1",
+        "cutoff_policy": "per-page-v1",
+    }
+    state = {
+        "acquisition_protocol": 5,
+        **policies,
+        "acquisition_policy_sha256": digest(json_bytes(policies)),
+        "scope": scope,
+    }
+    with pytest.raises(CatalogueError, match="scope"):
+        capture._acquisition_protocol(state)
 
 
 def test_scoped_request_and_receipt_identity_is_bound_to_scope():
@@ -52,6 +73,9 @@ def test_scoped_request_and_receipt_identity_is_bound_to_scope():
 
     manifest = copy.deepcopy(context)
     assert capture._receipt_matches_context(manifest, context)
+    manifest["acquisition_protocol"] = True
+    assert not capture._receipt_matches_context(manifest, context)
+    manifest = copy.deepcopy(context)
     manifest["series_scope"] = series_scope("KXGDP")
     assert not capture._receipt_matches_context(manifest, context)
 
@@ -74,7 +98,19 @@ def test_scoped_capture_seals_protocol_scope_and_exact_series_tasks(tmp_path):
     with store.lock():
         state = capture.new_capture(store, None)
 
-    assert state["acquisition_protocol"] == 4
+    assert state["acquisition_protocol"] == 5
+    assert state["rate_policy"] == "fixed"
+    assert state["parent_policy"] == "singular-v1"
+    assert state["cutoff_policy"] == "per-page-v1"
+    assert state["acquisition_policy_sha256"] == capture.digest(
+        capture.json_bytes(
+            {
+                "rate_policy": "fixed",
+                "parent_policy": "singular-v1",
+                "cutoff_policy": "per-page-v1",
+            }
+        )
+    )
     assert state["scope"] == series_scope("KXCPI")
     assert state["root_id"]
     assert [work["endpoint"] for work in state["tasks"]] == [
@@ -106,3 +142,32 @@ def test_scoped_capture_seals_protocol_scope_and_exact_series_tasks(tmp_path):
     }
     with pytest.raises(CatalogueError, match="full series acquisition"):
         capture.new_capture(store, ["KXCPI-MARKET"])
+
+
+def test_protocol5_policy_is_bound_to_request_and_cannot_be_mutated():
+    state = {
+        "capture_id": "a" * 32,
+        "acquisition_protocol": 5,
+        "scope": series_scope("KXCPI"),
+        "rate_policy": "fixed",
+        "parent_policy": "singular-v1",
+        "cutoff_policy": "per-page-v1",
+        "acquisition_policy_sha256": capture.digest(
+            capture.json_bytes(
+                {
+                    "rate_policy": "fixed",
+                    "parent_policy": "singular-v1",
+                    "cutoff_policy": "per-page-v1",
+                }
+            )
+        ),
+        "tasks": [capture.task("/series/KXCPI", "series", singular=True)],
+        "task_scopes": {"0": "series"},
+    }
+    context = capture._request_context(state, 0)
+    assert context["acquisition_policy_sha256"] == state["acquisition_policy_sha256"]
+    assert capture._receipt_matches_context(context, context)
+    altered = copy.deepcopy(state)
+    altered["rate_policy"] = "adaptive"
+    with pytest.raises(CatalogueError, match="policy"):
+        capture._acquisition_protocol(altered)

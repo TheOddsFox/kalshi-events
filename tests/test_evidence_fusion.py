@@ -250,6 +250,10 @@ def test_transient_parent_information_does_not_extend_capture_state_contract(sto
         "version",
         "journal_version",
         "acquisition_protocol",
+        "rate_policy",
+        "parent_policy",
+        "cutoff_policy",
+        "acquisition_policy_sha256",
         "capture_id",
         "selected",
         "started_at",
@@ -265,7 +269,7 @@ def test_transient_parent_information_does_not_extend_capture_state_contract(sto
         "coverage",
         "error",
     }
-    assert persisted["acquisition_protocol"] == 3
+    assert persisted["acquisition_protocol"] == 5
     assert persisted["incremental"] is False
     assert persisted["task_scopes"] == {
         "1": "series",

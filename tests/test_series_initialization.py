@@ -12,7 +12,7 @@ from kalshi_events.common import CatalogueError, Store
 
 @pytest.mark.parametrize(
     ("first_ticker", "second_ticker", "expected_version"),
-    [(None, "KXCPI", 3), ("KXCPI", None, 4)],
+    [(None, "KXCPI", 5), ("KXCPI", None, 5)],
 )
 def test_concurrent_root_initializers_cannot_replace_each_others_marker(
     tmp_path, monkeypatch, first_ticker, second_ticker, expected_version
@@ -49,13 +49,13 @@ def test_concurrent_root_initializers_cannot_replace_each_others_marker(
     marker = json.loads(marker_bytes)
     assert marker["storage_version"] == expected_version
     assert winner.storage_version == expected_version
-    if expected_version == 4:
+    if second_ticker is None:
         assert winner.scope == common.series_scope("KXCPI")
     else:
         assert winner.scope is None
         assert marker_bytes == common.json_bytes(common.CURRENT_ROOT_MARKER)
     with pytest.raises(CatalogueError):
-        Store(root, series_ticker=("KXCPI" if expected_version == 3 else "KXGDP"))
+        Store(root, series_ticker=("KXGDP" if second_ticker is None else "KXCPI"))
     assert winner.path("root.json").read_bytes() == marker_bytes
 
 

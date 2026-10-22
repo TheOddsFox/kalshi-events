@@ -435,7 +435,13 @@ def test_existing_byte_identity_profiles_freeze_legacy_acquisition_protocol():
 
     capture = Capture()
     assert benchmark._freeze_legacy_acquisition("full", "full", capture)
-    state = {"acquisition_protocol": 3}
+    state = {
+        "acquisition_protocol": 5,
+        "rate_policy": "fixed",
+        "parent_policy": "singular-v1",
+        "cutoff_policy": "per-page-v1",
+        "acquisition_policy_sha256": "a" * 64,
+    }
     assert capture._initialize_v2(None, state) == {}
 
     current = Capture()

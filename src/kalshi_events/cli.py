@@ -156,7 +156,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
-    if store.scope is not None and args.command not in {"status", "discard"}:
+    if store.scope is not None and args.command not in {"status", "discard", "upgrade-root"}:
         raise CatalogueError("catalogue commands cannot operate on a scoped series root")
     if args.command == "current":
         return publish.current(store, catalogue_version=args.catalogue_version)

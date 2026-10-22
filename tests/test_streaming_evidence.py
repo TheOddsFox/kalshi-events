@@ -485,7 +485,7 @@ def test_boolean_decoded_size_is_invalid_even_when_numerically_equal(store):
 
 def test_new_root_marker_is_rejected_by_legacy_exact_marker_check(store):
     marker = json.loads(store.path("root.json").read_text())
-    assert marker == {**LEGACY_MARKER, "storage_version": 3}
+    assert marker == {**LEGACY_MARKER, "storage_version": 5}
 
     def legacy_writer():
         # This is the v1 Store constructor's exact marker guard.
@@ -514,7 +514,7 @@ def test_explicit_root_upgrade_preserves_existing_evidence_and_requires_lock(tmp
     assert main(["--root", str(root), "upgrade-root"]) == 0
     assert json.loads((root / "root.json").read_text()) == {
         **LEGACY_MARKER,
-        "storage_version": 3,
+        "storage_version": 5,
     }
     assert evidence.read_bytes() == before
 

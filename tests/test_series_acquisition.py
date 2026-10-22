@@ -60,7 +60,7 @@ def test_scoped_capture_acquires_live_history_and_authoritative_parents(tmp_path
     result, clients = _capture(store, _responses())
 
     assert result["complete"] is True
-    assert result["acquisition_protocol"] == 4
+    assert result["acquisition_protocol"] == 5
     assert result["scope"] == {
         "kind": "series",
         "series_ticker": "KXCPI",

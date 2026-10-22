@@ -63,8 +63,8 @@ def _utc(value: Any, label: str) -> datetime:
 
 def root_id(store: Store, *, create: bool = False) -> str:
     """Read the stable logical root identity, creating it only for v2 work."""
-    if store.storage_version not in {2, 3, 4} or (create and store.storage_version not in {3, 4}):
-        raise CatalogueError("incremental catalogue work requires an upgraded storage-v3 root")
+    if store.storage_version not in {2, 3, 4, 5} or (create and store.storage_version != 5):
+        raise CatalogueError("incremental catalogue work requires an upgraded storage-v5 root")
     if create and not store.writer_locked_by_current_thread:
         raise CatalogueError("root identity creation requires the canonical writer lock")
     path = store.path("root-id.json")
@@ -655,11 +655,17 @@ def parent_lookup_tasks(
             and parent not in final_series_members
             and ("series", parent) not in identities.parent_lookups
         )
-    from kalshi_events.capture import ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL, task
+    from kalshi_events.capture import (
+        ACQUISITION_PROTOCOL,
+        CURRENT_ACQUISITION_PROTOCOL,
+        SCOPED_ACQUISITION_PROTOCOL,
+        task,
+    )
 
     event_params = (
         {"exclude_markets": "true"}
-        if state.get("acquisition_protocol") in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL}
+        if state.get("acquisition_protocol")
+        in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL, CURRENT_ACQUISITION_PROTOCOL}
         else None
     )
 

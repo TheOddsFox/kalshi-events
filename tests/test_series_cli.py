@@ -135,7 +135,7 @@ def test_series_refresh_emits_scoped_machine_result_and_uses_one_refresh_workflo
 
 @pytest.mark.parametrize(
     "action",
-    ["capture", "load", "build", "publish", "replay", "rebuild", "current", "dbt", "upgrade-root"],
+    ["capture", "load", "build", "publish", "replay", "rebuild", "current", "dbt"],
 )
 def test_generic_catalogue_actions_reject_scoped_roots(tmp_path, action):
     root = tmp_path / "series"
@@ -143,6 +143,37 @@ def test_generic_catalogue_actions_reject_scoped_roots(tmp_path, action):
     parsed = cli.parser().parse_args(["--root", str(root), action])
     with pytest.raises(CatalogueError, match="cannot operate on a scoped series root"):
         cli.execute(parsed)
+
+
+def test_upgrade_root_is_allowed_for_legacy_scoped_roots(tmp_path, capsys):
+    root = tmp_path / "series"
+    root.mkdir()
+    marker = {"owner": "oddsfox.kalshi.events.v1", "storage_version": 4, "scope": SCOPE}
+    (root / "root.json").write_text(json.dumps(marker))
+    (root / "root-id.json").write_text(
+        json.dumps({"version": 1, "root_id": "0123456789abcdef0123456789abcdef"})
+    )
+    store = Store(root)
+    from kalshi_events.incremental import root_id
+
+    identity = root_id(store)
+    (root / "evidence.bin").write_bytes(b"unchanged")
+
+    code = cli.main(["--root", str(root), "upgrade-root"])
+
+    assert code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"storage_version": 5, "upgraded": True}
+    assert json.loads((root / "root.json").read_text()) == {
+        "owner": "oddsfox.kalshi.events.v1",
+        "storage_version": 5,
+        "scope": SCOPE,
+    }
+    assert Store(root).scope == SCOPE
+    assert (root / "evidence.bin").read_bytes() == b"unchanged"
+    from kalshi_events.incremental import root_id as read_root_id
+
+    assert read_root_id(Store(root)) == identity
 
 
 def test_global_refresh_rejects_scoped_root_without_running_workflow(tmp_path, monkeypatch, capsys):

@@ -16,6 +16,10 @@ def _legacy_checkpoint(store, state):
     logical = dict(state)
     logical.pop("journal_version")
     logical.pop("acquisition_protocol", None)
+    logical.pop("rate_policy", None)
+    logical.pop("parent_policy", None)
+    logical.pop("cutoff_policy", None)
+    logical.pop("acquisition_policy_sha256", None)
     if logical.get("selected") is not None:
         logical["tasks"] = [
             acquisition.task("/historical/cutoff", None, singular=True),
@@ -67,17 +71,21 @@ def test_journal_control_size_does_not_scale_with_cursor_history(store):
 
 def test_acquisition_protocol_is_sealed_and_legacy_missing_protocol_keeps_request_identity(store):
     state = acquisition.new_capture(store, ["MARKET"])
-    assert state["acquisition_protocol"] == 3
+    assert state["acquisition_protocol"] == 5
     context = acquisition._request_context(state, 0)
-    assert context["acquisition_protocol"] == 3
+    assert context["acquisition_protocol"] == 5
 
     state.pop("acquisition_protocol")
+    state.pop("rate_policy")
+    state.pop("parent_policy")
+    state.pop("cutoff_policy")
+    state.pop("acquisition_policy_sha256")
     request_key = [state["capture_id"], 0, "page", "", 0]
     legacy = acquisition._request_context(state, 0)
     assert "acquisition_protocol" not in legacy
     assert legacy["request_id"] == digest(json_bytes(request_key))
 
-    for invalid in (True, False, 2, 4, 3.0, "3"):
+    for invalid in (True, False, 2, 4, 6, 3.0, "3"):
         state["acquisition_protocol"] = invalid
         with pytest.raises(CatalogueError, match="unsupported acquisition protocol"):
             acquisition._request_context(state, 0)
@@ -190,6 +198,10 @@ def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
     legacy = dict(state)
     legacy.pop("journal_version")
     legacy.pop("acquisition_protocol", None)
+    legacy.pop("rate_policy", None)
+    legacy.pop("parent_policy", None)
+    legacy.pop("cutoff_policy", None)
+    legacy.pop("acquisition_policy_sha256", None)
     del legacy["max_response_bytes"]
     store.write(relative, legacy)
     with pytest.raises(CatalogueError, match="pre-1.0 captures are not readable"):

@@ -21,6 +21,10 @@ def _scoped_marker():
     return {**common.OWNER_MARKER, "storage_version": 4, "scope": copy.deepcopy(SERIES_SCOPE)}
 
 
+def _current_scoped_marker():
+    return {**common.OWNER_MARKER, "storage_version": 5, "scope": copy.deepcopy(SERIES_SCOPE)}
+
+
 @pytest.mark.parametrize("existing_empty_directory", [False, True])
 def test_new_series_root_seals_scope_and_reopens_without_selection(
     tmp_path, existing_empty_directory
@@ -30,11 +34,11 @@ def test_new_series_root_seals_scope_and_reopens_without_selection(
         root.mkdir()
     store = Store(root, series_ticker="KXCPI")
 
-    assert store.storage_version == 4
+    assert store.storage_version == 5
     assert store.scope == SERIES_SCOPE
-    assert json.loads(store.path("root.json").read_text()) == _scoped_marker()
+    assert json.loads(store.path("root.json").read_text()) == _current_scoped_marker()
     reopened = Store(root)
-    assert reopened.storage_version == 4
+    assert reopened.storage_version == 5
     assert reopened.scope == SERIES_SCOPE
     with reopened.writer_guard():
         reopened.write("sentinel.json", {"scope": "KXCPI"})
@@ -57,21 +61,34 @@ def test_scope_descriptor_cannot_mutate_the_open_roots_scope(tmp_path):
 
     with store.writer_guard():
         assert store.scope == SERIES_SCOPE
-    assert json.loads(store.path("root.json").read_text()) == _scoped_marker()
+    assert json.loads(store.path("root.json").read_text()) == _current_scoped_marker()
 
 
-def test_upgrade_root_cannot_downgrade_scoped_storage_or_rewrite_evidence(tmp_path):
-    store = Store(tmp_path / "series", series_ticker="KXCPI")
-    marker = store.path("root.json").read_bytes()
+def test_upgrade_scoped_v4_preserves_scope_identity_and_evidence(tmp_path):
+    root = tmp_path / "series"
+    root.mkdir()
+    marker_path = root / "root.json"
+    marker_path.write_bytes(json_bytes(_scoped_marker()))
+    (root / "root-id.json").write_bytes(
+        json_bytes({"version": 1, "root_id": "0123456789abcdef0123456789abcdef"})
+    )
+    store = Store(root)
+    from kalshi_events.incremental import root_id
+
+    identity = root_id(store)
+    marker = marker_path.read_bytes()
     evidence = store.path("evidence.bin")
     evidence.write_bytes(b"keep scoped evidence")
 
-    with store.lock(allow_legacy=True) as lock, pytest.raises(CatalogueError):
+    with store.lock(allow_legacy=True) as lock:
         store.upgrade_root(lock)
 
-    assert store.path("root.json").read_bytes() == marker
+    assert store.path("root.json").read_bytes() != marker
+    assert json.loads(store.path("root.json").read_text()) == _current_scoped_marker()
     assert evidence.read_bytes() == b"keep scoped evidence"
-    assert store.storage_version == 4
+    assert store.storage_version == 5
+    assert store.scope == SERIES_SCOPE
+    assert root_id(store) == identity
 
 
 def test_existing_series_root_rejects_conflicting_selection_without_rewriting(tmp_path):
@@ -99,9 +116,9 @@ def test_series_selection_never_converts_existing_ordinary_root(tmp_path, versio
     assert {path.name: path.read_bytes() for path in root.iterdir()} == before
 
 
-def test_ordinary_root_creation_remains_storage_three(tmp_path):
+def test_ordinary_root_creation_uses_storage_five(tmp_path):
     store = Store(tmp_path / "ordinary")
-    assert store.storage_version == 3
+    assert store.storage_version == 5
     assert store.scope is None
     assert store.path("root.json").read_bytes() == json_bytes(common.CURRENT_ROOT_MARKER)
 

@@ -334,6 +334,10 @@ def _freeze_legacy_acquisition(profile: str, scenario: str, capture: Any) -> boo
                 state["tasks"] = tasks
                 state["task_scopes"] = {}
             state.pop("acquisition_protocol", None)
+            state.pop("rate_policy", None)
+            state.pop("parent_policy", None)
+            state.pop("cutoff_policy", None)
+            state.pop("acquisition_policy_sha256", None)
             return initialize(store, state)
 
         capture._initialize_v2 = initialize_legacy
@@ -1514,7 +1518,7 @@ print(json.dumps({"storage_version_before": before, "storage_version_after": sto
     upgrade = json.loads(completed.stdout)
     assert upgrade == {
         "storage_version_before": 2,
-        "storage_version_after": 3,
+        "storage_version_after": 5,
         "root_id_before": FIXED_ROOT_ID,
         "root_id_after": FIXED_ROOT_ID,
     }, f"candidate baseline clone did not upgrade v2 to v3: {upgrade}"
