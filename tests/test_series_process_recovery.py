@@ -381,7 +381,7 @@ def test_scoped_process_exit_capture_resumes_without_repeating_committed_request
     assert json.loads(resumed.stdout)["capture_id"] == capture_id
     requests = [json.loads(line) for line in request_log.read_bytes().splitlines()]
     counts = Counter(row["request_id"] for row in requests)
-    assert len(counts) == 6
+    assert len(counts) == 7
     assert all(counts[request_id] == 1 for request_id in usable_ids)
     assert {request_id for request_id, count in counts.items() if count > 1} == interrupted_ids
     assert all(count == (2 if key in interrupted_ids else 1) for key, count in counts.items())
@@ -392,7 +392,7 @@ def test_scoped_process_exit_capture_resumes_without_repeating_committed_request
         assert len(interrupted_ids) == len(incomplete_reservations) == 1
         assert len(usable_ids) == 1
         assert len(before_requests) == 2
-        assert sum(counts.values()) == 7
+        assert sum(counts.values()) == 8
     elif boundary in {"journal", "apply"}:
         assert len(interrupted_ids) <= 1
         assert len(incomplete_reservations) <= 1
@@ -404,7 +404,7 @@ def test_scoped_process_exit_capture_resumes_without_repeating_committed_request
         assert accounting(Store(root))["accounting_complete"] is False
     state = capture.complete_capture(Store(root), capture_id)
     pages = list(capture.capture_pages(Store(root), state))
-    assert len(pages) == len({manifest["page_id"] for manifest, _ in pages}) == 6
+    assert len(pages) == len({manifest["page_id"] for manifest, _ in pages}) == 7
     assert len(list(observations(pages))) == 4
     assert all(manifest["series_scope"] == state["scope"] for manifest, _ in pages)
     assert (root / "current-series.json").read_bytes() == pointer

@@ -164,10 +164,10 @@ def test_only_undelimited_tail_can_be_discarded_before_resume(store, tail):
     path.write_bytes(committed + tail)
     resumed = acquisition.capture(store, resume=initial["capture_id"], client_factory=FakeClient)
     assert resumed["complete"]
-    assert resumed["requests"] == 5
+    assert resumed["requests"] == 6
     assert journal_path(store, initial["capture_id"]).read_bytes().startswith(committed)
     assert_chain_and_anchor(store, initial["capture_id"])
-    assert len(list(store.path("raw").glob("*/manifest.json"))) == 7
+    assert len(list(store.path("raw").glob("*/manifest.json"))) == 8
 
 
 @pytest.mark.parametrize(
@@ -360,8 +360,8 @@ def test_append_error_recovers_committed_or_uncommitted_page_once(store, monkeyp
     identity = capture_id(store)
     resumed = acquisition.capture(store, resume=identity, client_factory=FakeClient)
     assert resumed["complete"]
-    assert len(list(store.path("raw").glob("*/manifest.json"))) == 7
-    assert len(acquisition.page_receipts(store, resumed)) == 7
+    assert len(list(store.path("raw").glob("*/manifest.json"))) == 9
+    assert len(acquisition.page_receipts(store, resumed)) == 9
     assert_chain_and_anchor(store, identity)
 
 
@@ -384,8 +384,8 @@ def test_budget_stop_after_durable_page_preserves_recoverable_work(store, monkey
     monkeypatch.setattr(store, "append", original)
     resumed = acquisition.capture(store, resume=initial["capture_id"], client_factory=FakeClient)
     assert resumed["complete"]
-    assert len(list(store.path("raw").glob("*/manifest.json"))) == 7
-    assert len(acquisition.page_receipts(store, resumed)) == 7
+    assert len(list(store.path("raw").glob("*/manifest.json"))) == 9
+    assert len(acquisition.page_receipts(store, resumed)) == 9
     assert_chain_and_anchor(store, initial["capture_id"])
 
 
@@ -445,8 +445,8 @@ def test_crash_after_each_durable_boundary_recovers_without_duplicate_requests(
     identity = capture_id(store)
     resumed = acquisition.capture(store, resume=identity, client_factory=RecordingClient)
     assert crashed and resumed["complete"]
-    assert len(issued) == len(set(issued)) == 7
-    assert len(acquisition.page_receipts(store, resumed)) == 7
+    assert len(issued) == len(set(issued)) == (8 if boundary == "snapshot" else 9)
+    assert len(acquisition.page_receipts(store, resumed)) == (8 if boundary == "snapshot" else 9)
     assert_chain_and_anchor(store, identity)
 
 
@@ -498,9 +498,9 @@ def test_raw_body_without_usable_receipt_is_retried_after_process_death(store, m
     identity = capture_id(store)
     resumed = acquisition.capture(store, resume=identity, client_factory=factory)
     assert resumed["complete"]
-    assert len(issued) == 8
-    assert sorted(Counter(issued).values()) == [1, 1, 1, 1, 1, 1, 2]
-    assert len(acquisition.page_receipts(store, resumed)) == 7
+    assert len(issued) == 10
+    assert sorted(Counter(issued).values()) == [1, 1, 1, 1, 1, 1, 1, 1, 2]
+    assert len(acquisition.page_receipts(store, resumed)) == 9
     assert_chain_and_anchor(store, identity)
 
 
@@ -527,8 +527,8 @@ def test_usable_receipt_orphan_is_recovered_without_reissuing_its_request(store)
     identity = capture_id(store)
     resumed = acquisition.capture(store, resume=identity, client_factory=OrphanedClient)
     assert resumed["complete"]
-    assert len(issued) == len(set(issued)) == 7
-    assert len(acquisition.page_receipts(store, resumed)) == 7
+    assert len(issued) == len(set(issued)) == 9
+    assert len(acquisition.page_receipts(store, resumed)) == 9
     assert_chain_and_anchor(store, identity)
 
 
@@ -578,7 +578,7 @@ def test_writer_resume_decodes_prefix_and_post_snapshot_suffix_bodies_once(store
         count_reads.setattr(acquisition, "read_page", counted_read)
         resumed = acquisition.capture(store, resume=identity, client_factory=PaginatedClient)
     assert resumed["complete"]
-    assert len(issued) == len(set(issued)) == 116
+    assert len(issued) == len(set(issued)) == 117
     expected = {row["relative"]: 1 for row in acquisition.page_receipts(store, resumed)}
     assert counts == expected
     assert_chain_and_anchor(store, identity)
@@ -656,6 +656,17 @@ def test_cursor_loop_seen_before_budget_stop_is_rejected_immediately_on_resume(s
 
 
 def test_parent_discovery_replays_128_task_batch_and_keeps_the_129th_parent(store, monkeypatch):
+    # Exercise the sealed pre-batching task-plan compatibility path: its parent
+    # hydration control adds 129 singular tasks in bounded 128-item records.
+    monkeypatch.setattr(
+        acquisition,
+        "_PROTOCOL5_POLICIES",
+        {
+            "rate_policy": "fixed",
+            "parent_policy": "singular-v1",
+            "cutoff_policy": "checkpoint-v1",
+        },
+    )
     original = store.append
     interrupted = False
     parents = []
@@ -870,7 +881,7 @@ def test_durable_genesis_recovers_when_first_snapshot_was_never_written(store, m
     monkeypatch.setattr(store, "write", original)
     resumed = acquisition.capture(store, resume=identity, client_factory=FakeClient)
     assert resumed["complete"]
-    assert resumed["requests"] == 7
+    assert resumed["requests"] == 8
     records, _ = assert_chain_and_anchor(store, identity)
     assert sum(record["op"] == "start" for record in records) == 1
 

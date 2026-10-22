@@ -430,6 +430,14 @@ def test_history_stress_fixture_is_broad_and_refreshes_about_one_percent():
 
 def test_existing_byte_identity_profiles_freeze_legacy_acquisition_protocol():
     class Capture:
+        _CHECKPOINT_TASK_FIELDS = {
+            "cutoff_ordinal",
+            "cutoff_reason",
+            "pages_since_cutoff",
+            "last_cutoff_at",
+            "data_done",
+        }
+
         def _initialize_v2(self, _store, state):
             return state
 
@@ -441,8 +449,9 @@ def test_existing_byte_identity_profiles_freeze_legacy_acquisition_protocol():
         "parent_policy": "singular-v1",
         "cutoff_policy": "per-page-v1",
         "acquisition_policy_sha256": "a" * 64,
+        "tasks": [{"endpoint": "/historical/markets", "cutoff_ordinal": 1}],
     }
-    assert capture._initialize_v2(None, state) == {}
+    assert capture._initialize_v2(None, state)["tasks"] == [{"endpoint": "/historical/markets"}]
 
     current = Capture()
     assert not benchmark._freeze_legacy_acquisition("selected-stress", "full", current)
@@ -452,8 +461,36 @@ def test_existing_byte_identity_profiles_freeze_legacy_acquisition_protocol():
     assert benchmark._freeze_legacy_acquisition("baseline-setup", "history-sparse", baseline)
 
 
+def test_legacy_freeze_supports_reference_capture_without_protocol5_fields():
+    class ReferenceCapture:
+        def _initialize_v2(self, _store, state):
+            return state
+
+    capture = ReferenceCapture()
+    assert benchmark._freeze_legacy_acquisition("full", "full", capture)
+    state = {
+        "acquisition_protocol": 2,
+        "compression": "gzip",
+        "tasks": [{"endpoint": "/historical/markets", "params": {}}],
+    }
+
+    frozen = capture._initialize_v2(None, state)
+
+    assert frozen["tasks"] == [{"endpoint": "/historical/markets", "params": {}}]
+    assert frozen["compression"] == "identity"
+    assert "acquisition_protocol" not in frozen
+
+
 def test_legacy_targeted_freeze_restores_original_singular_task_plan():
     class Capture:
+        _CHECKPOINT_TASK_FIELDS = {
+            "cutoff_ordinal",
+            "cutoff_reason",
+            "pages_since_cutoff",
+            "last_cutoff_at",
+            "data_done",
+        }
+
         @staticmethod
         def task(endpoint, kind, *, singular=False, requested=None):
             return {

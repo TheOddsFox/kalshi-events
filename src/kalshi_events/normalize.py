@@ -75,6 +75,10 @@ class ParentIndex:
         self.processed: set[str] = set()
         self.scope_membership: dict[str, dict[int, set[str]]] = {}
         self.parent_lookups: dict[tuple[str, str], tuple[int, str, str]] = {}
+        self.parent_batch_candidates: dict[
+            tuple[str, int], dict[str, tuple[tuple[str, str, str | None], str, str]]
+        ] = {}
+        self.parent_batch_terminal: set[tuple[str, int]] = set()
 
     @staticmethod
     def _put(target: dict[str, tuple], identity: str, winner: tuple) -> None:
@@ -111,10 +115,49 @@ class ParentIndex:
             "page_id": manifest["page_id"],
             "received_at": manifest["received_at"],
         }
-        for index, native in enumerate(
-            records(payload, envelope, singular=manifest.get("singular", False))
-        ):
+        rows = records(payload, envelope, singular=manifest.get("singular", False))
+        parent_batch = manifest.get("parent_batch")
+        batch_id = manifest.get("parent_batch_id")
+        generation = manifest.get("task_generation")
+        allowed_batch: set[str] | None = None
+        if parent_batch is not None:
+            selection = manifest.get("parent_batch_tickers")
+            if (
+                parent_batch not in {"ordinary", "multivariate"}
+                or not isinstance(batch_id, str)
+                or len(batch_id) != 64
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or not isinstance(selection, str)
+            ):
+                raise CatalogueError("malformed event parent batch receipt context")
+            batch_values = selection.split(",")
+            if (
+                not batch_values
+                or len(batch_values) > 100
+                or len(batch_values) != len(set(batch_values))
+            ):
+                raise CatalogueError("malformed event parent batch selection")
+            allowed_batch = {ticker(value) for value in batch_values}
+        for index, native in enumerate(rows):
             identity, parent = native_identity(kind, native)
+            if allowed_batch is not None:
+                if kind != "events" or identity not in allowed_batch:
+                    raise CatalogueError("event parent batch returned an unrequested identity")
+                candidate_key = (batch_id, generation)
+                candidates = self.parent_batch_candidates.setdefault(candidate_key, {})
+                candidate = (
+                    (
+                        provenance["received_at"],
+                        digest(json_bytes([provenance["page_id"], f"/{envelope}/{index}"])),
+                        parent,
+                    ),
+                    provenance["page_id"],
+                    manifest["request_id"],
+                )
+                previous = candidates.get(identity)
+                if previous is None or candidate[0][:2] > previous[0][:2]:
+                    candidates[identity] = candidate
             if scoped_series is not None:
                 if kind == "series" and identity != scoped_series:
                     raise CatalogueError("series definition differs from the scoped ticker")
@@ -137,6 +180,7 @@ class ParentIndex:
                     not manifest.get("singular")
                     or (kind == "series" and scope == "series" and identity == scoped_series)
                 )
+                and parent_batch is None
             ):
                 if (
                     kind == "markets"
@@ -159,6 +203,9 @@ class ParentIndex:
             if kind == "series":
                 self._put(self.series, identity, winner[:2] + (None,))
             elif kind == "events":
+                # Native warehouse winners span every observation generation. Batch
+                # eligibility is tracked separately and promoted only after the final
+                # pagination generation reaches its terminal page.
                 self._put(self.events, identity, winner)
                 if "markets" in native:
                     for market in records(native, "markets"):
@@ -171,6 +218,42 @@ class ParentIndex:
                         native_identity("markets", market)
             else:
                 self._put(self.markets, identity, winner)
+        if allowed_batch is not None and payload.get("cursor") == "":
+            self.parent_batch_terminal.add((batch_id, generation))
+
+    def effective_parent_evidence(
+        self, state: dict[str, Any]
+    ) -> tuple[dict[str, tuple[str, str, str | None]], dict[tuple[str, str], tuple[int, str, str]]]:
+        """Add only terminal, final-generation batch results to authoritative parent views."""
+        events = dict(self.events)
+        lookups = dict(self.parent_lookups)
+        for work in state.get("tasks", []):
+            role = work.get("parent_batch")
+            if role is None or not work.get("done"):
+                continue
+            batch_id = digest(
+                json_bytes(
+                    [
+                        work.get("endpoint"),
+                        work.get("params"),
+                        work.get("kind"),
+                        work.get("singular"),
+                        work.get("requested"),
+                    ]
+                )
+            )
+            generation = work.get("restarts", 0)
+            key = (batch_id, generation)
+            if key not in self.parent_batch_terminal:
+                continue
+            for identity, (winner, page_id, request_id) in self.parent_batch_candidates.get(
+                key, {}
+            ).items():
+                self._put(events, identity, winner)
+                direct = lookups.get(("events", identity))
+                if direct is None or direct[1:] == (page_id, request_id):
+                    lookups[("events", identity)] = (200, page_id, request_id)
+        return events, lookups
 
 
 def observations(pages: Iterable[tuple[dict[str, Any], Any]]) -> Iterator[dict[str, Any]]:

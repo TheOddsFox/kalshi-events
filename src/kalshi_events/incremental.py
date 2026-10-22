@@ -492,6 +492,7 @@ def parent_lookup_tasks(
     identities: Any,
 ) -> list[dict[str, Any]]:
     """Find active parent identities that require a fresh point lookup in this capture."""
+    effective_events, effective_lookups = identities.effective_parent_evidence(state)
     scope_values: dict[str, set[str]] = {}
     final_scope_values: dict[str, set[str]] = {}
     for index, scope in state.get("task_scopes", {}).items():
@@ -571,14 +572,14 @@ def parent_lookup_tasks(
             market_winners[market] = winner
     lookup_events = {
         identity
-        for (kind, identity), outcome in identities.parent_lookups.items()
+        for (kind, identity), outcome in effective_lookups.items()
         if kind == "events" and outcome[0] == 200
     }
     active_events = event_members | lookup_events
     event_winners = {
         event: winner for event, winner in baseline_events.items() if event in active_events
     }
-    for event, winner in identities.events.items():
+    for event, winner in effective_events.items():
         if event in active_events and (
             event not in event_winners or winner[:2] > event_winners[event][:2]
         ):
@@ -588,9 +589,7 @@ def parent_lookup_tasks(
         parent
         for winner in market_winners.values()
         for parent in (winner[2],)
-        if parent
-        and parent not in event_members
-        and ("events", parent) not in identities.parent_lookups
+        if parent and parent not in event_members and ("events", parent) not in effective_lookups
     }
     missing_series = {
         parent
@@ -598,16 +597,16 @@ def parent_lookup_tasks(
         if event in active_events
         and parent
         and parent not in series_members
-        and ("series", parent) not in identities.parent_lookups
+        and ("series", parent) not in effective_lookups
     }
     if state.get("scope") is not None:
         for winner in market_winners.values():
             parent = winner[2]
-            outcome = identities.parent_lookups.get(("events", parent)) if parent else None
+            outcome = effective_lookups.get(("events", parent)) if parent else None
             if parent and parent not in event_members and outcome is not None and outcome[0] != 200:
                 raise CatalogueError("series market winner lacks an authoritative event parent")
         for event, parent in event_parents.items():
-            outcome = identities.parent_lookups.get(("series", parent)) if parent else None
+            outcome = effective_lookups.get(("series", parent)) if parent else None
             if (
                 event in active_events
                 and parent
@@ -636,16 +635,16 @@ def parent_lookup_tasks(
             for parent in final_market_parents.values()
             if parent
             and parent not in final_event_members
-            and ("events", parent) not in identities.parent_lookups
+            and ("events", parent) not in effective_lookups
         )
         final_active_events = final_event_members | {
             identity
-            for (kind, identity), outcome in identities.parent_lookups.items()
+            for (kind, identity), outcome in effective_lookups.items()
             if kind == "events" and outcome[0] == 200
         }
         final_event_parents = {
             event: winner[2]
-            for event, winner in identities.events.items()
+            for event, winner in effective_events.items()
             if event in final_active_events
         }
         missing_series.update(
@@ -653,32 +652,11 @@ def parent_lookup_tasks(
             for event, parent in final_event_parents.items()
             if parent
             and parent not in final_series_members
-            and ("series", parent) not in identities.parent_lookups
+            and ("series", parent) not in effective_lookups
         )
-    from kalshi_events.capture import (
-        ACQUISITION_PROTOCOL,
-        CURRENT_ACQUISITION_PROTOCOL,
-        SCOPED_ACQUISITION_PROTOCOL,
-        task,
-    )
+    from kalshi_events.capture import parent_lookup_plan
 
-    event_params = (
-        {"exclude_markets": "true"}
-        if state.get("acquisition_protocol")
-        in {ACQUISITION_PROTOCOL, SCOPED_ACQUISITION_PROTOCOL, CURRENT_ACQUISITION_PROTOCOL}
-        else None
-    )
-
-    return [
-        *[
-            task(f"/events/{identity}", "events", singular=True, params=event_params)
-            for identity in sorted(missing_events)
-        ],
-        *[
-            task(f"/series/{identity}", "series", singular=True)
-            for identity in sorted(missing_series)
-        ],
-    ]
+    return parent_lookup_plan(state, missing_events, missing_series)
 
 
 def verify_predecessor(store: Store, state: dict[str, Any]) -> None:

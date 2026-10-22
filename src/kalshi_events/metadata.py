@@ -29,7 +29,7 @@ from kalshi_events.common import (
     safe_path,
     selections,
 )
-from kalshi_events.normalize import project_pages
+from kalshi_events.normalize import ParentIndex, project_pages
 
 CONTRACT = "oddsfox.kalshi.metadata.v1"
 RELATIONS = ("series", "events", "markets", "coverage")
@@ -86,7 +86,15 @@ def export(
     if state["selected"] is not None and not set(selected).issubset(state["selected"]):
         raise CatalogueError("capture does not cover the selected markets")
     _ = store.remaining
-    projection = project_pages(capture_pages(store, state), selected=set(selected))
+    parent_index = ParentIndex()
+
+    def indexed_pages():
+        for manifest, payload in capture_pages(store, state):
+            parent_index.add_page(manifest, payload)
+            yield manifest, payload
+
+    projection = project_pages(indexed_pages(), selected=set(selected))
+    _, parent_lookups = parent_index.effective_parent_evidence(state)
     by_market = {row["market_ticker"]: row for row in projection["markets"]}
     coverage = []
     for identity in selected:
@@ -102,7 +110,10 @@ def export(
                     "error": "not observed in completed requested capture",
                 }
             )
-        elif not market["usable"]:
+        elif not market["usable"] or (
+            state.get("parent_policy") == "batched-v1"
+            and _metadata_parent_missing(market, projection, parent_lookups)
+        ):
             coverage.append(
                 {
                     "market_ticker": identity,
@@ -171,6 +182,27 @@ def export(
         "root": str(store.root),
         "retained_bytes": store.check_storage()["retained_bytes"],
     }
+
+
+def _metadata_parent_missing(
+    market: dict[str, Any],
+    projection: dict[str, list[dict[str, Any]]],
+    parent_lookups: dict[tuple[str, str], tuple[int, str, str]],
+) -> bool:
+    """A fresh authoritative point miss overrides older list observations."""
+    event_ticker = market.get("event_ticker")
+    event_lookup = parent_lookups.get(("events", event_ticker))
+    if event_lookup is not None and event_lookup[0] != 200:
+        return True
+    event = next(
+        (row for row in projection["events"] if row.get("event_ticker") == event_ticker),
+        None,
+    )
+    if event is None:
+        return True
+    series_ticker = event.get("series_ticker")
+    series_lookup = parent_lookups.get(("series", series_ticker))
+    return series_lookup is not None and series_lookup[0] != 200
 
 
 def refresh(

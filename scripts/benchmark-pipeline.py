@@ -333,6 +333,11 @@ def _freeze_legacy_acquisition(profile: str, scenario: str, capture: Any) -> boo
                         tasks.append(work)
                 state["tasks"] = tasks
                 state["task_scopes"] = {}
+            # New protocol-5 constructors seed historical-list checkpoint fields.
+            # Frozen protocol-2 comparisons must retain their original task shape.
+            for work in state["tasks"]:
+                for key in getattr(capture, "_CHECKPOINT_TASK_FIELDS", ()):
+                    work.pop(key, None)
             state.pop("acquisition_protocol", None)
             state.pop("rate_policy", None)
             state.pop("parent_policy", None)

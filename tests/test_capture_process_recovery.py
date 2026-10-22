@@ -228,7 +228,7 @@ def test_process_exit_capture_resumes_from_durable_evidence(
             "receipt": 0,
             "journal": 1,
             "apply": 1,
-            "snapshot": 7,
+            "snapshot": 8,
         }[boundary]
     )
     assert (root / "current.json").read_bytes() == pointer
@@ -261,7 +261,7 @@ def test_process_exit_capture_resumes_from_durable_evidence(
     assert json.loads(resumed.stdout)["complete"]
     requested = [json.loads(line) for line in request_log.read_bytes().splitlines()]
     counts = Counter(row["request_id"] for row in requested)
-    assert len(counts) == 7
+    assert len(counts) == 8
     assert all(counts[request_id] == 1 for request_id in usable_ids)
     assert {request_id for request_id, count in counts.items() if count > 1} == interrupted_ids
     assert all(
@@ -277,9 +277,9 @@ def test_process_exit_capture_resumes_from_durable_evidence(
     assert (root / "current.json").read_bytes() == pointer
     state = acquisition.complete_capture(Store(root), capture_id)
     pages = list(acquisition.capture_pages(Store(root), state))
-    assert len(pages) == 7
+    assert len(pages) == 8  # Includes the protocol-5 terminal cutoff checkpoint.
     page_ids = {manifest["page_id"] for manifest, _ in pages}
-    assert len(page_ids) == 7
+    assert len(page_ids) == 8
     for _, attempt in attempts:
         assert (attempt["page_id"] in page_ids) == attempt["accounting_complete"]
     assert len(list(observations(pages))) == 7

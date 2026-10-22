@@ -36,7 +36,7 @@ def _legacy_checkpoint(store, state):
 def test_native_full_catalogue_keeps_history_and_relationships(store, factory):
     state = acquisition.capture(store, client_factory=factory)
     assert state["complete"]
-    assert state["requests"] == 7
+    assert state["requests"] == 8
     projected = project_pages(acquisition.capture_pages(store, state))
     assert {m["market_ticker"] for m in projected["markets"]} == {
         "MARKET",
@@ -98,8 +98,8 @@ def test_new_capture_seals_gzip_and_downward_rate_policy_by_default(store):
     assert state["rate_policy"] == "decrease-on-429"
     assert acquisition._protocol5_policies(state) == {
         "rate_policy": "decrease-on-429",
-        "parent_policy": "singular-v1",
-        "cutoff_policy": "per-page-v1",
+        "parent_policy": "batched-v1",
+        "cutoff_policy": "checkpoint-v1",
     }
 
 
@@ -190,7 +190,8 @@ def test_budget_stop_resumes_without_publishing_incomplete(store, factory):
     resumed = acquisition.capture(store, resume=state["capture_id"], client_factory=factory)
     assert resumed["complete"]
     # The two receipts from the first run are applied from the journal, never reissued.
-    assert resumed["requests"] == 5
+    # The additional request is the protocol-5 terminal cutoff checkpoint.
+    assert resumed["requests"] == 6
 
 
 def test_budget_exhaustion_exits_three_with_incomplete_json(store, factory, monkeypatch, capsys):

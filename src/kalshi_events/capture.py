@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -36,7 +37,7 @@ from kalshi_events.common import (
     ticker,
     validate_series_scope,
 )
-from kalshi_events.normalize import ParentIndex, records
+from kalshi_events.normalize import ParentIndex, native_identity, records
 from kalshi_events.transport import MAX_CONCURRENT_REQUESTS, PublicClient, read_page, source_url
 
 EVENT_PAGE_LIMIT = 200
@@ -49,9 +50,21 @@ SCOPED_ACQUISITION_PROTOCOL = 4
 CURRENT_ACQUISITION_PROTOCOL = 5
 _PROTOCOL5_POLICIES = {
     "rate_policy": "fixed",
-    "parent_policy": "singular-v1",
-    "cutoff_policy": "per-page-v1",
+    "parent_policy": "batched-v1",
+    "cutoff_policy": "checkpoint-v1",
 }
+_LEGACY_PROTOCOL5_POLICIES = {
+    "parent_policy": {"singular-v1", "batched-v1"},
+    "cutoff_policy": {"per-page-v1", "checkpoint-v1"},
+}
+_CHECKPOINT_TASK_FIELDS = {
+    "cutoff_ordinal",
+    "cutoff_reason",
+    "pages_since_cutoff",
+    "last_cutoff_at",
+    "data_done",
+}
+_PARENT_BATCH_FIELDS = {"parent_batch", "batch_found"}
 MAX_SELECTION_BATCH = 100
 MAX_INITIAL_BATCH_URL_BYTES = 6144
 MAX_JOURNAL_RECORD_BYTES = 16 * 1024**2
@@ -88,6 +101,7 @@ class _CaptureState(dict[str, Any]):
         self.recent_page: tuple[str, dict[str, Any], Any] | None = None
         self.verified_journal_sha256: str | None = None
         self.verified_snapshot_sha256: str | None = None
+        self.cutoff_monotonic: dict[int, float] = {}
         self.task_identities = {_task_identity(work) for work in self.get("tasks", [])}
 
 
@@ -113,6 +127,51 @@ def task(
         # Historical reads are preceded by a fresh cutoff read recorded as its own receipt.
         "cutoff_due": _historical(endpoint),
     }
+
+
+def _protocol_task(
+    state: dict[str, Any],
+    endpoint: str,
+    kind: str | None,
+    *,
+    singular: bool = False,
+    params: dict[str, Any] | None = None,
+    requested: str | None = None,
+    parent_batch: str | None = None,
+) -> dict[str, Any]:
+    """Create a task with only the fields enabled by its sealed protocol-5 policies."""
+    work = task(endpoint, kind, singular=singular, params=params, requested=requested)
+    if (
+        _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
+        and state.get("cutoff_policy") == "checkpoint-v1"
+        and _historical(endpoint)
+        and not singular
+    ):
+        initial_cutoff = _historical(endpoint) and not singular
+        work.update(
+            cutoff_ordinal=1 if initial_cutoff else 0,
+            cutoff_reason="start" if initial_cutoff else None,
+            pages_since_cutoff=0,
+            last_cutoff_at=None,
+            data_done=False,
+        )
+    if parent_batch is not None:
+        work.update(parent_batch=parent_batch, batch_found=[])
+    return work
+
+
+def _checkpoint_policy(state: dict[str, Any]) -> bool:
+    return (
+        _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
+        and state.get("cutoff_policy") == "checkpoint-v1"
+    )
+
+
+def _batched_parent_policy(state: dict[str, Any]) -> bool:
+    return (
+        _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
+        and state.get("parent_policy") == "batched-v1"
+    )
 
 
 def _historical(endpoint: str) -> bool:
@@ -319,9 +378,8 @@ def _protocol5_policies(state: dict[str, Any]) -> dict[str, str]:
         not isinstance(values["rate_policy"], str)
         or values["rate_policy"] not in {"fixed", "decrease-on-429"}
         or any(
-            value != _PROTOCOL5_POLICIES[key]
-            for key, value in values.items()
-            if key != "rate_policy"
+            not isinstance(values[key], str) or values[key] not in allowed
+            for key, allowed in _LEGACY_PROTOCOL5_POLICIES.items()
         )
     ):
         raise CatalogueError("unsupported protocol 5 acquisition policy")
@@ -401,6 +459,27 @@ def _validate_series_task_plan(state: dict[str, Any]) -> None:
     for work in tasks[len(expected) :]:
         endpoint = work.get("endpoint", "")
         prefix = "/events/"
+        if work.get("parent_batch") is not None:
+            params = work.get("params", {})
+            values = params.get("tickers", "").split(",") if isinstance(params, dict) else []
+            if (
+                not _batched_parent_policy(state)
+                or work.get("parent_batch") != "ordinary"
+                or endpoint != "/events"
+                or work.get("kind") != "events"
+                or work.get("singular")
+                or params.get("limit") != EVENT_PAGE_LIMIT
+                or params.get("with_nested_markets") != "false"
+                or not values
+                or len(values) > MAX_SELECTION_BATCH
+                or len(values) != len(set(values))
+                or work.get("requested") is not None
+                or work.get("cutoff_due")
+            ):
+                raise CatalogueError("scoped capture contains an invalid event parent batch")
+            for value in values:
+                ticker(value)
+            continue
         if (
             work.get("kind") != "events"
             or not work.get("singular")
@@ -463,7 +542,9 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
     batch_values: list[str] = []
     has_batches = False
     for work in state["tasks"]:
-        if not isinstance(work, dict) or set(work) != {
+        if not isinstance(work, dict) or not isinstance(work.get("endpoint"), str):
+            raise CatalogueError("invalid journal traversal state")
+        expected_task_fields = {
             "endpoint",
             "kind",
             "singular",
@@ -474,7 +555,16 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             "done",
             "pending",
             "cutoff_due",
-        }:
+        }
+        if (
+            _checkpoint_policy(state)
+            and _historical(work.get("endpoint", ""))
+            and not work.get("singular")
+        ):
+            expected_task_fields |= _CHECKPOINT_TASK_FIELDS
+        if not expected_task_fields.issubset(work) or not set(work).issubset(
+            expected_task_fields | _PARENT_BATCH_FIELDS
+        ):
             raise CatalogueError("invalid journal traversal state")
         if (
             not isinstance(work.get("endpoint"), str)
@@ -494,6 +584,80 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             or not isinstance(work.get("cutoff_due"), bool)
         ):
             raise CatalogueError("invalid journal traversal state")
+        has_checkpoint = (
+            _checkpoint_policy(state) and _historical(work["endpoint"]) and not work["singular"]
+        )
+        if has_checkpoint and (
+            isinstance(work.get("cutoff_ordinal"), bool)
+            or not isinstance(work.get("cutoff_ordinal"), int)
+            or work["cutoff_ordinal"] < 0
+            or work.get("cutoff_reason")
+            not in {None, "start", "resume", "cursor-reset", "pages", "interval", "terminal"}
+            or isinstance(work.get("pages_since_cutoff"), bool)
+            or not isinstance(work.get("pages_since_cutoff"), int)
+            or work["pages_since_cutoff"] < 0
+            or (
+                work.get("last_cutoff_at") is not None
+                and not isinstance(work["last_cutoff_at"], str)
+            )
+            or not isinstance(work.get("data_done"), bool)
+        ):
+            raise CatalogueError("invalid historical cutoff checkpoint state")
+        if has_checkpoint and (
+            (
+                work["cutoff_reason"] is not None
+                and (not work["cutoff_due"] or work["cutoff_ordinal"] < 1)
+            )
+            or (
+                _historical(work["endpoint"])
+                and not work["singular"]
+                and work["cutoff_due"]
+                and work["cutoff_reason"] is None
+            )
+            or (work["data_done"] and not (work["done"] or work["cutoff_due"]))
+        ):
+            raise CatalogueError("contradictory historical cutoff checkpoint state")
+        if "parent_batch" in work and (
+            not _batched_parent_policy(state)
+            or work.get("parent_batch") not in {"ordinary", "multivariate"}
+            or not isinstance(work.get("batch_found"), list)
+            or any(not isinstance(value, str) for value in work["batch_found"])
+            or len(work["batch_found"]) > MAX_SELECTION_BATCH
+            or len(work["batch_found"]) != len(set(work["batch_found"]))
+        ):
+            raise CatalogueError("invalid parent batch traversal state")
+        if ("parent_batch" in work) != ("batch_found" in work):
+            raise CatalogueError("incomplete parent batch traversal state")
+        if "parent_batch" in work:
+            endpoint = "/events" if work["parent_batch"] == "ordinary" else "/events/multivariate"
+            params = work.get("params")
+            if (
+                work.get("endpoint") != endpoint
+                or work.get("kind") != "events"
+                or work.get("singular") is not False
+                or work.get("requested") is not None
+                or not isinstance(params, dict)
+                or set(params) != {"tickers", "limit", "with_nested_markets"}
+                or params.get("limit") != EVENT_PAGE_LIMIT
+                or params.get("with_nested_markets") != "false"
+                or not isinstance(params.get("tickers"), str)
+            ):
+                raise CatalogueError("invalid parent batch request")
+            selected_events = params["tickers"].split(",")
+            if (
+                not selected_events
+                or len(selected_events) < 20
+                or len(selected_events) > MAX_SELECTION_BATCH
+                or len(selected_events) != len(set(selected_events))
+                or _event_batch_url_size(
+                    selected_events, multivariate=work["parent_batch"] == "multivariate"
+                )
+                > MAX_INITIAL_BATCH_URL_BYTES
+                or any(value not in selected_events for value in work["batch_found"])
+            ):
+                raise CatalogueError("invalid parent batch selection")
+            for value in selected_events:
+                ticker(value)
         batch = _batch_tickers(work)
         if batch is not None:
             has_batches = True
@@ -589,7 +753,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         singular_series = _is_scoped_capture(state) and scope == "series" and work["singular"]
         if not expected or (work["singular"] and not singular_series):
             raise CatalogueError("reconciliation scope does not match its traversal")
-        if _batch_tickers(work) is not None:
+        if _batch_tickers(work) is not None or work.get("parent_batch") is not None:
             raise CatalogueError("selected market batches cannot define a reconciliation scope")
     return state
 
@@ -658,6 +822,17 @@ def _validate_control_transition(
         if candidate.get("complete") is not False or candidate.get("error") is not None:
             raise CatalogueError("invalid error-clear control")
         return
+    if kind == "cutoff_schedule":
+        if candidate.get("complete") is not False or not _checkpoint_policy(candidate):
+            raise CatalogueError("invalid cutoff scheduling control")
+        scheduled = [
+            work
+            for work in candidate["tasks"]
+            if work.get("cutoff_due") and work.get("cutoff_reason") in {"resume", "interval"}
+        ]
+        if not scheduled:
+            raise CatalogueError("invalid cutoff scheduling transition")
+        return
     raise CatalogueError("unknown journal control transition")
 
 
@@ -685,21 +860,29 @@ def _apply_control_record(
             raise CatalogueError("hydration control exceeds its bounded delta")
         identities: set[str] = set()
         for work in additions:
+            expected_fields = {
+                "endpoint",
+                "kind",
+                "singular",
+                "params",
+                "requested",
+                "cursor",
+                "restarts",
+                "done",
+                "pending",
+                "cutoff_due",
+            }
+            if (
+                _checkpoint_policy(genesis)
+                and isinstance(work, dict)
+                and _historical(work.get("endpoint", ""))
+                and not work.get("singular")
+            ):
+                expected_fields |= _CHECKPOINT_TASK_FIELDS
             if (
                 not isinstance(work, dict)
-                or set(work)
-                != {
-                    "endpoint",
-                    "kind",
-                    "singular",
-                    "params",
-                    "requested",
-                    "cursor",
-                    "restarts",
-                    "done",
-                    "pending",
-                    "cutoff_due",
-                }
+                or not expected_fields.issubset(work)
+                or not set(work).issubset(expected_fields | _PARENT_BATCH_FIELDS)
                 or not isinstance(work.get("endpoint"), str)
                 or not isinstance(work.get("params"), dict)
                 or not isinstance(work.get("singular"), bool)
@@ -710,6 +893,20 @@ def _apply_control_record(
             ):
                 raise CatalogueError("invalid hydration task")
             endpoint = work["endpoint"]
+            if "parent_batch" in work:
+                _validate_logical_state(
+                    {
+                        **genesis,
+                        "tasks": [*genesis["tasks"], work],
+                        "task_scopes": genesis.get("task_scopes", {}),
+                    },
+                    genesis["capture_id"],
+                )
+                identity = _task_identity(work)
+                if identity in known_tasks or identity in identities:
+                    raise CatalogueError("hydration control duplicates a traversal")
+                identities.add(identity)
+                continue
             identity = _task_identity(work)
             expected_prefix = "/events/" if work.get("kind") == "events" else "/series/"
             expected_params = (
@@ -776,6 +973,42 @@ def _apply_control_record(
             state.update(candidate)
         elif not isinstance(payload.get("state_sha256"), str):
             raise CatalogueError("invalid completion state checksum")
+        return
+    if kind == "cutoff_schedule":
+        if set(payload) != {"kind", "index", "reason", "ordinal", "state_sha256"}:
+            raise CatalogueError("invalid cutoff scheduling control fields")
+        index = payload.get("index")
+        reason = payload.get("reason")
+        ordinal = payload.get("ordinal")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(state["tasks"])
+            or reason not in {"resume", "interval"}
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+        ):
+            raise CatalogueError("invalid cutoff scheduling control")
+        if replay:
+            with metrics.phase("control_state_copy"):
+                candidate = copy.deepcopy(state)
+            work = candidate["tasks"][index]
+            if (
+                not _historical(work["endpoint"])
+                or work["singular"]
+                or work["done"]
+                or work["cutoff_due"]
+                or work["cutoff_ordinal"] + 1 != ordinal
+            ):
+                raise CatalogueError("cutoff scheduling does not follow task state")
+            work.update(cutoff_due=True, cutoff_reason=reason, cutoff_ordinal=ordinal)
+            _validate_control_transition(genesis, candidate, kind, known_tasks)
+            if payload.get("state_sha256") != _state_digest(candidate, seen):
+                raise CatalogueError("cutoff scheduling state checksum mismatch")
+            state.clear()
+            state.update(candidate)
+        elif not _is_sha256(payload.get("state_sha256")):
+            raise CatalogueError("invalid cutoff scheduling checksum")
         return
     if kind in {"stop", "clear_error"}:
         expected = (
@@ -1038,7 +1271,7 @@ def _read_v2(
                 raise CatalogueError("journal contains a duplicate page receipt")
             seen_request_ids.add(request_id)
             seen_relatives.add(relative)
-            row = {"index": index, "relative": relative}
+            row = {"index": index, "relative": relative, "request_id": request_id}
             page_rows.append(row)
             if envelope is None or record["seq"] > anchor_key[0]:
                 manifest, page_payload = _replay_page(
@@ -1177,12 +1410,25 @@ def _derive_page_change(
         "coverage": {},
         "tasks": [],
         "cutoff": None,
+        "cursor_reset": False,
+        "cutoff_checkpoint": False,
     }
     if _phase(work) == "cutoff":
         if manifest.get("status") != 200:
             raise CatalogueError("historical cutoff receipt is invalid")
         change["cutoff"] = _validated_cutoff(payload)
-        updated["cutoff_due"] = False
+        if _checkpoint_policy(state) and _historical(work["endpoint"]) and not work["singular"]:
+            updated.update(
+                cutoff_due=False,
+                cutoff_reason=None,
+                pages_since_cutoff=0,
+                last_cutoff_at=manifest.get("received_at"),
+            )
+            if updated.get("data_done"):
+                updated["done"] = True
+            change["cutoff_checkpoint"] = True
+        else:
+            updated["cutoff_due"] = False
         return change
 
     status = manifest["status"]
@@ -1197,6 +1443,16 @@ def _derive_page_change(
         batch = _batch_tickers(work)
         if batch is not None:
             change["coverage_remove"] = tuple(batch)
+        if work.get("parent_batch") is not None:
+            updated["batch_found"] = []
+        if _checkpoint_policy(state) and _historical(work["endpoint"]) and not work["singular"]:
+            updated.update(
+                cutoff_due=True,
+                cutoff_reason="cursor-reset",
+                cutoff_ordinal=work["cutoff_ordinal"] + 1,
+                pages_since_cutoff=0,
+            )
+            change["cursor_reset"] = True
     elif status == 404 and work["singular"] and work["kind"] in {"markets", "events", "series"}:
         updated["done"] = True
         if work["kind"] == "markets" and work["requested"]:
@@ -1228,6 +1484,22 @@ def _derive_page_change(
             "markets": "market" if work["singular"] else "markets",
         }[work["kind"]]
         rows = records(payload, envelope, singular=work["singular"])
+        parent_batch = work.get("parent_batch")
+        parent_batch_values = (
+            work["params"].get("tickers", "").split(",") if parent_batch is not None else None
+        )
+        if parent_batch_values is not None:
+            allowed_parents = set(parent_batch_values)
+            for row in rows:
+                identity, parent_series = native_identity("events", row)
+                if identity not in allowed_parents:
+                    raise CatalogueError("event parent batch returned an unrequested ticker")
+                if parent_batch == "ordinary" and (
+                    row.get("mve_collection_ticker") or row.get("mve_selected_legs")
+                ):
+                    raise CatalogueError("ordinary event parent batch returned a combo event")
+                if _is_scoped_capture(state) and parent_series != state["scope"]["series_ticker"]:
+                    raise CatalogueError("event parent batch returned an out-of-scope series")
         batch = _batch_tickers(work)
         batch_found: set[str] = set()
         if batch is not None:
@@ -1257,6 +1529,49 @@ def _derive_page_change(
             change["seen_touch"] = True
             updated["cursor"] = cursor
             updated["done"] = not cursor
+        if parent_batch_values is not None:
+            found = set(work.get("batch_found", [])) | {
+                ticker(row.get("event_ticker")) for row in rows
+            }
+            updated["batch_found"] = sorted(found)
+            if updated["done"]:
+                requested = set(parent_batch_values)
+                missing = requested - found
+                if parent_batch == "ordinary":
+                    multivariate = multivariate_parent_plan(state, missing)
+                    change["tasks"].extend(multivariate)
+                    scheduled = {
+                        value
+                        for addition in multivariate
+                        if addition.get("parent_batch") == "multivariate"
+                        for value in addition["params"]["tickers"].split(",")
+                    }
+                    scheduled.update(
+                        addition["endpoint"].rsplit("/", 1)[-1]
+                        for addition in multivariate
+                        if addition.get("singular") and addition["endpoint"].startswith("/events/")
+                    )
+                    for value in sorted(missing - scheduled):
+                        change["tasks"].append(
+                            _protocol_task(
+                                state,
+                                f"/events/{value}",
+                                "events",
+                                singular=True,
+                                params={"exclude_markets": "true"},
+                            )
+                        )
+                else:
+                    for value in sorted(missing):
+                        change["tasks"].append(
+                            _protocol_task(
+                                state,
+                                f"/events/{value}",
+                                "events",
+                                singular=True,
+                                params={"exclude_markets": "true"},
+                            )
+                        )
         if work["kind"] == "markets" and work["requested"]:
             change["coverage"][work["requested"]] = {
                 "market_ticker": work["requested"],
@@ -1286,7 +1601,38 @@ def _derive_page_change(
                     if identity not in identities and identity not in added_identities:
                         change["tasks"].append(lookup)
                         added_identities.add(identity)
-    updated["cutoff_due"] = _historical(work["endpoint"]) and not updated["done"]
+    if change["cursor_reset"]:
+        pass
+    elif _checkpoint_policy(state) and _historical(work["endpoint"]) and not work["singular"]:
+        if updated.get("data_done"):
+            updated["done"] = True
+            updated["cutoff_due"] = False
+            updated["cutoff_reason"] = None
+        else:
+            pages = work["pages_since_cutoff"] + 1
+            updated["pages_since_cutoff"] = pages
+            if updated["done"]:
+                updated.update(
+                    data_done=True,
+                    done=False,
+                    cutoff_due=True,
+                    cutoff_reason="terminal",
+                    cutoff_ordinal=work["cutoff_ordinal"] + 1,
+                )
+            elif pages >= 100:
+                updated.update(
+                    cutoff_due=True,
+                    cutoff_reason="pages",
+                    cutoff_ordinal=work["cutoff_ordinal"] + 1,
+                    pages_since_cutoff=0,
+                )
+            else:
+                updated["cutoff_due"] = False
+                updated["cutoff_reason"] = None
+    elif _checkpoint_policy(state) and _phase(work) == "cutoff":
+        updated["cutoff_due"] = _historical(work["endpoint"])
+    else:
+        updated["cutoff_due"] = _historical(work["endpoint"]) and not updated["done"]
     return change
 
 
@@ -1307,11 +1653,16 @@ def _apply_page_change(
     state["coverage"].update(change["coverage"])
     if change["cutoff"] is not None:
         state["cutoff"] = change["cutoff"]
+    if change.get("cutoff_checkpoint") and isinstance(state, _CaptureState):
+        state.cutoff_monotonic[index] = time.monotonic()
     if change["tasks"]:
         identities = _task_identity_set(state)
         for addition in change["tasks"]:
+            identity = _task_identity(addition)
+            if identity in identities:
+                continue
             state["tasks"].append(addition)
-            identities.add(_task_identity(addition))
+            identities.add(identity)
 
 
 def _validated_cutoff(payload: Any) -> dict[str, Any]:
@@ -1494,6 +1845,31 @@ def _commit_control_delta(store: Store, state: _CaptureState, delta: dict[str, A
         if not candidate.get("error"):
             raise CatalogueError("cannot clear a capture without a recorded error")
         candidate["error"] = None
+    elif kind == "cutoff_schedule":
+        index = delta.get("index")
+        reason = delta.get("reason")
+        ordinal = delta.get("ordinal")
+        if (
+            set(delta) != {"kind", "index", "reason", "ordinal"}
+            or isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(candidate["tasks"])
+            or reason not in {"resume", "interval"}
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+        ):
+            raise CatalogueError("invalid cutoff scheduling delta")
+        work = candidate["tasks"][index]
+        if (
+            not _checkpoint_policy(candidate)
+            or not _historical(work["endpoint"])
+            or work["singular"]
+            or work["done"]
+            or work["cutoff_due"]
+            or work["cutoff_ordinal"] + 1 != ordinal
+        ):
+            raise CatalogueError("cutoff scheduling does not follow task state")
+        work.update(cutoff_due=True, cutoff_reason=reason, cutoff_ordinal=ordinal)
     else:
         raise CatalogueError("unsupported journal control")
     known = {_task_identity(work): work for work in state["tasks"]}
@@ -1503,11 +1879,17 @@ def _commit_control_delta(store: Store, state: _CaptureState, delta: dict[str, A
         "state_sha256": _state_digest(candidate, state.seen_cursors),
     }
     _append_v2_record(store, state, "control", payload)
-    state.clear()
-    state.update(candidate)
-    if kind == "hydrate":
-        _track_added_task_identities(state, delta["tasks"])
-    _after_transition(store, state)
+    try:
+        state.clear()
+        state.update(candidate)
+        if kind == "hydrate":
+            _track_added_task_identities(state, delta["tasks"])
+        _after_transition(store, state)
+    except BaseException:
+        # A durable control record may have been applied only partially. Recovery
+        # must replay it before another transition can be appended.
+        state.journal_uncertain = True
+        raise
 
 
 def _commit_page_v2(
@@ -1553,7 +1935,7 @@ def _commit_page_v2_measured(
             _apply_page_change(state, state.seen_cursors, index, change)
             with metrics.phase("parent_index_merge"):
                 _merge_parent_index(identities, page_index)
-            state.page_rows.append({"index": index, "relative": relative})
+            state.page_rows.append({"index": index, "relative": relative, "request_id": request_id})
             state.processed.add(relative)
             state.request_ids.add(request_id)
             identities.processed.add(relative)
@@ -1573,6 +1955,13 @@ def _merge_parent_index(target: ParentIndex, source: ParentIndex) -> None:
         for identity, winner in getattr(source, name).items():
             ParentIndex._put(existing, identity, winner)
     target.parent_lookups.update(source.parent_lookups)
+    for key, candidates in source.parent_batch_candidates.items():
+        existing_candidates = target.parent_batch_candidates.setdefault(key, {})
+        for identity, candidate in candidates.items():
+            previous = existing_candidates.get(identity)
+            if previous is None or candidate[0][:2] > previous[0][:2]:
+                existing_candidates[identity] = candidate
+    target.parent_batch_terminal.update(source.parent_batch_terminal)
     for scope, generations in source.scope_membership.items():
         target_generations = target.scope_membership.setdefault(scope, {})
         for generation, identities in generations.items():
@@ -1598,7 +1987,120 @@ def capture_pages(
             raise CatalogueError("raw evidence belongs to another capture")
         if not _receipt_matches_state_protocol(manifest, state):
             raise CatalogueError("raw receipt protocol differs from its capture")
+        if _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL and (
+            _batched_parent_policy(state) or _checkpoint_policy(state)
+        ):
+            _validate_receipt_task_binding(manifest, state, row)
         yield manifest, payload
+
+
+def _validate_receipt_task_binding(
+    manifest: dict[str, Any], state: dict[str, Any], row: dict[str, Any]
+) -> None:
+    """Rebind protocol-5 receipt context to its sealed task when rereading evidence."""
+    index = row.get("index")
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(state["tasks"])
+    ):
+        raise CatalogueError("raw receipt references an invalid capture task")
+    work = state["tasks"][index]
+    if manifest.get("capture_id") != state["capture_id"]:
+        raise CatalogueError("raw receipt belongs to another capture")
+    if (
+        isinstance(manifest.get("task_index"), bool)
+        or not isinstance(manifest.get("task_index"), int)
+        or manifest.get("task_index") != index
+    ):
+        raise CatalogueError("raw receipt task index differs from its journal entry")
+    if manifest.get("request_id") != row.get("request_id"):
+        raise CatalogueError("raw receipt request ID differs from its journal entry")
+
+    phase = manifest.get("phase")
+    if phase not in {"page", "cutoff"}:
+        raise CatalogueError("raw receipt has an invalid task phase")
+    checkpoint_task = (
+        _checkpoint_policy(state) and _historical(work["endpoint"]) and not work["singular"]
+    )
+    if phase == "cutoff" and not checkpoint_task and not _historical(work["endpoint"]):
+        raise CatalogueError("raw cutoff receipt does not match a historical task")
+
+    # Reconstruct the request's cursor and generation from immutable receipt context.
+    # This verifies the request ID against the task identity even after the live task
+    # has advanced to a later cursor or pagination generation.
+    candidate = dict(state)
+    request_work = dict(work)
+    params = manifest.get("params")
+    if not isinstance(params, dict):
+        raise CatalogueError("raw receipt request parameters are malformed")
+    if phase == "page":
+        if manifest.get("endpoint") != work["endpoint"]:
+            raise CatalogueError("raw receipt endpoint differs from its task")
+        expected_params = dict(work["params"])
+        cursor = manifest.get("request_cursor", params.get("cursor", ""))
+        if not isinstance(cursor, str):
+            raise CatalogueError("raw receipt cursor is malformed")
+        if cursor != params.get("cursor", ""):
+            raise CatalogueError("raw receipt cursor context differs from its parameters")
+        if cursor:
+            expected_params["cursor"] = cursor
+        elif "cursor" in params:
+            raise CatalogueError("raw receipt has an empty cursor parameter")
+        if params != expected_params:
+            raise CatalogueError("raw receipt parameters differ from its task")
+        request_work["cursor"] = cursor
+        request_work["cutoff_due"] = False
+    else:
+        if manifest.get("endpoint") != CUTOFF_ENDPOINT or params:
+            raise CatalogueError("raw cutoff receipt request differs from its task")
+        request_work["cutoff_due"] = True
+        cursor = manifest.get("request_cursor", work["cursor"])
+        if not isinstance(cursor, str):
+            raise CatalogueError("raw cutoff receipt cursor context is malformed")
+        request_work["cursor"] = cursor
+
+    generation = manifest.get("request_generation", manifest.get("task_generation"))
+    generations = [work.get("restarts", 0)]
+    if generation is not None:
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise CatalogueError("raw receipt generation is malformed")
+        if generation > work.get("restarts", 0):
+            raise CatalogueError("raw receipt generation exceeds the task history")
+        request_work["restarts"] = generation
+    if "task_generation" in manifest and manifest.get("task_generation") != generation:
+        raise CatalogueError("raw receipt generation context is contradictory")
+    elif work.get("restarts", 0):
+        generations = list(range(work["restarts"] + 1))
+    if checkpoint_task:
+        ordinal = manifest.get("cutoff_ordinal")
+        reason = manifest.get("cutoff_reason")
+        if phase == "cutoff":
+            if (
+                isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal < 1
+                or ordinal > work["cutoff_ordinal"]
+                or reason
+                not in {"start", "resume", "cursor-reset", "pages", "interval", "terminal"}
+            ):
+                raise CatalogueError("raw cutoff receipt checkpoint differs from task history")
+            request_work["cutoff_ordinal"] = ordinal
+            request_work["cutoff_reason"] = reason
+        else:
+            request_work["cutoff_due"] = False
+    for attempt_generation in generations:
+        request_work["restarts"] = attempt_generation
+        expected = _request_context_for_task(candidate, index, request_work)
+        if (
+            manifest.get("request_id") == expected["request_id"]
+            and manifest.get("entity_kind") == expected["entity_kind"]
+            and manifest.get("singular") is expected["singular"]
+            and manifest.get("phase") == expected["phase"]
+            and _receipt_matches_context(manifest, expected)
+        ):
+            return
+    raise CatalogueError("raw receipt context is not bound to its capture task")
 
 
 def _selected_market_batches(values: list[str]) -> list[list[str]]:
@@ -1621,6 +2123,145 @@ def _selected_market_batches(values: list[str]) -> list[list[str]]:
     if current:
         batches.append(current)
     return batches
+
+
+def _event_batch_url_size(values: list[str], *, multivariate: bool) -> int:
+    endpoint = "/events/multivariate" if multivariate else "/events"
+    params = {
+        "tickers": ",".join(values),
+        "limit": EVENT_PAGE_LIMIT,
+        "with_nested_markets": "false",
+    }
+    return len(
+        str(httpx.Request("GET", source_url() + endpoint, params=params).url).encode("ascii")
+    )
+
+
+def _event_parent_batches(values: set[str] | list[str], *, multivariate: bool) -> list[list[str]]:
+    """Partition deterministically; small or URL-constrained groups use singular lookups."""
+    ordered = sorted({ticker(value) for value in values})
+    groups: list[list[str]] = []
+    current: list[str] = []
+    for value in ordered:
+        candidate = [*current, value]
+        if (
+            len(candidate) > MAX_SELECTION_BATCH
+            or _event_batch_url_size(candidate, multivariate=multivariate)
+            > MAX_INITIAL_BATCH_URL_BYTES
+        ):
+            if len(current) >= 20:
+                groups.append(current)
+            else:
+                groups.extend([[item] for item in current])
+            current = [value]
+            if (
+                _event_batch_url_size(current, multivariate=multivariate)
+                > MAX_INITIAL_BATCH_URL_BYTES
+            ):
+                raise CatalogueError("event ticker exceeds the initial parent batch URL limit")
+        else:
+            current = candidate
+    if len(current) >= 20:
+        groups.append(current)
+    else:
+        groups.extend([[item] for item in current])
+    return groups
+
+
+def parent_lookup_plan(
+    state: dict[str, Any], event_tickers: set[str] | list[str], series_tickers: set[str] | list[str]
+) -> list[dict[str, Any]]:
+    """Create deterministic parent requests for full and incremental hydration."""
+    result: list[dict[str, Any]] = []
+    batched = _batched_parent_policy(state)
+    for values, endpoint, kind in (
+        (event_tickers, "/events", "events"),
+        (series_tickers, "/series", "series"),
+    ):
+        if kind == "events" and batched and len(values) >= 20:
+            for group in _event_parent_batches(values, multivariate=False):
+                if len(group) >= 20:
+                    result.append(
+                        _protocol_task(
+                            state,
+                            endpoint,
+                            kind,
+                            params={
+                                "tickers": ",".join(group),
+                                "limit": EVENT_PAGE_LIMIT,
+                                "with_nested_markets": "false",
+                            },
+                            parent_batch="ordinary",
+                        )
+                    )
+                else:
+                    result.append(
+                        _protocol_task(
+                            state,
+                            f"{endpoint}/{ticker(group[0])}",
+                            kind,
+                            singular=True,
+                            params={"exclude_markets": "true"},
+                        )
+                    )
+        else:
+            for identity in sorted(values):
+                params = (
+                    {"exclude_markets": "true"}
+                    if kind == "events"
+                    and _acquisition_protocol(state)
+                    in {
+                        ACQUISITION_PROTOCOL,
+                        SCOPED_ACQUISITION_PROTOCOL,
+                        CURRENT_ACQUISITION_PROTOCOL,
+                    }
+                    else None
+                )
+                result.append(
+                    _protocol_task(
+                        state,
+                        f"{endpoint}/{ticker(identity)}",
+                        kind,
+                        singular=True,
+                        params=params,
+                    )
+                )
+    return result
+
+
+def multivariate_parent_plan(
+    state: dict[str, Any], event_tickers: set[str] | list[str]
+) -> list[dict[str, Any]]:
+    if not _batched_parent_policy(state) or _is_scoped_capture(state):
+        return []
+    result = []
+    for group in _event_parent_batches(event_tickers, multivariate=True):
+        if len(group) >= 20:
+            result.append(
+                _protocol_task(
+                    state,
+                    "/events/multivariate",
+                    "events",
+                    params={
+                        "tickers": ",".join(group),
+                        "limit": EVENT_PAGE_LIMIT,
+                        "with_nested_markets": "false",
+                    },
+                    parent_batch="multivariate",
+                )
+            )
+        else:
+            result.extend(
+                _protocol_task(
+                    state,
+                    f"/events/{ticker(identity)}",
+                    "events",
+                    singular=True,
+                    params={"exclude_markets": "true"},
+                )
+                for identity in group
+            )
+    return result
 
 
 def new_capture(
@@ -1752,6 +2393,17 @@ def new_capture(
         policies = {**_PROTOCOL5_POLICIES, "rate_policy": rate_policy}
         state.update(policies)
         state["acquisition_policy_sha256"] = digest(json_bytes(policies))
+        state["tasks"] = [
+            _protocol_task(
+                state,
+                item["endpoint"],
+                item["kind"],
+                singular=item["singular"],
+                params=item["params"],
+                requested=item["requested"],
+            )
+            for item in work
+        ]
     if scope is not None:
         state.update(scope=scope, root_id=logical_root_id)
     if pin is not None:
@@ -1763,6 +2415,25 @@ def _phase(work: dict[str, Any]) -> str:
     return "cutoff" if work["cutoff_due"] else "page"
 
 
+def _schedule_cutoff(store: Store, state: _CaptureState, index: int, reason: str) -> None:
+    work = state["tasks"][index]
+    _commit_control_delta(
+        store,
+        state,
+        {
+            "kind": "cutoff_schedule",
+            "index": index,
+            "reason": reason,
+            "ordinal": work["cutoff_ordinal"] + 1,
+        },
+    )
+
+
+def _interval_cutoff_due(state: _CaptureState, index: int) -> bool:
+    anchor = state.cutoff_monotonic.get(index)
+    return anchor is not None and time.monotonic() - anchor >= 300
+
+
 def _plan(work: dict[str, Any], phase: str) -> tuple[str, dict[str, Any], str | None, bool]:
     if phase == "cutoff":
         return CUTOFF_ENDPOINT, {}, None, True
@@ -1771,11 +2442,23 @@ def _plan(work: dict[str, Any], phase: str) -> tuple[str, dict[str, Any], str | 
 
 
 def _request_context(state: dict[str, Any], index: int) -> dict[str, Any]:
-    work = state["tasks"][index]
+    return _request_context_for_task(state, index, state["tasks"][index])
+
+
+def _request_context_for_task(
+    state: dict[str, Any], index: int, work: dict[str, Any]
+) -> dict[str, Any]:
     phase = _phase(work)
     _, _, kind, singular = _plan(work, phase)
     protocol = _acquisition_protocol(state)
     request_key = [state["capture_id"], index, phase, work["cursor"], work["restarts"]]
+    if work.get("parent_batch") is not None:
+        request_key.extend([work["parent_batch"], _task_identity(work), work["params"]["tickers"]])
+    checkpoint_task = (
+        _checkpoint_policy(state) and _historical(work["endpoint"]) and not work["singular"]
+    )
+    if phase == "cutoff" and checkpoint_task:
+        request_key.extend([work["cutoff_reason"], work["cutoff_ordinal"]])
     if _is_scoped_capture(state):
         request_key.append(validate_series_scope(state["scope"]))
     if protocol == CURRENT_ACQUISITION_PROTOCOL:
@@ -1804,10 +2487,51 @@ def _request_context(state: dict[str, Any], index: int) -> dict[str, Any]:
     scope = state.get("task_scopes", {}).get(str(index))
     if scope is not None:
         context.update(task_scope=scope, task_generation=work["restarts"])
+    if work.get("parent_batch") is not None:
+        context.update(
+            parent_batch=work["parent_batch"],
+            parent_batch_id=_task_identity(work),
+            parent_batch_tickers=work["params"]["tickers"],
+            task_generation=work["restarts"],
+        )
+    if protocol == CURRENT_ACQUISITION_PROTOCOL and (
+        work.get("parent_batch") is not None or checkpoint_task
+    ):
+        # These immutable request inputs let later readers bind receipts to the
+        # sealed task even when a snapshot skips replay of the journal prefix.
+        context.update(request_cursor=work["cursor"], request_generation=work["restarts"])
+    if phase == "cutoff" and checkpoint_task:
+        context.update(
+            cutoff_reason=work["cutoff_reason"],
+            cutoff_ordinal=work["cutoff_ordinal"],
+        )
     return context
 
 
 def _receipt_matches_context(manifest: dict[str, Any], context: dict[str, Any]) -> bool:
+    for key in (
+        "parent_batch",
+        "parent_batch_id",
+        "parent_batch_tickers",
+        "task_scope",
+        "task_generation",
+        "request_generation",
+        "request_cursor",
+        "cutoff_reason",
+        "cutoff_ordinal",
+    ):
+        if key in {"task_generation", "request_generation", "cutoff_ordinal"}:
+            for source in (manifest, context):
+                if key in source and (
+                    isinstance(source[key], bool) or not isinstance(source[key], int)
+                ):
+                    return False
+        if key == "request_cursor" and key in manifest and not isinstance(manifest[key], str):
+            return False
+        if (key in manifest) != (key in context) or (
+            key in context and manifest.get(key) != context[key]
+        ):
+            return False
     if ("acquisition_protocol" in manifest) != ("acquisition_protocol" in context):
         return False
     if "acquisition_protocol" not in context:
@@ -1839,6 +2563,19 @@ def _receipt_matches_context(manifest: dict[str, Any], context: dict[str, Any]) 
 
 def _receipt_matches_state_protocol(manifest: dict[str, Any], state: dict[str, Any]) -> bool:
     protocol = _acquisition_protocol(state)
+    if any(
+        key in manifest for key in ("parent_batch", "parent_batch_id", "parent_batch_tickers")
+    ) and not _batched_parent_policy(state):
+        return False
+    if ("cutoff_reason" in manifest or "cutoff_ordinal" in manifest) and (
+        not _checkpoint_policy(state) or manifest.get("phase") != "cutoff"
+    ):
+        return False
+    if ("request_cursor" in manifest or "request_generation" in manifest) and not (
+        protocol == CURRENT_ACQUISITION_PROTOCOL
+        and (_batched_parent_policy(state) or _checkpoint_policy(state))
+    ):
+        return False
     if protocol == 2:
         return "acquisition_protocol" not in manifest
     value = manifest.get("acquisition_protocol")
@@ -1994,10 +2731,10 @@ def _hydrate(store: Store, state: dict[str, Any], identities: ParentIndex) -> bo
 
 
 def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
-    events = {identity: value[2] for identity, value in identities.events.items()}
+    effective_events, effective_lookups = identities.effective_parent_evidence(state)
+    events = {identity: value[2] for identity, value in effective_events.items()}
     series = identities.series
     markets = {identity: value[2] for identity, value in identities.markets.items()}
-    existing = {work["endpoint"] for work in state["tasks"]}
     if _is_scoped_capture(state):
         final_event_members: set[str] = set()
         current_market_members: set[str] = set()
@@ -2018,36 +2755,34 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
             for event_ticker in [market[2]]
             if event_ticker
             and event_ticker not in final_event_members
-            and ("events", event_ticker) not in identities.parent_lookups
+            and ("events", event_ticker) not in effective_lookups
         }
         missing_series = set()
     elif state.get("incremental"):
         missing_events = set()
         missing_series = set()
     else:
-        missing_events = set(markets.values()) - events.keys()
+        resolved_event_lookups = {
+            identity for kind, identity in effective_lookups if kind == "events"
+        }
+        required_events = set(markets.values())
+        batch_observations = {
+            identity
+            for candidates in identities.parent_batch_candidates.values()
+            for identity in candidates
+        }
+        missing_events = (
+            (required_events - events.keys())
+            | (required_events & batch_observations - resolved_event_lookups)
+        ) - resolved_event_lookups
         missing_series = {value for value in events.values() if value} - series.keys()
-    for kind, missing, endpoint in (
-        ("events", missing_events, "/events"),
-        ("series", missing_series, "/series"),
-    ):
-        for identity in sorted(missing):
-            path = f"{endpoint}/{ticker(identity)}"
-            if path not in existing:
-                params = (
-                    {"exclude_markets": "true"}
-                    if kind == "events"
-                    and _acquisition_protocol(state)
-                    in {
-                        ACQUISITION_PROTOCOL,
-                        SCOPED_ACQUISITION_PROTOCOL,
-                        CURRENT_ACQUISITION_PROTOCOL,
-                    }
-                    else None
-                )
-                addition = task(path, kind, singular=True, params=params)
-                state["tasks"].append(addition)
-                _track_added_task_identities(state, [addition])
+    existing_identities = _task_identity_set(state)
+    for addition in parent_lookup_plan(state, missing_events, missing_series):
+        identity = _task_identity(addition)
+        if identity not in existing_identities:
+            state["tasks"].append(addition)
+            existing_identities.add(identity)
+            _track_added_task_identities(state, [addition])
     if state.get("task_scopes") and (
         not _is_scoped_capture(state) or state.get("incremental") is True
     ):
@@ -2087,8 +2822,8 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
         for market_ticker in current_market_members:
             market = identities.markets.get(market_ticker)
             event_ticker = market[2] if market is not None else None
-            event = identities.events.get(event_ticker) if event_ticker is not None else None
-            lookup = identities.parent_lookups.get(("events", event_ticker))
+            event = effective_events.get(event_ticker) if event_ticker is not None else None
+            lookup = effective_lookups.get(("events", event_ticker))
             event_is_authoritative = event_ticker in final_event_members or (
                 lookup is not None and lookup[0] == 200
             )
@@ -2099,10 +2834,21 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
     if state["selected"] is not None:
         for selected in state["selected"]:
             parent = markets.get(selected)
-            if (
-                state["coverage"].get(selected, {}).get("status") == "found"
-                and parent
-                and (parent not in events or events[parent] not in series)
+            event_lookup = effective_lookups.get(("events", parent)) if parent else None
+            series_lookup = (
+                effective_lookups.get(("series", events.get(parent))) if parent in events else None
+            )
+            if state["coverage"].get(selected, {}).get("status") == "found" and (
+                not parent
+                or parent not in events
+                or events[parent] not in series
+                or (
+                    _batched_parent_policy(state)
+                    and (
+                        (event_lookup is not None and event_lookup[0] != 200)
+                        or (series_lookup is not None and series_lookup[0] != 200)
+                    )
+                )
             ):
                 state["coverage"][selected] = {
                     "market_ticker": selected,
@@ -2166,6 +2912,8 @@ def _run(
     seen: dict[int, set[str]],
     budget: Budget,
     identities: ParentIndex,
+    *,
+    resumed: bool = False,
 ) -> None:
     running: dict[Future, int] = {}
     busy: set[int] = set()
@@ -2173,6 +2921,7 @@ def _run(
     queued = set(ready)
     metrics.add("tasks_enqueued", len(ready))
     failure: Exception | None = None
+    resume_cutoffs_pending = resumed and _checkpoint_policy(state)
 
     def enqueue(index: int) -> None:
         if index not in busy and index not in queued and not state["tasks"][index]["done"]:
@@ -2190,6 +2939,17 @@ def _run(
                 _ = budget.remaining
                 while ready and len(running) < MAX_CONCURRENT_REQUESTS and failure is None:
                     with metrics.phase("scheduler_work"):
+                        if resume_cutoffs_pending and not recovered and not running:
+                            for task_index, task_state in enumerate(state["tasks"]):
+                                if (
+                                    _historical(task_state["endpoint"])
+                                    and not task_state["singular"]
+                                    and not task_state["done"]
+                                    and not task_state["cutoff_due"]
+                                ):
+                                    _schedule_cutoff(store, state, task_index, "resume")
+                                    enqueue(task_index)
+                            resume_cutoffs_pending = False
                         index = ready.popleft()
                         queued.discard(index)
                         work = state["tasks"][index]
@@ -2204,6 +2964,21 @@ def _run(
                             _consume(store, state, index, relative, seen, identities)
                             metrics.endpoint_page(endpoint, recovered=True)
                             enqueue_appended(task_count)
+                            enqueue(index)
+                            continue
+                        if recovered:
+                            ready.append(index)
+                            queued.add(index)
+                            break
+                        if (
+                            _checkpoint_policy(state)
+                            and _historical(work["endpoint"])
+                            and not work["singular"]
+                            and not work["done"]
+                            and not work["cutoff_due"]
+                            and _interval_cutoff_due(state, index)
+                        ):
+                            _schedule_cutoff(store, state, index, "interval")
                             enqueue(index)
                             continue
                         endpoint, params, _, _ = _plan(work, _phase(work))
@@ -2383,6 +3158,10 @@ def _capture_locked(
                         raise CatalogueError("raw evidence belongs to another capture")
                     if not _receipt_matches_state_protocol(manifest, state):
                         raise CatalogueError("raw receipt protocol differs from its capture")
+                    if _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL and (
+                        _batched_parent_policy(state) or _checkpoint_policy(state)
+                    ):
+                        _validate_receipt_task_binding(manifest, state, row)
                     with (
                         metrics.phase("page_application"),
                         metrics.thread_cpu_phase("page_processing_cpu"),
@@ -2390,7 +3169,17 @@ def _capture_locked(
                         identities.add_page(manifest, payload)
                     identities.processed.add(row["relative"])
             recovered = _recover_receipts(store, state) if resume else {}
-            _run(store, state, client, pool, recovered, seen, budget, identities)
+            _run(
+                store,
+                state,
+                client,
+                pool,
+                recovered,
+                seen,
+                budget,
+                identities,
+                resumed=resume is not None,
+            )
     except (CatalogueError, OSError) as exc:
         if state.get("journal_version") != JOURNAL_VERSION:
             state["error"] = str(exc)

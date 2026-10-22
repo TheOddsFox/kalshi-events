@@ -641,6 +641,8 @@ def _task_scopes(state: dict[str, Any]) -> dict[str, str]:
     for index, work in enumerate(state.get("tasks", [])):
         if not isinstance(work, dict) or work.get("singular"):
             continue
+        if work.get("parent_batch") is not None or "tickers" in work.get("params", {}):
+            continue
         endpoint = work.get("endpoint")
         kind = work.get("kind")
         if endpoint == "/series" and kind == "series":
@@ -699,6 +701,7 @@ def _write_parent_outcomes(
     connection: duckdb.DuckDBPyConnection,
     capture_id: str,
     index: ParentIndex,
+    state: dict[str, Any],
 ) -> None:
     connection.execute(
         """create table if not exists landing.parent_eligibility (
@@ -706,9 +709,10 @@ def _write_parent_outcomes(
              status integer, receipt varchar)"""
     )
     connection.execute("delete from landing.parent_eligibility where capture_id = ?", [capture_id])
+    _, outcomes = index.effective_parent_evidence(state)
     rows = [
         (capture_id, kind, identity, status, page_id)
-        for (kind, identity), (status, page_id, _) in sorted(index.parent_lookups.items())
+        for (kind, identity), (status, page_id, _) in sorted(outcomes.items())
     ]
     if rows:
         connection.executemany(
@@ -836,7 +840,7 @@ def _projection_membership(
         scope: previous.get(scope, set()) ^ membership.get(scope, set()) for scope in SCOPE_KIND
     }
     _write_membership(connection, membership)
-    _write_parent_outcomes(connection, state["capture_id"], index)
+    _write_parent_outcomes(connection, state["capture_id"], index, state)
     return membership, changes
 
 
@@ -1321,6 +1325,7 @@ def _parent_closure_is_fresh(
     state: dict[str, Any],
     index: ParentIndex,
 ) -> None:
+    _, parent_lookups = index.effective_parent_evidence(state)
     listed_events = {
         identity
         for scope in ("events_live", "events_combo")
@@ -1346,14 +1351,14 @@ def _parent_closure_is_fresh(
     required_events = {parent for _, parent in rows if parent}
     scoped = state.get("scope") is not None
     for event in required_events - listed_events:
-        outcome = index.parent_lookups.get(("events", event))
+        outcome = parent_lookups.get(("events", event))
         if outcome is None or (scoped and outcome[0] != 200):
             raise CatalogueError(
                 "full capture lacks fresh parent evidence for final membership; capture a new full baseline"
             )
     active_events = listed_events | {
         identity
-        for (kind, identity), outcome in index.parent_lookups.items()
+        for (kind, identity), outcome in parent_lookups.items()
         if kind == "events" and outcome[0] == 200
     }
     if not active_events:
@@ -1369,7 +1374,7 @@ def _parent_closure_is_fresh(
     ).fetchall()
     for _, parent in event_rows:
         if parent and parent not in listed_series:
-            outcome = index.parent_lookups.get(("series", parent))
+            outcome = parent_lookups.get(("series", parent))
             if outcome is None or (scoped and outcome[0] != 200):
                 raise CatalogueError(
                     "full capture lacks fresh series evidence for final membership; capture a new full baseline"
