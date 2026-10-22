@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
+import signal
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -121,6 +124,370 @@ def test_combo_heavy_fixture_is_deterministic_and_separate_from_frozen_fixture()
     _, history = fixture.response("/historical/markets", {})
     assert sum(bool(row["mve_selected_legs"]) for row in history["markets"]) == 190
     assert history["markets"][0]["settlement_value_dollars"] == "1.000000000000000001"
+
+
+def test_combo_heavy_fixture_honors_refresh_scenarios_without_changing_frozen_hashes():
+    baseline = benchmark.ComboHeavyFixtureClient(1000, "sparse-change", "baseline")
+    no_change = benchmark.ComboHeavyFixtureClient(1000, "no-change", "refresh")
+    sparse = benchmark.ComboHeavyFixtureClient(1000, "sparse-change", "refresh")
+    all_change = benchmark.ComboHeavyFixtureClient(1000, "all-change", "refresh")
+
+    assert baseline._market(0)["title"] == "Fixture contract 0"
+    assert no_change.response("/events", {"min_updated_ts": "x"})[1]["events"] == []
+    assert sparse.response("/events", {"min_updated_ts": "x"})[1]["events"]
+    assert sparse._market(1)["title"] == "Updated combo contract"
+    assert sparse._market(20)["title"] != "Updated combo contract"
+    assert all_change._market(20)["title"] == "Updated contract"
+
+    _, no_change_history = no_change.response("/historical/markets", {})
+    _, sparse_history = sparse.response("/historical/markets", {})
+    _, all_change_history = all_change.response("/historical/markets", {})
+
+    def history_rows(fixture, first_page):
+        rows = list(first_page["markets"])
+        cursor = first_page["cursor"]
+        while cursor:
+            _, page = fixture.response("/historical/markets", {"cursor": cursor})
+            rows.extend(page["markets"])
+            cursor = page["cursor"]
+        return rows
+
+    no_change_rows = history_rows(no_change, no_change_history)
+    sparse_rows = history_rows(sparse, sparse_history)
+    all_change_rows = history_rows(all_change, all_change_history)
+    expected_tickers = [f"HIST-{index:06d}" for index in range(1000)]
+    assert [row["ticker"] for row in no_change_rows] == expected_tickers
+    assert [row["ticker"] for row in sparse_rows] == expected_tickers
+    assert [row["ticker"] for row in all_change_rows] == expected_tickers
+    assert [row["title"] for row in no_change_rows] == [
+        baseline._market(index)["title"] for index in range(1000)
+    ]
+    changed_history_indexes = {
+        index
+        for index, row in enumerate(sparse_rows)
+        if row["title"] != baseline._market(index)["title"]
+    }
+    assert changed_history_indexes == {0, 1}
+    rows = list(all_change_history["markets"])
+    cursor = all_change_history["cursor"]
+    while cursor:
+        _, page = all_change.response("/historical/markets", {"cursor": cursor})
+        rows.extend(page["markets"])
+        cursor = page["cursor"]
+    assert len(rows) == 1000
+    assert (
+        benchmark._fixture_sha256(197)
+        == "b31fe8247035fe326c055c320fc14b6fe2e675fbc197057d9bb7595bdd4034d8"
+    )
+    assert benchmark._fixture_sha256(
+        197, fixture_variant="combo-heavy"
+    ) != benchmark._fixture_sha256(197)
+
+
+def test_combo_heavy_fixture_hash_includes_later_historical_pages(monkeypatch):
+    original = benchmark._fixture_sha256(401, "full", "combo-heavy")
+    response = benchmark.ComboHeavyFixtureClient.response
+
+    def changed_last_history_page(self, endpoint, params):
+        status, payload = response(self, endpoint, params)
+        if endpoint == "/historical/markets" and params.get("cursor") == "400":
+            payload["markets"][0]["ticker"] += "-changed"
+        return status, payload
+
+    monkeypatch.setattr(benchmark.ComboHeavyFixtureClient, "response", changed_last_history_page)
+    assert benchmark._fixture_sha256(401, "full", "combo-heavy") != original
+
+
+def test_combo_heavy_profiles_do_not_legacy_freeze_new_acquisition_policy():
+    class Capture:
+        def _initialize_v2(self, _store, state):
+            return state
+
+    assert not benchmark._freeze_legacy_acquisition(
+        "full", "full", Capture(), fixture_variant="combo-heavy"
+    )
+    assert benchmark._freeze_legacy_acquisition("full", "full", Capture())
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        ("full", 2003),
+        ("no-change", 1952),
+        ("sparse-change", 1954),
+        ("all-change", 2003),
+    ],
+)
+def test_combo_heavy_expected_observation_counts_include_live_and_history_tiers(profile, expected):
+    assert benchmark._fixture_observation_count(1000, profile, "combo-heavy") == expected
+
+
+@pytest.mark.parametrize("profile", ["full", "no-change", "sparse-change", "all-change"])
+def test_combo_heavy_expected_observation_count_matches_fixture_pages(profile):
+    markets = 20
+    fixture = benchmark.ComboHeavyFixtureClient(markets, profile, "refresh")
+
+    def count_pages(endpoint, params):
+        count = 0
+        cursor = params.get("cursor", "")
+        while True:
+            page_params = dict(params)
+            if cursor:
+                page_params["cursor"] = cursor
+            _, payload = fixture.response(endpoint, page_params)
+            count += sum(len(payload.get(key, [])) for key in ("series", "events", "markets"))
+            cursor = payload.get("cursor", "")
+            if not cursor:
+                return count
+
+    observed = count_pages("/series", {})
+    if profile == "full":
+        observed += count_pages("/events", {})
+        observed += count_pages("/markets", {})
+    else:
+        observed += count_pages("/events", {"min_updated_ts": "fixture-watermark"})
+        observed += count_pages("/markets", {"mve_filter": "only"})
+        observed += count_pages(
+            "/markets", {"mve_filter": "exclude", "min_updated_ts": "fixture-watermark"}
+        )
+    observed += count_pages("/events/multivariate", {})
+    observed += count_pages("/historical/markets", {})
+    assert benchmark._fixture_observation_count(markets, profile, "combo-heavy") == observed
+
+
+def test_combo_heavy_combo_summary_counts_live_and_historical_tiers():
+    live_markets, live_legs = benchmark._fixture_combo_counts(20, "combo-heavy")
+    summary = benchmark._fixture_combo_summary(20, "full", "combo-heavy")
+    assert live_markets == 19
+    assert summary == {
+        "combo_markets": 2 * live_markets,
+        "combo_legs_expected": 2 * live_legs,
+        "live_combo_markets": live_markets,
+        "live_combo_legs_expected": live_legs,
+        "historical_combo_markets": live_markets,
+        "historical_combo_legs_expected": live_legs,
+    }
+    sparse = benchmark._fixture_combo_summary(20, "sparse-change", "combo-heavy")
+    assert sparse["combo_markets"] == 38
+    assert sparse["combo_legs_expected"] == 2 * live_legs
+
+
+@pytest.mark.parametrize(("markets", "pages"), [(197, 1), (1000, 5)])
+def test_full_scope_pages_use_combined_live_and_historical_traversals(markets, pages):
+    assert benchmark._fixture_full_scope_market_pages(markets, "combo-heavy") == (
+        2 * pages,
+        {"live_combined": pages, "historical": pages},
+    )
+    assert benchmark._fixture_full_scope_market_pages(markets, "frozen") == (
+        pages,
+        {"combined": pages},
+    )
+
+
+def test_combo_heavy_refresh_summary_reports_full_history_reconciliation():
+    assert benchmark._fixture_refresh_history_count(1000, "no-change", "combo-heavy") == 1000
+    assert benchmark._fixture_refresh_history_count(1000, "sparse-change", "combo-heavy") == 1000
+    assert benchmark._fixture_historical_market_count(1000, "sparse-change", "combo-heavy") == 1000
+    assert benchmark._fixture_refresh_history_count(1000, "full", "combo-heavy") == 0
+    assert benchmark._fixture_historical_market_count(197, "targeted", "frozen") is None
+
+
+def test_frozen_fixture_observation_count_remains_compatible():
+    assert benchmark._fixture_observation_count(197, "full", "frozen") == 200
+    assert benchmark._fixture_observation_count(197, "sparse-change", "frozen") == 201
+    assert benchmark._fixture_historical_market_count(197, "full", "frozen") == 0
+    assert benchmark._fixture_historical_market_count(197, "no-change", "frozen") == 1
+    assert benchmark._fixture_historical_market_count(197, "all-change", "frozen") == 1
+
+
+def test_frozen_v2_gate_requires_same_receipt_outputs_and_repeatable_identity():
+    comparison = {
+        "pair": 0,
+        "same_capture_id": True,
+        "semantic_relations_match": True,
+        "parquet_schema_match": True,
+        "artifact_bytes_match": True,
+        "release_id_match": True,
+        "logical_release_manifest_match": True,
+        "warehouse_sha256_match": False,
+        "lineage_match": True,
+    }
+    gate = benchmark._frozen_v2_gate([comparison], {"reference": True, "candidate": True})
+    assert gate["passed"] is True
+    comparison["artifact_bytes_match"] = False
+    gate = benchmark._frozen_v2_gate([comparison], {"reference": True, "candidate": True})
+    assert gate["passed"] is False
+
+
+def test_logical_lineage_comparison_ignores_but_validates_physical_warehouse_hashes():
+    fields = {
+        "root_id": "a" * 32,
+        "baseline_release_id": "release",
+        "baseline_manifest_sha256": "b" * 64,
+        "baseline_capture_id": "capture",
+        "previous_watermark": "2026-01-01T00:00:00Z",
+        "watermark_started_at": "2026-01-02T00:00:00Z",
+        "delta_depth": 0,
+        "membership_sha256": "c" * 64,
+    }
+    reference = {"lineage": {**fields, "warehouse_sha256": "d" * 64}, "lineage_valid": True}
+    candidate = {"lineage": {**fields, "warehouse_sha256": "e" * 64}, "lineage_valid": True}
+    assert benchmark._logical_lineage_match(reference, candidate)
+    assert benchmark._logical_lineage_signature(reference) == benchmark._logical_lineage_signature(
+        candidate
+    )
+    candidate["lineage"]["warehouse_sha256"] = "invalid"
+    assert not benchmark._logical_lineage_match(reference, candidate)
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="benchmark workers use POSIX process groups on macOS"
+)
+def test_supervisor_terminates_descendants_before_returning(tmp_path: Path, monkeypatch):
+    processes = []
+    original_popen = benchmark.subprocess.Popen
+
+    def tracked_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(benchmark.subprocess, "Popen", tracked_popen)
+    command = [
+        sys.executable,
+        "-c",
+        "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])",
+    ]
+    with pytest.raises(RuntimeError, match="descendants were still running"):
+        benchmark._run_supervised(command, timeout=8)
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+    assert not benchmark._worker_group_alive(processes[0])
+
+
+@pytest.mark.skipif(os.name != "posix", reason="benchmark uses POSIX signal and process groups")
+def test_sigterm_during_supervision_reaps_worker_group_before_exit(tmp_path: Path):
+    worker_pid_file = tmp_path / "worker.pid"
+    cleanup_marker = tmp_path / "caller-cleanup-ran"
+    descendant_code = (
+        "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)"
+    )
+    child_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}, sys.argv[1]]); "
+        "time.sleep(60)"
+    )
+    parent_code = """
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('benchmark_under_test', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._run_supervised([sys.executable, '-c', sys.argv[4], sys.argv[2]], timeout=60)
+open(sys.argv[3], 'w').write('unexpected')
+"""
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            parent_code,
+            str(SCRIPT),
+            str(worker_pid_file),
+            str(cleanup_marker),
+            child_code,
+        ],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while not worker_pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert worker_pid_file.exists(), "supervised worker did not start"
+    worker_pid = int(worker_pid_file.read_text())
+    os.kill(parent.pid, signal.SIGTERM)
+    assert parent.wait(timeout=10) == 128 + signal.SIGTERM
+    assert not cleanup_marker.exists(), "caller cleanup must not run after termination"
+    for _ in range(100):
+        try:
+            os.kill(worker_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("supervised worker remained alive after benchmark parent SIGTERM")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="benchmark SIGTERM handler is POSIX-specific")
+def test_supervisor_restores_prior_sigterm_handler_after_normal_exit():
+    previous = signal.getsignal(signal.SIGTERM)
+    assert benchmark._run_supervised([sys.executable, "-c", "pass"], timeout=6).returncode == 0
+    assert signal.getsignal(signal.SIGTERM) is previous
+
+
+def test_changed_acquisition_gate_uses_native_relations_not_receipt_identity():
+    pair = {"pair": 0, "native_values_and_membership_match": True, "capture_id_match": False}
+    assert benchmark._native_acquisition_gate([pair], {"reference": True})["passed"] is True
+    pair["native_values_and_membership_match"] = False
+    assert benchmark._native_acquisition_gate([pair], {"reference": True})["passed"] is False
+
+
+def test_root_inventory_detects_content_changes_not_only_metadata(tmp_path: Path):
+    root = tmp_path / "capture"
+    root.mkdir()
+    evidence = root / "receipt.bin"
+    evidence.write_bytes(b"first")
+    before = benchmark._root_inventory(root)
+    evidence.write_bytes(b"other")
+    after = benchmark._root_inventory(root)
+    assert before != after
+
+
+def test_benchmark_child_timeout_is_bounded_to_three_minutes():
+    assert benchmark.BENCHMARK_CHILD_TIMEOUT_SECONDS == 180
+
+
+def test_frozen_benchmark_worker_commands_pass_same_capture_root_and_id(tmp_path: Path):
+    source = tmp_path / "candidate"
+    frozen = tmp_path / "seed"
+    clone = tmp_path / "clone"
+    result = tmp_path / "result.json"
+    command = benchmark._frozen_build_worker_command(source, frozen, clone, "capture-1", result)
+    assert command[command.index("--frozen-root") + 1] == str(frozen)
+    assert command[command.index("--root") + 1] == str(clone)
+    assert command[command.index("--capture-id") + 1] == "capture-1"
+
+    capture_command = benchmark._worker_command(
+        source,
+        clone,
+        result,
+        1000,
+        "full",
+        fixture_variant="combo-heavy",
+        capture_only=True,
+    )
+    assert "--capture-only" in capture_command
+    assert capture_command[capture_command.index("--fixture") + 1] == "combo-heavy"
+
+
+def test_frozen_worker_rejects_output_paths_before_copying(tmp_path: Path, monkeypatch):
+    import shutil
+
+    source = benchmark._script_checkout()
+    frozen = tmp_path / "frozen"
+    frozen.mkdir()
+    output = source / ".benchmark-output-must-not-be-created"
+    copied = False
+
+    def unexpected_copy(*_args, **_kwargs):
+        nonlocal copied
+        copied = True
+        raise AssertionError("copy must not run before path validation")
+
+    monkeypatch.setattr(shutil, "copytree", unexpected_copy)
+    with pytest.raises(ValueError, match="outside every source checkout"):
+        benchmark._frozen_v2_build_worker(
+            source, frozen, output, "capture-id", tmp_path / "result.json"
+        )
+    assert not copied
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("count", [1, 100, 10_000, 100_000])
@@ -884,3 +1251,69 @@ def test_worker_cli_rejects_invalid_required_arguments(arguments, expected_error
     )
     assert result.returncode == 2
     assert expected_error in result.stderr
+
+
+def test_frozen_v2_cli_requires_an_explicit_prepared_capture(tmp_path: Path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--profile",
+            "frozen-v2-build",
+            "--report-dir",
+            str(tmp_path / "report"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "requires --compare-root, --frozen-root, and --capture-id" in result.stderr
+
+
+def test_capture_preparation_cli_requires_combo_heavy_fixture(tmp_path: Path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--prepare-frozen-capture",
+            str(tmp_path / "capture"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "requires --fixture combo-heavy --profile full" in result.stderr
+
+
+def test_combo_fixture_worker_preserves_sealed_transport_options(tmp_path: Path):
+    root = tmp_path / "capture-root"
+    result_path = tmp_path / "capture-result.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--worker",
+            "--markets",
+            "1",
+            "--root",
+            str(root),
+            "--result",
+            str(result_path),
+            "--worker-profile",
+            "full",
+            "--fixture",
+            "combo-heavy",
+            "--capture-only",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads(result_path.read_text())
+    assert metrics["rate_policy"]["policy"] == "decrease-on-429"
+    assert metrics["rate_policy"]["initial_rate"] == 1000
+    assert metrics["endpoint_families"]["/markets"]["requested_encodings"] == {"gzip": 1}
+    assert metrics["endpoint_families"]["/markets"]["observed_encodings"] == {"identity": 1}

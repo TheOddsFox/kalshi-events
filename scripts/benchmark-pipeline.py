@@ -6,15 +6,18 @@ from __future__ import annotations
 import argparse
 import contextlib
 import contextvars
+import functools
 import hashlib
 import importlib.metadata
 import importlib.util
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,9 +33,159 @@ HISTORY_STRESS_PASSES = HISTORY_STRESS_COUNT // HISTORY_STRESS_IDENTITIES
 SELECTED_PROFILES = {"selected-stress", "selected-single", "selected-fallback"}
 TARGETED_PROFILES = {"targeted", *SELECTED_PROFILES}
 COMPOSED_REFRESH_PROFILES = {"no-change", "sparse-change", "all-change"}
+FIXTURE_VARIANTS = {"frozen", "combo-heavy"}
+COMBO_HEAVY_FIXTURE_LABEL = "combo-heavy"
+BENCHMARK_CHILD_TIMEOUT_SECONDS = 180
+BENCHMARK_TERMINATION_RESERVE_SECONDS = 5
 _request_id = contextvars.ContextVar("fixture_request_id")
 _page_request = contextvars.ContextVar("benchmark_page_request", default=None)
 _inside_page_read = contextvars.ContextVar("benchmark_inside_page_read", default=False)
+
+
+class _UnreapedWorkerGroup(RuntimeError):
+    """A supervised worker left descendants alive; its disposable root must be preserved."""
+
+
+def _cleanup_on_sigterm(function):
+    """Turn SIGTERM into a BaseException so active isolated worker groups are reaped."""
+
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        if threading.current_thread() is not threading.main_thread():
+            return function(*args, **kwargs)
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def terminate(signum, _frame):
+            signal.signal(signum, signal.SIG_IGN)
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, terminate)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    return wrapped
+
+
+def _worker_group_alive(process: subprocess.Popen[Any]) -> bool:
+    if os.name != "posix":
+        return process.poll() is None
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_worker_group(
+    process: subprocess.Popen[Any], reserve_seconds: float = BENCHMARK_TERMINATION_RESERVE_SECONDS
+) -> bool:
+    """TERM then KILL a whole worker session, returning whether it is fully gone."""
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, 15)
+        elif process.poll() is None:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return False
+    first_wait = min(3.0, max(0.0, reserve_seconds - 2.0))
+    deadline = time.monotonic() + first_wait
+    while time.monotonic() < deadline:
+        process.poll()  # Reap the direct worker before checking for surviving descendants.
+        if not _worker_group_alive(process):
+            break
+        time.sleep(min(0.05, deadline - time.monotonic()))
+    if _worker_group_alive(process):
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, 9)
+            elif process.poll() is None:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return False
+    remaining = max(0.0, reserve_seconds - first_wait)
+    deadline = time.monotonic() + remaining
+    while time.monotonic() < deadline:
+        process.poll()
+        if not _worker_group_alive(process):
+            break
+        time.sleep(min(0.05, deadline - time.monotonic()))
+    if process.poll() is None:
+        try:
+            process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return False
+    return not _worker_group_alive(process)
+
+
+@_cleanup_on_sigterm
+def _run_supervised(
+    command: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str] | None = None,
+    capture_output: bool = False,
+    text: bool = False,
+    check: bool = True,
+) -> subprocess.CompletedProcess[Any]:
+    """Run a worker and its descendants within a deadline and termination reserve."""
+    stdout = subprocess.PIPE if capture_output else None
+    stderr = subprocess.PIPE if capture_output else None
+    process = None
+    output = error_output = None
+    termination_reserve = min(BENCHMARK_TERMINATION_RESERVE_SECONDS, timeout)
+    active_seconds = max(0.0, timeout - termination_reserve)
+    try:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            text=text,
+            start_new_session=(os.name == "posix"),
+        )
+        output, error_output = process.communicate(timeout=active_seconds)
+    except subprocess.TimeoutExpired as exc:
+        assert process is not None
+        if not _terminate_worker_group(process, termination_reserve):
+            raise _UnreapedWorkerGroup(
+                f"benchmark worker descendants remain after timeout: {command!r}"
+            ) from exc
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=output, stderr=error_output
+        ) from exc
+    except BaseException as exc:
+        if (
+            process is not None
+            and _worker_group_alive(process)
+            and not _terminate_worker_group(process, termination_reserve)
+        ):
+            raise _UnreapedWorkerGroup(
+                f"benchmark worker descendants remain after interruption: {command!r}"
+            ) from exc
+        raise
+    assert process is not None
+    if _worker_group_alive(process):
+        if not _terminate_worker_group(process, termination_reserve):
+            raise _UnreapedWorkerGroup(
+                f"benchmark worker exited but descendants remain: {command!r}"
+            )
+        raise RuntimeError(
+            f"benchmark worker exited while descendants were still running: {command!r}"
+        )
+    completed = subprocess.CompletedProcess(command, process.returncode, output, error_output)
+    if check and completed.returncode:
+        raise subprocess.CalledProcessError(
+            completed.returncode, command, output=output, stderr=error_output
+        )
+    return completed
 
 
 def _baseline_metrics(source_root: Path) -> Any:
@@ -296,8 +449,12 @@ def _timed_write(function: Any, metrics: Any) -> Any:
     return wrapped
 
 
-def _freeze_legacy_acquisition(profile: str, scenario: str, capture: Any) -> bool:
+def _freeze_legacy_acquisition(
+    profile: str, scenario: str, capture: Any, fixture_variant: str = "frozen"
+) -> bool:
     """Keep pre-existing byte-identity profiles on request protocol 2."""
+    if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL:
+        return False
     frozen = profile in {
         "full",
         "targeted",
@@ -532,15 +689,17 @@ class ComboHeavyFixtureClient(FixtureClient):
 
     LEG_CARDINALITIES = (1, 2, 4, 8, 32)
 
-    def __init__(self, markets: int, stage: str = "full") -> None:
-        super().__init__(markets, "full", stage)
+    def __init__(self, markets: int, scenario: str = "full", stage: str = "full") -> None:
+        super().__init__(markets, scenario, stage)
 
     def response(self, endpoint: str, params: dict[str, Any]) -> tuple[int, Any]:
         if endpoint == "/historical/markets":
             start = int(params.get("cursor", "0"))
-            stop = min(start + PAGE_SIZE, self.markets)
+            indexes = range(self.markets)
+            selected = indexes[start : start + PAGE_SIZE]
+            stop = start + len(selected)
             rows = []
-            for index in range(start, stop):
+            for index in selected:
                 row = self._market(index)
                 row.update(
                     ticker=f"HIST-{index:06d}",
@@ -554,7 +713,7 @@ class ComboHeavyFixtureClient(FixtureClient):
                 rows.append(row)
             return 200, {
                 "markets": rows,
-                "cursor": str(stop) if stop < self.markets else "",
+                "cursor": str(stop) if stop < len(indexes) else "",
             }
         return super().response(endpoint, params)
 
@@ -567,6 +726,8 @@ class ComboHeavyFixtureClient(FixtureClient):
         row = super()._market(index)
         if not self._is_combo(index):
             return row
+        if self.stage == "refresh" and self.scenario == "sparse-change" and index == 1:
+            row["title"] = "Updated combo contract"
         ordinal = index - index // 20
         cardinality = 200 if ordinal % 200 == 0 else self.LEG_CARDINALITIES[ordinal % 5]
         row["mve_selected_legs"] = [
@@ -931,6 +1092,8 @@ def _worker(
     scenario: str = "full",
     refresh_mode: str = "full",
     baseline_capture_id: str | None = None,
+    fixture_variant: str = "frozen",
+    capture_only: bool = False,
 ) -> None:
     os.environ["DLT_TELEMETRY"] = "0"
     os.environ["DLT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
@@ -938,7 +1101,7 @@ def _worker(
     from kalshi_events import capture, common, metadata, normalize, publish, transport, warehouse
     from kalshi_events.common import Limits, Store
 
-    frozen_acquisition = _freeze_legacy_acquisition(profile, scenario, capture)
+    frozen_acquisition = _freeze_legacy_acquisition(profile, scenario, capture, fixture_variant)
 
     legacy_metrics = False
     try:
@@ -957,6 +1120,8 @@ def _worker(
     dlt_phase_seconds: dict[str, float] = {}
     _instrument_dlt_trace(warehouse, dlt_phase_seconds)
     capture.capture = _timed_function(capture.capture, metrics, "capture")
+    if capture_only and (profile != "full" or fixture_variant != COMBO_HEAVY_FIXTURE_LABEL):
+        raise ValueError("capture-only mode requires the full combo-heavy fixture")
 
     # Each independent process gets deterministic, noncolliding capture identities.
     seed = (
@@ -1016,6 +1181,8 @@ def _worker(
     fixture = (
         SelectedStressFixtureClient()
         if profile in SELECTED_PROFILES
+        else ComboHeavyFixtureClient(markets, fixture_scenario, fixture_stage)
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL
         else FixtureClient(markets, fixture_scenario, fixture_stage)
     )
 
@@ -1033,8 +1200,8 @@ def _worker(
             stream=httpx.ByteStream(body),
         )
 
-    def client_factory(root_store, budget, **_options):
-        client = transport.PublicClient(root_store, budget)
+    def client_factory(root_store, budget, **options):
+        client = transport.PublicClient(root_store, budget, **options)
         client.client.close()
         client.client = httpx.Client(transport=httpx.MockTransport(handler))
         original_get = client.get
@@ -1125,9 +1292,10 @@ def _worker(
                 if profile in SELECTED_PROFILES
                 else (["MKT-000000"] if profile == "targeted" else None)
             )
-            state = capture.capture(
-                Store(root, limits), client_factory=client_factory, selected=selected
-            )
+            store = Store(root, limits)
+            if capture_only:
+                _seed_incremental_root(store)
+            state = capture.capture(store, client_factory=client_factory, selected=selected)
             if profile in TARGETED_PROFILES:
                 from kalshi_events import metadata
 
@@ -1140,9 +1308,13 @@ def _worker(
                 )
             else:
                 _require_complete(state, profile)
-                warehouse.build(Store(root, limits), state["capture_id"])
-                release = publish.publish(Store(root, limits), state["capture_id"])
-                output = Path(release["output"])
+                if capture_only:
+                    release = {"source_release_id": None, "output": None}
+                    output = None
+                else:
+                    warehouse.build(Store(root, limits), state["capture_id"])
+                    release = publish.publish(Store(root, limits), state["capture_id"])
+                    output = Path(release["output"])
 
         result = measured.report() if measured else {"version": 0}
         result["dlt_phase_seconds"] = dlt_phase_seconds
@@ -1166,21 +1338,10 @@ def _worker(
                 if profile in SELECTED_PROFILES
                 else 3
                 if profile == "targeted"
-                else markets
-                + (
-                    4
-                    if profile
-                    in {
-                        "no-change",
-                        "sparse-change",
-                        "all-change",
-                        "history-sparse",
-                        "baseline-setup",
-                    }
-                    else 3
-                )
+                else _fixture_observation_count(markets, profile, fixture_variant)
             ),
             profile=profile,
+            fixture_variant=fixture_variant,
             receipt_uuid_format=_receipt_uuid_format(receipt_profile),
             acquisition_protocol="legacy-frozen-v2" if frozen_acquisition else "current",
             refresh_mode=refresh_mode
@@ -1203,6 +1364,8 @@ def _worker(
             if path.is_file()
         }
         if profile in TARGETED_PROFILES
+        else {}
+        if output is None
         else {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(output.glob("*.parquet"))
@@ -1255,9 +1418,11 @@ def _worker(
             output, None, "full", root, state["capture_id"]
         )
         result["lineage_valid"] = True
-    manifest_path = output / "manifest.json"
+    manifest_path = output / "manifest.json" if output is not None else None
     result["release_manifest_sha256"] = (
-        hashlib.sha256(manifest_path.read_bytes()).hexdigest() if manifest_path.is_file() else None
+        hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if manifest_path is not None and manifest_path.is_file()
+        else None
     )
     pointer_name = _publication_pointer_name(profile, refresh_mode)
     result["publication_pointer_sha256"] = (
@@ -1267,7 +1432,7 @@ def _worker(
             result.get("release_id"),
             result.get("release_manifest_sha256"),
         )
-        if profile not in TARGETED_PROFILES
+        if output is not None and profile not in TARGETED_PROFILES
         else None
     )
     result["fixture_timestamps_frozen"] = {
@@ -1277,26 +1442,39 @@ def _worker(
         "warehouse": capture_time,
         "publish": capture_time,
     }
-    if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}:
-        result["semantic_relations"] = _semantic_relation_hashes(
-            root, state["capture_id"], catalogue_version=2 if refresh_mode == "incremental" else 1
+    composed_profile = profile in {"no-change", "sparse-change", "all-change", "history-sparse"}
+    if (
+        composed_profile
+        or (fixture_variant == COMBO_HEAVY_FIXTURE_LABEL and profile == "full")
+        and not capture_only
+    ):
+        catalogue_version = (
+            2
+            if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}
+            and refresh_mode == "incremental"
+            else 1
         )
-        if refresh_mode == "incremental":
+        result["semantic_relations"] = _semantic_relation_hashes(
+            root, state["capture_id"], catalogue_version=catalogue_version
+        )
+        if composed_profile and refresh_mode == "incremental":
             result["lineage"] = _assert_lineage_manifest(
                 output, baseline_capture_id, refresh_mode, root, state["capture_id"]
             )
             result["lineage_valid"] = True
             result["observation_counts"] = _assert_history_composition(
-                root, output, profile, markets
+                root, output, profile, markets, fixture_variant
             )
-        result["provenance_assertions"] = _assert_incremental_provenance(
-            root,
-            state["capture_id"],
-            baseline_capture_id,
-            profile,
-            refresh_mode,
-            markets,
-        )
+        if composed_profile:
+            result["provenance_assertions"] = _assert_incremental_provenance(
+                root,
+                state["capture_id"],
+                baseline_capture_id,
+                profile,
+                refresh_mode,
+                markets,
+                fixture_variant,
+            )
         if legacy_metrics:
             result["unsupported_phases"] = ["request", "decompression", "export"]
             result["unsupported_phase_notes"] = {
@@ -1305,7 +1483,7 @@ def _worker(
                 "export": "legacy observer does not isolate publication export timing",
             }
 
-    if profile != "baseline-setup":
+    if profile != "baseline-setup" and not capture_only:
         verification_context = metrics.collect() if metrics else contextlib.nullcontext(None)
         with verification_context as verified:
             verify_store = Store(root, limits)
@@ -1325,7 +1503,340 @@ def _worker(
             - verification_counters.get("raw_body_json_decodes", 0),
         )
     result["provenance"] = _environment(source_root, limits, root)
+    result["capture_only"] = capture_only
     result_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def _parquet_schemas(output: Path) -> dict[str, str]:
+    import pyarrow.parquet as parquet
+
+    return {
+        path.name: hashlib.sha256(parquet.read_schema(path).serialize().to_pybytes()).hexdigest()
+        for path in sorted(output.glob("*.parquet"))
+    }
+
+
+def _frozen_v2_build_worker(
+    source_root: Path, frozen_root: Path, root: Path, capture_id: str, result_path: Path
+) -> None:
+    """Run one v2 full-baseline build against an already captured immutable root."""
+    import shutil
+
+    frozen_root = frozen_root.expanduser()
+    if frozen_root.is_symlink():
+        raise ValueError("frozen capture root must be an existing non-symlink directory")
+    frozen_root = frozen_root.resolve()
+    if not frozen_root.is_dir():
+        raise ValueError("frozen capture root must be an existing non-symlink directory")
+    if any(path.is_symlink() for path in frozen_root.rglob("*")):
+        raise ValueError("frozen capture root must not contain symlinks")
+    _validate_worker_destinations(root, result_path, source_root)
+    for destination in (root.resolve(), result_path.resolve()):
+        if destination == frozen_root or destination.is_relative_to(frozen_root):
+            raise ValueError("worker outputs must be outside the frozen capture root")
+    if frozen_root.is_relative_to(root.resolve()):
+        raise ValueError("worker clone must not contain the frozen capture root")
+
+    clone_started = time.perf_counter()
+    shutil.copytree(frozen_root, root)
+    clone_seconds = round(time.perf_counter() - clone_started, 6)
+    os.environ["DLT_TELEMETRY"] = "0"
+    os.environ["DLT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
+    sys.path.insert(0, str(source_root / "src"))
+    from kalshi_events import capture, common, metadata, normalize, publish, transport, warehouse
+    from kalshi_events.common import Limits, Store
+
+    try:
+        from kalshi_events import metrics
+    except ImportError:
+        metrics = _baseline_metrics(source_root)
+        _instrument_baseline(
+            metrics, [common, capture, metadata, normalize, transport, warehouse, publish]
+        )
+    else:
+        _instrument_current_raw_file_reads(
+            metrics, [common, capture, metadata, normalize, transport, warehouse, publish]
+        )
+    _instrument_warehouse_json_loads(warehouse, metrics)
+    dlt_phase_seconds: dict[str, float] = {}
+    _instrument_dlt_trace(warehouse, dlt_phase_seconds)
+    for module in (capture, common, metadata, normalize, transport, warehouse, publish):
+        if hasattr(module, "now"):
+            module.now = lambda: FIXED_TIME
+    store = Store(root, Limits(max_rate=1000, max_requests=10000, max_download_bytes=4 * 1024**3))
+    if store.storage_version != 5:
+        raise ValueError("frozen-v2-build comparisons require storage-version-5 roots")
+    state = capture.read_capture(store, capture_id)
+    if state.get("complete") is not True or state.get("incremental") is True:
+        raise ValueError("frozen v2 build requires a complete full capture")
+    if (
+        store.path(f"builds-v2/{capture_id}").exists()
+        or store.path(f"builds/{capture_id}").exists()
+    ):
+        raise ValueError("frozen capture already has a build; prepare an unbuilt capture root")
+    for manifest_path in store.path("releases").glob("*/manifest.json"):
+        manifest = json.loads(manifest_path.read_bytes())
+        if manifest.get("capture_id") == capture_id:
+            raise ValueError("frozen capture already has a release; prepare an unpublished root")
+
+    started = time.perf_counter()
+    with metrics.collect() as build_measured:
+        warehouse.build_v2_full(Store(root, store.limits), capture_id)
+    build_metrics = build_measured.report()
+    with metrics.collect() as publish_measured:
+        release = publish.publish(Store(root, store.limits), capture_id, catalogue_version=2)
+    publish_metrics = publish_measured.report()
+    pipeline_elapsed = {
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "build": build_metrics,
+        "publish": publish_metrics,
+    }
+    output = Path(release["output"])
+    verification_started = time.perf_counter()
+    with metrics.collect() as verified:
+        capture.complete_capture(Store(root, store.limits), capture_id)
+        publish.verify_release(output)
+    verification = verified.report()
+    verification["elapsed_seconds"] = round(time.perf_counter() - verification_started, 6)
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    logical_manifest = {key: value for key, value in manifest.items() if key != "warehouse_sha256"}
+    result = {
+        **pipeline_elapsed,
+        "pipeline_elapsed_seconds": pipeline_elapsed.get("elapsed_seconds"),
+        "clone_seconds": clone_seconds,
+        "dlt_phase_seconds": dlt_phase_seconds,
+        "verification": verification,
+        "capture_id": capture_id,
+        "storage_version": store.storage_version,
+        "release_id": release["source_release_id"],
+        "artifact_sha256": {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(output.glob("*.parquet"))
+        },
+        "parquet_schema_sha256": _parquet_schemas(output),
+        "semantic_relations": _semantic_relation_hashes(root, capture_id, catalogue_version=2),
+        "release_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "logical_release_manifest_sha256": hashlib.sha256(
+            json.dumps(logical_manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "warehouse_sha256": manifest["warehouse_sha256"],
+        "publication_pointer_sha256": _publication_pointer_sha256(
+            root,
+            "current-v2.json",
+            release["source_release_id"],
+            hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        ),
+        "lineage": _assert_lineage_manifest(output, None, "full", root, capture_id),
+        "lineage_valid": True,
+        "output_bytes": sum(path.stat().st_size for path in output.glob("*.parquet")),
+        "source_revision": _revision(source_root),
+    }
+    result_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def _frozen_build_worker_command(
+    source_root: Path, frozen_root: Path, root: Path, capture_id: str, result_path: Path
+) -> list[str]:
+    return [
+        sys.executable,
+        __file__,
+        "--worker-frozen-v2-build",
+        "--source-root",
+        str(source_root),
+        "--frozen-root",
+        str(frozen_root),
+        "--root",
+        str(root),
+        "--capture-id",
+        capture_id,
+        "--result",
+        str(result_path),
+    ]
+
+
+def _root_inventory(root: Path) -> dict[str, tuple[int, bool, str | None]]:
+    inventory = {}
+    for path in sorted(root.rglob("*")):
+        if not (path.is_file() or path.is_symlink()):
+            continue
+        is_symlink = path.is_symlink()
+        size = path.stat(follow_symlinks=False).st_size
+        checksum = None
+        if not is_symlink:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            checksum = digest.hexdigest()
+        inventory[path.relative_to(root).as_posix()] = (size, is_symlink, checksum)
+    return inventory
+
+
+def _run_frozen_v2_build(
+    source_root: Path,
+    report_dir: Path,
+    label: str,
+    pair_label: str,
+    frozen_root: Path,
+    capture_id: str,
+) -> dict[str, Any]:
+    clone = report_dir / f"frozen-v2-root-{label}-{pair_label}"
+    result_path = report_dir / f"frozen-v2-result-{label}-{pair_label}.json"
+    if clone.exists():
+        raise ValueError(f"benchmark clone path already exists: {clone}")
+    worker_started = time.perf_counter()
+    cleanup_safe = True
+    try:
+        _run_supervised(
+            _frozen_build_worker_command(source_root, frozen_root, clone, capture_id, result_path),
+            check=True,
+            env=os.environ.copy(),
+            timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
+        )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["worker_wall_seconds"] = round(time.perf_counter() - worker_started, 6)
+        result["role"] = label
+        return result
+    except _UnreapedWorkerGroup:
+        cleanup_safe = False
+        raise
+    finally:
+        import shutil
+
+        if cleanup_safe:
+            shutil.rmtree(clone, ignore_errors=True)
+
+
+def _frozen_v2_gate(
+    comparisons: list[dict[str, Any]], identity_stability: dict[str, bool]
+) -> dict[str, Any]:
+    required = (
+        "same_capture_id",
+        "semantic_relations_match",
+        "parquet_schema_match",
+        "artifact_bytes_match",
+        "release_id_match",
+        "logical_release_manifest_match",
+        "lineage_match",
+    )
+    failed_pairs = [
+        pair["pair"] for pair in comparisons if not all(pair.get(key) is True for key in required)
+    ]
+    return {
+        "passed": not failed_pairs and all(identity_stability.values()),
+        "failed_pairs": failed_pairs,
+        "identity_stability": identity_stability,
+        "basis": "same frozen receipts and v2 full-baseline operation; native rows, schemas, Parquet bytes, release identity, manifest, and logical lineage",
+    }
+
+
+def _run_frozen_v2_comparison(
+    source_root: Path,
+    compare_root: Path,
+    frozen_root: Path,
+    capture_id: str,
+    report_dir: Path,
+    warmups: int,
+    runs: int,
+) -> dict[str, Any]:
+    inventory_started = time.perf_counter()
+    before = _root_inventory(frozen_root)
+    inventory_before_seconds = round(time.perf_counter() - inventory_started, 6)
+    if any(is_symlink for _, is_symlink, _ in before.values()):
+        raise ValueError("frozen capture root must not contain symlinks")
+    roots = {"reference": source_root, "candidate": compare_root}
+    results: dict[str, list[dict[str, Any]]] = {label: [] for label in roots}
+    for warmup in range(warmups):
+        for label, root in roots.items():
+            _run_frozen_v2_build(
+                root, report_dir, label, f"warmup-{warmup}", frozen_root, capture_id
+            )
+    comparisons = []
+    for pair in range(runs):
+        ordered = list(roots.items()) if pair % 2 == 0 else list(reversed(list(roots.items())))
+        paired: dict[str, dict[str, Any]] = {}
+        for label, root in ordered:
+            result = _run_frozen_v2_build(
+                root, report_dir, label, f"pair-{pair}", frozen_root, capture_id
+            )
+            results[label].append(result)
+            paired[label] = result
+        reference, candidate = paired["reference"], paired["candidate"]
+        comparisons.append(
+            {
+                "pair": pair,
+                "build_elapsed_ratio": round(
+                    candidate["pipeline_elapsed_seconds"] / reference["pipeline_elapsed_seconds"],
+                    6,
+                ),
+                "same_capture_id": reference["capture_id"] == candidate["capture_id"],
+                "semantic_relations_match": reference["semantic_relations"]
+                == candidate["semantic_relations"],
+                "parquet_schema_match": reference["parquet_schema_sha256"]
+                == candidate["parquet_schema_sha256"],
+                "artifact_bytes_match": reference["artifact_sha256"]
+                == candidate["artifact_sha256"],
+                "release_id_match": reference["release_id"] == candidate["release_id"],
+                "release_manifest_match": reference["release_manifest_sha256"]
+                == candidate["release_manifest_sha256"],
+                "logical_release_manifest_match": reference["logical_release_manifest_sha256"]
+                == candidate["logical_release_manifest_sha256"],
+                "warehouse_sha256_match": reference["warehouse_sha256"]
+                == candidate["warehouse_sha256"],
+                "lineage_match": _logical_lineage_match(reference, candidate),
+                "reference": reference,
+                "candidate": candidate,
+            }
+        )
+    identity_stability = {}
+    for label, samples in results.items():
+        keys = (
+            "semantic_relations",
+            "parquet_schema_sha256",
+            "artifact_sha256",
+            "release_id",
+            "logical_release_manifest_sha256",
+        )
+        identity_stability[label] = all(
+            all(sample.get(key) == samples[0].get(key) for key in keys)
+            and _logical_lineage_signature(sample) == _logical_lineage_signature(samples[0])
+            for sample in samples[1:]
+        )
+    inventory_started = time.perf_counter()
+    unchanged = _root_inventory(frozen_root) == before
+    inventory_after_seconds = round(time.perf_counter() - inventory_started, 6)
+    gate = _frozen_v2_gate(comparisons, identity_stability)
+    gate["frozen_input_unchanged"] = unchanged
+    gate["passed"] = gate["passed"] and unchanged
+    return {
+        "profile": "frozen-v2-build",
+        "comparison_contract": "same complete capture receipts and same full v2 build/publish/verify operation",
+        "source_revisions": {
+            "reference": _revision(source_root),
+            "candidate": _revision(compare_root),
+        },
+        "frozen_input": {"root": str(frozen_root), "capture_id": capture_id},
+        "storage_compatibility": {
+            "seed_storage_version": 5,
+            "both_implementations_must_support_storage_version_5": True,
+            "pre_v5_runtime_comparison_supported": False,
+        },
+        "warmups": warmups,
+        "runs": runs,
+        "clone_time_is_separate": True,
+        "frozen_inventory_hash_seconds": {
+            "before": inventory_before_seconds,
+            "after": inventory_after_seconds,
+        },
+        "clone_times_seconds": {
+            label: [sample["clone_seconds"] for sample in samples]
+            for label, samples in results.items()
+        },
+        "paired_comparisons": comparisons,
+        "results": results,
+        "correctness_gate": gate,
+    }
 
 
 def _require_complete(state: dict[str, Any], profile: str) -> None:
@@ -1492,6 +2003,23 @@ def _logical_lineage_match(reference: dict[str, Any], candidate: dict[str, Any])
     )
 
 
+def _logical_lineage_signature(result: dict[str, Any]) -> tuple[Any, ...]:
+    lineage = result.get("lineage", {})
+    return tuple(
+        lineage.get(field)
+        for field in (
+            "root_id",
+            "baseline_release_id",
+            "baseline_manifest_sha256",
+            "baseline_capture_id",
+            "previous_watermark",
+            "watermark_started_at",
+            "delta_depth",
+            "membership_sha256",
+        )
+    )
+
+
 def _upgrade_baseline_clone(source_root: Path, root: Path) -> tuple[float, dict[str, Any]]:
     """Upgrade a copied v2 baseline using the candidate checkout, outside timed refresh work."""
     code = """
@@ -1513,12 +2041,13 @@ print(json.dumps({"storage_version_before": before, "storage_version_after": sto
         source_path + os.pathsep + existing_pythonpath if existing_pythonpath else source_path
     )
     started = time.perf_counter()
-    completed = subprocess.run(
+    completed = _run_supervised(
         [sys.executable, "-c", code, str(root)],
         check=True,
         capture_output=True,
         text=True,
         env=environment,
+        timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
     )
     elapsed = round(time.perf_counter() - started, 6)
     upgrade = json.loads(completed.stdout)
@@ -1532,7 +2061,7 @@ print(json.dumps({"storage_version_before": before, "storage_version_after": sto
 
 
 def _assert_history_composition(
-    root: Path, output: Path, profile: str, markets: int
+    root: Path, output: Path, profile: str, markets: int, fixture_variant: str = "frozen"
 ) -> dict[str, Any]:
     import duckdb
 
@@ -1584,7 +2113,7 @@ def _assert_history_composition(
             "history-sparse refresh must affect no more than 2% of market identities, "
             f"found {affected_projection_count}/{markets} in landing.affected_markets"
         )
-    combo_count = sum(FixtureClient._is_combo(index) for index in range(markets))
+    combo_count, _ = _fixture_combo_counts(markets, fixture_variant)
     event_updates = 0 if profile == "no-change" else 1
     market_updates = (
         0
@@ -1600,7 +2129,9 @@ def _assert_history_composition(
     history_updates = 1 if profile == "history-sparse" else 0
     baseline_relations = 2 if profile == "history-sparse" else 3
     expected_new = (
-        baseline_relations + combo_count + event_updates + market_updates + history_updates
+        _fixture_observation_count(markets, profile, fixture_variant)
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL
+        else baseline_relations + combo_count + event_updates + market_updates + history_updates
     )
     assert new_rows == expected_new, f"expected {expected_new} T1 observations, found {new_rows}"
     assert total_rows == baseline_rows + new_rows
@@ -1624,21 +2155,33 @@ def _assert_incremental_provenance(
     profile: str,
     refresh_mode: str,
     markets: int,
+    fixture_variant: str = "frozen",
 ) -> dict[str, Any]:
     import duckdb
 
     build_dir = "builds-v2" if refresh_mode == "incremental" else "builds"
     database = root / f"{build_dir}/{capture_id}/warehouse.duckdb"
+    carried_index = (
+        2
+        if profile == "history-sparse"
+        else 20
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL and markets > 20
+        else 1
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL
+        else 1
+    )
+    carried_ticker = f"MKT-{carried_index:06d}"
     with duckdb.connect(str(database), read_only=True) as connection:
         rows = {
             row[0]: {"capture_id": row[1], "received_at": str(row[2])}
             for row in connection.execute(
                 "select market_ticker, capture_id, received_at from main.current_markets "
-                "where market_ticker in ('MKT-000000', 'MKT-000001', 'MKT-000002')"
+                "where market_ticker in ('MKT-000000', 'MKT-000001', 'MKT-000002', ?)",
+                [carried_ticker],
             ).fetchall()
         }
     assertions = {}
-    carried_ticker = "MKT-000002" if profile == "history-sparse" else "MKT-000001"
+    carried_is_combo = _fixture_class(fixture_variant)._is_combo(carried_index)
     with duckdb.connect(str(database), read_only=True) as connection:
         event_row = connection.execute(
             "select capture_id, received_at from main.current_events where event_ticker='EVENT'"
@@ -1655,9 +2198,11 @@ def _assert_incremental_provenance(
             "capture_id": event_row[0],
             "received_at": str(event_row[1]),
         }
-    if markets > 2:
+    if markets > 2 and carried_index < markets:
         carried = rows[carried_ticker]
-        if profile == "all-change":
+        if profile == "all-change" or (
+            fixture_variant == COMBO_HEAVY_FIXTURE_LABEL and carried_is_combo
+        ):
             expected_id = capture_id
             expected_prefix = "2026-01-02"
         else:
@@ -1687,6 +2232,8 @@ def _worker_command(
     scenario: str = "full",
     refresh_mode: str = "full",
     baseline_capture_id: str | None = None,
+    fixture_variant: str = "frozen",
+    capture_only: bool = False,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -1706,9 +2253,13 @@ def _worker_command(
         scenario,
         "--refresh-mode",
         refresh_mode,
+        "--fixture",
+        fixture_variant,
     ]
     if baseline_capture_id:
         command += ["--baseline-capture-id", baseline_capture_id]
+    if capture_only:
+        command.append("--capture-only")
     return command
 
 
@@ -1720,11 +2271,12 @@ def _prepare_incremental_baseline(
     markets: int,
     scenario: str,
     role: str,
+    fixture_variant: str = "frozen",
 ) -> tuple[Path, dict[str, Any], float]:
     root = report_dir / f"baseline-{label}-{pair}"
     result_path = report_dir / f"baseline-{label}-{pair}.json"
     started = time.perf_counter()
-    subprocess.run(
+    _run_supervised(
         _worker_command(
             source_root,
             root,
@@ -1733,9 +2285,11 @@ def _prepare_incremental_baseline(
             "baseline-setup",
             scenario,
             _paired_refresh_mode(scenario, role),
+            fixture_variant=fixture_variant,
         ),
         check=True,
         env=os.environ.copy(),
+        timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
     )
     setup_seconds = round(time.perf_counter() - started, 6)
     return root, json.loads(result_path.read_text(encoding="utf-8")), setup_seconds
@@ -1754,6 +2308,7 @@ def _run_one(
     profile: str = "full",
     role: str = "reference",
     prepared_baseline: tuple[Path, dict[str, Any], float] | None = None,
+    fixture_variant: str = "frozen",
 ) -> dict[str, Any]:
     import shutil
 
@@ -1772,7 +2327,7 @@ def _run_one(
     if scenario != "full":
         if prepared_baseline is None:
             baseline_root, setup_result, setup_seconds = _prepare_incremental_baseline(
-                source_root, report_dir, label, pair, markets, scenario, role
+                source_root, report_dir, label, pair, markets, scenario, role, fixture_variant
             )
             remove_baseline = True
         else:
@@ -1790,7 +2345,7 @@ def _run_one(
         baseline_clone_seconds = None
 
     started = time.perf_counter()
-    subprocess.run(
+    _run_supervised(
         _worker_command(
             source_root,
             root,
@@ -1800,9 +2355,11 @@ def _run_one(
             scenario,
             refresh_mode,
             baseline_capture_id,
+            fixture_variant,
         ),
         check=True,
         env=os.environ.copy(),
+        timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["worker_wall_seconds"] = round(time.perf_counter() - started, 6)
@@ -1822,34 +2379,53 @@ def _run_one(
     return result
 
 
+@_cleanup_on_sigterm
 def _sampled_storage_run(
-    source_root: Path, report_dir: Path, label: str, markets: int, profile: str
+    source_root: Path,
+    report_dir: Path,
+    label: str,
+    markets: int,
+    profile: str,
+    fixture_variant: str = "frozen",
 ) -> dict[str, Any]:
     """Run an untimed duplicate while sampling actual on-disk high-water usage."""
     root = report_dir / f"storage-root-{label}"
     result_path = report_dir / f"storage-run-{label}.json"
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            __file__,
-            "--worker",
-            "--source-root",
-            str(source_root),
-            "--root",
-            str(root),
-            "--markets",
-            str(markets),
-            "--result",
-            str(result_path),
-            "--worker-profile",
-            profile,
-        ],
-        env=os.environ.copy(),
-    )
+    process = None
+    cleanup_safe = True
     retained_peak = temporary_peak = samples = 0
     interval = 0.05
+    deadline = time.monotonic() + max(
+        0, BENCHMARK_CHILD_TIMEOUT_SECONDS - BENCHMARK_TERMINATION_RESERVE_SECONDS
+    )
     try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                __file__,
+                "--worker",
+                "--source-root",
+                str(source_root),
+                "--root",
+                str(root),
+                "--markets",
+                str(markets),
+                "--result",
+                str(result_path),
+                "--worker-profile",
+                profile,
+                "--fixture",
+                fixture_variant,
+            ],
+            env=os.environ.copy(),
+            start_new_session=(os.name == "posix"),
+        )
         while process.poll() is None:
+            if time.monotonic() >= deadline:
+                if not _terminate_worker_group(process):
+                    cleanup_safe = False
+                    raise _UnreapedWorkerGroup("storage sample worker descendants remain alive")
+                raise subprocess.TimeoutExpired(process.args, BENCHMARK_CHILD_TIMEOUT_SECONDS)
             retained = temporary = 0
             if root.exists():
                 for directory, _, filenames in os.walk(root, followlinks=False):
@@ -1870,12 +2446,33 @@ def _sampled_storage_run(
             samples += 1
             time.sleep(interval)
         if process.wait() != 0:
-            raise subprocess.CalledProcessError(process.returncode, process.args)
+            worker_error = subprocess.CalledProcessError(process.returncode, process.args)
+        else:
+            worker_error = None
+        if _worker_group_alive(process):
+            if not _terminate_worker_group(process):
+                cleanup_safe = False
+                raise _UnreapedWorkerGroup("storage sample worker exited with live descendants")
+            raise RuntimeError("storage sample worker exited while descendants were still running")
+        if worker_error is not None:
+            raise worker_error
+    except BaseException:
+        if (
+            process is not None
+            and _worker_group_alive(process)
+            and not _terminate_worker_group(process)
+        ):
+            cleanup_safe = False
+            raise _UnreapedWorkerGroup(
+                "storage sample worker descendants remain after interruption"
+            ) from None
+        raise
     finally:
         import shutil
 
-        shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(result_path.with_suffix(".metadata"), ignore_errors=True)
+        if cleanup_safe:
+            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(result_path.with_suffix(".metadata"), ignore_errors=True)
     return {
         "source": str(source_root),
         "sample_interval_seconds": interval,
@@ -1929,33 +2526,139 @@ def _environment(source_root: Path, limits: Any, data_root: Path | None = None) 
     }
 
 
-def _fixture_sha256(markets: int, profile: str = "full") -> str:
+def _fixture_class(fixture_variant: str) -> type[FixtureClient]:
+    if fixture_variant == "frozen":
+        return FixtureClient
+    if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL:
+        return ComboHeavyFixtureClient
+    raise ValueError(f"unsupported fixture variant: {fixture_variant}")
+
+
+def _fixture_combo_counts(markets: int, fixture_variant: str) -> tuple[int, int]:
+    fixture_type = _fixture_class(fixture_variant)
+    combo_markets = 0
+    combo_legs = 0
+    for index in range(markets):
+        if not fixture_type._is_combo(index):
+            continue
+        combo_markets += 1
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL:
+            ordinal = index - index // 20
+            combo_legs += (
+                200
+                if ordinal % 200 == 0
+                else ComboHeavyFixtureClient.LEG_CARDINALITIES[ordinal % 5]
+            )
+        else:
+            combo_legs += 1
+    return combo_markets, combo_legs
+
+
+def _fixture_combo_summary(markets: int, profile: str, fixture_variant: str) -> dict[str, int]:
+    live_markets, live_legs = _fixture_combo_counts(markets, fixture_variant)
+    historical_markets = (
+        live_markets
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL
+        and profile in {"full", "no-change", "sparse-change", "all-change"}
+        else 0
+    )
+    historical_legs = (
+        live_legs
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL
+        and profile in {"full", "no-change", "sparse-change", "all-change"}
+        else 0
+    )
+    return {
+        "combo_markets": live_markets + historical_markets,
+        "combo_legs_expected": live_legs + historical_legs,
+        "live_combo_markets": live_markets,
+        "live_combo_legs_expected": live_legs,
+        "historical_combo_markets": historical_markets,
+        "historical_combo_legs_expected": historical_legs,
+    }
+
+
+def _fixture_observation_count(markets: int, profile: str, fixture_variant: str) -> int:
+    """Return fixture observations expected from the selected acquisition scenario."""
+    if fixture_variant != COMBO_HEAVY_FIXTURE_LABEL:
+        return markets + (
+            4 if profile in COMPOSED_REFRESH_PROFILES | {"history-sparse", "baseline-setup"} else 3
+        )
+    combos, _ = _fixture_combo_counts(markets, fixture_variant)
+    if profile in {"full", "baseline-setup", "baseline-v2-setup"}:
+        # Full live membership plus a complete historical-market reconciliation.
+        return 2 * markets + 3
+    if profile == "no-change":
+        # Historical membership and combo markets reconcile fully even with no metadata updates.
+        return combos + markets + 2
+    if profile == "sparse-change":
+        return combos + markets + 4  # full history plus one live/event delta
+    if profile == "all-change":
+        return 2 * markets + 3
+    raise ValueError(f"unsupported combo-heavy profile: {profile}")
+
+
+def _fixture_historical_market_count(
+    markets: int, profile: str, fixture_variant: str
+) -> int | None:
+    if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL:
+        return markets if profile in {"full", "no-change", "sparse-change", "all-change"} else None
+    if profile in {"all-change", "no-change", "sparse-change", "history-sparse"}:
+        return 1
+    if profile in {"full", "baseline-setup", "baseline-v2-setup"}:
+        return 0
+    return None
+
+
+def _fixture_refresh_history_count(markets: int, profile: str, fixture_variant: str) -> int:
+    if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL and profile in {
+        "no-change",
+        "sparse-change",
+        "all-change",
+    }:
+        return markets
+    return 1 if profile == "history-sparse" else 0
+
+
+def _fixture_full_scope_market_pages(
+    markets: int, fixture_variant: str
+) -> tuple[int, dict[str, int]]:
+    live_pages = (markets + PAGE_SIZE - 1) // PAGE_SIZE
+    if fixture_variant == "frozen":
+        return live_pages, {"combined": live_pages}
+    history_pages = (markets + PAGE_SIZE - 1) // PAGE_SIZE
+    return live_pages + history_pages, {
+        "live_combined": live_pages,
+        "historical": history_pages,
+    }
+
+
+def _fixture_sha256(markets: int, profile: str = "full", fixture_variant: str = "frozen") -> str:
     digest = hashlib.sha256()
     scenario = (
         profile
         if profile in {"no-change", "sparse-change", "all-change", "history-sparse"}
         else "full"
     )
-    digest.update(
-        json.dumps(
-            {
-                "baseline_time": "2026-01-01T00:00:00Z",
-                "refresh_time": "2026-01-02T00:00:00Z",
-                "page_size": PAGE_SIZE,
-                "scenario": scenario,
-            },
-            sort_keys=True,
-        ).encode()
-    )
+    fixture_type = _fixture_class(fixture_variant)
+    fixture_identity = {
+        "baseline_time": "2026-01-01T00:00:00Z",
+        "refresh_time": "2026-01-02T00:00:00Z",
+        "page_size": PAGE_SIZE,
+        "scenario": scenario,
+    }
+    if fixture_variant != "frozen":
+        fixture_identity["fixture_variant"] = fixture_variant
+    digest.update(json.dumps(fixture_identity, sort_keys=True).encode())
     for stage in ("baseline", "refresh"):
-        fixture = FixtureClient(markets, scenario, stage)
+        fixture = fixture_type(markets, scenario, stage)
         digest.update(json.dumps(fixture._event(), sort_keys=True, separators=(",", ":")).encode())
         source_requests = [
             ("/historical/cutoff", {}),
             ("/series", {}),
             ("/events/multivariate", {}),
         ]
-        if scenario != "history-sparse":
+        if scenario != "history-sparse" and fixture_variant == "frozen":
             source_requests.append(("/historical/markets", {}))
         for endpoint, params in source_requests:
             digest.update(
@@ -1965,6 +2668,21 @@ def _fixture_sha256(markets: int, profile: str = "full") -> str:
                     separators=(",", ":"),
                 ).encode()
             )
+        if fixture_variant == COMBO_HEAVY_FIXTURE_LABEL:
+            cursor = ""
+            while True:
+                params = {"cursor": cursor} if cursor else {}
+                payload = fixture.response("/historical/markets", params)
+                digest.update(
+                    json.dumps(
+                        ["/historical/markets", params, payload],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                )
+                cursor = payload[1].get("cursor", "")
+                if not cursor:
+                    break
         if scenario == "history-sparse":
             cursor = ""
             while True:
@@ -2078,6 +2796,23 @@ def _correctness_gate(
     }
 
 
+def _native_acquisition_gate(
+    comparisons: list[dict[str, Any]], identity_stability: dict[str, bool]
+) -> dict[str, Any]:
+    """Compare changed acquisition protocols by native rows/membership, not receipt identity."""
+    failed_pairs = [
+        pair["pair"]
+        for pair in comparisons
+        if pair.get("native_values_and_membership_match") is not True
+    ]
+    return {
+        "passed": not failed_pairs and all(identity_stability.values()),
+        "failed_pairs": failed_pairs,
+        "identity_stability": identity_stability,
+        "basis": "native values and current membership; source receipt, observation, Parquet, and release identities may change with acquisition protocol",
+    }
+
+
 def _identity_stability(
     results: dict[str, list[dict[str, Any]]],
     *,
@@ -2129,6 +2864,18 @@ def main() -> int:
     parser.add_argument("--compare-root", type=Path)
     parser.add_argument("--source-revision", default=None)
     parser.add_argument("--compare-revision", default=None)
+    parser.add_argument("--fixture", choices=tuple(sorted(FIXTURE_VARIANTS)), default="frozen")
+    parser.add_argument(
+        "--prepare-frozen-capture",
+        type=Path,
+        help="create a fresh external combo-heavy full capture root for a same-receipt build comparison",
+    )
+    parser.add_argument(
+        "--frozen-root",
+        type=Path,
+        help="completed, unpublished capture-only root used by frozen-v2-build",
+    )
+    parser.add_argument("--capture-id", help="capture to build in frozen-v2-build mode")
     parser.add_argument(
         "--profile",
         choices=(
@@ -2143,6 +2890,7 @@ def main() -> int:
             "sparse-change",
             "all-change",
             "history-sparse",
+            "frozen-v2-build",
         ),
         default="full",
     )
@@ -2157,6 +2905,8 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-frozen-v2-build", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--capture-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -2189,6 +2939,24 @@ def main() -> int:
     )
     parser.add_argument("--baseline-capture-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.worker_frozen_v2_build:
+        if (
+            args.frozen_root is None
+            or args.capture_id is None
+            or args.result is None
+            or args.root is None
+        ):
+            parser.error(
+                "frozen build worker requires --frozen-root, --root, --capture-id, and --result"
+            )
+        _frozen_v2_build_worker(
+            args.source_root.resolve(),
+            args.frozen_root,
+            args.root,
+            args.capture_id,
+            args.result,
+        )
+        return 0
     if args.worker:
         if args.markets is None or args.markets < 1:
             parser.error("worker --markets must be positive")
@@ -2209,10 +2977,97 @@ def main() -> int:
             args.scenario,
             args.refresh_mode,
             args.baseline_capture_id,
+            args.fixture,
+            args.capture_only,
         )
         return 0
     if args.runs < 1 or args.warmups < 0:
         parser.error("--runs must be positive and --warmups nonnegative")
+    if args.prepare_frozen_capture is not None:
+        if args.fixture != COMBO_HEAVY_FIXTURE_LABEL or args.profile != "full":
+            parser.error("--prepare-frozen-capture requires --fixture combo-heavy --profile full")
+        if args.compare_root or args.frozen_root or args.capture_id:
+            parser.error("capture preparation cannot be combined with comparison inputs")
+        root = args.prepare_frozen_capture.expanduser().absolute()
+        if args.markets is not None and args.markets < 1:
+            parser.error("--markets must be positive")
+        result_path = root.with_name(root.name + "-capture-result.json")
+        if root.exists() or root.is_symlink() or result_path.exists() or result_path.is_symlink():
+            parser.error("capture root and adjacent result file must not already exist")
+        try:
+            _validate_worker_destinations(root, result_path, args.source_root, args.compare_root)
+        except ValueError as exc:
+            parser.error(str(exc))
+        _run_supervised(
+            _worker_command(
+                args.source_root.resolve(),
+                root,
+                result_path,
+                args.markets or 197,
+                "full",
+                fixture_variant=COMBO_HEAVY_FIXTURE_LABEL,
+                capture_only=True,
+            ),
+            check=True,
+            env=os.environ.copy(),
+            timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
+        )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        print(
+            json.dumps(
+                {"root": str(root), "capture_id": result["capture_id"], "result": str(result_path)}
+            )
+        )
+        return 0
+    if args.profile == "frozen-v2-build":
+        if not args.compare_root or not args.frozen_root or not args.capture_id:
+            parser.error("frozen-v2-build requires --compare-root, --frozen-root, and --capture-id")
+        if args.sample_storage or args.fixture != "frozen":
+            parser.error("frozen-v2-build does not accept storage sampling or fixture variants")
+        frozen_root = args.frozen_root.expanduser().resolve()
+        if args.frozen_root.expanduser().is_symlink():
+            parser.error("--frozen-root must not be a symlink")
+        if not frozen_root.is_dir():
+            parser.error("--frozen-root must name an existing capture root")
+        if args.runs < 1 or args.warmups < 0:
+            parser.error("--runs must be positive and --warmups nonnegative")
+        source_root = args.source_root.resolve()
+        compare_root = args.compare_root.resolve()
+        report_dir = args.report_dir.resolve()
+        if report_dir.exists():
+            parser.error("--report-dir must name a new directory outside the source roots")
+        protected_roots = (_script_checkout(), source_root, compare_root, frozen_root)
+        if any(
+            report_dir == protected
+            or report_dir.is_relative_to(protected)
+            or protected.is_relative_to(report_dir)
+            for protected in protected_roots
+        ):
+            parser.error("--report-dir and frozen root must be disjoint from source checkouts")
+        if any(
+            frozen_root == source
+            or frozen_root.is_relative_to(source)
+            or source.is_relative_to(frozen_root)
+            for source in (source_root, compare_root, _script_checkout())
+        ):
+            parser.error("--frozen-root must be outside every source checkout")
+        report_dir.mkdir(parents=True, exist_ok=False)
+        summary = _run_frozen_v2_comparison(
+            source_root,
+            compare_root,
+            frozen_root,
+            args.capture_id,
+            report_dir,
+            args.warmups,
+            args.runs,
+        )
+        report = report_dir / "benchmark-summary.json"
+        report.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        print(report)
+        if not summary["correctness_gate"]["passed"]:
+            print("frozen v2 correctness gate failed; see benchmark-summary.json", file=sys.stderr)
+            return 1
+        return 0
     markets = (
         args.markets
         if args.markets is not None
@@ -2238,6 +3093,15 @@ def main() -> int:
         )
     if incremental_profile and args.sample_storage:
         parser.error("--sample-storage currently supports full, targeted, or resume profiles only")
+    if args.fixture == COMBO_HEAVY_FIXTURE_LABEL and args.profile not in {
+        "full",
+        "no-change",
+        "sparse-change",
+        "all-change",
+    }:
+        parser.error(
+            "--fixture combo-heavy supports full, no-change, sparse-change, and all-change"
+        )
     report_dir = args.report_dir.resolve()
     if report_dir.exists():
         parser.error("--report-dir must name a new directory outside the repository")
@@ -2264,13 +3128,21 @@ def main() -> int:
                 markets,
                 scenario,
                 "reference",
+                args.fixture,
             )
             prepared_baselines = {label: baseline for label, _ in roots}
         else:
             for label, root in roots:
                 role = "candidate" if label == "compare" else "reference"
                 prepared_baselines[label] = _prepare_incremental_baseline(
-                    root, report_dir, f"{label}-shared", 0, markets, scenario, role
+                    root,
+                    report_dir,
+                    f"{label}-shared",
+                    0,
+                    markets,
+                    scenario,
+                    role,
+                    args.fixture,
                 )
     for label, root in roots:
         for warmup in range(args.warmups):
@@ -2284,6 +3156,7 @@ def main() -> int:
                 args.profile,
                 role,
                 prepared_baselines.get(label),
+                args.fixture,
             )
     results: dict[str, list[dict[str, Any]]] = {label: [] for label, _ in roots}
     for pair in range(args.runs):
@@ -2300,18 +3173,28 @@ def main() -> int:
                     args.profile,
                     role,
                     prepared_baselines.get(label),
+                    args.fixture,
                 )
             )
+    combo_summary = _fixture_combo_summary(markets, args.profile, args.fixture)
+    live_combo_markets = combo_summary["live_combo_markets"]
+    live_combo_legs = combo_summary["live_combo_legs_expected"]
+    combo_markets = combo_summary["combo_markets"]
+    combo_legs = combo_summary["combo_legs_expected"]
+    full_scope_market_pages, full_scope_market_pages_by_tier = _fixture_full_scope_market_pages(
+        markets, args.fixture
+    )
     summary = {
         "fixture": {
             "markets": markets,
+            "fixture_variant": args.fixture,
             "receipt_uuid_format": _receipt_uuid_format(args.profile),
             "observations_expected": (
                 len(_selected_profile_tickers(args.profile))
                 if args.profile in SELECTED_PROFILES
                 else 3
                 if args.profile == "targeted"
-                else markets + (4 if incremental_profile else 3)
+                else _fixture_observation_count(markets, args.profile, args.fixture)
             ),
             "selected_tickers": _selected_profile_tickers(args.profile)
             if args.profile in SELECTED_PROFILES
@@ -2319,7 +3202,9 @@ def main() -> int:
             "retained_baseline_history_observations": (
                 HISTORY_STRESS_COUNT if args.profile == "history-sparse" else 0
             ),
-            "refresh_history_observations": 1 if args.profile == "history-sparse" else 0,
+            "refresh_history_observations": _fixture_refresh_history_count(
+                markets, args.profile, args.fixture
+            ),
             "history_passes_per_market": (
                 HISTORY_STRESS_PASSES if args.profile == "history-sparse" else 0
             ),
@@ -2329,9 +3214,26 @@ def main() -> int:
                 else None
             ),
             "page_size": PAGE_SIZE,
-            "full_scope_market_pages": (markets + PAGE_SIZE - 1) // PAGE_SIZE,
-            "combo_markets": sum(FixtureClient._is_combo(index) for index in range(markets)),
-            "combo_legs_expected": sum(FixtureClient._is_combo(index) for index in range(markets)),
+            "full_scope_market_pages": full_scope_market_pages,
+            "full_scope_market_pages_by_tier": full_scope_market_pages_by_tier,
+            "combo_markets": combo_markets,
+            "combo_legs_expected": combo_legs,
+            "live_combo_markets": live_combo_markets,
+            "live_combo_legs_expected": live_combo_legs,
+            "historical_combo_markets": combo_summary["historical_combo_markets"],
+            "historical_combo_legs_expected": combo_summary["historical_combo_legs_expected"],
+            "live_market_observations_expected": (
+                markets
+                if args.profile in {"full", "all-change", "baseline-setup", "baseline-v2-setup"}
+                else live_combo_markets + 1
+                if args.profile == "sparse-change"
+                else live_combo_markets
+                if args.profile == "no-change"
+                else None
+            ),
+            "historical_market_observations_expected": _fixture_historical_market_count(
+                markets, args.profile, args.fixture
+            ),
             "incremental_updated_market_pages": (
                 (
                     0
@@ -2349,13 +3251,7 @@ def main() -> int:
                         )
                         // PAGE_SIZE
                         if args.profile == "history-sparse"
-                        else (
-                            markets
-                            - sum(FixtureClient._is_combo(i) for i in range(markets))
-                            + PAGE_SIZE
-                            - 1
-                        )
-                        // PAGE_SIZE
+                        else (markets - live_combo_markets + PAGE_SIZE - 1) // PAGE_SIZE
                     )
                 )
                 if incremental_profile
@@ -2364,7 +3260,7 @@ def main() -> int:
             "fixture_sha256": (
                 _selected_stress_fixture_sha256(_selected_profile_tickers(args.profile))
                 if args.profile in SELECTED_PROFILES
-                else _fixture_sha256(markets, args.profile)
+                else _fixture_sha256(markets, args.profile, args.fixture)
             ),
         },
         "environment": _environment(args.source_root.resolve(), None),
@@ -2412,6 +3308,11 @@ def main() -> int:
             "reference": str(args.source_root.resolve()),
             "candidate": str(args.compare_root.resolve()),
             "elapsed_ratio": "candidate/reference; below 1 is faster",
+            "comparison_contract": (
+                "changed acquisition: compare native values and current membership; receipt, observation, Parquet, and release identities may differ"
+                if args.fixture == COMBO_HEAVY_FIXTURE_LABEL
+                else "frozen legacy fixture: compare existing artifact and release identities"
+            ),
         }
         summary["paired_comparisons"] = [
             {
@@ -2420,6 +3321,18 @@ def main() -> int:
                     candidate[index]["pipeline_elapsed_seconds"]
                     / reference[index]["pipeline_elapsed_seconds"],
                     4,
+                ),
+                "native_values_and_membership_match": (
+                    reference[index].get("semantic_relations") is not None
+                    and reference[index].get("semantic_relations")
+                    == candidate[index].get("semantic_relations")
+                    if args.fixture == COMBO_HEAVY_FIXTURE_LABEL
+                    else None
+                ),
+                "capture_id_match": (
+                    reference[index].get("capture_id") == candidate[index].get("capture_id")
+                    if args.fixture == COMBO_HEAVY_FIXTURE_LABEL
+                    else None
                 ),
                 **(
                     _selected_comparison(reference[index], candidate[index])
@@ -2487,16 +3400,23 @@ def main() -> int:
             incremental=incremental_profile,
             v2_physical_hint=args.profile in {"baseline-v2-setup", "history-sparse"},
         )
-        summary["correctness_gate"] = _correctness_gate(
-            summary["paired_comparisons"],
-            incremental=incremental_profile,
-            identity_stability=identity_stability,
-            selected_stress=args.profile in SELECTED_PROFILES,
-            v2_output=args.profile in {"baseline-v2-setup", "history-sparse"},
-        )
+        if args.fixture == COMBO_HEAVY_FIXTURE_LABEL:
+            summary["correctness_gate"] = _native_acquisition_gate(
+                summary["paired_comparisons"], identity_stability
+            )
+        else:
+            summary["correctness_gate"] = _correctness_gate(
+                summary["paired_comparisons"],
+                incremental=incremental_profile,
+                identity_stability=identity_stability,
+                selected_stress=args.profile in SELECTED_PROFILES,
+                v2_output=args.profile in {"baseline-v2-setup", "history-sparse"},
+            )
     if args.sample_storage:
         summary["untimed_storage_samples"] = {
-            label: _sampled_storage_run(root, report_dir, label, markets, args.profile)
+            label: _sampled_storage_run(
+                root, report_dir, label, markets, args.profile, args.fixture
+            )
             for label, root in roots
         }
     report = report_dir / "benchmark-summary.json"
