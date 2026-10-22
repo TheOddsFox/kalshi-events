@@ -191,12 +191,32 @@ def read_page(
 class RateLimiter:
     """Start spacing of one slot per 1/max_rate seconds, shared by every traversal of a client."""
 
-    def __init__(self, max_rate: float):
+    def __init__(self, max_rate: float, *, rate_policy: str = "fixed"):
+        if (
+            isinstance(max_rate, bool)
+            or not isinstance(max_rate, (int, float))
+            or not math.isfinite(max_rate)
+            or max_rate <= 0
+        ):
+            raise CatalogueError("max_rate must be finite and positive")
+        if not isinstance(rate_policy, str) or rate_policy not in {
+            "fixed",
+            "decrease-on-429",
+        }:
+            raise CatalogueError("rate policy must be fixed or decrease-on-429")
+        self.initial_rate = max_rate
+        self.effective_rate = max_rate
+        self.minimum_rate = max_rate
+        self.floor_rate = min(max_rate, 0.25)
+        self.rate_policy = rate_policy
+        self.generation = 0
+        self.change_count = 0
         self.interval = 1.0 / max_rate
         self._lock = threading.Lock()
         self._next_start = 0.0
+        self._record_policy()
 
-    def acquire(self, budget: Budget) -> None:
+    def acquire(self, budget: Budget) -> int:
         while True:
             _ = budget.remaining
             with self._lock:
@@ -204,12 +224,39 @@ class RateLimiter:
                 start = max(current, self._next_start)
                 if start <= current:
                     self._next_start = current + self.interval
-                    return
+                    return self.generation
                 wait = start - current
             if wait >= budget.remaining:
                 raise BudgetExceeded("deadline cannot accommodate request spacing")
             with metrics.phase("rate_wait"):
                 time.sleep(wait)
+
+    def on_429(self, generation: int) -> bool:
+        """Lower the shared rate once per current generation; stale responses only cool down."""
+        with self._lock:
+            if self.rate_policy != "decrease-on-429" or generation != self.generation:
+                return False
+            decreased = max(self.floor_rate, self.effective_rate / 2)
+            if decreased >= self.effective_rate:
+                return False
+            self.effective_rate = decreased
+            self.minimum_rate = min(self.minimum_rate, decreased)
+            self.interval = 1.0 / decreased
+            self.generation += 1
+            self.change_count += 1
+            self._next_start = max(self._next_start, time.monotonic() + self.interval)
+            self._record_policy()
+            return True
+
+    def _record_policy(self) -> None:
+        metrics.rate_policy_update(
+            self.rate_policy,
+            self.initial_rate,
+            self.minimum_rate,
+            self.effective_rate,
+            self.change_count,
+            self.generation,
+        )
 
     def defer(self, seconds: float) -> None:
         """Hold every traversal back, for example after a Retry-After from the source."""
@@ -245,14 +292,22 @@ def backoff_seconds(attempt: int, retry_after: float | None) -> float:
 
 
 class PublicClient:
-    def __init__(self, store: Store, budget: Budget, *, compression: str = "identity"):
+    def __init__(
+        self,
+        store: Store,
+        budget: Budget,
+        *,
+        compression: str = "identity",
+        rate_policy: str = "fixed",
+    ):
         if compression not in {"identity", "gzip"}:
             raise CatalogueError("compression must be identity or gzip")
         self.store = store
         self.budget = budget
         self.compression = compression
         self.base_url = source_url()
-        self.limiter = RateLimiter(store.limits.max_rate)
+        self.rate_policy = rate_policy
+        self.limiter = RateLimiter(store.limits.max_rate, rate_policy=rate_policy)
         self.client = httpx.Client(
             trust_env=False,
             follow_redirects=False,
@@ -285,7 +340,7 @@ class PublicClient:
             raise CatalogueError("invalid source endpoint")
         for attempt in range(MAX_ATTEMPTS):
             last = attempt == MAX_ATTEMPTS - 1
-            self.limiter.acquire(self.budget)
+            rate_generation = self.limiter.acquire(self.budget)
             allowance = self.budget.reserve()
             attempt_id = uuid.uuid4().hex
             relative = f"raw/{attempt_id}/manifest.json"
@@ -332,6 +387,11 @@ class PublicClient:
                     retry_after = response.headers.get("retry-after")
                     encoding = response.headers.get("content-encoding", "identity").strip().lower()
                     telemetry.response(status, encoding)
+                    if status == 429:
+                        self.limiter.on_429(rate_generation)
+                        retry_delay = retry_after_seconds(retry_after)
+                        if retry_delay is not None:
+                            self.limiter.defer(retry_delay)
                     if encoding not in {"identity", "gzip"}:
                         raise CatalogueError("unsupported response content encoding")
                     if encoding == "gzip" and self.compression != "gzip":

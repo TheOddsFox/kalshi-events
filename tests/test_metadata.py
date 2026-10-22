@@ -62,7 +62,7 @@ def test_no_stale_fallback_after_direct_absence(store, factory, tmp_path):
     state = capture(
         store,
         selected=["MARKET"],
-        client_factory=lambda s, b: FakeClient(s, b, {"/markets/MARKET": (404, {})}),
+        client_factory=lambda s, b, **_options: FakeClient(s, b, {"/markets/MARKET": (404, {})}),
     )
     output = tmp_path / "metadata"
     export(store, ["MARKET"], output)
@@ -96,7 +96,7 @@ def test_metadata_above_old_32mib_file_ceiling(store, tmp_path):
     state = capture(
         store,
         selected=["MARKET"],
-        client_factory=lambda s, b: FakeClient(
+        client_factory=lambda s, b, **_options: FakeClient(
             s, b, {"/markets/MARKET": (200, {"market": native})}
         ),
     )

@@ -129,8 +129,8 @@ class Client(transport.PublicClient):
         local.request_id = context['request_id']
         return super().get(endpoint, params, context)
 
-def factory(actual_store, budget):
-    client = Client(actual_store, budget)
+def factory(actual_store, budget, **options):
+    client = Client(actual_store, budget, **options)
     headers = dict(client.client.headers)
     client.client.close()
     def handler(request):

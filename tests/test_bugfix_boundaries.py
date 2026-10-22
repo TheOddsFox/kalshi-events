@@ -131,7 +131,7 @@ def test_capture_journals_only_receipts_with_durable_files_and_raw_directory_ent
                 committed.append(receipt)
         return original_append(actual_store, relative, body)
 
-    def client_factory(actual_store, budget):
+    def client_factory(actual_store, budget, **options):
         source = FakeClient(actual_store, budget)
 
         def respond(request):
@@ -139,7 +139,7 @@ def test_capture_journals_only_receipts_with_durable_files_and_raw_directory_ent
             status, payload = source.response(endpoint, dict(request.url.params))
             return httpx.Response(status, stream=httpx.ByteStream(json_bytes(payload)))
 
-        client = PublicClient(actual_store, budget)
+        client = PublicClient(actual_store, budget, **options)
         client.client.close()
         client.client = httpx.Client(transport=httpx.MockTransport(respond), trust_env=False)
         return client

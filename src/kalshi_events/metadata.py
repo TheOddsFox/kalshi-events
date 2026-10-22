@@ -174,11 +174,22 @@ def export(
 
 
 def refresh(
-    store: Store, selected: list[str], output: Path, *, max_output_bytes: int = MAX_BUNDLE_BYTES
+    store: Store,
+    selected: list[str],
+    output: Path,
+    *,
+    max_output_bytes: int = MAX_BUNDLE_BYTES,
+    compression: str | None = None,
+    rate_policy: str | None = None,
 ) -> dict[str, Any]:
     if store.scope is not None:
         raise CatalogueError("metadata v1 refresh is not supported for scoped series roots")
-    state = capture(store, selected=selections(selected))
+    state = capture(
+        store,
+        selected=selections(selected),
+        compression=compression,
+        rate_policy=rate_policy,
+    )
     if not state["complete"]:
         message = "targeted metadata acquisition incomplete: " + (state["error"] or "unknown error")
         if state["budget_exhausted"]:

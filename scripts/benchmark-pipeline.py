@@ -338,6 +338,7 @@ def _freeze_legacy_acquisition(profile: str, scenario: str, capture: Any) -> boo
             state.pop("parent_policy", None)
             state.pop("cutoff_policy", None)
             state.pop("acquisition_policy_sha256", None)
+            state["compression"] = "identity"
             return initialize(store, state)
 
         capture._initialize_v2 = initialize_legacy
@@ -1027,7 +1028,7 @@ def _worker(
             stream=httpx.ByteStream(body),
         )
 
-    def client_factory(root_store, budget):
+    def client_factory(root_store, budget, **_options):
         client = transport.PublicClient(root_store, budget)
         client.client.close()
         client.client = httpx.Client(transport=httpx.MockTransport(handler))

@@ -76,7 +76,12 @@ def test_existing_series_root_derives_scope_and_rejects_conflicts(tmp_path, monk
     code = cli.main(["--root", str(root), "series", "refresh"])
     assert code == 0
     assert seen["scope"] == SCOPE
-    assert seen["kwargs"] == {"full": False, "capture_id": None, "compression": None}
+    assert seen["kwargs"] == {
+        "full": False,
+        "capture_id": None,
+        "compression": None,
+        "rate_policy": None,
+    }
 
     with pytest.raises(CatalogueError, match="series scope requires"):
         cli.execute(
@@ -128,6 +133,7 @@ def test_series_refresh_emits_scoped_machine_result_and_uses_one_refresh_workflo
         "full": False,
         "capture_id": "b" * 32,
         "compression": "gzip",
+        "rate_policy": None,
     }
     assert result["series_scope"] == SCOPE
     assert result["publication_state"] == "verified"

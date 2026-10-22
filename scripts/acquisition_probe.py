@@ -660,6 +660,8 @@ def _capture_command(
         str(temporary),
         "--compression",
         compression,
+        "--rate-policy",
+        "fixed",
     ]
     return [sys.executable, str(worker), "--result", str(result), "--", *cli]
 

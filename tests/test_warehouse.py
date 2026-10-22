@@ -288,7 +288,7 @@ def test_combo_leg_with_missing_authoritative_event_remains_unresolved_in_wareho
     }
     state = capture(
         store,
-        client_factory=lambda s, b: FakeClient(
+        client_factory=lambda s, b, **_options: FakeClient(
             s,
             b,
             {

@@ -37,7 +37,7 @@ def test_combo_leg_with_wrong_native_event_remains_unresolved(store):
     }
     state = acquisition.capture(
         store,
-        client_factory=lambda s, b: FakeClient(
+        client_factory=lambda s, b, **_options: FakeClient(
             s, b, {"/markets": (200, {"markets": [MARKET, combo], "cursor": ""})}
         ),
     )
@@ -60,7 +60,7 @@ def test_metadata_preserves_native_lifecycle_and_settlement_strings(store, tmp_p
     state = acquisition.capture(
         store,
         selected=["MARKET"],
-        client_factory=lambda s, b: FakeClient(
+        client_factory=lambda s, b, **_options: FakeClient(
             s, b, {"/markets/MARKET": (200, {"market": native})}
         ),
     )
@@ -81,7 +81,7 @@ def test_cursor_failure_stays_incomplete_and_cannot_export(store, tmp_path, fail
 
     with pytest.raises(CatalogueError, match="cursor"):
         acquisition.capture(
-            store, client_factory=lambda s, b: FakeClient(s, b, {"/events": events})
+            store, client_factory=lambda s, b, **_options: FakeClient(s, b, {"/events": events})
         )
     capture_id = next(store.path("captures").iterdir()).name
     state = acquisition.read_capture(store, capture_id)
@@ -97,7 +97,7 @@ def test_direct_market_lookup_cannot_substitute_another_native_identity(store):
         acquisition.capture(
             store,
             selected=["MARKET"],
-            client_factory=lambda s, b: FakeClient(
+            client_factory=lambda s, b, **_options: FakeClient(
                 s, b, {"/markets/MARKET": (200, {"market": {**MARKET, "ticker": "OTHER"}})}
             ),
         )
@@ -116,8 +116,8 @@ def test_raw_market_commit_before_pending_checkpoint_is_reused_on_resume(
     original_get = PublicClient.get
     requested = []
 
-    def factory(actual_store, budget):
-        client = PublicClient(actual_store, budget)
+    def factory(actual_store, budget, **options):
+        client = PublicClient(actual_store, budget, **options)
         client.client.close()
 
         def source(request):

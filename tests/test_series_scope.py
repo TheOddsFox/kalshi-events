@@ -99,13 +99,14 @@ def test_scoped_capture_seals_protocol_scope_and_exact_series_tasks(tmp_path):
         state = capture.new_capture(store, None)
 
     assert state["acquisition_protocol"] == 5
-    assert state["rate_policy"] == "fixed"
+    assert state["rate_policy"] == "decrease-on-429"
+    assert state["compression"] == "gzip"
     assert state["parent_policy"] == "singular-v1"
     assert state["cutoff_policy"] == "per-page-v1"
     assert state["acquisition_policy_sha256"] == capture.digest(
         capture.json_bytes(
             {
-                "rate_policy": "fixed",
+                "rate_policy": "decrease-on-429",
                 "parent_policy": "singular-v1",
                 "cutoff_policy": "per-page-v1",
             }

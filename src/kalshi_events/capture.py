@@ -313,7 +313,15 @@ def _acquisition_protocol(state: dict[str, Any]) -> int:
 
 def _protocol5_policies(state: dict[str, Any]) -> dict[str, str]:
     values = {key: state.get(key) for key in _PROTOCOL5_POLICIES}
-    if any(value != _PROTOCOL5_POLICIES[key] for key, value in values.items()):
+    if (
+        not isinstance(values["rate_policy"], str)
+        or values["rate_policy"] not in {"fixed", "decrease-on-429"}
+        or any(
+            value != _PROTOCOL5_POLICIES[key]
+            for key, value in values.items()
+            if key != "rate_policy"
+        )
+    ):
         raise CatalogueError("unsupported protocol 5 acquisition policy")
     expected = digest(json_bytes(values))
     if state.get("acquisition_policy_sha256") != expected:
@@ -1413,13 +1421,16 @@ def _selected_market_batches(values: list[str]) -> list[list[str]]:
 def new_capture(
     store: Store,
     selected: list[str] | None,
-    compression: str = "identity",
+    compression: str = "gzip",
     *,
     incremental: bool = False,
+    rate_policy: str = "decrease-on-429",
     _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if compression not in {"identity", "gzip"}:
         raise CatalogueError("compression must be identity or gzip")
+    if not isinstance(rate_policy, str) or rate_policy not in {"fixed", "decrease-on-429"}:
+        raise CatalogueError("rate policy must be fixed or decrease-on-429")
     if incremental and selected:
         raise CatalogueError("incremental capture cannot be combined with market selection")
     scope = store.scope
@@ -1533,8 +1544,9 @@ def new_capture(
         "error": None,
     }
     if protocol == CURRENT_ACQUISITION_PROTOCOL:
-        state.update(_PROTOCOL5_POLICIES)
-        state["acquisition_policy_sha256"] = digest(json_bytes(_PROTOCOL5_POLICIES))
+        policies = {**_PROTOCOL5_POLICIES, "rate_policy": rate_policy}
+        state.update(policies)
+        state["acquisition_policy_sha256"] = digest(json_bytes(policies))
     if scope is not None:
         state.update(scope=scope, root_id=logical_root_id)
     if pin is not None:
@@ -2128,6 +2140,7 @@ def _capture_locked(
     resume: str | None = None,
     client_factory: Any = None,
     compression: str | None = None,
+    rate_policy: str | None = None,
     incremental: bool = False,
     _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
@@ -2146,8 +2159,9 @@ def _capture_locked(
         else new_capture(
             store,
             selected,
-            compression or "identity",
+            compression if compression is not None else "gzip",
             incremental=incremental,
+            rate_policy=rate_policy if rate_policy is not None else "decrease-on-429",
             _on_capture_id=_on_capture_id,
         )
     )
@@ -2169,6 +2183,14 @@ def _capture_locked(
     sealed_compression = state.get("compression", "identity")
     if compression is not None and compression != sealed_compression:
         raise CatalogueError("resume compression differs from capture")
+    sealed_rate_policy = state.get("rate_policy", "fixed")
+    if rate_policy is not None and rate_policy != sealed_rate_policy:
+        raise CatalogueError("resume rate policy differs from capture")
+    client_options = {}
+    if sealed_compression != "identity":
+        client_options["compression"] = sealed_compression
+    if sealed_rate_policy != "fixed":
+        client_options["rate_policy"] = sealed_rate_policy
     decoded_ceiling = state.get("max_decoded_response_bytes", state["max_response_bytes"])
     budget = Budget(
         store,
@@ -2191,11 +2213,7 @@ def _capture_locked(
     budget_exhausted = False
     try:
         with (
-            (
-                factory(store, budget, compression=sealed_compression)
-                if sealed_compression != "identity"
-                else factory(store, budget)
-            ) as client,
+            factory(store, budget, **client_options) as client,
             ThreadPoolExecutor(
                 max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="kalshi-traversal"
             ) as pool,
@@ -2255,6 +2273,7 @@ def capture(
     resume: str | None = None,
     client_factory: Any = None,
     compression: str | None = None,
+    rate_policy: str | None = None,
     incremental: bool = False,
     _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
@@ -2268,6 +2287,7 @@ def capture(
             resume=resume,
             client_factory=client_factory,
             compression=compression,
+            rate_policy=rate_policy,
             incremental=incremental,
             _on_capture_id=_on_capture_id,
         )

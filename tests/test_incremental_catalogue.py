@@ -108,14 +108,14 @@ class Snapshot:
                 return (200, {envelope: row}) if row is not None else (404, {})
         raise AssertionError(f"unexpected offline endpoint: {endpoint}")
 
-    def factory(self, store, budget):
+    def factory(self, store, budget, **options):
         snapshot = self
 
         class Client(FakeClient):
             def response(self, endpoint, params):
                 return snapshot.response(endpoint, params)
 
-        return Client(store, budget)
+        return Client(store, budget, **options)
 
 
 def capture_at(store, snapshot, timestamp=DELTA_TIME, *, client_factory=None, **kwargs):

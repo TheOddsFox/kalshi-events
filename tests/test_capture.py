@@ -91,6 +91,31 @@ def test_acquisition_protocol_is_sealed_and_legacy_missing_protocol_keeps_reques
             acquisition._request_context(state, 0)
 
 
+def test_new_capture_seals_gzip_and_downward_rate_policy_by_default(store):
+    state = acquisition.new_capture(store, None)
+
+    assert state["compression"] == "gzip"
+    assert state["rate_policy"] == "decrease-on-429"
+    assert acquisition._protocol5_policies(state) == {
+        "rate_policy": "decrease-on-429",
+        "parent_policy": "singular-v1",
+        "cutoff_policy": "per-page-v1",
+    }
+
+
+def test_capture_resume_preserves_legacy_sealed_compression_and_rate_policy(store, factory):
+    state = acquisition.new_capture(store, None, compression="identity", rate_policy="fixed")
+
+    resumed = acquisition.capture(
+        store,
+        resume=state["capture_id"],
+        client_factory=factory,
+    )
+
+    assert resumed["compression"] == "identity"
+    assert resumed["rate_policy"] == "fixed"
+
+
 def test_completed_capture_reads_do_not_depend_on_current_source_origin(
     store, factory, monkeypatch
 ):
@@ -141,7 +166,8 @@ def test_each_historical_read_records_its_own_cutoff(store):
         return 200, {"markets": [HISTORICAL], "cursor": "page-2"}
 
     state = acquisition.capture(
-        store, client_factory=lambda s, b: FakeClient(s, b, {"/historical/markets": markets})
+        store,
+        client_factory=lambda s, b, **_options: FakeClient(s, b, {"/historical/markets": markets}),
     )
     assert state["complete"]
     cutoffs = [
@@ -244,7 +270,7 @@ def test_invalidated_cursor_restarts_and_retains_all_observations(store):
         return 200, {"events": [EVENTS[0]], "cursor": "expired"}
 
     state = acquisition.capture(
-        store, client_factory=lambda s, b: FakeClient(s, b, {"/events": events})
+        store, client_factory=lambda s, b, **_options: FakeClient(s, b, {"/events": events})
     )
     assert state["complete"]
     assert state["tasks"][2]["restarts"] == 1
@@ -269,7 +295,8 @@ def test_invalidated_cursor_restarts_and_retains_all_observations(store):
 def test_malformed_pages_never_complete(store, payload):
     with pytest.raises(CatalogueError):
         acquisition.capture(
-            store, client_factory=lambda s, b: FakeClient(s, b, {"/markets": (200, payload)})
+            store,
+            client_factory=lambda s, b, **_options: FakeClient(s, b, {"/markets": (200, payload)}),
         )
     assert not acquisition.read_capture(store, next(store.path("captures").iterdir()).name)[
         "complete"
@@ -281,7 +308,7 @@ def test_missing_parent_does_not_disappear_or_infer_ticker_prefix(store):
     state = acquisition.capture(
         store,
         selected=[native["ticker"]],
-        client_factory=lambda s, b: FakeClient(
+        client_factory=lambda s, b, **_options: FakeClient(
             s, b, {f"/markets/{native['ticker']}": (200, {"market": native})}
         ),
     )
@@ -298,7 +325,7 @@ def test_targeted_absence_checks_historical_and_never_reuses_previous(store, fac
     second = acquisition.capture(
         store,
         selected=["MARKET"],
-        client_factory=lambda s, b: FakeClient(s, b, {"/markets/MARKET": (404, {})}),
+        client_factory=lambda s, b, **_options: FakeClient(s, b, {"/markets/MARKET": (404, {})}),
     )
     assert first["coverage"]["MARKET"]["status"] == "found"
     assert second["coverage"]["MARKET"]["status"] == "absent"

@@ -142,6 +142,7 @@ class Metrics:
         self.peak_http_concurrency = 0
         self.active_http_requests = 0
         self.endpoint_families: dict[str, dict[str, Any]] = {}
+        self.rate_policy: dict[str, Any] | None = None
 
     def add(self, name: str, value: int = 1) -> None:
         with self._lock:
@@ -169,6 +170,7 @@ class Metrics:
             "store_accounted_high_water_bytes": dict(sorted(self.high_water.items())),
             "peak_http_concurrency": self.peak_http_concurrency,
             "peak_rss_bytes": peak_rss_bytes,
+            "rate_policy": dict(self.rate_policy) if self.rate_policy is not None else None,
             "endpoint_families": {
                 family: _endpoint_report(row)
                 for family, row in sorted(self.endpoint_families.items())
@@ -247,6 +249,29 @@ def endpoint_page(endpoint: str, *, recovered: bool = False) -> None:
         row = current.endpoint_families.setdefault(family, _new_endpoint_row())
         key = "recovered_pages" if recovered else "committed_pages"
         row[key] += 1
+
+
+def rate_policy_update(
+    policy: str,
+    initial_rate: float,
+    minimum_rate: float,
+    final_rate: float,
+    changes: int,
+    generation: int,
+) -> None:
+    """Keep only the bounded invocation-level rate summary in the opt-in report."""
+    current = _active.get()
+    if current is None:
+        return
+    with current._lock:
+        current.rate_policy = {
+            "policy": policy,
+            "initial_rate": initial_rate,
+            "minimum_rate": minimum_rate,
+            "final_rate": final_rate,
+            "change_count": changes,
+            "generation": generation,
+        }
 
 
 @contextmanager

@@ -49,7 +49,7 @@ def _factory(events, live, historical):
         "/historical/markets": (200, {"markets": historical, "cursor": ""}),
         **{f"/events/{row['event_ticker']}": (200, {"event": row}) for row in events},
     }
-    return lambda store, budget: FakeClient(store, budget, responses=responses)
+    return lambda store, budget, **_options: FakeClient(store, budget, responses=responses)
 
 
 def _rows(publication, relation):

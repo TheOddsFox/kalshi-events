@@ -62,11 +62,17 @@ def parser() -> argparse.ArgumentParser:
         if name == "capture":
             command.add_argument("--market-ticker", action="append")
             command.add_argument("--compression", choices=("identity", "gzip"), default=None)
+            command.add_argument(
+                "--rate-policy", choices=("fixed", "decrease-on-429"), default=None
+            )
             command.add_argument("--incremental", action="store_true")
         if name == "refresh":
             command.add_argument("--full", action="store_true")
             command.add_argument("--capture-id")
             command.add_argument("--compression", choices=("identity", "gzip"), default=None)
+            command.add_argument(
+                "--rate-policy", choices=("fixed", "decrease-on-429"), default=None
+            )
         if name in {"current", "replay", "rebuild", "publish"}:
             command.add_argument("--catalogue-version", type=int, choices=(1, 2), default=1)
         if name == "discard":
@@ -84,6 +90,11 @@ def parser() -> argparse.ArgumentParser:
         if name != "verify":
             action.add_argument("--market-ticker", action="append", required=True)
             action.add_argument("--max-output-bytes", type=int, default=MAX_BUNDLE_BYTES)
+            if name == "refresh":
+                action.add_argument("--compression", choices=("identity", "gzip"), default=None)
+                action.add_argument(
+                    "--rate-policy", choices=("fixed", "decrease-on-429"), default=None
+                )
         if name == "export":
             action.add_argument("--capture-id")
         _limits(action)
@@ -94,6 +105,7 @@ def parser() -> argparse.ArgumentParser:
     refresh_action.add_argument("--full", action="store_true")
     refresh_action.add_argument("--capture-id")
     refresh_action.add_argument("--compression", choices=("identity", "gzip"), default=None)
+    refresh_action.add_argument("--rate-policy", choices=("fixed", "decrease-on-429"), default=None)
     for name in ("current", "replay", "rebuild"):
         action = series_actions.add_parser(name)
         if name == "replay":
@@ -177,6 +189,7 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
                     selected=args.market_ticker,
                     resume=args.capture_id,
                     compression=args.compression,
+                    rate_policy=args.rate_policy,
                     incremental=args.incremental,
                 )
             return {
@@ -213,7 +226,12 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
         if args.command == "metadata":
             if args.metadata_action == "refresh":
                 return metadata.refresh(
-                    store, args.market_ticker, args.output, max_output_bytes=args.max_output_bytes
+                    store,
+                    args.market_ticker,
+                    args.output,
+                    max_output_bytes=args.max_output_bytes,
+                    compression=args.compression,
+                    rate_policy=args.rate_policy,
                 )
             return metadata.export(
                 store,
@@ -371,6 +389,7 @@ def _refresh_main(args: argparse.Namespace) -> int:
                     full=args.full,
                     capture_id=args.capture_id,
                     compression=args.compression,
+                    rate_policy=args.rate_policy,
                 )
                 if series_command:
                     result["series_scope"] = store.scope

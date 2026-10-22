@@ -55,7 +55,7 @@ def test_pipeline_fuses_evidence_passes_without_losing_cutoffs_or_fresh_verifica
     with metrics.collect() as captured:
         state = acquisition.capture(
             store,
-            client_factory=lambda s, b: FakeClient(
+            client_factory=lambda s, b, **_options: FakeClient(
                 s, b, {"/historical/cutoff": cutoff, "/historical/markets": historical}
             ),
         )
@@ -305,7 +305,7 @@ def test_compact_parent_collection_preserves_native_validation(store, failure):
     with pytest.raises(CatalogueError):
         acquisition.capture(
             store,
-            client_factory=lambda s, b: FakeClient(s, b, {endpoint: (200, payload)}),
+            client_factory=lambda s, b, **_options: FakeClient(s, b, {endpoint: (200, payload)}),
         )
     capture_id = next(store.path("captures").iterdir()).name
     assert acquisition.read_capture(store, capture_id)["complete"] is False
@@ -314,7 +314,7 @@ def test_compact_parent_collection_preserves_native_validation(store, failure):
 def test_empty_event_series_parent_remains_empty_in_projection(store):
     state = acquisition.capture(
         store,
-        client_factory=lambda s, b: FakeClient(
+        client_factory=lambda s, b, **_options: FakeClient(
             s,
             b,
             {

@@ -100,10 +100,12 @@ CUTOFF = {"market_settled_ts": "2026-01-01T00:00:00Z", "trades_created_ts": "202
 class FakeClient:
     """Offline stand-in for PublicClient with the same receipt and budget contract."""
 
-    def __init__(self, store, budget, responses=None):
+    def __init__(self, store, budget, responses=None, **client_options):
         self.store = store
         self.budget = budget
         self.responses = responses or {}
+        self.compression = client_options.get("compression", "identity")
+        self.rate_policy = client_options.get("rate_policy", "fixed")
 
     def __enter__(self):
         return self

@@ -32,6 +32,7 @@ def run(
     full: bool = False,
     capture_id: str | None = None,
     compression: str | None = None,
+    rate_policy: str | None = None,
     on_capture_id: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Run refresh while the caller holds the canonical root writer lock."""
@@ -53,6 +54,8 @@ def run(
                 raise CatalogueError("targeted captures cannot be resumed by refresh")
             if compression is not None and compression != state.get("compression", "identity"):
                 raise CatalogueError("resume compression differs from capture")
+            if rate_policy is not None and rate_policy != state.get("rate_policy", "fixed"):
+                raise CatalogueError("resume rate policy differs from capture")
             incremental_mode = state.get("incremental") is True
         elif incremental_mode:
             if store.scope is not None:
@@ -70,6 +73,7 @@ def run(
                 store,
                 resume=capture_id,
                 compression=compression,
+                rate_policy=rate_policy,
                 incremental=incremental_mode if capture_id is None else False,
                 _on_capture_id=lambda value: _remember_id(result, value, on_capture_id),
             )

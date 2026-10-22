@@ -211,8 +211,10 @@ def test_serial_identity_then_gzip_with_fixed_bounded_arguments(
     )
     assert gzip_cli[gzip_cli.index("--max-requests") + 1] == "12"
     assert gzip_cli[gzip_cli.index("--max-download-bytes") + 1] == str(64 * probe.MIB)
-    assert identity_cli[-2:] == ["--compression", "identity"]
-    assert gzip_cli[-2:] == ["--compression", "gzip"]
+    assert identity_cli[identity_cli.index("--compression") + 1] == "identity"
+    assert gzip_cli[gzip_cli.index("--compression") + 1] == "gzip"
+    assert identity_cli[identity_cli.index("--rate-policy") + 1] == "fixed"
+    assert gzip_cli[gzip_cli.index("--rate-policy") + 1] == "fixed"
     assert report["samples"][1]["receipts"]["observed_encodings"] == {"identity": 1}
     assert report["samples"][1]["encoding_fallback"] is True
     assert (output / "reports" / "summary.json").is_file()

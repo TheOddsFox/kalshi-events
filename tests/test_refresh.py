@@ -142,6 +142,27 @@ def test_resume_rejects_conflicting_compression_before_capture(
     assert result["error"] == "resume compression differs from capture"
 
 
+def test_resume_rejects_conflicting_rate_policy_before_capture(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        capture,
+        "read_capture",
+        lambda *_a, **_k: {
+            "capture_id": "d" * 32,
+            "selected": None,
+            "compression": "gzip",
+            "rate_policy": "fixed",
+        },
+    )
+    monkeypatch.setattr(capture, "capture", lambda *_a, **_k: pytest.fail("network started"))
+
+    result, code = refresh.run(store, capture_id="d" * 32, rate_policy="decrease-on-429")
+
+    assert code == 1
+    assert result["error"] == "resume rate policy differs from capture"
+
+
 def test_conflicting_full_and_capture_id_is_structured_failure(store: Store) -> None:
     result, code = refresh.run(store, full=True, capture_id="d" * 32)
     assert code == 1

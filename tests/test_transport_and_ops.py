@@ -300,8 +300,8 @@ def test_partial_http_read_attempts_remain_accounted_and_capture_can_resume(stor
             yield b'{"market":'
             raise httpx.ReadError("synthetic interrupted HTTP 200 stream")
 
-    def broken_source(actual_store, budget):
-        client = PublicClient(actual_store, budget)
+    def broken_source(actual_store, budget, **options):
+        client = PublicClient(actual_store, budget, **options)
         client.client.close()
 
         def source(request):

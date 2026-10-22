@@ -45,14 +45,14 @@ class Source:
         assert endpoint in responses, f"unexpected request: {endpoint}"
         return responses[endpoint]
 
-    def factory(self, store, budget):
+    def factory(self, store, budget, **options):
         source = self
 
         class Client(FakeClient):
             def response(self, endpoint, params):
                 return source.response(endpoint, params)
 
-        return Client(store, budget)
+        return Client(store, budget, **options)
 
 
 def _capture_at(

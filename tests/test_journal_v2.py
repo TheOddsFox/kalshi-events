@@ -147,7 +147,7 @@ def test_periodic_snapshot_boundary_counts_domain_transitions(
     monkeypatch.setattr(store, "append", stop_before_next_transition)
     with pytest.raises(PowerLoss):
         acquisition.capture(
-            store, client_factory=lambda s, b: FakeClient(s, b, {"/events": events})
+            store, client_factory=lambda s, b, **_options: FakeClient(s, b, {"/events": events})
         )
     assert committed == transitions
     _, envelope = assert_chain_and_anchor(store, capture_id(store))
@@ -283,7 +283,7 @@ def test_recomputed_snapshot_checksums_cannot_replace_journal_bound_state(store,
         return 200, {"events": [EVENTS[0]], "cursor": "" if params.get("cursor") else "next"}
 
     state = acquisition.capture(
-        store, client_factory=lambda s, b: FakeClient(s, b, {"/events": events})
+        store, client_factory=lambda s, b, **_options: FakeClient(s, b, {"/events": events})
     )
     path = snapshot_path(store, state["capture_id"])
     envelope = json.loads(path.read_text())
@@ -463,8 +463,8 @@ def test_raw_body_without_usable_receipt_is_retried_after_process_death(store, m
                 issued.append((context or {}).get("request_id"))
             return super().get(endpoint, params, context)
 
-    def factory(actual_store, budget):
-        client = RecordingClient(actual_store, budget)
+    def factory(actual_store, budget, **options):
+        client = RecordingClient(actual_store, budget, **options)
         headers = dict(client.client.headers)
         client.client.close()
 
@@ -608,7 +608,7 @@ def test_native_validation_failure_never_commits_or_applies_the_page(store, monk
         with pytest.raises(CatalogueError):
             acquisition.capture(
                 store,
-                client_factory=lambda s, b: FakeClient(
+                client_factory=lambda s, b, **_options: FakeClient(
                     s, b, {"/markets": (200, {"markets": [native], "cursor": ""})}
                 ),
             )

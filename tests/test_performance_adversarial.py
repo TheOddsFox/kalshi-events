@@ -24,8 +24,8 @@ class PowerLoss(BaseException):
 def public_factory(requests, responder=None):
     lock = threading.Lock()
 
-    def factory(store, budget):
-        client = PublicClient(store, budget)
+    def factory(store, budget, **options):
+        client = PublicClient(store, budget, **options)
         headers = dict(client.client.headers)
         client.client.close()
 
