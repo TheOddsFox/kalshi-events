@@ -31,6 +31,8 @@ _ENDPOINT_FAMILIES = frozenset(
         "/events",
         "/events/{ticker}",
         "/events/multivariate",
+        "/multivariate_event_collections",
+        "/multivariate_event_collections/{ticker}",
         "/markets",
         "/markets/{ticker}",
         "/historical/cutoff",
@@ -53,6 +55,12 @@ def endpoint_family(endpoint: str) -> str:
             return candidate
     if len(parts) == 4 and parts[1:3] == ["historical", "markets"] and _TICKER.fullmatch(parts[3]):
         return "/historical/markets/{ticker}"
+    if (
+        len(parts) == 3
+        and parts[1] == "multivariate_event_collections"
+        and _TICKER.fullmatch(parts[2])
+    ):
+        return "/multivariate_event_collections/{ticker}"
     return "other"
 
 
