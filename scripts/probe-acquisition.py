@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(SOURCE_ROOT / "src"))
 
 MIB = 1024**2
@@ -550,9 +551,34 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="new external directory for disposable roots and reports",
     )
+    parser.add_argument("--profile", choices=("screening", "throughput"), default="screening")
     parser.add_argument("--rates", nargs="+", help="one to three distinct rates, each <= 20")
+    parser.add_argument(
+        "--series-ticker", action="append", help="ordinary event partition (throughput only)"
+    )
+    parser.add_argument(
+        "--collection-ticker",
+        action="append",
+        help="multivariate event partition (throughput only)",
+    )
     args = parser.parse_args(argv)
     try:
+        if args.profile == "throughput":
+            from acquisition_probe import (
+                parse_throughput_rates,
+                run_throughput,
+                validate_throughput_selection,
+            )
+
+            rates = parse_throughput_rates(args.rates)
+            partitions = validate_throughput_selection(args.series_ticker, args.collection_ticker)
+            report = run_throughput(
+                args.output, rates, partitions=partitions, invocation_started=started
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0 if report["complete"] else 1
+        if args.series_ticker or args.collection_ticker:
+            raise ValueError("partition selectors require --profile throughput")
         rates = parse_rates(args.rates)
         report = run(args.output, rates, invocation_started=started)
     except (OSError, ValueError) as exc:
