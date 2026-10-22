@@ -408,7 +408,7 @@ class FixtureClient:
                     elif self.scenario == "history-sparse":
                         indexes = [i for i in indexes if i % 100 == 0]
             else:
-                indexes = list(range(self.markets))
+                indexes = range(self.markets)
             start = int(params.get("cursor", "0"))
             page = indexes[start : start + PAGE_SIZE]
             stop = start + len(page)

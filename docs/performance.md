@@ -4,6 +4,8 @@ The benchmark generates deterministic public-API-shaped responses without networ
 
 The frozen full fixture contains 197 markets and three parent observations. The scale fixture contains 249,997 markets and three parents, including 249 combo markets. Both use 200-market response pages, exact decimal strings, native combo legs, repeated parents, rules and nested price ranges. This synthetic pagination is a benchmark input, not an estimate of exchange page counts or live runtime. A separate 1,203-market test exercises seven pages and a combo leg without changing the frozen fixtures.
 
+The original unfiltered mock market traversal rebuilt the complete market-index list on every page. Its quadratic fixture work can dominate large capture timings. The current harness slices a lazy range and preserves the same pages and payloads. Historical results below describe their recorded harness bytes; this correction does not demonstrate a production-pipeline speedup. Record the harness revision when comparing runs.
+
 ## Reproduce a comparison
 
 Use one locked environment and two immutable source archives. Keep both archives and all generated roots/reports on the same filesystem, outside Git. Do not run another benchmark or test suite concurrently.
@@ -101,6 +103,42 @@ Clean full/scale performance targets and full recovery verification remain open 
 
 A manually invoked public probe on 2026-10-20 used the new script at the unchanged 10 requests/second with fresh roots on the MacBook's temporary filesystem. Identity and requested-gzip samples made three and four attempts respectively, all HTTP 200, with no retries or throttling observed. Both stopped at in-flight download reservations before their 12-attempt limit; they were partial captures, not complete catalogues. Aggregate recorded downloads were 716,121 bytes. Gzip was actually served on `/events` and `/markets`; cutoff responses used identity. The samples read different endpoint mixes and are not an equal-work compression or throughput benchmark. They do not measure the external SSD/cable or establish a safe higher public rate. Generated roots, receipts, metrics and reports remain outside Git and distributions.
 
+### 2026-10-22 bounded full-runtime investigation
+
+A separate session at `f20f9c13ab4a8054ea22d1283e6413bc7ae570a0` used the MacBook, locked Python 3.12 environment and external SSD. Measurement work ended after 44 minutes; analysis and independent review finished within 55 minutes. Generated roots, logs, scripts and reports remain outside Git and distributions under the operator's `kalshi-events-runtime/session-20261022T091527Z/` directory.
+
+The sustained production capture ran for 887.989 seconds at an explicit five requests/second. It accounted for 4,322 attempts and 5,364,842,001 encoded bytes: 4,321 HTTP 200 responses plus one finalized zero-download `ReadTimeout` at the deadline. Accounting remained complete. No HTTP 429 occurred in this sample. Achieved throughput was 4.867 attempts/second, 97.3% of the configured ceiling. Series completed at 15,336 records; the other traversals remained incomplete after 260,400 ordinary events, 247,000 multivariate events, 754,000 live markets and 514,000 historical markets. These are interval observations, not an atomic population census or an estimate of the unseen remainder.
+
+Short comparisons then used fresh roots:
+
+| Requested rate | Encoding | Validated data pages | Acquisition seconds | Encoded / decoded bytes | HTTP 429 |
+|---|---|---:|---:|---:|---:|
+| 5/s | Identity | 219 | 51.369 | 356,291,719 / 356,291,719 | 0 |
+| 5/s | Requested gzip | 219 | 51.340 | 47,242,465 / 409,187,786 | 0 |
+| 10/s | Identity | 210 | 35.298 | 283,685,049 / 283,685,049 | 13 |
+
+The requested-gzip sample served 219 gzip data responses and 31 identity cutoff responses. Its own encoded/decoded totals demonstrate wire compression; different source content and endpoint mixes prevent a controlled comparison with the identity sample. Gzip barely changed throughput at the five-request ceiling. The 10/s sample triggered the required stop; its gzip counterpart was not run. This does not establish a sustained public allowance or change the default rate.
+
+Sustained capture recorded 45.4 seconds of main-thread page CPU, 20.2 seconds of file synchronization, 0.093 seconds of directory synchronization and 848 MiB peak self RSS. Encoded arrival averaged 5.76 MiB/s. Together with near-ceiling request throughput, these support request pacing and HTTP/cursor waits as the primary acquisition constraint, rather than SSD bandwidth. Timers overlap and cannot be added into wall time. Unrelated applications were active; system-wide disk bursts during local processing cannot all be attributed to this pipeline.
+
+The full synthetic benchmark completed one warm-up and three measured runs at each of 10k, 100k and 250k markets, with stable public artifacts. Its original million-market warm-up hit the 180-second cap. Review identified the quadratic whole-index construction described above; that timeout cannot establish production backend cost. The repository was not patched during the measurement session.
+
+To isolate downstream work, four disposable copies of that completed million-market capture ran the existing explicit v1 build, publication and standalone verification. One warm-up and all three measured runs passed with identical public release identities. The measured build-plus-publication paired median was 50.934 seconds; adding standalone verification within each pair gave 55.505 seconds, with a 54.360–68.986-second range. Evidence-copy costs and failed setup attempts were excluded. The synthetic acquisition protocol was frozen at version 2; the published contract was catalogue v1. These numbers do not measure initial acquisition or additional v2 certification work.
+
+The real sample was 91.2% combo markets in the live tier and 97.5% in history, containing 12,165,500 leg observations. The synthetic fixture has about 0.1% combo markets with one leg each. Real combo-leg joins, integrity checks and exports therefore remain an uncalibrated downstream cost; the roughly 51-second synthetic result is not a full-build forecast for the real catalogue.
+
+For illustration only, assuming equal populations in each of the four large traversals, the observed rate/latency model and an unchanged four-way progress model imply these acquisition scenarios:
+
+| Assumed total across four traversals | Population per traversal | Modelled acquisition |
+|---|---:|---:|
+| 4 million | 1 million | 45–60 minutes |
+| 10 million | 2.5 million | 111–150 minutes |
+| 25 million | 6.25 million | 278–374 minutes |
+
+These are explicit assumptions, not inferred exchange totals, confidence intervals or upper bounds. The models include historical cutoff requests but exclude unknown parent hydration. At the measured rate, 10,000 additional lookup attempts would consume about 34 minutes of request budget. The incomplete prefix's unresolved parent references do not predict final lookup counts because later pages can resolve them. Full end-to-end runtime remains uncalibrated until population/tail behavior and representative combo-heavy downstream work are measured.
+
+Aggregate live accounting was 5,072 attempts and 6,052,061,234 encoded bytes, below the session's 10,000-attempt/20-GiB ceilings. Final retained test data was about 14.7 GiB. Raw response hashes were independently checked, partial evidence was preserved and measurement processes were reaped. No full catalogue publication, full verification suite, higher persistent rate or production optimization was claimed.
+
 ### Small-fixture diagnostic overhead checks
 
 On 2026-10-20, immutable source archives of `8c13274` and `f2c6a61` were compared with the existing frozen benchmark harness, locked dependencies, one warm-up and three alternating measured pairs on the MacBook temporary filesystem. Both revisions used the same fixture, limits and 1,000-request/second synthetic pace. These are small offline observations, not live or scale performance acceptance. Diagnostics were enabled; this measures their added hooks alongside unchanged pipeline work.
@@ -115,7 +153,7 @@ Every measured pair preserved public artifact bytes and release identities; iden
 
 The first targeted result exceeded the 10% investigation threshold. Repeating the same three-pair protocol without overlapping agent checks did not reproduce that median regression: reference run times were 57.936–58.581 ms and candidate times 56.872–86.152 ms. Capture medians were 46.990 versus 49.010 ms and raw-write medians 7.680 versus 8.442 ms. The first matrix varied more widely, including reference runs from 61.284–95.034 ms. These short timings do not establish the cause of the variation or a significant speedup.
 
-The full-small result is also noisy: one 1.15-second compatibility test overlapped part of that matrix, and dbt medians changed from 6.101 to 6.753 seconds despite unchanged dbt/warehouse implementation. Treat its artifact equivalence as correctness evidence and its timing as inconclusive. No agent tests overlapped either targeted matrix; unrelated host activity was not controlled. Long full/scale comparisons and clean timing targets remain deferred to the workstation.
+The full-small result is also noisy: one 1.15-second compatibility test overlapped part of that matrix, and dbt medians changed from 6.101 to 6.753 seconds despite unchanged dbt/warehouse implementation. Treat its artifact equivalence as correctness evidence and its timing as inconclusive. No agent tests overlapped either targeted matrix; unrelated host activity was not controlled. Long full/scale comparisons and clean timing targets remain open for a quiet MacBook session.
 
 ## KXCPI series acceptance
 
