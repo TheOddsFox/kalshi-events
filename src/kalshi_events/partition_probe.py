@@ -7,6 +7,7 @@ import hashlib
 import uuid
 from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from decimal import Decimal
 from typing import Any
 
 from kalshi_events import metrics
@@ -24,6 +25,34 @@ from kalshi_events.transport import PublicClient, read_page
 
 MAX_CURSOR_LENGTH = 8192
 PAGE_SIZE = 200
+
+
+def _event_payload_digest(event: dict[str, Any]) -> str:
+    """Hash payload values plus the paths where JSON decimals were parsed.
+
+    ``json_bytes`` represents Decimal values as strings for compatibility with
+    existing evidence. Including typed paths prevents a Decimal from colliding
+    with an identical provider string without retaining a second full payload.
+    """
+    decimal_paths = hashlib.sha256()
+    path: list[tuple[str, str | int]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Decimal):
+            decimal_paths.update(json_bytes(path))
+        elif isinstance(value, dict):
+            for key in sorted(value):
+                path.append(("key", key))
+                visit(value[key])
+                path.pop()
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                path.append(("index", index))
+                visit(item)
+                path.pop()
+
+    visit(event)
+    return hashlib.sha256(json_bytes([event, decimal_paths.hexdigest()])).hexdigest()
 
 
 def _inventory_digest(rows: Counter[tuple[str, str]]) -> str:
@@ -162,7 +191,7 @@ def acquire_partitions(
                 for field in ("collection_ticker", "mve_collection_ticker"):
                     if field in event and ticker(event[field]) != partition["ticker"]:
                         raise CatalogueError("event contradicts its selected collection")
-            checksum = hashlib.sha256(json_bytes(event)).hexdigest()
+            checksum = _event_payload_digest(event)
             state["inventory"][(identity, checksum)] += 1
             state["identities"].add(identity)
             state["observations"] += 1

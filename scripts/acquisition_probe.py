@@ -45,6 +45,7 @@ GLOBAL = {
 }
 RESPONSE = {"encoded_bytes": 32 * MIB, "decoded_bytes": 64 * MIB}
 MAX_REPORT_BYTES = 1024**2
+MAX_REPORT_INTEGER = 2**63 - 1
 TICKER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 
 
@@ -104,6 +105,7 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 def _load_report(path: Path) -> dict[str, Any] | None:
     try:
+        path = safe_path(path)
         if path.is_symlink() or path.stat().st_size > MAX_REPORT_BYTES:
             return None
         value = json.loads(
@@ -111,14 +113,14 @@ def _load_report(path: Path) -> dict[str, Any] | None:
             parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON")),
             parse_float=lambda raw: _finite_float(raw),
         )
-    except (OSError, UnicodeError, ValueError, RecursionError):
+    except (CatalogueError, OSError, UnicodeError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 
 
 def _load_pilot_report(path: Path) -> dict[str, Any] | None:
     try:
-        safe_path(path)
+        path = safe_path(path)
         if path.is_symlink() or path.stat().st_size > MAX_PILOT_REPORT_BYTES:
             return None
         value = json.loads(
@@ -126,7 +128,7 @@ def _load_pilot_report(path: Path) -> dict[str, Any] | None:
             parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON")),
             parse_float=lambda raw: _finite_float(raw),
         )
-    except (OSError, UnicodeError, ValueError, RecursionError):
+    except (CatalogueError, OSError, UnicodeError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -171,6 +173,17 @@ def _valid_pilot_report(
         not _nonnegative(accounting.get(k))
         for k in ("attempts", "downloaded_or_reserved_bytes", "retained_bytes", "temporary_bytes")
     ) or not isinstance(accounting.get("accounting_complete"), bool):
+        return False
+    attempt_limit = PREFLIGHT["attempts"] if operation == "preflight" else PARTITION["attempts"]
+    download_limit = (
+        PREFLIGHT["downloaded_bytes"] if operation == "preflight" else PARTITION["downloaded_bytes"]
+    )
+    if (
+        accounting["attempts"] > attempt_limit
+        or accounting["downloaded_or_reserved_bytes"] > download_limit
+        or accounting["retained_bytes"] > TOTAL["retained_bytes"]
+        or accounting["temporary_bytes"] > TOTAL["temporary_bytes"]
+    ):
         return False
     receipts = value["receipts"]
     if not isinstance(receipts, dict) or set(receipts) != {
@@ -257,13 +270,17 @@ def _valid_pilot_report(
         return False
     if (
         isinstance(result.get("workers"), bool)
+        or not _nonnegative(result.get("workers"))
         or result.get("workers") not in range(1, 9)
         or (workers is not None and result.get("workers") != workers)
         or not isinstance(result.get("completed"), bool)
         or (
             result.get("budget_stop") is not None
-            and result.get("budget_stop")
-            not in {"request allowance exhausted", "download allowance exhausted"}
+            and (
+                not isinstance(result.get("budget_stop"), str)
+                or result.get("budget_stop")
+                not in {"request allowance exhausted", "download allowance exhausted"}
+            )
         )
         or any(
             not _nonnegative(result.get(k))
@@ -271,9 +288,13 @@ def _valid_pilot_report(
         )
         or not isinstance(result.get("partitions"), list)
         or len(result["partitions"]) > 8
+        or result["pages"] > PARTITION["attempts"]
+        or result["observations"] > PARTITION["attempts"] * 200
+        or result["overlap_unique_identities"] > PARTITION["attempts"] * 200
     ):
         return False
     total_rows = 0
+    total_pages = 0
     for row in result["partitions"]:
         if not isinstance(row, dict) or set(row) != {
             "kind",
@@ -287,14 +308,18 @@ def _valid_pilot_report(
         }:
             return False
         if (
-            row.get("kind") not in {"series", "collection"}
+            not isinstance(row.get("kind"), str)
+            or row.get("kind") not in {"series", "collection"}
             or not isinstance(row.get("ticker"), str)
             or any(
                 not _nonnegative(row.get(k))
                 for k in ("pages", "observations", "unique_identities", "inventory_rows")
             )
+            or row["pages"] > PARTITION["attempts"]
+            or row["observations"] > row["pages"] * 200
             or not isinstance(row.get("identity_digests"), list)
             or len(row["identity_digests"]) != row["unique_identities"]
+            or row["unique_identities"] > row["observations"]
             or any(not _is_sha256(value) for value in row["identity_digests"])
             or row["identity_digests"] != sorted(set(row["identity_digests"]))
             or row["unique_identities"] > 40_000
@@ -309,6 +334,7 @@ def _valid_pilot_report(
         ):
             return False
         total_rows += row["observations"]
+        total_pages += row["pages"]
     expected_partitions = [(row["kind"], row["ticker"]) for row in (partitions or [])]
     actual_partitions = [(row["kind"], row["ticker"]) for row in result["partitions"]]
     if actual_partitions != expected_partitions:
@@ -317,6 +343,7 @@ def _valid_pilot_report(
         return False
     return (
         total_rows == result["observations"]
+        and total_pages == result["pages"]
         and value["returncode"] in {0, 1, 3}
         and (
             (value["returncode"] == 0 and result["completed"] is True)
@@ -355,7 +382,7 @@ def _valid_pilot_measurements(value: dict[str, Any]) -> bool:
             not isinstance(k, str)
             or isinstance(v, bool)
             or not isinstance(v, (int, float))
-            or not math.isfinite(v)
+            or not _finite_measurement(v)
             or v < 0
             for k, v in metrics_value["phases_seconds"].items()
         )
@@ -404,7 +431,7 @@ def _valid_pilot_measurements(value: dict[str, Any]) -> bool:
         or (
             not isinstance(seconds, bool)
             and isinstance(seconds, (int, float))
-            and math.isfinite(seconds)
+            and _finite_measurement(seconds)
             and seconds >= 0
         )
         for seconds in timings.values()
@@ -419,7 +446,14 @@ def _finite_float(raw: str) -> float:
 
 
 def _nonnegative(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    return (
+        isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_REPORT_INTEGER
+    )
+
+
+def _finite_measurement(value: int | float) -> bool:
+    # math.isfinite(int) can overflow while converting untrusted huge JSON integers.
+    return _nonnegative(value) if isinstance(value, int) else math.isfinite(value)
 
 
 def _valid_worker_report(value: dict[str, Any] | None) -> bool:
@@ -456,12 +490,23 @@ def _valid_worker_report(value: dict[str, Any] | None) -> bool:
         for key in ("attempts", "downloaded_or_reserved_bytes", "retained_bytes", "temporary_bytes")
     ) or not isinstance(accounting.get("accounting_complete"), bool):
         return False
+    if (
+        accounting["attempts"] > GLOBAL["attempts"]
+        or accounting["downloaded_or_reserved_bytes"] > GLOBAL["downloaded_bytes"]
+        or accounting["retained_bytes"] > TOTAL["retained_bytes"]
+        or accounting["temporary_bytes"] > TOTAL["temporary_bytes"]
+    ):
+        return False
     capture = value["capture"]
     if capture is not None and (
         not isinstance(capture, dict)
         or not isinstance(capture.get("complete"), bool)
         or (
             capture.get("capture_id") is not None and not isinstance(capture.get("capture_id"), str)
+        )
+        or (
+            capture.get("error") is not None
+            and (not isinstance(capture.get("error"), str) or len(capture["error"]) > 600)
         )
     ):
         return False
@@ -480,7 +525,9 @@ def _valid_worker_report(value: dict[str, Any] | None) -> bool:
     ):
         return False
     if (
-        not isinstance(receipts.get("http_429"), bool)
+        receipts["attempts"] > GLOBAL["attempts"]
+        or receipts["encoded_bytes"] > GLOBAL["downloaded_bytes"]
+        or not isinstance(receipts.get("http_429"), bool)
         or not isinstance(receipts.get("observed_encodings"), dict)
         or not isinstance(receipts.get("response_statuses"), dict)
     ):
@@ -529,7 +576,7 @@ def _valid_worker_report(value: dict[str, Any] | None) -> bool:
             not isinstance(key, str)
             or isinstance(seconds, bool)
             or not isinstance(seconds, (int, float))
-            or not math.isfinite(seconds)
+            or not _finite_measurement(seconds)
             or seconds < 0
             for key, seconds in metrics["phases_seconds"].items()
         ):
@@ -559,7 +606,7 @@ def _valid_worker_report(value: dict[str, Any] | None) -> bool:
     if not isinstance(timings, dict) or any(
         isinstance(timings.get(key), bool)
         or not isinstance(timings.get(key), (int, float))
-        or not math.isfinite(timings[key])
+        or not _finite_measurement(timings[key])
         or timings[key] < 0
         for key in ("accounting_seconds", "worker_seconds")
     ):
@@ -568,7 +615,7 @@ def _valid_worker_report(value: dict[str, Any] | None) -> bool:
     if acquisition_seconds is not None and (
         isinstance(acquisition_seconds, bool)
         or not isinstance(acquisition_seconds, (int, float))
-        or not math.isfinite(acquisition_seconds)
+        or not _finite_measurement(acquisition_seconds)
         or acquisition_seconds < 0
     ):
         return False
@@ -1430,7 +1477,13 @@ def run_throughput(
 
 
 def _per_second(count: int, duration: float | None) -> float | None:
-    return round(count / duration, 4) if duration is not None and duration > 0 else None
+    if duration is None or duration <= 0:
+        return None
+    try:
+        rate = count / duration
+    except OverflowError:
+        return None
+    return round(rate, 4) if math.isfinite(rate) else None
 
 
 def _expected_acquisition_budget(worker_report: dict[str, Any]) -> bool:

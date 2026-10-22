@@ -324,6 +324,11 @@ def test_shared_collection_series_overlap_preserves_every_observation_serial_and
     fixture = event_fixture("duplicates")
     first, second = fixture["partitions"][1], fixture["partitions"][3]
     second["events"].append(copy.deepcopy(first["events"][0]))
+    json.loads(
+        json.dumps([first["events"], second["events"]]),
+        parse_float=lambda _: pytest.fail("this fixture oracle requires no JSON decimal values"),
+    )
+    empty_decimal_paths = digest(b"")
     selected = [{"kind": "collection", "ticker": row["ticker"]} for row in (first, second)]
     bindings = {row["ticker"]: "MVE-SERIES" for row in (first, second)}
     results = []
@@ -340,7 +345,8 @@ def test_shared_collection_series_overlap_preserves_every_observation_serial_and
         assert result["completed"] is True
         for reported, source in zip(result["partitions"], (first, second), strict=True):
             counts = Counter(
-                (row["event_ticker"], digest(json_bytes(row))) for row in source["events"]
+                (row["event_ticker"], digest(json_bytes([row, empty_decimal_paths])))
+                for row in source["events"]
             )
             expected = [
                 [identity, checksum, count]
