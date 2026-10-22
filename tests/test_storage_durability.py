@@ -210,3 +210,25 @@ def test_directory_sync_failure_is_retried_when_directory_already_exists(tmp_pat
 
     assert target.is_dir()
     assert attempts == [tmp_path.parent, tmp_path, tmp_path, target.parent]
+
+
+def test_spool_remains_accounted_if_directory_sync_fails(store, monkeypatch):
+    before = store.usage()["retained_bytes"]
+    spool = store.spool("raw/sync/body.bin")
+    body = b"committed encoded entity"
+    spool.write(body)
+    monkeypatch.setattr(
+        common, "fsync_directory", lambda _: (_ for _ in ()).throw(OSError("sync failed"))
+    )
+    with pytest.raises(OSError, match="sync failed"):
+        spool.commit()
+    assert spool.closed
+    assert not spool.path.exists()
+    assert spool.destination.read_bytes() == body
+    assert store.usage()["retained_bytes"] == before + len(body)
+    assert store.usage()["temporary_bytes"] == 0
+    assert str(spool.path) not in store._sizes
+    assert store._sizes[str(spool.destination)] == len(body)
+    spool.abort()
+    assert spool.destination.read_bytes() == body
+    assert store.usage()["retained_bytes"] == before + len(body)

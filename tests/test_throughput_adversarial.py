@@ -46,8 +46,8 @@ def test_worker_report_symlink_is_untrusted(tmp_path: Path) -> None:
     link = tmp_path / "report.json"
     try:
         link.symlink_to(target)
-    except OSError:
-        pytest.skip("symlink creation unavailable to this Windows account")
+    except OSError as exc:
+        pytest.fail(f"POSIX symlink creation failed: {exc}")
     assert probe._load_report(link) is None
 
 
@@ -93,9 +93,9 @@ def test_output_rejects_symlink_ancestor_before_starting_child(tmp_path: Path) -
     link = tmp_path / "linked"
     try:
         link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlink creation unavailable to this Windows account")
-    with pytest.raises(ValueError, match="symlinks or reparse"):
+    except OSError as exc:
+        pytest.fail(f"POSIX symlink creation failed: {exc}")
+    with pytest.raises(ValueError, match="symlinks"):
         probe.run_throughput(link / "output", [10.0])
     assert not (target / "output").exists()
 

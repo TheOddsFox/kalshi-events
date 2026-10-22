@@ -7,9 +7,28 @@ from pathlib import Path
 
 import pytest
 
+from kalshi_events import metrics
 from kalshi_events.cli import main
 from kalshi_events.common import Store
 from kalshi_events.metrics import collect, phase
+
+
+@pytest.mark.parametrize(("platform", "expected_multiplier"), [("darwin", 1), ("linux", 1024)])
+def test_posix_rss_units_remain_unchanged(monkeypatch, platform, expected_multiplier):
+    class Resource:
+        RUSAGE_SELF = 1
+        RUSAGE_CHILDREN = 2
+
+        @staticmethod
+        def getrusage(who):
+            return type("Usage", (), {"ru_maxrss": 17 + who})()
+
+    monkeypatch.setattr(metrics, "resource", Resource)
+    monkeypatch.setattr(metrics.sys, "platform", platform)
+    assert metrics.Metrics().report()["peak_rss_bytes"] == {
+        "self": 18 * expected_multiplier,
+        "children": 19 * expected_multiplier,
+    }
 
 
 def test_measurements_are_opt_in_and_cli_json_is_unchanged(tmp_path, capsys):

@@ -28,7 +28,7 @@ def test_rates_default_and_validation() -> None:
             probe.parse_rates(values)
 
 
-def test_output_must_be_new_external_and_without_reparse_points(tmp_path: Path) -> None:
+def test_output_must_be_new_external_and_without_symlinks(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     with pytest.raises(ValueError, match="outside"):

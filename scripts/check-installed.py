@@ -11,10 +11,8 @@ import tempfile
 from pathlib import Path
 
 
-def venv_executable(venv: Path, command: str, *, windows: bool = os.name == "nt") -> Path:
-    directory = "Scripts" if windows else "bin"
-    executable = f"{command}.exe" if windows else command
-    return venv / directory / executable
+def venv_executable(venv: Path, command: str) -> Path:
+    return venv / "bin" / command
 
 
 def main():

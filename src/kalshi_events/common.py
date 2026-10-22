@@ -24,7 +24,6 @@ from filelock import FileLock, Timeout
 
 from kalshi_events import metrics
 
-_WINDOWS = os.name == "nt"
 MAX_BUNDLE_BYTES = 128 * 1024**2
 TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
@@ -117,8 +116,6 @@ def _initialize_root_marker(root: Path, marker: Path, value: dict[str, Any]) -> 
     # the second initializer then fails closed instead of racing the marker installation.
     if any(root.iterdir()):
         raise CatalogueError("operator root must be new, empty, or a Kalshi events root")
-    if _WINDOWS:
-        fsync_directory(root)
     lock = FileLock(str(root / "writer.lock"), timeout=0)
     try:
         lock.acquire()
@@ -187,28 +184,19 @@ def selections(values: list[str]) -> list[str]:
 
 
 def path_is_link(path: Path) -> bool:
-    """Include junctions and other Windows reparse points in the no-alias boundary."""
+    """Reject symbolic links at evidence and operator-root boundaries."""
     try:
         value = path.lstat()
     except FileNotFoundError:
         return False
-    return stat.S_ISLNK(value.st_mode) or bool(
-        getattr(value, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    )
+    return stat.S_ISLNK(value.st_mode)
 
 
 def safe_path(path: Path) -> Path:
     path = path.absolute()
-    if _WINDOWS:
-        from kalshi_events._windows import validate_path
-
-        try:
-            validate_path(path)
-        except OSError as exc:
-            raise CatalogueError(str(exc)) from exc
     for part in (path, *path.parents):
         if path_is_link(part):
-            raise CatalogueError(f"symlink or reparse point is forbidden: {part}")
+            raise CatalogueError(f"symlink is forbidden: {part}")
     return path.resolve()
 
 
@@ -235,7 +223,7 @@ def durable_mkdir(path: Path) -> None:
         current = current.parent
     if not current.is_dir():
         raise CatalogueError(f"directory path is not a directory: {current}")
-    if _WINDOWS or current != Path(current.anchor):
+    if current != Path(current.anchor):
         fsync_directory(current.parent)
     for directory in reversed(missing):
         with suppress(FileExistsError):
@@ -270,7 +258,7 @@ def fsync_file(path: Path) -> None:
     path = safe_path(path)
     if not path.is_file():
         raise CatalogueError("cannot sync a missing or nonregular file")
-    with path.open("r+b" if _WINDOWS else "rb") as stream:
+    with path.open("rb") as stream:
         metrics.add("fsync_calls")
         with metrics.phase("file_sync"):
             os.fsync(stream.fileno())
@@ -281,20 +269,6 @@ def fsync_directory(path: Path) -> None:
     path = safe_path(path)
     if not path.is_dir():
         raise CatalogueError("cannot sync a missing directory")
-    if _WINDOWS:
-        from kalshi_events._windows import flush_directory
-
-        metrics.add("fsync_calls")
-        metrics.add("volume_flush_calls")
-        try:
-            with metrics.phase("directory_sync"), metrics.phase("volume_flush"):
-                flush_directory(path)
-        except OSError as exc:
-            raise CatalogueError(
-                "Windows writes require an elevated Administrator terminal on local NTFS; "
-                f"volume durability barrier failed: {exc}"
-            ) from exc
-        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         metrics.add("fsync_calls")
@@ -503,8 +477,6 @@ class Store:
     def lock(self, *, allow_legacy: bool = False) -> Any:
         if not allow_legacy:
             self._require_writable()
-        if _WINDOWS:
-            fsync_directory(self.root)
         lock = FileLock(str(self.path("writer.lock")), timeout=0)
         try:
             acquisition = lock.acquire()
@@ -634,15 +606,11 @@ class Store:
                 for name in dirs:
                     child = Path(base) / name
                     if path_is_link(child):
-                        raise CatalogueError(
-                            f"symlink or reparse point inside operator root: {child}"
-                        )
+                        raise CatalogueError(f"symlink inside operator root: {child}")
                 for name in files:
                     child = Path(base) / name
                     if path_is_link(child):
-                        raise CatalogueError(
-                            f"symlink or reparse point inside operator root: {child}"
-                        )
+                        raise CatalogueError(f"symlink inside operator root: {child}")
                     present[str(child)] = child.stat().st_size
         with self._lock:
             for key in [k for k in self._sizes if k == prefix or k.startswith(prefix + os.sep)]:

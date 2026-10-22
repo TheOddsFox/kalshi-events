@@ -1070,7 +1070,7 @@ def run_throughput(
     try:
         destination = safe_path(destination)
     except Exception as exc:
-        raise ValueError("output path cannot contain symlinks or reparse points") from exc
+        raise ValueError("output path cannot contain symlinks") from exc
     if destination == source_root or source_root in destination.parents:
         raise ValueError("output directory must be outside the repository")
     if destination.exists() or not destination.parent.is_dir():

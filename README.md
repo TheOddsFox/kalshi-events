@@ -210,7 +210,7 @@ Tests use synthetic source responses. Loopback HTTP is available only with both 
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion. Both installed wheels and source checkouts include dbt resources; runtime data, credentials, local Pad state and warehouse files are excluded from distributions.
 
-Native Windows Python 3.12 uses `python scripts/verify.py --fast` or `python scripts/verify.py`. Windows writers require an **elevated Administrator terminal and a fixed local NTFS drive**. Directory durability uses volume-wide flushing at the existing barriers; this can flush other applications' writes and materially affect timings. Unsupported drives, reparse points and insufficient permissions fail closed. See the [Windows setup and validation handoff](docs/windows.md); native execution and clean performance targets remain unverified.
+The supported execution environment is the MacBook with Python 3.12 and POSIX file/directory synchronization. Keep full-run operator roots, temporary files and benchmark reports on the external SSD, outside the checkout. Run the canonical verification commands above before a full catalogue pass; clean full/scale comparisons remain open.
 
 ## Offline benchmarking
 

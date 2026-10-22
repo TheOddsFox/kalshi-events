@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 import os
-import stat
 import subprocess
 import sys
 import time
@@ -56,17 +55,6 @@ def parse_rates(values: list[str] | None) -> list[float]:
     return rates
 
 
-def _is_reparse(path: Path) -> bool:
-    try:
-        mode = path.lstat().st_mode
-        if stat.S_ISLNK(mode):
-            return True
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
-        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-    except FileNotFoundError:
-        return False
-
-
 def validate_output(path: Path, repository: Path) -> Path:
     """Return the canonical destination, requiring a new external directory path."""
     from kalshi_events.common import safe_path
@@ -75,7 +63,7 @@ def validate_output(path: Path, repository: Path) -> Path:
     try:
         destination = safe_path(expanded)
     except Exception as exc:
-        raise ValueError("output path cannot contain symlinks or reparse points") from exc
+        raise ValueError("output path cannot contain symlinks") from exc
     repo = repository.resolve()
     if destination == repo or repo in destination.parents:
         raise ValueError("output directory must be outside the repository")
@@ -157,11 +145,11 @@ def _nonnegative_int(value: Any) -> bool:
 def _account(root: Path) -> dict[str, Any] | None:
     """Use the producer's receipt and Store accounting, never successful-page counts."""
     try:
-        from kalshi_events.common import Limits, Store
+        from kalshi_events.common import Limits, Store, safe_path
         from kalshi_events.transport import accounting
 
-        marker = root / "root.json"
-        if not root.is_dir() or not marker.is_file() or _is_reparse(marker):
+        marker = safe_path(root / "root.json")
+        if not root.is_dir() or not marker.is_file():
             return None
         store = Store(
             root,

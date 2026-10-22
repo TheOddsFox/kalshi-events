@@ -1836,17 +1836,14 @@ def _environment(source_root: Path, limits: Any, data_root: Path | None = None) 
         for path in sorted((source_root / "src/kalshi_events").rglob("*"))
         if path.is_file() and path.suffix in {".py", ".sql", ".yml"}
     }
-    windows = platform.system() == "Windows"
     return {
         "platform": platform.platform(),
         "python": sys.version,
         "python_executable": sys.executable,
         "packages": packages,
         "filesystem_device": filesystem_device,
-        "durability_requirement": (
-            "elevated-local-NTFS-volume-flush" if windows else "POSIX-file-and-directory-fsync"
-        ),
-        "child_peak_rss_available": not windows,
+        "durability_requirement": "POSIX-file-and-directory-fsync",
+        "child_peak_rss_available": True,
         "runtime_source_sha256": source_files,
         "limits": vars(limits) if limits is not None else None,
     }
@@ -2310,8 +2307,6 @@ def main() -> int:
             "hashes": "Instrumented common.digest/file_digest calls, including normalize/metadata aliases, plus explicitly counted transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hashing.",
             "hash_bytes": "Bytes counted by instrumented common.digest/file_digest and explicit transport/journal hashing; excludes uninstrumented lineage/membership and third-party/internal hash bytes.",
             "fsync_calls": "Python-level explicit fsync calls observed or inferred by the legacy observer; excludes DuckDB/C++ internal syncs.",
-            "volume_flush_calls": "Native Windows whole-volume durability barriers, also counted in fsync_calls; includes unrelated writes flushed by the OS.",
-            "volume_flush": "Time spent in native Windows volume validation/open/flush/close barriers; included in pipeline work.",
             "encoded_hashing": "Hash time for encoded HTTP entity bodies; legacy observer also classifies transport.digest calls here.",
             "metadata_scans": "Filesystem inventory walk/reconcile calls; metadata JSON parsing is counted separately.",
             "metadata_scan": "Elapsed time in filesystem inventory walk/reconcile operations, excluding metadata JSON decoding.",

@@ -179,27 +179,27 @@ def test_report_loaders_reject_actual_symlinks(tmp_path: Path, loader: str) -> N
     link = tmp_path / "report.json"
     try:
         link.symlink_to(target)
-    except OSError:
-        pytest.skip("symlink creation unavailable to this Windows account")
+    except OSError as exc:
+        pytest.fail(f"POSIX symlink creation failed: {exc}")
     assert getattr(probe, loader)(link) is None
 
 
 @pytest.mark.parametrize("loader", ["_load_report", "_load_pilot_report"])
-def test_report_loaders_treat_reparse_path_errors_as_untrusted(
+def test_report_loaders_treat_unsafe_path_errors_as_untrusted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loader: str
 ) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text("{}", encoding="utf-8")
 
-    def reject_reparse(path: Path) -> Path:
+    def reject_unsafe_path(path: Path) -> Path:
         assert path == report_path
-        raise CatalogueError("reparse point in report path")
+        raise CatalogueError("symlink in report path")
 
-    monkeypatch.setattr(probe, "safe_path", reject_reparse)
+    monkeypatch.setattr(probe, "safe_path", reject_unsafe_path)
     assert getattr(probe, loader)(report_path) is None
 
 
-def test_pilot_report_reparse_error_saves_unknown_accounting_and_stops(
+def test_pilot_report_unsafe_path_saves_unknown_accounting_and_stops(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     MixedWorker.commands = []
@@ -210,7 +210,7 @@ def test_pilot_report_reparse_error_saves_unknown_accounting_and_stops(
     def reject_pilot_report(path: Path) -> Path:
         path = Path(path)
         if path.name.startswith("partition-") and path.name.endswith(".worker.json"):
-            raise CatalogueError("reparse point in pilot report path")
+            raise CatalogueError("symlink in pilot report path")
         return real_safe_path(path)
 
     monkeypatch.setattr(probe, "safe_path", reject_pilot_report)

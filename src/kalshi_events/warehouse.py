@@ -123,8 +123,8 @@ def build_directory(capture_id: str, catalogue_version: int = 1) -> str:
     return f"builds-v2/{capture_id}" if catalogue_version == 2 else f"builds/{capture_id}"
 
 
-def _dbt_executable(python_executable: str, *, windows: bool = os.name == "nt") -> Path:
-    return Path(python_executable).parent / ("dbt.exe" if windows else "dbt")
+def _dbt_executable(python_executable: str) -> Path:
+    return Path(python_executable).parent / "dbt"
 
 
 def _receipt_body_path(relative: str) -> str:

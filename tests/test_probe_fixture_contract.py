@@ -128,7 +128,7 @@ def test_wide_unicode_exact_decimals_and_gzip_bytes_are_deterministic():
     compressed = encoded_body(payload, "gzip")
     assert compressed == encoded_body(copy.deepcopy(payload), "gzip")
     assert compressed[4:8] == b"\x00\x00\x00\x00"
-    assert compressed[9] == 255  # A platform-independent gzip header also works on Windows.
+    assert compressed[9] == 255  # The fixture pins a deterministic gzip header.
     assert gzip.decompress(compressed) == identity
     decoded = json.loads(identity)
     assert decoded == payload
