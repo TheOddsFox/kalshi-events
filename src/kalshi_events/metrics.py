@@ -37,7 +37,7 @@ _ENDPOINT_FAMILIES = frozenset(
         "/historical/markets/{ticker}",
     }
 )
-_TICKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+_TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()\- ]{0,254}[A-Za-z0-9._()\-])?\Z")
 
 
 def endpoint_family(endpoint: str) -> str:

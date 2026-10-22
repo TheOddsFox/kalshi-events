@@ -28,7 +28,7 @@ def test_protocol_four_requires_an_exact_series_scope():
         None,
         {**scope, "include_multivariate": True},
         {**scope, "extra": "value"},
-        {**scope, "series_ticker": "bad ticker"},
+        {**scope, "series_ticker": "bad/ticker"},
     ):
         with pytest.raises(CatalogueError):
             capture._acquisition_protocol({"acquisition_protocol": 4, "scope": malformed})
@@ -101,14 +101,14 @@ def test_scoped_capture_seals_protocol_scope_and_exact_series_tasks(tmp_path):
     assert state["acquisition_protocol"] == 5
     assert state["rate_policy"] == "decrease-on-429"
     assert state["compression"] == "gzip"
-    assert state["parent_policy"] == "singular-v1"
-    assert state["cutoff_policy"] == "per-page-v1"
+    assert state["parent_policy"] == "batched-v1"
+    assert state["cutoff_policy"] == "checkpoint-v1"
     assert state["acquisition_policy_sha256"] == capture.digest(
         capture.json_bytes(
             {
                 "rate_policy": "decrease-on-429",
-                "parent_policy": "singular-v1",
-                "cutoff_policy": "per-page-v1",
+                "parent_policy": "batched-v1",
+                "cutoff_policy": "checkpoint-v1",
             }
         )
     )

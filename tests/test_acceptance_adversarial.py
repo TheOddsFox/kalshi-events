@@ -17,6 +17,11 @@ def _legacy_checkpoint(store, state):
     logical = dict(state)
     logical.pop("journal_version")
     logical.pop("acquisition_protocol", None)
+    logical.pop("rate_policy", None)
+    logical.pop("parent_policy", None)
+    logical.pop("cutoff_policy", None)
+    logical.pop("acquisition_policy_sha256", None)
+    logical.pop("compression", None)
     if logical.get("selected") is not None:
         logical["tasks"] = [
             acquisition.task("/historical/cutoff", None, singular=True),

@@ -175,7 +175,7 @@ def test_each_historical_read_records_its_own_cutoff(store):
         for manifest, _ in acquisition.capture_pages(store, state)
         if manifest["endpoint"] == "/historical/cutoff"
     ]
-    # One cutoff for the catalogue-start read plus one before each of the two historical pages.
+    # The initial catalogue cutoff plus the historical list's start and terminal checkpoints.
     assert len(cutoffs) == 3
     assert all(manifest["status"] == 200 for manifest in cutoffs)
 

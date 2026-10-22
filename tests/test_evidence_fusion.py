@@ -89,9 +89,18 @@ def test_pipeline_fuses_evidence_passes_without_losing_cutoffs_or_fresh_verifica
     counters = published.report()["counters"]
     assert counters.get("raw_body_json_decodes", 0) == len(cutoffs)
     assert all(opened[path] >= 1 for path in paths)
+    cutoff_manifests = [
+        manifest
+        for manifest, _ in acquisition.capture_pages(store, state)
+        if manifest["endpoint"] == "/historical/cutoff"
+    ]
+    assert Counter(
+        (manifest.get("cutoff_reason"), manifest.get("cutoff_ordinal"))
+        for manifest in cutoff_manifests
+    ) == Counter({(None, None): 1, ("start", 1): 1, ("terminal", 2): 1})
     coverage = pq.read_table(Path(release["output"]) / "coverage.parquet").to_pylist()
     retained = json.loads(coverage[0]["cutoff_json"])
-    assert len(retained) == len(cutoffs) == 4
+    assert len(retained) == len(cutoffs) == 3
     assert sorted(json_bytes(row["cutoff"]) for row in retained) == sorted(
         json_bytes(value) for value in cutoffs
     )

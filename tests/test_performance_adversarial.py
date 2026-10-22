@@ -170,6 +170,11 @@ def test_parent_request_parameters_follow_capture_protocol(store, advancing_cloc
         if protocol == "legacy-v1":
             logical.pop("journal_version")
         logical.pop("acquisition_protocol")
+        logical.pop("rate_policy", None)
+        logical.pop("parent_policy", None)
+        logical.pop("cutoff_policy", None)
+        logical.pop("acquisition_policy_sha256", None)
+        logical.pop("compression", None)
         logical["tasks"] = [
             acquisition.task("/historical/cutoff", None, singular=True),
             acquisition.task("/markets/MARKET", "markets", singular=True, requested="MARKET"),

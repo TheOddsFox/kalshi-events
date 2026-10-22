@@ -196,7 +196,7 @@ def test_context_preserves_cutoff_history_and_decodes_only_cutoff_receipts(basel
     with store.lock(), warehouse.operation_context(store) as context:
         first_cutoffs = []
         warehouse.certified(store, capture_id, cutoff_sink=first_cutoffs, _context=context)
-        assert len(first_cutoffs) == 2
+        assert len(first_cutoffs) == 3
         monkeypatch.setattr(Path, "open", audited)
         monkeypatch.setattr(warehouse, "read_page", decoded)
         second_cutoffs = []
