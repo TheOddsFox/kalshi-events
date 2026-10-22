@@ -59,9 +59,24 @@ uv run --locked python scripts/probe-acquisition.py --output /absolute/new/acqui
 uv run --locked python scripts/probe-acquisition.py --output /absolute/new/rate-probe --rates 5 10 20
 ```
 
-The default compares identity and requested gzip at 10 requests/second. Explicit rates replace that list; at most three distinct finite positive rates up to 20 are accepted. Samples run serially against fresh roots and never build or publish. Each sample allows 12 attempts, 30 seconds and 64 MiB encoded downloads, with independent 32 MiB encoded and 64 MiB decoded response ceilings. The whole run allows 72 attempts, 256 MiB encoded downloads and 180 seconds, plus at most five seconds for termination/reaping. Aggregate retained and temporary allowances are 2 GiB and 1 GiB under existing Store accounting semantics. Remaining allowances can shorten later samples.
+The default compares identity and requested gzip at 10 requests/second. Explicit rates replace that list; at most three distinct finite positive rates up to 20 are accepted. Samples run serially against fresh roots and never build or publish. Each sample allows 12 attempts, 30 seconds and 64 MiB encoded downloads, with independent 32 MiB encoded and 64 MiB decoded response ceilings. The screening run retains its 72-attempt, 256-MiB and 180-second acquisition allowances, plus at most five seconds for termination/reaping. Its legacy parent-side evidence inspection can exceed that wall allowance; use the throughput profile below for supervised acquisition and accounting together. Aggregate retained and temporary allowances are 2 GiB and 1 GiB under existing Store accounting semantics. Remaining allowances can shorten later samples.
 
 The output separates roots, reports and logs and preserves failed evidence. Timeouts or uncertain accounting stop subsequent samples. A request-budget stop with verified accounting is an expected partial sample. Requested gzip may produce identity fallback. The report distinguishes attempts, completed pages, errors/retries, bytes, observed encodings and timing. Samples may retrieve different changing source data; their byte ratios are not controlled compression benchmarks. No rate is selected automatically and no production settings change. Short probes establish capability observations, not sustained full-crawl throughput.
+
+For longer, explicitly bounded comparisons, select the throughput profile:
+
+```sh
+uv run --locked python scripts/probe-acquisition.py --profile throughput \
+  --output /absolute/new/throughput-probe --rates 10 15 20 \
+  --series-ticker KXMIDTERMVOTETURN --series-ticker KXMIDTERMMOV \
+  --collection-ticker KXMVECROSSCATEGORY-R
+```
+
+Omit selectors for global samples only. Otherwise supply two to eight distinct ordinary-series or multivariate-collection partitions. Rates default to `[10]`; explicitly supplied rates run in ascending order. The sequence is identity/gzip at the lowest rate, one serial and one parallel selected-event sample when requested, then identity/gzip at remaining rates. Global samples use the production capture command. Partition samples acquire diagnostic raw evidence only: they cannot build or publish a catalogue and cannot resume.
+
+The throughput profile permits 2,000 attempts, 4 GiB encoded downloads and 15 minutes for the entire invocation, including startup, preflight and reporting. Collection preflight permits 100 attempts/64 MiB/30 seconds; each global sample 250 attempts/512 MiB/60 seconds; each partition sample 200 attempts/512 MiB/60 seconds. Five seconds within each child allowance are reserved for finalization. Termination and reaping have at most five additional seconds. Responses retain independent 32 MiB encoded and 64 MiB decoded ceilings. Aggregate Store-accounted retained/temporary limits are 8 GiB/2 GiB; preceding consumption reduces subsequent allowances.
+
+Reports preserve partial evidence and stop remaining scenarios after any HTTP 429, timeout, uncertain accounting, invariant failure or unexpected command failure. Fewer than 100 validated data pages or ten seconds of acquisition is insufficient for a throughput conclusion. Even larger samples establish only short-window observations. Collection membership relies on the provider's filter, checked against its collection definition's series; it is not an independently certified catalogue scope. See [performance guidance](docs/performance.md) for interpretation and actual results.
 
 ## Build and publish
 

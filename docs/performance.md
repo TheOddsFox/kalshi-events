@@ -63,6 +63,40 @@ Worker times overlap and phases nest: neither their sum nor HTTP elapsed time al
 
 The manual `scripts/probe-acquisition.py` runner compares identity and requested gzip serially using fresh roots. Only explicitly supplied rates are tried; the default remains 10 requests/second. Fixed per-sample and aggregate budgets, preserved partial reports and uncertain-accounting stops keep this diagnostic separate from production operation. See README for exact limits. Live source content can differ between samples, so a lower byte count or shorter sample is not an equal-work speedup. Identity fallback is a valid observed result.
 
+The optional `--profile throughput` extends those observations without changing the production traversal. Its global samples still execute the ordinary capture CLI, including cutoff, journals, parent hydration and synchronization. Explicit event selectors append serial/parallel diagnostic samples within the same invocation. Those samples omit production capture journals, hydration, warehouses and publication; compare serial versus parallel only within that diagnostic engine. Their time cannot be credited as an end-to-end production speedup.
+
+Throughput reports separate validated HTTP-200 data pages from cutoff/control/error responses and distinguish diagnostic verified pages from journal-committed production pages. They include requested/observed encoding, attempts and page rates, acquisition/subprocess/reporting durations, existing phase timings, synchronization, Store-accounted peaks and RSS. Unknown values remain unavailable. A sample with fewer than 100 validated data pages or ten seconds of acquisition is insufficient for a throughput conclusion. Longer samples still cannot establish sustained public capacity, a safe default rate or global equivalence. Kalshi's [published rate tiers](https://docs.kalshi.com/getting_started/rate_limits) describe authenticated token budgets, not this public client's unauthenticated allowance.
+
+Partitioning can overlap independent cursor chains but cannot divide one hot partition. A retained earlier sample placed its first 2,000 multivariate events in one series and 9,684 of its first 10,000 live markets in one collection. These are prefix observations, not a full distribution census. Complete combo/history reconciliation, parent resolution, full integrity checks and deterministic exports remain production costs. For subsequent catalogue runs, use explicit v2 incremental refreshes and full rebases as described above; this pilot does not change their coverage or freshness semantics.
+
+### 2026-10-22 bounded catalogue experiment
+
+Reference `6b13f70` was archived externally with interpreter, locked dependency versions, machine/filesystem details and source/fixture hashes. Candidate acquisition code was frozen at `6091a61`. Generated evidence is retained outside the checkout under `/Volumes/Mac SSD/oddsfox-data/kalshi-events-throughput/implementation-20261022T073032Z/`; it is not distributed.
+
+The offline comparison used the same diagnostic engine, frozen gzip input, external SSD, 20-request/second ceiling and limits for both worker counts. Each fixture had one warm-up per mode and three alternating measured pairs. All observation multisets matched, including duplicate payloads and corrections. Median seconds were:
+
+| Fixture | One worker | Eight workers |
+|---|---:|---:|
+| Balanced | 0.389 | 0.386 |
+| Many small | 0.379 | 0.381 |
+| Empty | 0.169 | 0.167 |
+| Skewed | 0.489 | 0.487 |
+| Dominant partition | 0.595 | 0.603 |
+| Duplicate observations | 0.605 | 0.594 |
+| Wide payloads | 0.386 | 0.383 |
+
+These tiny MockTransport fixtures have no artificial network latency and are dominated by pacing. Differences range from about -1.9% to +1.3%; they do not establish a meaningful speedup or a reproducible regression above 10%. The machine was not reserved for these measurements; clean scale comparisons remain open for the Windows workstation. Mechanical barrier tests independently prove concurrent requests, one outstanding request per partition and a shared limiter/budget. Full source, per-run phase/counter/RSS/storage reports and fixture identities are in `offline-pairs-final-6091a61/report.json` in the external evidence directory.
+
+A separate balanced-fixture metrics-on/off comparison used one warm-up per mode and three alternating pairs with identical inventories. Median acquisition was 0.385 seconds without metrics and 0.379 seconds with metrics; this small variation does not show measurable overhead or a speedup. Its report is `metrics-overhead-6091a61/report.json` in the same external directory.
+
+The manually invoked live session used the exact approved ordinary scopes `KXMIDTERMVOTETURN`, `KXMIDTERMMOV` and collection `KXMVECROSSCATEGORY-R`, with explicit rates 10, 15 and 20. Preflight successfully bound the collection to series `KXMVECROSSCATEGORY`; that definition was served as gzip (31,531 encoded bytes, 346,041 decoded bytes). The first global identity sample observed HTTP 429 and the supervisor stopped all remaining scenarios. Gzip global samples, partition comparisons and higher rates were therefore **not run**.
+
+The whole session took 37.146 seconds, with 251 attempts including preflight and 222,833,910 encoded bytes. The global sample took 35.789 seconds of acquisition: 250 attempts, 238 HTTP 200 responses, 12 HTTP 429 responses/retries, 218 validated data pages and 20 cutoff pages. It reached 6.99 attempts/second and 6.09 data pages/second, with peak HTTP concurrency five. Every global response used identity encoding. The capture remained incomplete at its request allowance; this was not a complete catalogue or a sustained-capacity measurement.
+
+Global accumulated timings included header waits 36.636 seconds, response-iterator waits 32.659, limiter waits 57.845 and retry waits 9.080; these overlap across workers and cannot be summed or treated as wall time. Spool writes took 0.324 seconds and file synchronization 0.553 seconds; 3,005 total sync calls were recorded. Main-thread page CPU was 1.528 seconds. Reported self peak RSS was 322,732,032 bytes. Aggregate Store-accounted retained storage ended at 223,128,882 bytes, temporary high-water was 20,104,540 bytes and no temporary bytes remained. This sample provides no evidence that SSD bandwidth is the limiting factor, and no basis for increasing the default public rate.
+
+The experiment completed its required throttling stop, preserving partial evidence and verified accounting. Compression and partition throughput comparisons remain inconclusive. No new full-crawl or end-to-end acceleration claim follows from these results. Long canonical suites and native Windows execution remain separate manual gates; GitHub CI stays removed.
+
 Clean full/scale performance targets and actual native Windows recovery remain open.
 
 A manually invoked public probe on 2026-10-20 used the new script at the unchanged 10 requests/second with fresh roots on the MacBook's temporary filesystem. Identity and requested-gzip samples made three and four attempts respectively, all HTTP 200, with no retries or throttling observed. Both stopped at in-flight download reservations before their 12-attempt limit; they were partial captures, not complete catalogues. Aggregate recorded downloads were 716,121 bytes. Gzip was actually served on `/events` and `/markets`; cutoff responses used identity. The samples read different endpoint mixes and are not an equal-work compression or throughput benchmark. They do not measure the external SSD/cable or establish a safe higher public rate. Generated roots, receipts, metrics and reports remain outside Git and distributions.

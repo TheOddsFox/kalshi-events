@@ -40,6 +40,14 @@ The full baseline can exceed default budgets; explicitly size them before a long
 
 The probe uses the active interpreter without POSIX shell syntax. It creates separate roots/reports/logs, preserves failures and stops on timeout or uncertain accounting. The parent deadline includes child startup, followed by up to five seconds for termination and reaping. All writes retain Windows volume barriers, which can dominate short samples and include unrelated applications' writes. Live probes run only when explicitly invoked; verification uses offline fixtures. Preserve the report alongside Windows/Python/dependency versions and storage configuration. Actual native execution of these additions remains a workstation acceptance requirement.
 
+The longer throughput profile uses the same active interpreter and shell-free subprocess handling:
+
+```powershell
+uv run --locked python scripts/probe-acquisition.py --profile throughput --output C:\kalshi-probes\new-throughput --rates 10 15 20 --series-ticker KXMIDTERMVOTETURN --series-ticker KXMIDTERMMOV --collection-ticker KXMVECROSSCATEGORY-R
+```
+
+It supervises acquisition and accounting in the same child; a timed-out child cannot trigger an unbounded parent evidence scan. Roots, metrics, logs and reports remain separate. Select a new external directory on the accepted elevated local NTFS setup; symlinks and reparse points are rejected. The complete invocation is bounded to 15 minutes, 2,000 attempts and 4 GiB encoded downloads, with at most five additional seconds for termination/reaping. All sample and storage allowances in the [README](../README.md) apply unchanged. Parallel diagnostic durations include native volume barriers; do not attribute their cost solely to the API or compare them directly with POSIX file-sync timings.
+
 ## Dedicated series ingestion
 
 The series commands use the same native executable and path rules. Start in a new directory on the accepted fixed local NTFS drive:
