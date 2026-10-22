@@ -96,6 +96,48 @@ def test_structural_fixture_covers_pagination_combo_legs_and_native_decimals():
     assert combos[0]["volume_fp"] == "12.3456789"
 
 
+def test_combo_heavy_fixture_is_deterministic_and_separate_from_frozen_fixture():
+    fixture = benchmark.ComboHeavyFixtureClient(1000)
+    first = [fixture._market(index) for index in range(1000)]
+    second = [fixture._market(index) for index in range(1000)]
+    assert first == second
+    assert sum(bool(row["mve_selected_legs"]) for row in first) == 950
+    leg_counts = sorted(len(row["mve_selected_legs"]) for row in first if row["mve_selected_legs"])
+    assert 200 in leg_counts
+    assert {1, 2, 4, 8, 32, 200}.issubset(set(leg_counts))
+    assert any(
+        leg["event_ticker"].startswith("MISSING-EVENT")
+        for row in first
+        for leg in row["mve_selected_legs"]
+    )
+    assert any(
+        leg["market_ticker"].startswith("MISSING-MARKET")
+        for row in first
+        for leg in row["mve_selected_legs"]
+    )
+    assert max(len(row["rules_primary"]) for row in first) > len(
+        benchmark.FixtureClient(1000)._market(0)["rules_primary"]
+    )
+    _, history = fixture.response("/historical/markets", {})
+    assert sum(bool(row["mve_selected_legs"]) for row in history["markets"]) == 190
+    assert history["markets"][0]["settlement_value_dollars"] == "1.000000000000000001"
+
+
+@pytest.mark.parametrize("count", [1, 100, 10_000, 100_000])
+def test_parent_hydration_fixture_scales_with_distinct_stable_identities(count: int):
+    parents = benchmark.parent_hydration_fixture(count)
+    assert len(parents) == count
+    assert len(set(parents)) == count
+    assert parents[0] == "EVENT-000000"
+    assert parents[-1] == f"EVENT-{count - 1:06d}"
+
+
+@pytest.mark.parametrize("bad_count", [0, -1, True, 1.5])
+def test_parent_hydration_fixture_rejects_invalid_counts(bad_count):
+    with pytest.raises(ValueError, match="positive integer"):
+        benchmark.parent_hydration_fixture(bad_count)
+
+
 def test_selected_stress_fixture_covers_lookup_edges_without_changing_frozen_full_fixture():
     tickers = benchmark.selected_stress_tickers()
     fixture = benchmark.SelectedStressFixtureClient()

@@ -1809,10 +1809,28 @@ def _inspect_capture_receipts(
         receipt = decode(regular_bytes(path, 1024**2))
         if not isinstance(receipt, dict):
             raise CatalogueError("invalid raw receipt during throughput accounting")
+        status = receipt.get("status")
+        accounting_complete = receipt.get("accounting_complete")
+        downloaded = receipt.get("downloaded_bytes", receipt.get("size", 0))
+        retry_delay = receipt.get("retry_delay_seconds")
+        if (
+            (status is not None and not _nonnegative(status))
+            or not isinstance(accounting_complete, bool)
+            or not _nonnegative(downloaded)
+            or (
+                retry_delay is not None
+                and (
+                    isinstance(retry_delay, bool)
+                    or not isinstance(retry_delay, (int, float))
+                    or not _finite_measurement(retry_delay)
+                    or retry_delay < 0
+                )
+            )
+        ):
+            raise CatalogueError("malformed raw receipt accounting during throughput inspection")
         attempts += 1
         if receipt.get("endpoint") == "/historical/cutoff":
             control_responses += 1
-        status = receipt.get("status")
         if isinstance(status, int) and not isinstance(status, bool):
             statuses[str(status)] = statuses.get(str(status), 0) + 1
             http_429 = http_429 or status == 429
@@ -1836,9 +1854,7 @@ def _inspect_capture_receipts(
             encoding = "identity"
         if valid_observation and encoding in {"identity", "gzip"}:
             encodings[encoding] = encodings.get(encoding, 0) + 1
-        size = receipt.get("downloaded_bytes", receipt.get("size", 0))
-        if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
-            encoded_bytes += size
+        encoded_bytes += downloaded
         if receipt.get("retry_delay_seconds") is not None:
             retry_attempts += 1
     data_pages = control_pages = 0

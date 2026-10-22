@@ -413,6 +413,38 @@ def test_only_committed_http_200_data_pages_count_for_throughput(
     assert report["non_data_responses"] == 3
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", True),
+        ("status", "bad"),
+        ("accounting_complete", "yes"),
+        ("downloaded_bytes", True),
+        ("downloaded_bytes", -1),
+        ("retry_delay_seconds", True),
+        ("retry_delay_seconds", -0.1),
+        ("retry_delay_seconds", "soon"),
+    ],
+)
+def test_worker_rejects_malformed_retry_and_receipt_accounting_types(
+    tmp_path: Path, field: str, value: Any
+) -> None:
+    store = Store(tmp_path / "malformed-root")
+    manifest: dict[str, Any] = {
+        "version": 1,
+        "endpoint": "/markets",
+        "status": 200,
+        "size": 1,
+        "downloaded_bytes": 1,
+        "accounting_complete": True,
+        "sha256": "0" * 64,
+    }
+    manifest[field] = value
+    store.write("raw/attempt/manifest.json", manifest)
+    with pytest.raises(CatalogueError, match="malformed raw receipt accounting"):
+        probe._inspect_capture_receipts(store, capture, None)
+
+
 def test_worker_timeout_kills_child_and_stops_matrix(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

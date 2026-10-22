@@ -285,6 +285,8 @@ def _sample(
     deadline: float,
     used: dict[str, int | None],
 ) -> dict[str, Any]:
+    from acquisition_probe import _capture_command, _load_report, _valid_worker_report
+
     root = paths["roots"] / f"sample-{index:02d}-rate-{rate:g}-{compression}"
     root.mkdir()
     metrics_path = paths["metrics"] / f"sample-{index:02d}.json"
@@ -315,7 +317,7 @@ def _sample(
             "stop_reason": "aggregate budget exhausted",
         }
 
-    cmd = _command(
+    cmd = _capture_command(
         root,
         metrics_path,
         rate,
@@ -363,12 +365,46 @@ def _sample(
         }
 
     elapsed = time.monotonic() - child_started
-    result = _read_json(stdout_path)
-    accounting_result = None if timed_out and returncode is None else _account(root)
-    metrics = _metrics_summary(metrics_path)
-    receipt_summary = _receipt_summary(root, result.get("capture_id") if result else None)
-    if not receipt_summary["valid"]:
+    worker_path = metrics_path.with_suffix(".worker.json")
+    worker_report = _load_report(worker_path)
+    trusted_worker = (
+        not timed_out
+        and returncode == 0
+        and _valid_worker_report(worker_report)
+        and worker_report is not None
+        and (
+            worker_report["returncode"] not in {0, 3} or isinstance(worker_report["capture"], dict)
+        )
+    )
+    if trusted_worker:
+        assert worker_report is not None
+        result = worker_report["capture"]
+        accounting_result = worker_report["accounting"]
+        metrics = worker_report["metrics"]
+        receipts = worker_report["receipts"]
+        receipt_summary = {
+            "attempts": receipts["attempts"],
+            "retry_attempts": receipts["retry_attempts"],
+            "response_statuses": receipts["response_statuses"],
+            "observed_encodings": receipts["observed_encodings"],
+            "encoded_receipt_bytes": receipts["encoded_bytes"],
+            "committed_pages": receipts["data_pages"] + receipts["control_pages"],
+            "valid": True,
+        }
+        returncode = worker_report["returncode"]
+    else:
+        result = None
         accounting_result = None
+        metrics = None
+        receipt_summary = {
+            "attempts": None,
+            "retry_attempts": None,
+            "response_statuses": {},
+            "observed_encodings": {},
+            "encoded_receipt_bytes": None,
+            "committed_pages": None,
+            "valid": False,
+        }
     if accounting_result is None:
         accounting_label = "unknown"
     elif accounting_result["accounting_complete"]:
@@ -397,7 +433,13 @@ def _sample(
         "compression": compression,
         "requested_encoding": compression,
         "root": str(root),
-        "status": "timed_out" if timed_out else "completed" if returncode == 0 else "partial",
+        "status": "timed_out"
+        if timed_out
+        else "completed"
+        if trusted_worker and returncode == 0
+        else "partial"
+        if trusted_worker
+        else "invalid_worker_report",
         "returncode": returncode,
         "elapsed_seconds": round(elapsed, 3),
         "capture": result,
@@ -451,12 +493,23 @@ def _sample(
     stop_reason = None
     if timed_out:
         stop_reason = "sample deadline exceeded; child terminated"
+    elif not trusted_worker:
+        stop_reason = "worker did not exit cleanly or returned untrusted accounting"
+    elif returncode not in {0, 3}:
+        stop_reason = "capture worker reported an unexpected failure"
     elif accounting_result is None or sample["accounting"] != "verified":
         stop_reason = (
             "child could not be reaped within the termination grace"
             if timed_out and returncode is None
             else "accounting or storage usage is unknown"
         )
+    elif (
+        accounting_result["attempts"] > remaining_attempts
+        or accounting_result["downloaded_or_reserved_bytes"] > remaining_download
+        or accounting_result["retained_bytes"] > remaining_retained
+        or accounting_result["temporary_bytes"] > remaining_temporary
+    ):
+        stop_reason = "sample accounting exceeded its assigned allowance"
     elif (
         used["attempts"] > TOTAL["attempts"] or used["downloaded_bytes"] > TOTAL["downloaded_bytes"]
     ):

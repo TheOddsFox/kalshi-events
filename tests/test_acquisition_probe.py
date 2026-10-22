@@ -56,6 +56,25 @@ class FakePopen:
     behavior: str = "success"
     startup: Any = None
     receipt: dict[str, Any] | None = None
+    worker_accounting: dict[str, Any] = {
+        "attempts": 1,
+        "downloaded_or_reserved_bytes": 123,
+        "accounting_complete": True,
+        "retained_bytes": 100,
+        "temporary_bytes": 0,
+    }
+    worker_metrics: dict[str, Any] | None = {
+        "counters": {"requests": 1},
+        "phases_seconds": {"request": 0.1},
+        "store_accounted_high_water_bytes": {"temporary": 10},
+        "endpoint_families": {},
+        "elapsed_seconds": 0.2,
+        "peak_http_concurrency": 1,
+        "peak_rss_bytes": {"self": 10, "children": 0},
+    }
+    worker_returncode = 0
+    invalid_worker_report = False
+    missing_capture = False
 
     def __init__(
         self, command: list[str], *, stdout: Any, stderr: Any, env: dict[str, str], shell: bool
@@ -70,16 +89,43 @@ class FakePopen:
         self.instances.append(self)
         if self.startup is not None:
             self.startup()
-        if self.receipt is not None:
-            root = Path(command[command.index("--root") + 1])
-            manifest = root / "raw" / "attempt" / "manifest.json"
-            manifest.parent.mkdir(parents=True)
-            manifest.write_text(json.dumps(self.receipt), encoding="utf-8")
         if self.behavior != "timeout":
-            self.stdout.write(
-                json.dumps({"capture_id": "capture-1", "complete": True, "requests": 1})
-            )
-            self.stderr.write("")
+            result_path = Path(command[command.index("--result") + 1])
+            report = {
+                "version": 1,
+                "command": "capture",
+                "returncode": self.worker_returncode,
+                "capture": None
+                if self.missing_capture
+                else {
+                    "capture_id": "capture-1",
+                    "complete": self.worker_returncode == 0,
+                    "error": None,
+                },
+                "accounting": dict(self.worker_accounting),
+                "receipts": {
+                    "data_pages": 1,
+                    "control_pages": 0,
+                    "control_responses": 0,
+                    "non_data_responses": 0,
+                    "attempts": self.worker_accounting["attempts"],
+                    "retry_attempts": 0,
+                    "encoded_bytes": 123,
+                    "http_429": False,
+                    "observed_encodings": {"identity": 1},
+                    "response_statuses": {"200": 1},
+                },
+                "metrics": self.worker_metrics,
+                "timings": {
+                    "acquisition_seconds": 0.1,
+                    "accounting_seconds": 0.01,
+                    "worker_seconds": 0.12,
+                },
+                "error": None,
+            }
+            if self.invalid_worker_report:
+                report["receipts"]["attempts"] = True
+            result_path.write_text(json.dumps(report), encoding="utf-8")
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_timeouts.append(timeout)
@@ -94,41 +140,33 @@ class FakePopen:
 
 def _patch_success(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(probe.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(
-        probe,
-        "_account",
-        lambda root: {
-            "attempts": 1,
-            "downloaded_or_reserved_bytes": 123,
-            "accounting_complete": True,
-            "retained_bytes": 100,
-            "temporary_bytes": 0,
-        },
-    )
-    monkeypatch.setattr(
-        probe,
-        "_metrics_summary",
-        lambda path: {
-            "counters": {"requests": 1},
-            "phases_seconds": {"request": 0.1},
-            "store_accounted_high_water_bytes": {"temporary": 10},
-            "endpoint_families": {},
-            "elapsed_seconds": 0.2,
-        },
-    )
-    monkeypatch.setattr(
-        probe,
-        "_receipt_summary",
-        lambda root, capture_id: {
-            "attempts": 1,
-            "retry_attempts": 0,
-            "response_statuses": {"200": 1},
-            "observed_encodings": {"identity": 1},
-            "encoded_receipt_bytes": 123,
-            "committed_pages": 1,
-            "valid": True,
-        },
-    )
+    monkeypatch.setattr(probe, "_account", lambda root: pytest.fail("parent accounting ran"))
+    FakePopen.behavior = "success"
+    FakePopen.startup = None
+    FakePopen.receipt = None
+    FakePopen.worker_accounting = {
+        "attempts": 1,
+        "downloaded_or_reserved_bytes": 123,
+        "accounting_complete": True,
+        "retained_bytes": 100,
+        "temporary_bytes": 0,
+    }
+    FakePopen.worker_metrics = {
+        "counters": {"requests": 1},
+        "phases_seconds": {"request": 0.1},
+        "store_accounted_high_water_bytes": {"temporary": 10},
+        "endpoint_families": {},
+        "elapsed_seconds": 0.2,
+        "peak_http_concurrency": 1,
+        "peak_rss_bytes": {"self": 10, "children": 0},
+    }
+    FakePopen.worker_returncode = 0
+    FakePopen.invalid_worker_report = False
+    FakePopen.missing_capture = False
+
+
+def _cli_arguments(command: list[str]) -> list[str]:
+    return command[command.index("--") + 1 :]
 
 
 def test_serial_identity_then_gzip_with_fixed_bounded_arguments(
@@ -157,14 +195,24 @@ def test_serial_identity_then_gzip_with_fixed_bounded_arguments(
     assert report["limits"]["per_sample"]["seconds"] == 30.0
     assert len(FakePopen.commands) == 2
     identity, gzip = FakePopen.commands
-    assert identity[:3] == gzip[:3] == [probe.sys.executable, "-m", "kalshi_events.cli"]
-    assert "--max-requests" in identity and identity[identity.index("--max-requests") + 1] == "12"
-    assert identity[identity.index("--max-response-bytes") + 1] == str(32 * probe.MIB)
-    assert identity[identity.index("--max-decoded-response-bytes") + 1] == str(64 * probe.MIB)
-    assert gzip[gzip.index("--max-requests") + 1] == "12"
-    assert gzip[gzip.index("--max-download-bytes") + 1] == str(64 * probe.MIB)
-    assert identity[-2:] == ["--compression", "identity"]
-    assert gzip[-2:] == ["--compression", "gzip"]
+    identity_cli, gzip_cli = _cli_arguments(identity), _cli_arguments(gzip)
+    assert (
+        identity[:2]
+        == gzip[:2]
+        == [
+            probe.sys.executable,
+            str(probe.SOURCE_ROOT / "scripts" / "probe-acquisition-worker.py"),
+        ]
+    )
+    assert identity_cli[identity_cli.index("--max-requests") + 1] == "12"
+    assert identity_cli[identity_cli.index("--max-response-bytes") + 1] == str(32 * probe.MIB)
+    assert identity_cli[identity_cli.index("--max-decoded-response-bytes") + 1] == str(
+        64 * probe.MIB
+    )
+    assert gzip_cli[gzip_cli.index("--max-requests") + 1] == "12"
+    assert gzip_cli[gzip_cli.index("--max-download-bytes") + 1] == str(64 * probe.MIB)
+    assert identity_cli[-2:] == ["--compression", "identity"]
+    assert gzip_cli[-2:] == ["--compression", "gzip"]
     assert report["samples"][1]["receipts"]["observed_encodings"] == {"identity": 1}
     assert report["samples"][1]["encoding_fallback"] is True
     assert (output / "reports" / "summary.json").is_file()
@@ -176,14 +224,14 @@ def test_unknown_accounting_stops_remaining_scenarios_and_keeps_partial_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_success(monkeypatch)
-    monkeypatch.setattr(probe, "_account", lambda root: None)
+    FakePopen.invalid_worker_report = True
     FakePopen.commands = []
     FakePopen.instances = []
     FakePopen.wait_timeouts = []
     output = tmp_path / "probe"
     report = probe.run(output, [5.0, 10.0])
     assert report["complete"] is False
-    assert report["stop_reason"] == "accounting or storage usage is unknown"
+    assert report["stop_reason"] == "worker did not exit cleanly or returned untrusted accounting"
     assert len(FakePopen.commands) == 1
     saved = json.loads((output / "reports" / "summary.json").read_text())
     assert saved["samples"][0]["accounting"] == "unknown"
@@ -206,6 +254,33 @@ def test_timeout_kills_and_reaps_child_then_preserves_evidence_paths(
     assert FakePopen.instances[0].killed is True
     assert Path(sample["root"]).is_dir()
     assert Path(sample["logs"]["stderr"]).is_file()
+
+
+def test_unexpected_capture_failure_stops_matrix_after_supervised_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_success(monkeypatch)
+    FakePopen.worker_returncode = 1
+    FakePopen.commands = []
+    report = probe.run(tmp_path / "probe", [5.0, 10.0])
+    assert len(FakePopen.commands) == 1
+    assert report["samples"][0]["status"] == "partial"
+    assert report["samples"][0]["accounting"] == "verified"
+    assert report["samples"][0]["stop_reason"] == "capture worker reported an unexpected failure"
+    assert report["accounting"]["attempts"] == 1
+
+
+def test_success_exit_without_capture_result_is_untrusted_and_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_success(monkeypatch)
+    FakePopen.missing_capture = True
+    FakePopen.commands = []
+    report = probe.run(tmp_path / "probe", [5.0, 10.0])
+    assert len(FakePopen.commands) == 1
+    assert report["samples"][0]["accounting"] == "unknown"
+    assert report["samples"][0]["status"] == "invalid_worker_report"
+    assert report["stop_reason"] == "worker did not exit cleanly or returned untrusted accounting"
 
 
 def test_committed_page_count_uses_validated_capture_rows_not_journal_lines(store, factory) -> None:
@@ -231,23 +306,14 @@ def test_existing_temporary_files_reduce_next_sample_allowance_and_accumulate_hi
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_success(monkeypatch)
-    monkeypatch.setattr(
-        probe,
-        "_account",
-        lambda root: {
-            "attempts": 1,
-            "downloaded_or_reserved_bytes": 123,
-            "accounting_complete": True,
-            "retained_bytes": 100,
-            "temporary_bytes": 40,
-        },
-    )
+    FakePopen.worker_accounting["temporary_bytes"] = 40
     FakePopen.commands = []
     FakePopen.instances = []
     FakePopen.wait_timeouts = []
     FakePopen.behavior = "success"
     report = probe.run(tmp_path / "probe", [10.0])
-    assert FakePopen.commands[1][FakePopen.commands[1].index("--max-temp-bytes") + 1] == str(
+    second_cli = _cli_arguments(FakePopen.commands[1])
+    assert second_cli[second_cli.index("--max-temp-bytes") + 1] == str(
         probe.TOTAL["temporary_bytes"] - 40
     )
     assert report["accounting"]["temporary_bytes"] == 80
@@ -258,18 +324,8 @@ def test_missing_metrics_stops_even_when_receipt_accounting_is_verified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_success(monkeypatch)
-    monkeypatch.setattr(
-        probe,
-        "_account",
-        lambda root: {
-            "attempts": 1,
-            "downloaded_or_reserved_bytes": 123,
-            "accounting_complete": True,
-            "retained_bytes": 100,
-            "temporary_bytes": 17,
-        },
-    )
-    monkeypatch.setattr(probe, "_metrics_summary", lambda path: None)
+    FakePopen.worker_accounting["temporary_bytes"] = 17
+    FakePopen.worker_metrics = None
     FakePopen.commands = []
     FakePopen.instances = []
     report = probe.run(tmp_path / "probe", [10.0])
@@ -358,20 +414,12 @@ def test_malformed_receipt_field_stops_with_partial_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_success(monkeypatch)
-    monkeypatch.setattr(probe, "_receipt_summary", REAL_RECEIPT_SUMMARY)
     FakePopen.commands = []
     FakePopen.instances = []
-    FakePopen.receipt = {
-        "status": 200,
-        "accounting_complete": True,
-        "downloaded_bytes": "bad",
-    }
-    try:
-        report = probe.run(tmp_path / "probe", [10.0])
-    finally:
-        FakePopen.receipt = None
+    FakePopen.invalid_worker_report = True
+    report = probe.run(tmp_path / "probe", [10.0])
     assert report["complete"] is False
-    assert report["stop_reason"] == "accounting or storage usage is unknown"
+    assert report["stop_reason"] == "worker did not exit cleanly or returned untrusted accounting"
     assert report["samples"][0]["accounting"] == "unknown"
     assert (tmp_path / "probe" / "reports" / "summary.json").is_file()
 
@@ -381,13 +429,9 @@ def test_malformed_temporary_peak_stops_and_marks_storage_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_peak: Any
 ) -> None:
     _patch_success(monkeypatch)
-    monkeypatch.setattr(
-        probe,
-        "_metrics_summary",
-        lambda path: {"store_accounted_high_water_bytes": {"temporary": bad_peak}},
-    )
+    FakePopen.worker_metrics["store_accounted_high_water_bytes"]["temporary"] = bad_peak
     report = probe.run(tmp_path / "probe", [10.0])
     assert report["complete"] is False
-    assert report["stop_reason"] == "accounting or storage usage is unknown"
-    assert report["accounting"]["temporary_bytes"] == 0
+    assert report["stop_reason"] == "worker did not exit cleanly or returned untrusted accounting"
+    assert report["accounting"]["temporary_bytes"] is None
     assert report["accounting"]["temporary_high_water_bytes"] is None

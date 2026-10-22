@@ -517,6 +517,76 @@ class FixtureClient:
         return row
 
 
+class ComboHeavyFixtureClient(FixtureClient):
+    """Separate combo-heavy payload seam; the frozen production fixtures stay untouched."""
+
+    LEG_CARDINALITIES = (1, 2, 4, 8, 32)
+
+    def __init__(self, markets: int, stage: str = "full") -> None:
+        super().__init__(markets, "full", stage)
+
+    def response(self, endpoint: str, params: dict[str, Any]) -> tuple[int, Any]:
+        if endpoint == "/historical/markets":
+            start = int(params.get("cursor", "0"))
+            stop = min(start + PAGE_SIZE, self.markets)
+            rows = []
+            for index in range(start, stop):
+                row = self._market(index)
+                row.update(
+                    ticker=f"HIST-{index:06d}",
+                    status="finalized",
+                    result="yes" if index % 2 == 0 else "no",
+                    settlement_ts="2025-12-01T00:00:00Z",
+                    settlement_value_dollars=(
+                        "1.000000000000000001" if index % 2 == 0 else "0.000000000000000001"
+                    ),
+                )
+                rows.append(row)
+            return 200, {
+                "markets": rows,
+                "cursor": str(stop) if stop < self.markets else "",
+            }
+        return super().response(endpoint, params)
+
+    @staticmethod
+    def _is_combo(index: int) -> bool:
+        # 95% combo density approximates the retained 91.2%/97.5% live/history tiers.
+        return index % 20 != 0
+
+    def _market(self, index: int) -> dict[str, Any]:
+        row = super()._market(index)
+        if not self._is_combo(index):
+            return row
+        ordinal = index - index // 20
+        cardinality = 200 if ordinal % 200 == 0 else self.LEG_CARDINALITIES[ordinal % 5]
+        row["mve_selected_legs"] = [
+            {
+                "event_ticker": (
+                    f"MISSING-EVENT-{ordinal:06d}"
+                    if leg_index == 0 and ordinal % 17 == 0
+                    else "EVENT"
+                ),
+                "market_ticker": (
+                    f"MISSING-MARKET-{ordinal:06d}"
+                    if leg_index == 0 and ordinal % 19 == 0
+                    else f"MKT-{leg_index:06d}"
+                ),
+                "side": "yes" if (ordinal + leg_index) % 2 == 0 else "no",
+            }
+            for leg_index in range(cardinality)
+        ]
+        row["rules_primary"] += " " + ("Combo settlement detail. " * 64)
+        row["floor_strike"] = f"{ordinal}.000000000000000001"
+        return row
+
+
+def parent_hydration_fixture(count: int) -> list[str]:
+    """Deterministic distinct parent identities for scheduler-scale fixtures."""
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("parent workload count must be a positive integer")
+    return [f"EVENT-{index:06d}" for index in range(count)]
+
+
 def selected_stress_tickers() -> list[str]:
     """A stable selection set with shared parents and lookup edge cases."""
     return [*(f"S{i:03d}" for i in range(96)), "HIST", "MISS", "ORPHAN", "MKT-" + "X" * 252]
