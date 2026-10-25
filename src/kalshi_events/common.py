@@ -298,7 +298,7 @@ def fsync_directory(path: Path) -> None:
 
 @dataclass(frozen=True)
 class Limits:
-    max_rate: float = 10.0
+    max_rate: float = 5.0
     max_requests: int = 25_000
     max_download_bytes: int = 4 * 1024**3
     max_response_bytes: int = 384 * 1024**2

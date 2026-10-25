@@ -10,7 +10,7 @@ import pytest
 from conftest import FakeClient
 
 from kalshi_events.capture import capture
-from kalshi_events.cli import main
+from kalshi_events.cli import main, parser
 from kalshi_events.common import Budget, BudgetExceeded, CatalogueError, Limits, Store
 from kalshi_events.transport import (
     MAX_ATTEMPTS,
@@ -57,13 +57,31 @@ class SimulatedClock:
             self.condition.notify_all()
 
 
-def test_default_rate_is_ten_per_second_and_nonpositive_rates_are_rejected():
-    assert Limits().max_rate == 10.0
+def test_default_rate_is_five_per_second_and_nonpositive_rates_are_rejected():
+    assert Limits().max_rate == 5.0
     assert Limits().max_response_bytes == 384 * 1024**2
+    assert RateLimiter(Limits().max_rate).interval == pytest.approx(0.2)
     assert RateLimiter(10).interval == pytest.approx(0.1)
     for value in (0, -1, 0.0):
         with pytest.raises(CatalogueError, match="max_rate"):
             Limits(max_rate=value)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["capture"],
+        ["refresh", "--full"],
+        ["refresh", "--capture-id", "existing-capture"],
+        ["metadata", "refresh", "--market-ticker", "MARKET", "--output", "bundle"],
+        ["series", "refresh", "--series-ticker", "KXCPI", "--full"],
+    ],
+)
+@pytest.mark.parametrize("explicit_rate", [None, "10", "0.5"])
+def test_acquisition_cli_defaults_to_five_and_preserves_explicit_rates(command, explicit_rate):
+    arguments = command + (["--max-rate", explicit_rate] if explicit_rate is not None else [])
+    args = parser().parse_args(arguments)
+    assert args.max_rate == (5.0 if explicit_rate is None else float(explicit_rate))
 
 
 def test_cli_rejects_zero_rate_before_touching_the_root(tmp_path, capsys):

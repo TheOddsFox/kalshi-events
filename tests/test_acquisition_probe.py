@@ -21,7 +21,7 @@ REAL_RECEIPT_SUMMARY = probe._receipt_summary
 
 
 def test_rates_default_and_validation() -> None:
-    assert probe.parse_rates(None) == [10.0]
+    assert probe.parse_rates(None) == [5.0]
     assert probe.parse_rates(["5", "10", "20"]) == [5.0, 10.0, 20.0]
     for values in ([], ["1", "1"], ["nan"], ["inf"], ["0"], ["20.01"], ["1", "2", "3", "4"]):
         with pytest.raises(ValueError):

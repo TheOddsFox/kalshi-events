@@ -66,7 +66,7 @@ def test_one_concurrent_response_wave_cannot_reduce_rate_once_per_worker(clock):
     assert limiter.effective_rate == 2.5
 
 
-@pytest.mark.parametrize("initial_rate", [10, 0.5, 0.25, 0.1])
+@pytest.mark.parametrize("initial_rate", [10, 5, 0.5, 0.25, 0.1])
 def test_repeated_new_generation_throttling_stops_at_operator_bounded_floor(clock, initial_rate):
     limiter = RateLimiter(initial_rate, rate_policy="decrease-on-429")
     budget = Deadline(clock, seconds=1000)
@@ -174,7 +174,7 @@ def test_throttled_transport_keeps_four_attempt_bound_and_every_retry_after(
         with pytest.raises(CatalogueError, match="HTTP 429"):
             client.get("/series")
         assert client.limiter.effective_rate == pytest.approx(
-            10 if rate_policy == "fixed" else 0.625
+            5 if rate_policy == "fixed" else 0.3125
         )
 
     assert len(starts) == MAX_ATTEMPTS == 4

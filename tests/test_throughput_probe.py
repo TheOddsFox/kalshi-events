@@ -118,7 +118,7 @@ def setup_function() -> None:
 
 
 def test_throughput_rates_sort_and_reject_invalid_values() -> None:
-    assert probe.parse_throughput_rates(None) == [10.0]
+    assert probe.parse_throughput_rates(None) == [5.0]
     assert probe.parse_throughput_rates(["20", "5", "10"]) == [5.0, 10.0, 20.0]
     for values in ([], ["1", "1"], ["nan"], ["inf"], ["0"], ["20.1"], ["1", "2", "3", "4"]):
         with pytest.raises(ValueError):

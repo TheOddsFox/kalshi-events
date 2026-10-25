@@ -51,7 +51,7 @@ TICKER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 
 def parse_throughput_rates(values: list[str] | None) -> list[float]:
     if values is None:
-        return [10.0]
+        return [5.0]
     if not 1 <= len(values) <= 3:
         raise ValueError("throughput profile accepts one to three request rates")
     rates: list[float] = []
