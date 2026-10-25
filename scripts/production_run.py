@@ -51,6 +51,13 @@ CAPTURE_ID = re.compile(r"[0-9a-f]{32}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
 REPORT_NAME = "session.json"
 OWNER_MARKER = ".production-root.json"
+DEADLINE_STOP_REASONS = frozenset(
+    {
+        "session or workflow deadline reached termination reserve",
+        "insufficient time remains to start and reap a child",
+        "insufficient wall-clock time remains to start and reap a child",
+    }
+)
 _STOP_IN_PROGRESS = False
 _SPAWNING_CHILD = False
 _PENDING_STOP_SIGNAL: int | None = None
@@ -453,6 +460,7 @@ def _monitor(
     capture_id: str | None = None,
     original_device: int | None = None,
     capture_notification: Path | None = None,
+    wall_deadline_epoch: float | None = None,
 ) -> tuple[int | None, str | None, bool]:
     samples: list[tuple[float, int]] = []
     next_sample = time.monotonic()
@@ -461,7 +469,8 @@ def _monitor(
     terminated = False
     while process.poll() is None:
         now = time.monotonic()
-        if now >= deadline - float(RUN_LIMITS["terminate_seconds"]):
+        remaining = _child_time_remaining(deadline, wall_deadline_epoch)
+        if remaining <= float(RUN_LIMITS["terminate_seconds"]):
             stop_reason = "session or workflow deadline reached termination reserve"
             reaped = _terminate(process)
             terminated = True
@@ -472,7 +481,6 @@ def _monitor(
                 free = shutil.disk_usage(directory).free
                 if original_device is not None and directory.stat().st_dev != original_device:
                     raise RunnerError("production filesystem mount changed during the run")
-                remaining = deadline - now
                 rss = _process_group_rss(
                     process.pid,
                     timeout=min(5.0, max(0.01, remaining - float(RUN_LIMITS["terminate_seconds"]))),
@@ -502,7 +510,8 @@ def _monitor(
             report["last_observed_at"] = _utc()
             _atomic_report(report_path, report)
             next_sample = now + float(RUN_LIMITS["sample_seconds"])
-        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+        remaining = _child_time_remaining(deadline, wall_deadline_epoch)
+        time.sleep(min(1.0, max(0.0, remaining - float(RUN_LIMITS["terminate_seconds"]))))
     if process.poll() is None and not terminated:
         reaped = _terminate(process)
         terminated = True
@@ -533,6 +542,7 @@ def _invoke(
     stderr_path: Path,
     capture_id: str | None = None,
     capture_notification: Path | None = None,
+    workflow_deadline: bool = False,
 ) -> tuple[int | None, str | None, bool]:
     from kalshi_events.common import safe_path
 
@@ -547,10 +557,30 @@ def _invoke(
     stderr_path = safe_path(stderr_path)
     if time.monotonic() >= deadline - float(RUN_LIMITS["terminate_seconds"]):
         return None, "insufficient time remains to start and reap a child", True
+    wall_deadline_epoch = _child_wall_deadline_epoch(
+        report, deadline, workflow_deadline=workflow_deadline
+    )
+    wall_now = time.time()
+    if wall_deadline_epoch is not None and wall_now >= wall_deadline_epoch - float(
+        RUN_LIMITS["terminate_seconds"]
+    ):
+        return None, "insufficient wall-clock time remains to start and reap a child", True
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         process: subprocess.Popen[Any] | None = None
         try:
             global _PENDING_STOP_SIGNAL, _SPAWNING_CHILD
+            wall_now = time.time()
+            if time.monotonic() >= deadline - float(RUN_LIMITS["terminate_seconds"]) or (
+                wall_deadline_epoch is not None
+                and wall_now >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+            ):
+                reason = (
+                    "insufficient wall-clock time remains to start and reap a child"
+                    if wall_deadline_epoch is not None
+                    and wall_now >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+                    else "insufficient time remains to start and reap a child"
+                )
+                return None, reason, True
             _SPAWNING_CHILD = True
             try:
                 process = subprocess.Popen(
@@ -582,6 +612,7 @@ def _invoke(
                 capture_id=capture_id,
                 original_device=original_device,
                 capture_notification=capture_notification,
+                wall_deadline_epoch=wall_deadline_epoch,
             )
         except BaseException as exc:
             _merge_capture_notification(report, capture_notification)
@@ -610,6 +641,7 @@ def _child_accounting(
     report: dict[str, Any],
     *,
     require_complete: bool = True,
+    workflow_deadline: bool = False,
 ) -> dict[str, Any]:
     command = [sys.executable, str(Path(__file__).resolve()), "--_account-root", str(operator)]
     run_id = uuid.uuid4().hex
@@ -624,8 +656,11 @@ def _child_accounting(
         deadline=deadline,
         stdout_path=stdout,
         stderr_path=stderr,
+        workflow_deadline=workflow_deadline,
     )
     value = _strict_json(stdout)
+    if reason in DEADLINE_STOP_REASONS:
+        raise BudgetStop(reason)
     if (
         returncode != 0
         or reason
@@ -657,6 +692,8 @@ def _root_summary(
     )
     code, reason, reaped = status
     value = _strict_json(stdout)
+    if reason in DEADLINE_STOP_REASONS:
+        raise BudgetStop(reason)
     if code != 0 or reason or not reaped or value is None:
         raise RunnerError("could not safely inspect current production publication")
     return value
@@ -695,6 +732,8 @@ def _release_verify(
             stderr_path=stderr,
         )
         value = _strict_json(stdout)
+        if reason in DEADLINE_STOP_REASONS:
+            raise BudgetStop(reason)
         if returncode != 0 or reason or not reaped or value is None:
             raise RunnerError("standalone release verification failed or has unknown status")
         return value
@@ -846,10 +885,16 @@ def _resource_guard(
     deadline: float,
     paths: dict[str, Path],
     require_complete_accounting: bool = True,
+    workflow_deadline: bool = False,
 ) -> dict[str, Any]:
     """Run Store's only full accounting walk in a supervised boundary child."""
     snapshot = _child_accounting(
-        operator, deadline, paths, report, require_complete=require_complete_accounting
+        operator,
+        deadline,
+        paths,
+        report,
+        require_complete=require_complete_accounting,
+        workflow_deadline=workflow_deadline,
     )
     external = _external_bytes(directory)
     storage = snapshot.get("storage")
@@ -920,6 +965,42 @@ def _monitor_deadline(report: dict[str, Any], *, workflow: bool) -> float:
     return min(monotonic_deadline, time.monotonic() + max(0.0, wall_remaining))
 
 
+def _child_wall_deadline_epoch(
+    report: dict[str, Any], monotonic_deadline: float, *, workflow_deadline: bool = False
+) -> float | None:
+    """Seal a child wall deadline from the original session and active-stage caps."""
+    started = report.get("started_epoch")
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
+        return None
+    stage_seconds = float(
+        RUN_LIMITS["workflow_seconds"] if workflow_deadline else RUN_LIMITS["active_cutoff_seconds"]
+    )
+    wall_now = time.time()
+    deadlines = [
+        float(started) + stage_seconds,
+        float(started) + float(RUN_LIMITS["active_cutoff_seconds"]),
+        wall_now + max(0.0, monotonic_deadline - time.monotonic()),
+    ]
+    session_deadline = report.get("deadline_epoch")
+    if isinstance(session_deadline, (int, float)) and not isinstance(session_deadline, bool):
+        deadlines.append(float(session_deadline))
+    return min(deadlines)
+
+
+def _child_time_remaining(
+    monotonic_deadline: float,
+    wall_deadline_epoch: float | None,
+    wall_now: float | None = None,
+) -> float:
+    remaining = monotonic_deadline - time.monotonic()
+    if wall_deadline_epoch is not None:
+        remaining = min(
+            remaining,
+            wall_deadline_epoch - (time.time() if wall_now is None else wall_now),
+        )
+    return remaining
+
+
 def _run_external_child(
     command: list[str],
     *,
@@ -951,6 +1032,7 @@ def _run_external_child(
         stderr_path=stderr,
         capture_id=capture_id,
         capture_notification=notification,
+        workflow_deadline=label == "refresh",
     )
     report["phase_seconds"][label] = report["phase_seconds"].get(label, 0) + (
         time.monotonic() - started
@@ -1049,11 +1131,17 @@ def run_production(
                         recorded,
                         started_at=float(report["started_monotonic"]),
                         started_epoch=float(report["started_epoch"]),
+                        wall_now=time.time(),
                         external_reserved_bytes=_external_bytes(directory),
                     )
                 snapshot = (
                     _resource_guard(
-                        directory, operator, report=report, deadline=session_deadline, paths=paths
+                        directory,
+                        operator,
+                        report=report,
+                        deadline=session_deadline,
+                        paths=paths,
+                        workflow_deadline=True,
                     )
                     if mode == "resume"
                     else None
@@ -1072,6 +1160,7 @@ def run_production(
                     started_at=float(report["started_monotonic"]),
                     external_reserved_bytes=_external_bytes(directory),
                     started_epoch=float(report["started_epoch"]),
+                    wall_now=time.time(),
                 )
                 duration = min(
                     float(allowances["max-duration-seconds"]),

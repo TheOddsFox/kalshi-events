@@ -739,3 +739,242 @@ def test_environment_report_uses_the_installed_distribution_name(production, mon
     versions = production._package_versions()
     assert versions["oddsfox-kalshi-events"] == "test-version"
     assert "kalshi-events" not in requested
+
+
+@pytest.mark.parametrize("movement", ["forward_wall", "forced_sleep", "backward_wall"])
+def test_active_monitor_rechecks_wall_deadline_without_extending_monotonic_limit(
+    production, tmp_path, monkeypatch, movement
+):
+    clock = {"mono": 100.0, "wall": 1000.0}
+    sleeps = []
+    stops = []
+    timeouts = []
+
+    class Child:
+        pid = 424242
+        returncode = None
+
+        def poll(self):
+            if self.returncode is None and len(sleeps) >= 6:
+                self.returncode = 0
+            return self.returncode
+
+        def wait(self, timeout):
+            return self.returncode
+
+    child = Child()
+
+    def sleep(duration):
+        sleeps.append(duration)
+        clock["mono"] += 0.001 if movement == "forced_sleep" else duration
+        clock["wall"] += duration
+        if len(sleeps) == 1:
+            clock["wall"] += -600 if movement == "backward_wall" else 48 * 3600 + 1
+
+    def terminate(actual):
+        assert actual is child
+        stops.append(clock.copy())
+        child.returncode = -15
+        return True
+
+    def rss(_group, *, timeout):
+        assert 0 < timeout <= 5
+        timeouts.append(timeout)
+        return 0
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(production.time, "sleep", sleep)
+    monkeypatch.setattr(production, "_process_group_rss", rss)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    monkeypatch.setattr(production, "_terminate", terminate)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+    report = {
+        "mode": "full",
+        "phase": "refresh",
+        "started_epoch": 1000,
+        "started_monotonic": 100,
+        "deadline_epoch": 1000 + 48 * 3600,
+        "resource_samples": [],
+        "peak_child_process_group_rss_bytes": 0,
+    }
+    deadline = 108 if movement == "backward_wall" else 100_000
+    code, reason, reaped = production._monitor(
+        child,
+        tmp_path,
+        tmp_path / "operator",
+        report,
+        tmp_path / "session.json",
+        deadline,
+        wall_deadline_epoch=1000 + 46 * 3600,
+    )
+    assert code == -15 and reason and reaped
+    assert len(stops) == 1
+    assert timeouts
+    if movement == "backward_wall":
+        assert stops[0]["mono"] == 103
+    else:
+        assert len(sleeps) == 1, "wall exhaustion was deferred until a later resource sample"
+        assert stops[0]["mono"] < 102
+
+
+def test_active_monitor_reserves_five_wall_seconds_and_clamps_ps_timeout_and_sleep(
+    production, tmp_path, monkeypatch
+):
+    clock = {"mono": 100.0, "wall": 1093.75}
+    sleeps = []
+    timeouts = []
+    stops = []
+
+    class Child:
+        pid = 424242
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            return self.returncode
+
+    child = Child()
+
+    def sleep(duration):
+        sleeps.append(duration)
+        clock["mono"] += duration
+        clock["wall"] += duration
+
+    def rss(_group, *, timeout):
+        timeouts.append(timeout)
+        return 0
+
+    def terminate(_child):
+        stops.append(clock.copy())
+        child.returncode = -15
+        return True
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(production.time, "sleep", sleep)
+    monkeypatch.setattr(production, "_process_group_rss", rss)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    monkeypatch.setattr(production, "_terminate", terminate)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+    code, reason, reaped = production._monitor(
+        child,
+        tmp_path,
+        tmp_path / "operator",
+        {"resource_samples": [], "peak_child_process_group_rss_bytes": 0},
+        tmp_path / "session.json",
+        10_000,
+        wall_deadline_epoch=1100,
+    )
+    assert code == -15 and reason and reaped
+    assert timeouts == [1.25]
+    assert sleeps == [1, 0.25]
+    assert stops == [{"mono": 101.25, "wall": 1095.0}]
+
+
+@pytest.mark.parametrize(
+    ("mode", "phase", "workflow_deadline", "seconds"),
+    [
+        ("full", "refresh", True, 46 * 3600),
+        ("resume", "accounting", True, 46 * 3600),
+        ("full", "accounting", False, 47 * 3600 + 50 * 60),
+        ("full", "standalone-verification", False, 47 * 3600 + 50 * 60),
+        ("resume", "activation", False, 47 * 3600 + 50 * 60),
+        ("activate-current", "root-summary", False, 47 * 3600 + 50 * 60),
+        ("activate-current", "activation", False, 47 * 3600 + 50 * 60),
+    ],
+)
+def test_child_wall_deadline_keeps_original_workflow_and_verification_stage_caps(
+    production, monkeypatch, mode, phase, workflow_deadline, seconds
+):
+    monkeypatch.setattr(production.time, "monotonic", lambda: 101)
+    monkeypatch.setattr(production.time, "time", lambda: 1001)
+    report = {
+        "mode": mode,
+        "phase": phase,
+        "started_epoch": 1000,
+        "started_monotonic": 100,
+        "deadline_epoch": 1000 + 48 * 3600,
+    }
+    assert (
+        production._child_wall_deadline_epoch(report, 300_000, workflow_deadline=workflow_deadline)
+        == 1000 + seconds
+    )
+
+
+def test_shorter_child_duration_is_also_a_wall_deadline(production, monkeypatch):
+    monkeypatch.setattr(production.time, "monotonic", lambda: 101)
+    monkeypatch.setattr(production.time, "time", lambda: 1001)
+    report = {
+        "mode": "full",
+        "phase": "refresh",
+        "started_epoch": 1000,
+        "started_monotonic": 100,
+        "deadline_epoch": 1000 + 48 * 3600,
+    }
+    assert production._child_wall_deadline_epoch(report, 111, workflow_deadline=True) == 1011
+
+
+def test_expired_wall_deadline_refuses_child_start_even_with_remaining_monotonic_time(
+    production, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(production.time, "monotonic", lambda: 101)
+    monkeypatch.setattr(production.time, "time", lambda: 1000 + 46 * 3600)
+    monkeypatch.setattr(
+        production.subprocess, "Popen", lambda *_a, **_kw: pytest.fail("expired wall child started")
+    )
+    report = {
+        "mode": "full",
+        "phase": "refresh",
+        "started_epoch": 1000,
+        "started_monotonic": 100,
+        "deadline_epoch": 1000 + 48 * 3600,
+        "system": {"filesystem_device": tmp_path.stat().st_dev},
+    }
+    code, reason, reaped = production._invoke(
+        [sys.executable, "-c", "pass"],
+        directory=tmp_path,
+        operator=tmp_path / "operator",
+        report=report,
+        report_path=tmp_path / "session.json",
+        deadline=100_000,
+        stdout_path=tmp_path / "stdout",
+        stderr_path=tmp_path / "stderr",
+        workflow_deadline=True,
+    )
+    assert code is None and reason and reaped
+    assert not (tmp_path / "stdout").exists()
+
+
+@pytest.mark.parametrize("label", ["refresh", "activation", "accounting"])
+def test_stage_dispatch_explicitly_selects_workflow_or_active_wall_deadline(
+    production, tmp_path, monkeypatch, label
+):
+    forwarded = []
+
+    def invoke(_command, **kwargs):
+        forwarded.append(kwargs)
+        return 0, None, True
+
+    monkeypatch.setattr(production, "_invoke", invoke)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    report = {"phase_seconds": {}}
+    production._run_external_child(
+        [sys.executable, "-c", "pass"],
+        directory=tmp_path,
+        operator=tmp_path / "operator",
+        paths={"logs": tmp_path, "report": tmp_path / "session.json"},
+        report=report,
+        deadline=time.monotonic() + 100,
+        label=label,
+    )
+    assert len(forwarded) == 1
+    assert forwarded[0]["workflow_deadline"] is (label == "refresh")
