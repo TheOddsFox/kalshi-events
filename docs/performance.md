@@ -394,6 +394,18 @@ Final-continuation metrics report 18,005.714 seconds of capture phase time, 15,3
 
 Read-only checks validated journal/snapshot state within the limits recorded in the continuation report. The capture was resumable when the run stopped; preserve the root, and do not resume automatically. The original acceptance window has since expired, so any future acceptance requires a new bounded session, offline recovery checks, and accounting that subtracts prior request/download use. The initial report is at `/Volumes/Mac SSD/oddsfox-data/kalshi-events-costs/acceptance-20261022T143236Z/reports/acceptance-report.md`; the final continuation report is at `/Volumes/Mac SSD/oddsfox-data/kalshi-events-costs/acceptance-20261022T143236Z/continuation3/reports/final-acceptance-report.md`.
 
+## Supervised production acceptance
+
+The supported `scripts/run-production.py` runner provides a bounded production attempt, not a measured runtime guarantee. The planning allowance is 24–48 hours with substantial uncertainty: no exchange-wide catalogue has completed and the real combo-heavy downstream cost remains unknown. A 48-hour budget stop is incomplete acceptance, even if acquisition or operator publication completed.
+
+The session begins after code verification and records the frozen revision, installed environment, machine/filesystem, initial free space and competing resource use. Refresh is bounded by hour 46; standalone verification and production activation must finish by hour 47:50, leaving ten minutes for reporting. All subprocesses share the remaining session allowance, with at most five additional seconds for termination and reaping. The runner retains gzip and the five-request/second ceiling with downward-only throttling adaptation; it performs no additional comparison probes or automatic networking recovery.
+
+Limits are 850,000 attempts, 256 GiB encoded downloads, 400 GiB aggregate retained session storage, a 350 GiB operator-root ceiling, and 64 GiB temporary/database sublimits. At least 150 GiB of SSD space must remain free. Each response is bounded at 384 MiB encoded and 768 MiB decoded. Every 15 seconds the supervisor samples free space and process resources; summed descendant RSS above 24 GiB for 60 seconds stops work. Shared pages can be counted repeatedly in that conservative RSS sum. These checks do not turn dlt's post-load accounting into a hard write quota.
+
+External reports distinguish capture, publication and production activation, including unknown outcomes. Record requests, retries, statuses, encoded/decoded bytes, endpoint progress, effective rate, phase durations, CPU/RSS, storage peaks, synchronization and stop reasons. Concurrent worker and nested phase timers overlap; do not add them to estimate wall time. Retain capture-specific recovery instructions, checksums and the observed source interval.
+
+Acceptance requires a completed full capture, certified catalogue v2 publication, successful independent release verification and readback of the activated `production.duckdb`. Until those gates pass, no full-catalogue production dataset or performance percentage is claimed. The previous eight-hour attempt remains historical evidence rather than successful production acceptance.
+
 ## Acceptance and remaining costs
 
 The parsing gate requires at least 50% fewer counted first-party in-process JSON decodes on the fixed full fixture, using the scope defined above. It does not establish a reduction across unobserved third-party or subprocess parsers. The scale target is at least 25% lower median pipeline time with equal work and limits. A missed time target remains an open performance result. Reproducible small or targeted median regressions above 10% require investigation.

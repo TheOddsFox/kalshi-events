@@ -142,6 +142,41 @@ Exit 0 means verified publication and cleanup completed; exit 3 means a budget s
 
 Incremental refresh retains the freshness and reconciliation limitations above. For 1–100 selected markets, use `metadata refresh` below to avoid a full catalogue traversal.
 
+## Supervised production catalogue
+
+Use the manual production runner to establish one consumer database on this MacBook. Run it with Python 3.12 in the locked project environment (`uv run --locked python` or the activated virtual environment):
+
+```sh
+python scripts/run-production.py \
+  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" --full
+# Resume only the exact reported capture after reviewing the stop reason.
+python scripts/run-production.py \
+  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --capture-id CAPTURE_ID
+# Recover activation of the current verified publication without acquisition.
+python scripts/run-production.py \
+  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" --activate-current
+```
+
+The directory contains the producer-owned `operator/` root, external session evidence in `runs/`, and the consumer entry point `production.duckdb`. The runner uses catalogue v2 only, retaining all ordinary and multivariate events and live/historical markets. It requests gzip at a five-request/second ceiling with downward adjustment after HTTP 429. It never resumes automatically or publishes incomplete acquisition.
+
+The approved session lasts at most 48 hours, including preflight and reporting. Refresh has a 46-hour cutoff; independent verification and activation must finish before hour 47:50. The ceilings are 850,000 attempts, 256 GiB encoded downloads, 400 GiB aggregate storage, 350 GiB operator-root storage, and 64 GiB each for temporary and database storage. At least 150 GiB must remain free. Per-response ceilings are 384 MiB encoded and 768 MiB decoded. Resource checks run every 15 seconds; summed descendant RSS over 24 GiB for one minute stops the run. This conservative RSS sum can count shared pages more than once. Existing dlt post-load quota limitations still apply.
+
+`production.duckdb` is an atomically activated hard link to the certified warehouse, sharing its physical storage. It appears only after the workflow completes, standalone release verification passes, and fresh certification binds the database checksum to the expected publication. Open it read-only:
+
+```python
+import duckdb
+
+connection = duckdb.connect(
+    "/Volumes/Mac SSD/oddsfox-data/kalshi-production/production.duckdb",
+    read_only=True,
+)
+```
+
+An existing reader retains its opened snapshot. DuckDB can reuse that database for additional connections to the same path in the same process: close every connection to the path before reopening, or use a fresh process to see the activated generation. A writable consumer can damage the shared certified file. Keep the hard link outside `operator/`, retain evidence and recovery pins, and never edit warehouse files. The entry point survives pruning of its original pathname, but does not pin the older raw-evidence closure.
+
+Publication and production activation are separate results. Failures before activation replacement preserve the previous production database. A failure after replacement can leave the new file present with activation still uncertain; the report does not imply rollback. Offline activation finishes the existing verified publication's pending retention cleanup before replacing the entry point. An explicit resume retains the original approved deadline and subtracts previously accounted requests/downloads; expired or uncertain acquisition accounting does not authorize more networking. Review the external report and use its exact recovery command. Existing catalogue commands do not update `production.duckdb`; explicitly use `--activate-current` after a later manual publication. Stop the supervisor with SIGTERM or Ctrl-C so it can terminate and reap its workers; do not use SIGKILL for an orderly stop. See the [production contract](docs/contracts.md#production-database-entry-point) and [acceptance guidance](docs/performance.md#supervised-production-acceptance).
+
 ## Complete ordinary-series ingestion
 
 Use a new dedicated root for one ordinary series, such as `KXCPI`:
