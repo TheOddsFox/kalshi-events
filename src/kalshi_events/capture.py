@@ -3070,6 +3070,7 @@ def _run(
     first_data_response_committed = False
     data_request_lock = Lock()
     recovery_cursor = 0
+    progress_timing_enabled = isinstance(store, Store) and isinstance(state, _CaptureState)
 
     def progress_counts() -> dict[str, int]:
         rows = state.page_rows if isinstance(state, _CaptureState) else []
@@ -3093,7 +3094,7 @@ def _run(
 
     def issue_request(endpoint: str, params: dict[str, Any], context: dict[str, Any]) -> str:
         nonlocal first_data_request_at
-        if endpoint != CUTOFF_ENDPOINT:
+        if progress_timing_enabled and endpoint != CUTOFF_ENDPOINT:
             with data_request_lock:
                 if first_data_request_at is None:
                     first_data_request_at = time.monotonic()
@@ -3101,6 +3102,8 @@ def _run(
 
     def report_first_data_request() -> None:
         nonlocal first_data_request_reported
+        if not progress_timing_enabled:
+            return
         with data_request_lock:
             started = first_data_request_at
         if started is not None and not first_data_request_reported:
@@ -3299,7 +3302,7 @@ def _run(
                 _consume(store, state, index, relative, seen, identities)
                 if request_id is not None:
                     first_data_response_committed = True
-                    if not first_data_page_reported:
+                    if progress_timing_enabled and not first_data_page_reported:
                         report_progress(
                             "first_new_request",
                             first_data_page_elapsed_seconds=(time.monotonic() - store.started),

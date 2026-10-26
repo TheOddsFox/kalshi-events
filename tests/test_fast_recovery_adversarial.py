@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from conftest import FakeClient
 from recovery_fixtures import build_recovery_root
 
-from kalshi_events import capture
+from kalshi_events import capture, recovery_index
 from kalshi_events.common import CatalogueError, Store, json_bytes
 from kalshi_events.incremental import root_id
 from kalshi_events.recovery_index import RecoveryParentIndex, sealed_settings_sha256
@@ -402,3 +403,102 @@ def test_recovery_cache_flush_failure_keeps_capture_incomplete_and_resumable(
     assert resumed["complete"] is True
     assert committed_ids.isdisjoint(retried)
     assert retried == []
+
+
+def test_recovery_cache_checkpoints_exactly_every_100_pages(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    capture_id = build_recovery_root(root, "primary", repeats=0, num_pages=101)
+    store = Store(root)
+    journal_path = store.path(f"captures/{capture_id}/pages.jsonl")
+    journal_before = journal_path.read_bytes()
+    monkeypatch.setattr(recovery_index, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    with store.writer_guard():
+        state = capture.read_capture(store, capture_id, _writer_resume=True)
+        assert len(state.page_rows) == 101
+        index = RecoveryParentIndex(
+            store,
+            capture_id,
+            root_id(store),
+            sealed_settings_sha256(state),
+            page_rows=state.page_rows,
+            page_anchors=state.page_anchors,
+            genesis_anchor=state.genesis_anchor,
+        )
+        cache_path = store.path(index.relative)
+        assert index.db is not None
+        assert index.db.execute("pragma journal_mode").fetchone()[0].lower() == "delete"
+        assert index.db.execute("pragma synchronous").fetchone()[0] == 2
+
+        for row in state.page_rows[:99]:
+            capture._index_receipt(store, state, row, index)
+        with sqlite3.connect(cache_path) as observer:
+            assert observer.execute(
+                "select indexed_pages from recovery_meta where id=1"
+            ).fetchone() == (0,)
+
+        capture._index_receipt(store, state, state.page_rows[99], index)
+        with sqlite3.connect(cache_path) as observer:
+            assert observer.execute(
+                "select indexed_pages from recovery_meta where id=1"
+            ).fetchone() == (100,)
+
+        capture._index_receipt(store, state, state.page_rows[100], index)
+        with sqlite3.connect(cache_path) as observer:
+            assert observer.execute(
+                "select indexed_pages from recovery_meta where id=1"
+            ).fetchone() == (100,)
+        index.close(flush=False)
+
+        reopened = RecoveryParentIndex(
+            store,
+            capture_id,
+            root_id(store),
+            sealed_settings_sha256(state),
+            page_rows=state.page_rows,
+            page_anchors=state.page_anchors,
+            genesis_anchor=state.genesis_anchor,
+        )
+        assert reopened.reused_pages == 100
+        assert reopened.watermark_pages == 100
+        reopened.close(flush=False)
+
+    assert journal_path.read_bytes() == journal_before
+
+
+def test_recovery_cache_time_checkpoint_uses_local_clock(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    capture_id = build_recovery_root(root, "primary", repeats=0, num_pages=2)
+    store = Store(root)
+    with store.writer_guard():
+        state = capture.read_capture(store, capture_id, _writer_resume=True)
+        clock = [0.0]
+        monkeypatch.setattr(recovery_index, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        store_started = store.started
+        index = RecoveryParentIndex(
+            store,
+            capture_id,
+            root_id(store),
+            sealed_settings_sha256(state),
+            page_rows=state.page_rows,
+            page_anchors=state.page_anchors,
+            genesis_anchor=state.genesis_anchor,
+        )
+        cache_path = store.path(index.relative)
+
+        clock[0] = 4.99
+        for row in state.page_rows:
+            capture._index_receipt(store, state, row, index)
+        with sqlite3.connect(cache_path) as observer:
+            assert observer.execute(
+                "select indexed_pages from recovery_meta where id=1"
+            ).fetchone() == (0,)
+
+        clock[0] = 5.0
+        index.flush()
+        with sqlite3.connect(cache_path) as observer:
+            assert observer.execute(
+                "select indexed_pages from recovery_meta where id=1"
+            ).fetchone() == (2,)
+        assert store.started == store_started
+        store.check_deadline()
+        index.close(flush=False)
