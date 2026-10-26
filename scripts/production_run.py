@@ -26,6 +26,8 @@ sys.path.insert(0, str(SOURCE_ROOT / "src"))
 
 GIB = 1024**3
 MIB = 1024**2
+HTTPX_MAX_RAW_CHUNK_BYTES = 64 * 1024
+RECONCILIATION_UV_LOCK_SHA256 = "9a802ab62302a6ec0d8db5a3c602552892c9370c33c4edc098a0501a192d1d17"
 RUN_LIMITS: dict[str, int | float | str] = {
     "session_seconds": 48 * 3600,
     "workflow_seconds": 46 * 3600,
@@ -41,6 +43,7 @@ RUN_LIMITS: dict[str, int | float | str] = {
     "minimum_free_bytes": 150 * GIB,
     "peak_rss_bytes": 24 * GIB,
     "peak_rss_seconds": 60,
+    "compressed_memory_stop_bytes": 20 * GIB,
     "sample_seconds": 15,
     "terminate_seconds": 5,
     "rate": 5,
@@ -56,6 +59,14 @@ DEADLINE_STOP_REASONS = frozenset(
         "session or workflow deadline reached termination reserve",
         "insufficient time remains to start and reap a child",
         "insufficient wall-clock time remains to start and reap a child",
+    }
+)
+RECOVERABLE_ACCOUNTING_STOP_REASONS = frozenset(
+    {
+        "refresh failed with unknown child accounting",
+        "process-group RSS exceeded 24 GiB for 60 seconds",
+        "system compressed memory reached the conservative stop threshold",
+        "SSD free space fell below 150 GiB",
     }
 )
 _STOP_IN_PROGRESS = False
@@ -96,9 +107,15 @@ def remaining_allowances(
     wall_now: float | None = None,
 ) -> dict[str, int | float | str]:
     """Calculate a new child's ceilings from verified receipts and session time."""
-    if accounting.get("accounting_complete") is not True:
+    bounded_recovery = (
+        accounting.get("accounting_basis") == "reserved-upper-bound"
+        and accounting.get("accounting_bound_verified") is True
+        and accounting.get("accounting_complete") is False
+    )
+    if accounting.get("accounting_complete") is not True and not bounded_recovery:
         raise RunnerError("prior acquisition accounting is incomplete; networking is blocked")
-    for name in ("attempts", "downloaded_bytes"):
+    byte_field = "downloaded_bytes_upper_bound" if bounded_recovery else "downloaded_bytes"
+    for name in ("attempts", byte_field):
         value = accounting.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise RunnerError("prior acquisition accounting is invalid")
@@ -126,7 +143,7 @@ def remaining_allowances(
         int(RUN_LIMITS["root_bytes"]), int(RUN_LIMITS["aggregate_bytes"]) - external_reserved_bytes
     )
     attempts = int(RUN_LIMITS["attempts"]) - accounting["attempts"]
-    downloads = int(RUN_LIMITS["downloaded_bytes"]) - accounting["downloaded_bytes"]
+    downloads = int(RUN_LIMITS["downloaded_bytes"]) - accounting[byte_field]
     if min(workflow_remaining, attempts, downloads, max_root) <= 0:
         raise BudgetStop("approved session allowance is exhausted")
     return {
@@ -485,15 +502,37 @@ def _monitor(
                     process.pid,
                     timeout=min(5.0, max(0.01, remaining - float(RUN_LIMITS["terminate_seconds"]))),
                 )
+                remaining = _child_time_remaining(deadline, wall_deadline_epoch)
+                if remaining <= float(RUN_LIMITS["terminate_seconds"]):
+                    stop_reason = "session or workflow deadline reached termination reserve"
+                    reaped = _terminate(process)
+                    terminated = True
+                    break
+                compressed = _system_compressed_bytes(
+                    timeout=min(
+                        5.0,
+                        max(0.01, remaining - float(RUN_LIMITS["terminate_seconds"])),
+                    )
+                )
             except (OSError, subprocess.SubprocessError, RunnerError) as exc:
-                stop_reason = f"resource accounting failed: {exc}"
+                if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
+                    RUN_LIMITS["terminate_seconds"]
+                ):
+                    stop_reason = "session or workflow deadline reached termination reserve"
+                else:
+                    stop_reason = f"resource accounting failed: {exc}"
                 reaped = _terminate(process)
                 terminated = True
                 break
             samples.append((now, rss))
             samples = samples[-8:]
             report["resource_samples"].append(
-                {"at": _utc(), "ssd_free_bytes": free, "child_process_group_rss_bytes": rss}
+                {
+                    "at": _utc(),
+                    "ssd_free_bytes": free,
+                    "child_process_group_rss_bytes": rss,
+                    "system_compressed_bytes": compressed,
+                }
             )
             report["last_observed_epoch"] = time.time()
             report["peak_child_process_group_rss_bytes"] = max(
@@ -503,6 +542,8 @@ def _monitor(
                 stop_reason = "SSD free space fell below 150 GiB"
             elif rss_limit_exceeded(samples):
                 stop_reason = "process-group RSS exceeded 24 GiB for 60 seconds"
+            elif compressed >= int(RUN_LIMITS["compressed_memory_stop_bytes"]):
+                stop_reason = "system compressed memory reached the conservative stop threshold"
             if stop_reason:
                 reaped = _terminate(process)
                 terminated = True
@@ -528,6 +569,18 @@ def _monitor(
         returncode = None
         reaped = False
     return returncode, stop_reason, reaped
+
+
+def _system_compressed_bytes(timeout: float = 5.0) -> int:
+    """Read macOS compressor pages so swapped/compressed memory cannot evade RSS limits."""
+    result = subprocess.run(
+        ["vm_stat"], check=True, capture_output=True, text=True, timeout=timeout
+    )
+    page_size = re.search(r"page size of (\d+) bytes", result.stdout)
+    compressed_pages = re.search(r"Pages stored in compressor:\s*(\d+)", result.stdout)
+    if page_size is None or compressed_pages is None or int(page_size.group(1)) <= 0:
+        raise RunnerError("macOS compressed-memory accounting is unavailable")
+    return int(page_size.group(1)) * int(compressed_pages.group(1))
 
 
 def _invoke(
@@ -642,8 +695,14 @@ def _child_accounting(
     *,
     require_complete: bool = True,
     workflow_deadline: bool = False,
+    capture_id: str | None = None,
 ) -> dict[str, Any]:
-    command = [sys.executable, str(Path(__file__).resolve()), "--_account-root", str(operator)]
+    command = [sys.executable, str(Path(__file__).resolve())]
+    command += (
+        ["--_account-recovery", str(operator), capture_id]
+        if capture_id is not None
+        else ["--_account-root", str(operator)]
+    )
     run_id = uuid.uuid4().hex
     stdout = paths["logs"] / f"accounting-{run_id}.stdout.json"
     stderr = paths["logs"] / f"accounting-{run_id}.stderr.log"
@@ -744,9 +803,8 @@ def _release_verify(
         )
 
 
-def _read_accounting_worker(root: Path) -> dict[str, Any]:
-    from kalshi_events.common import Limits, Store
-    from kalshi_events.transport import accounting
+def _read_accounting_worker(root: Path, expected_capture_id: str | None = None) -> dict[str, Any]:
+    from kalshi_events.common import Limits, Store, decode, regular_bytes
 
     store = Store(
         root,
@@ -762,7 +820,124 @@ def _read_accounting_worker(root: Path) -> dict[str, Any]:
             max_database_bytes=int(RUN_LIMITS["database_bytes"]),
         ),
     )
-    return {**accounting(store), "storage": store.usage(), "root_id": _root_id(store)}
+    with store.lock():
+        capture_state = None
+        if expected_capture_id is not None:
+            from kalshi_events.capture import read_capture
+
+            capture_state = read_capture(store, expected_capture_id)
+            if (
+                capture_state.get("capture_id") != expected_capture_id
+                or capture_state.get("selected") is not None
+                or capture_state.get("incremental") is True
+                or capture_state.get("acquisition_protocol") != 5
+                or capture_state.get("max_response_bytes") != int(RUN_LIMITS["response_bytes"])
+            ):
+                raise RunnerError(
+                    "recovery capture does not match the session's sealed full-scope policy"
+                )
+        attempts = downloaded_or_reserved = 0
+        accounting_complete = True
+        unfinished = []
+        for path in store.path("raw").glob("*/manifest.json"):
+            receipt = decode(regular_bytes(path, 1024**2))
+            if not isinstance(receipt, dict):
+                raise RunnerError("durable receipt manifest is not an object")
+            attempts += 1
+            complete = receipt.get("accounting_complete")
+            reservation = receipt.get("reserved_bytes")
+            page_id = receipt.get("page_id")
+            if (
+                isinstance(receipt.get("version"), bool)
+                or receipt.get("version") not in {1, 2}
+                or not isinstance(page_id, str)
+                or not CAPTURE_ID.fullmatch(page_id)
+                or page_id != path.parent.name
+            ):
+                raise RunnerError("durable receipt has invalid identity metadata")
+            if complete is True:
+                if "reserved_bytes" in receipt and (
+                    isinstance(reservation, bool)
+                    or not isinstance(reservation, int)
+                    or not 0 < reservation <= int(RUN_LIMITS["response_bytes"])
+                ):
+                    raise RunnerError("finalized receipt has invalid reservation metadata")
+                amount = receipt.get("downloaded_bytes", receipt.get("size"))
+                if (
+                    isinstance(amount, bool)
+                    or not isinstance(amount, int)
+                    or not 0
+                    <= amount
+                    <= int(RUN_LIMITS["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
+                ):
+                    raise RunnerError("finalized receipt has invalid downloaded-byte accounting")
+                status = receipt.get("status")
+                if status is not None and (
+                    isinstance(status, bool)
+                    or not isinstance(status, int)
+                    or not 100 <= status <= 599
+                ):
+                    raise RunnerError("finalized receipt has invalid HTTP status")
+                downloaded_or_reserved += amount
+                continue
+            if complete is not False:
+                raise RunnerError("durable receipt accounting state is malformed")
+            accounting_complete = False
+            downloaded_or_reserved += int(RUN_LIMITS["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
+            if (
+                isinstance(reservation, bool)
+                or not isinstance(reservation, int)
+                or not 0 < reservation <= int(RUN_LIMITS["response_bytes"])
+            ):
+                raise RunnerError("unfinished receipt has invalid reservation metadata")
+            if receipt.get("status") is not None:
+                raise RunnerError("unfinished receipt has a contradictory HTTP status")
+            if (
+                receipt.get("version") not in {1, 2}
+                or receipt.get("acquisition_protocol") != 5
+                or not isinstance(receipt.get("capture_id"), str)
+                or not CAPTURE_ID.fullmatch(receipt["capture_id"])
+                or not isinstance(receipt.get("request_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", receipt["request_id"])
+            ):
+                raise RunnerError("unfinished receipt lacks verifiable acquisition identity")
+            if capture_state is not None:
+                from kalshi_events.capture import _validate_receipt_task_binding
+
+                _validate_receipt_task_binding(
+                    receipt,
+                    capture_state,
+                    {
+                        "relative": path.relative_to(store.root).as_posix(),
+                        "index": receipt.get("task_index"),
+                        "request_id": receipt["request_id"],
+                    },
+                )
+            if complete is False:
+                unfinished.append(
+                    {
+                        "capture_id": receipt.get("capture_id"),
+                        "request_id": receipt.get("request_id"),
+                        "reserved_bytes": receipt.get("reserved_bytes"),
+                        "status": receipt.get("status"),
+                        "accounting_complete": False,
+                        "acquisition_protocol": receipt.get("acquisition_protocol"),
+                        "version": receipt.get("version"),
+                    }
+                )
+        totals = {
+            "attempts": attempts,
+            "downloaded_or_reserved_bytes": downloaded_or_reserved,
+            "accounting_complete": accounting_complete,
+        }
+        storage = store.usage()
+        logical_root = _root_id(store)
+    return {
+        **totals,
+        "unfinished_reservations": unfinished,
+        "storage": storage,
+        "root_id": logical_root,
+    }
 
 
 def _read_root_summary(root: Path) -> dict[str, Any]:
@@ -886,6 +1061,7 @@ def _resource_guard(
     paths: dict[str, Path],
     require_complete_accounting: bool = True,
     workflow_deadline: bool = False,
+    capture_id: str | None = None,
 ) -> dict[str, Any]:
     """Run Store's only full accounting walk in a supervised boundary child."""
     snapshot = _child_accounting(
@@ -895,6 +1071,7 @@ def _resource_guard(
         report,
         require_complete=require_complete_accounting,
         workflow_deadline=workflow_deadline,
+        capture_id=capture_id,
     )
     external = _external_bytes(directory)
     storage = snapshot.get("storage")
@@ -946,10 +1123,15 @@ def _current_warehouse_path(operator: Path) -> Path | None:
 
 
 def _check_accounting_match(snapshot: dict[str, Any], expected: dict[str, Any]) -> None:
+    expected_bytes = expected.get(
+        "downloaded_bytes_upper_bound"
+        if expected.get("accounting_basis") == "reserved-upper-bound"
+        else "downloaded_bytes"
+    )
     if (
-        snapshot.get("accounting_complete") is not True
+        snapshot.get("accounting_complete") is not expected.get("accounting_complete", True)
         or snapshot.get("attempts") != expected.get("attempts", expected.get("requests"))
-        or snapshot.get("downloaded_or_reserved_bytes") != expected.get("downloaded_bytes")
+        or snapshot.get("downloaded_or_reserved_bytes") != expected_bytes
     ):
         raise RunnerError(
             "durable receipt accounting is unknown or differs from the invocation ledger"
@@ -1063,9 +1245,12 @@ def run_production(
     full: bool = False,
     capture_id: str | None = None,
     activate_only: bool = False,
+    reconcile_accounting: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded full refresh/resume or verify-and-activate current v2."""
     mode = validate_mode(full, capture_id, activate_only)
+    if reconcile_accounting and mode != "resume":
+        raise RunnerError("accounting reconciliation requires --capture-id resume")
     directory = prepare_directory(directory, mode)
     operator = directory / "operator"
     if mode == "full":
@@ -1075,7 +1260,21 @@ def run_production(
     lock_context = _run_lock(directory)
     with lock_context:
         if mode == "resume":
-            report_path, report, paths = _load_resume(directory, str(capture_id))
+            report_path, report, paths = _load_resume(
+                directory, str(capture_id), reconcile_accounting=reconcile_accounting
+            )
+            if reconcile_accounting:
+                report.setdefault("original_revision", report.get("revision"))
+                report.setdefault("original_source_root", report.get("source_root"))
+                report["recovery_revision"] = _revision()
+                report["recovery_source_root"] = str(SOURCE_ROOT)
+                report["accounting_reconciliation"] = {
+                    "explicit": True,
+                    "started_at": _utc(),
+                    "prior_exactness_preserved": False,
+                    "prior_error": report.get("error"),
+                    "prior_recovery_instructions": report.get("recovery"),
+                }
             paths = _prepare_run_paths(directory, report_path)
             report["metrics_file"] = str(paths["metrics"])
             if report.get("root_id") is None:
@@ -1121,21 +1320,56 @@ def run_production(
             session_deadline = _monitor_deadline(report, workflow=False)
             standalone_result: dict[str, Any] | None = None
             if mode != "activate-current":
+                snapshot = None
                 if mode == "resume":
-                    recorded = {
-                        "attempts": report.get("requests"),
-                        "downloaded_bytes": report.get("downloaded_bytes"),
-                        "accounting_complete": report.get("accounting_complete"),
-                    }
-                    remaining_allowances(
-                        recorded,
-                        started_at=float(report["started_monotonic"]),
-                        started_epoch=float(report["started_epoch"]),
-                        wall_now=time.time(),
-                        external_reserved_bytes=_external_bytes(directory),
-                    )
-                snapshot = (
-                    _resource_guard(
+                    if reconcile_accounting:
+                        snapshot = _resource_guard(
+                            directory,
+                            operator,
+                            report=report,
+                            deadline=session_deadline,
+                            paths=paths,
+                            require_complete_accounting=False,
+                            workflow_deadline=True,
+                            capture_id=capture_id,
+                        )
+                        if snapshot.get("root_id") != report.get("root_id"):
+                            raise RunnerError(
+                                "operator root identity changed since this session began"
+                            )
+                        prior = _reconciliation_accounting(snapshot, str(capture_id))
+                        _check_accounting_match(snapshot, prior)
+                        report["accounting_basis"] = prior["accounting_basis"]
+                        report["accounting_bound_verified"] = prior["accounting_bound_verified"]
+                        report["unfinished_reservation_ids"] = prior["unfinished_reservation_ids"]
+                        report["requests"] = prior["attempts"]
+                        report["downloaded_bytes"] = prior.get("downloaded_bytes")
+                        report["downloaded_bytes_upper_bound"] = prior.get(
+                            "downloaded_bytes_upper_bound"
+                        )
+                        report["accounting_complete"] = prior["accounting_complete"]
+                        report["consumption_state"] = prior["accounting_basis"]
+                        report["accounting_reconciliation"].update(
+                            {
+                                "prior_exactness_preserved": prior["accounting_complete"],
+                                "basis": prior["accounting_basis"],
+                            }
+                        )
+                    else:
+                        prior = {
+                            "attempts": report.get("requests"),
+                            "downloaded_bytes": report.get("downloaded_bytes"),
+                            "accounting_complete": report.get("accounting_complete"),
+                        }
+                        remaining_allowances(
+                            prior,
+                            started_at=float(report["started_monotonic"]),
+                            started_epoch=float(report["started_epoch"]),
+                            wall_now=time.time(),
+                            external_reserved_bytes=_external_bytes(directory),
+                        )
+                if mode == "resume" and snapshot is None:
+                    snapshot = _resource_guard(
                         directory,
                         operator,
                         report=report,
@@ -1143,18 +1377,21 @@ def run_production(
                         paths=paths,
                         workflow_deadline=True,
                     )
-                    if mode == "resume"
-                    else None
-                )
                 if snapshot is not None:
-                    _check_accounting_match(snapshot, report)
+                    if not reconcile_accounting:
+                        _check_accounting_match(snapshot, report)
                     if snapshot.get("root_id") != report.get("root_id"):
                         raise RunnerError("operator root identity changed since this session began")
-                prior = (
-                    _accounting_shape(snapshot)
-                    if snapshot is not None
-                    else {"attempts": 0, "downloaded_bytes": 0, "accounting_complete": True}
-                )
+                if not reconcile_accounting:
+                    prior = (
+                        _accounting_shape(snapshot)
+                        if snapshot is not None
+                        else {
+                            "attempts": 0,
+                            "downloaded_bytes": 0,
+                            "accounting_complete": True,
+                        }
+                    )
                 allowances = remaining_allowances(
                     prior,
                     started_at=float(report["started_monotonic"]),
@@ -1168,10 +1405,15 @@ def run_production(
                 )
                 allowances["max-duration-seconds"] = duration
                 command = _refresh_command(operator, paths, mode, capture_id, allowances)
+                if reconcile_accounting:
+                    report["error"] = None
+                    report["recovery"] = None
                 report["previous_accounting"] = {
                     "requests": prior["attempts"],
-                    "downloaded_bytes": prior["downloaded_bytes"],
-                    "accounting_complete": True,
+                    "downloaded_bytes": prior.get("downloaded_bytes"),
+                    "downloaded_bytes_upper_bound": prior.get("downloaded_bytes_upper_bound"),
+                    "accounting_complete": prior.get("accounting_complete", True),
+                    "accounting_basis": prior.get("accounting_basis", "exact"),
                 }
                 report["accounting_complete"] = False
                 report["requests"] = None
@@ -1212,7 +1454,7 @@ def run_production(
                     return result, 3 if stop_reason else 1
                 report["capture_complete"] = cli_result.get("capture_complete") is True
                 report["publication_state"] = cli_result.get("publication_state", "unknown")
-                if cli_result.get("accounting_complete") is not True:
+                if cli_result.get("accounting_complete") is not True and not reconcile_accounting:
                     report["accounting_complete"] = False
                     report["error"] = "refresh reported incomplete acquisition accounting"
                     report["resumable"] = None
@@ -1228,30 +1470,97 @@ def run_production(
                     return result, 1
                 # A short supervised Store/receipt walk confirms the durable ledger and actual storage.
                 snapshot = _resource_guard(
-                    directory, operator, report=report, deadline=session_deadline, paths=paths
+                    directory,
+                    operator,
+                    report=report,
+                    deadline=session_deadline,
+                    paths=paths,
+                    require_complete_accounting=(
+                        not reconcile_accounting or prior.get("accounting_complete") is True
+                    ),
+                    capture_id=capture_id if reconcile_accounting else None,
                 )
+                prior_charged_bytes = prior.get("downloaded_bytes_upper_bound")
+                if prior_charged_bytes is None:
+                    prior_charged_bytes = prior.get("downloaded_bytes", 0)
                 if (
                     snapshot["attempts"] < prior["attempts"]
-                    or snapshot["downloaded_or_reserved_bytes"] < prior["downloaded_bytes"]
+                    or snapshot["downloaded_or_reserved_bytes"] < prior_charged_bytes
                 ):
                     raise RunnerError("durable receipt accounting decreased during the invocation")
-                cumulative = {
-                    "attempts": prior["attempts"] + int(cli_result.get("requests") or 0),
-                    "downloaded_bytes": prior["downloaded_bytes"]
-                    + int(cli_result.get("downloaded_bytes") or 0),
-                    "accounting_complete": True,
-                }
-                if cli_result.get("requests") is None or cli_result.get("downloaded_bytes") is None:
+                if reconcile_accounting:
+                    if (
+                        cli_result.get("requests") is None
+                        or cli_result.get("downloaded_bytes") is None
+                    ):
+                        raise RunnerError(
+                            "resumed child did not report exact invocation accounting"
+                        )
+                    if prior["accounting_complete"]:
+                        expected_after = {
+                            "attempts": prior["attempts"] + int(cli_result["requests"]),
+                            "downloaded_bytes": prior["downloaded_bytes"]
+                            + int(cli_result["downloaded_bytes"]),
+                            "accounting_complete": True,
+                        }
+                        _check_accounting_match(snapshot, expected_after)
+                        report["requests"] = snapshot["attempts"]
+                        report["downloaded_bytes"] = snapshot["downloaded_or_reserved_bytes"]
+                        report["downloaded_bytes_upper_bound"] = None
+                        report["accounting_basis"] = "exact"
+                        report["accounting_bound_verified"] = False
+                        report["unfinished_reservation_ids"] = []
+                        report["accounting_complete"] = True
+                        report["consumption_state"] = "verified"
+                    else:
+                        expected_after = {
+                            "attempts": prior["attempts"] + int(cli_result["requests"]),
+                            "downloaded_bytes_upper_bound": prior["downloaded_bytes_upper_bound"]
+                            + int(cli_result["downloaded_bytes"]),
+                            "accounting_complete": False,
+                            "accounting_basis": "reserved-upper-bound",
+                        }
+                        bound = _reserved_upper_bound(snapshot, str(report["capture_id"]))
+                        if (
+                            bound["reservation_inventory_sha256"]
+                            != prior["reservation_inventory_sha256"]
+                        ):
+                            raise RunnerError(
+                                "unfinished reservation inventory changed during the resumed invocation"
+                            )
+                        _check_accounting_match(snapshot, expected_after)
+                        report["requests"] = snapshot["attempts"]
+                        report["downloaded_bytes"] = None
+                        report["downloaded_bytes_upper_bound"] = bound[
+                            "downloaded_bytes_upper_bound"
+                        ]
+                        report["accounting_basis"] = bound["accounting_basis"]
+                        report["accounting_bound_verified"] = True
+                        report["unfinished_reservation_ids"] = bound["unfinished_reservation_ids"]
+                        report["accounting_complete"] = False
+                        report["consumption_state"] = "reserved-upper-bound"
+                elif (
+                    cli_result.get("requests") is None or cli_result.get("downloaded_bytes") is None
+                ):
                     cumulative = {
                         "attempts": snapshot["attempts"],
                         "downloaded_bytes": snapshot["downloaded_or_reserved_bytes"],
                         "accounting_complete": True,
                     }
-                _check_accounting_match(snapshot, cumulative)
-                report["requests"] = snapshot["attempts"]
-                report["downloaded_bytes"] = snapshot["downloaded_or_reserved_bytes"]
-                report["accounting_complete"] = True
-                report["consumption_state"] = "verified"
+                else:
+                    cumulative = {
+                        "attempts": prior["attempts"] + int(cli_result["requests"]),
+                        "downloaded_bytes": prior["downloaded_bytes"]
+                        + int(cli_result["downloaded_bytes"]),
+                        "accounting_complete": True,
+                    }
+                if not reconcile_accounting:
+                    _check_accounting_match(snapshot, cumulative)
+                    report["requests"] = snapshot["attempts"]
+                    report["downloaded_bytes"] = snapshot["downloaded_or_reserved_bytes"]
+                    report["downloaded_bytes_upper_bound"] = None
+                    report["accounting_complete"] = True
+                    report["consumption_state"] = "verified"
                 report["root_id"] = snapshot.get("root_id")
                 if (
                     code != 0
@@ -1421,7 +1730,14 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--full", action="store_true")
     modes.add_argument("--capture-id")
     modes.add_argument("--activate-current", action="store_true")
+    parser.add_argument(
+        "--reconcile-accounting",
+        action="store_true",
+        help="resume only after charging unfinished requests at their full durable reservation",
+    )
     args = parser.parse_args(argv)
+    if args.reconcile_accounting and not args.capture_id:
+        parser.error("--reconcile-accounting requires --capture-id")
     try:
         with _graceful_stop_handlers():
             result, code = run_production(
@@ -1429,6 +1745,7 @@ def main(argv: list[str] | None = None) -> int:
                 full=args.full,
                 capture_id=args.capture_id,
                 activate_only=args.activate_current,
+                reconcile_accounting=args.reconcile_accounting,
             )
     except (BudgetStop, RunnerInterrupted) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
@@ -1490,7 +1807,9 @@ def _session_report(
     return paths["report"], report, paths
 
 
-def _load_resume(directory: Path, capture_id: str) -> tuple[Path, dict[str, Any], dict[str, Path]]:
+def _load_resume(
+    directory: Path, capture_id: str, *, reconcile_accounting: bool = False
+) -> tuple[Path, dict[str, Any], dict[str, Path]]:
     matches = []
     run_root = directory / "runs"
     if run_root.is_dir():
@@ -1504,11 +1823,18 @@ def _load_resume(directory: Path, capture_id: str) -> tuple[Path, dict[str, Any]
     if len(matches) != 1:
         raise RunnerError("resume requires one durable session report for this capture ID")
     report_path, report = matches[0]
-    if (
-        report.get("accounting_complete") is not True
-        or report.get("production_state") == "verified"
+    recoverable_accounting_stop = _is_recoverable_accounting_stop(
+        report, capture_id, reconcile_accounting
+    )
+    if (report.get("accounting_complete") is not True and not recoverable_accounting_stop) or (
+        report.get("production_state") == "verified"
     ):
         raise RunnerError("resume accounting is unknown or production activation already succeeded")
+    if reconcile_accounting and (
+        report.get("system", {}).get("package_versions", {}).get("httpx") != "0.28.1"
+        or report.get("system", {}).get("uv_lock_sha256") != RECONCILIATION_UV_LOCK_SHA256
+    ):
+        raise RunnerError("the stopped session's HTTP chunk bound cannot be verified")
     if report.get("active_process_group") is not None:
         raise RunnerError(
             "session records an unreconciled child process group; explicit recovery is required"
@@ -1537,11 +1863,116 @@ def _load_resume(directory: Path, capture_id: str) -> tuple[Path, dict[str, Any]
     return report_path, report, paths
 
 
+def _is_recoverable_accounting_stop(
+    report: dict[str, Any], capture_id: str, reconcile_accounting: bool
+) -> bool:
+    """Allow only known resource stops through explicit, exact-capture recovery."""
+    return (
+        reconcile_accounting
+        and report.get("capture_id") == capture_id
+        and report.get("accounting_complete") is False
+        and report.get("phase") == "stopped"
+        and report.get("production_state") != "verified"
+        and report.get("error") in RECOVERABLE_ACCOUNTING_STOP_REASONS
+    )
+
+
 def _accounting_shape(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "attempts": snapshot["attempts"],
         "downloaded_bytes": snapshot["downloaded_or_reserved_bytes"],
         "accounting_complete": snapshot["accounting_complete"],
+    }
+
+
+def _reserved_upper_bound(snapshot: dict[str, Any], capture_id: str) -> dict[str, Any]:
+    """Validate incomplete durable receipts and charge their full pre-request reservations."""
+    attempts = snapshot.get("attempts")
+    amount = snapshot.get("downloaded_or_reserved_bytes")
+    pending = snapshot.get("unfinished_reservations")
+    if (
+        snapshot.get("accounting_complete") is not False
+        or isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts < 1
+        or isinstance(amount, bool)
+        or not isinstance(amount, int)
+        or amount < 0
+        or not isinstance(pending, list)
+        or not pending
+    ):
+        raise RunnerError("durable incomplete accounting cannot be bounded")
+    ids: set[str] = set()
+    inventory: list[tuple[str, str, int]] = []
+    charges = 0
+    for receipt in pending:
+        if not isinstance(receipt, dict):
+            raise RunnerError("unfinished receipt inventory is malformed")
+        request_id = receipt.get("request_id")
+        reservation = receipt.get("reserved_bytes")
+        receipt_version = receipt.get("version")
+        if (
+            receipt.get("capture_id") != capture_id
+            or receipt.get("acquisition_protocol") != 5
+            or isinstance(receipt_version, bool)
+            or receipt_version not in {1, 2}
+            or receipt.get("accounting_complete") is not False
+            or receipt.get("status") is not None
+            or not isinstance(request_id, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", request_id)
+            or request_id in ids
+            or isinstance(reservation, bool)
+            or not isinstance(reservation, int)
+            or not 0 < reservation <= int(RUN_LIMITS["response_bytes"])
+        ):
+            raise RunnerError("unfinished receipt cannot be safely charged")
+        ids.add(request_id)
+        inventory.append((request_id, receipt["capture_id"], reservation))
+        charges += int(RUN_LIMITS["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
+    if amount < charges or attempts < len(pending):
+        raise RunnerError("durable reservation totals are contradictory")
+    return {
+        "attempts": attempts,
+        "downloaded_bytes_upper_bound": amount,
+        "accounting_complete": False,
+        "accounting_basis": "reserved-upper-bound",
+        "accounting_bound_verified": True,
+        "unfinished_reservations": len(pending),
+        "unfinished_response_ceiling_bytes": len(pending) * int(RUN_LIMITS["response_bytes"]),
+        "unfinished_chunk_slack_bytes": len(pending) * HTTPX_MAX_RAW_CHUNK_BYTES,
+        "unfinished_reservation_ids": sorted(ids),
+        "reservation_inventory_sha256": hashlib.sha256(
+            json.dumps(sorted(inventory), separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+
+
+def _reconciliation_accounting(snapshot: dict[str, Any], capture_id: str) -> dict[str, Any]:
+    """Recover exact accounting when every durable receipt is closed, otherwise bound it."""
+    if snapshot.get("accounting_complete") is not True:
+        return _reserved_upper_bound(snapshot, capture_id)
+    attempts = snapshot.get("attempts")
+    amount = snapshot.get("downloaded_or_reserved_bytes")
+    pending = snapshot.get("unfinished_reservations")
+    if (
+        isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts < 0
+        or isinstance(amount, bool)
+        or not isinstance(amount, int)
+        or amount < 0
+        or pending != []
+    ):
+        raise RunnerError("durable exact accounting is malformed")
+    return {
+        "attempts": attempts,
+        "downloaded_bytes": amount,
+        "downloaded_bytes_upper_bound": None,
+        "accounting_complete": True,
+        "accounting_basis": "exact",
+        "accounting_bound_verified": False,
+        "unfinished_reservations": 0,
+        "unfinished_reservation_ids": [],
     }
 
 
@@ -1582,9 +2013,9 @@ def _read_cli_result(path: Path) -> dict[str, Any] | None:
     return result if result and isinstance(result.get("complete"), bool) else None
 
 
-def _accounting_worker_main(root: Path) -> int:
+def _accounting_worker_main(root: Path, capture_id: str | None = None) -> int:
     try:
-        value = _read_accounting_worker(root)
+        value = _read_accounting_worker(root, capture_id)
         print(json.dumps(value, sort_keys=True, allow_nan=False))
         return 0
     except Exception as exc:
@@ -1714,12 +2145,15 @@ def _merge_capture_notification(report: dict[str, Any], path: Path | None) -> No
 def _main_hidden(argv: list[str]) -> int | None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--_account-root", type=Path)
+    parser.add_argument("--_account-recovery", nargs=2)
     parser.add_argument("--_root-summary", type=Path)
     parser.add_argument("--_refresh-worker", nargs=7)
     parser.add_argument("--_activate-current", nargs=3)
     args, rest = parser.parse_known_args(argv)
     if args._account_root is not None and not rest:
         return _accounting_worker_main(args._account_root)
+    if args._account_recovery is not None and not rest:
+        return _accounting_worker_main(Path(args._account_recovery[0]), args._account_recovery[1])
     if args._root_summary is not None and not rest:
         return _root_summary_worker_main(args._root_summary)
     if args._refresh_worker is not None and not rest:

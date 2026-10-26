@@ -140,6 +140,327 @@ def test_response_reservation_is_clamped_to_remaining_download_budget(production
     assert 0 < remaining["max-response-bytes"] <= 100
 
 
+def test_reserved_upper_bound_accounting_is_explicit_and_charged(production):
+    reservation = {
+        "capture_id": "a" * 32,
+        "request_id": "b" * 64,
+        "reserved_bytes": 384 * 1024**2,
+        "status": None,
+        "accounting_complete": False,
+        "acquisition_protocol": 5,
+        "version": 1,
+    }
+    snapshot = {
+        "attempts": 10,
+        "downloaded_or_reserved_bytes": 416 * 1024**2 + 64 * 1024,
+        "accounting_complete": False,
+        "unfinished_reservations": [reservation],
+    }
+    bound = production._reserved_upper_bound(snapshot, "a" * 32)
+    assert bound["accounting_complete"] is False
+    assert bound["accounting_basis"] == "reserved-upper-bound"
+    assert bound["downloaded_bytes_upper_bound"] == 416 * 1024**2 + 64 * 1024
+    assert bound["unfinished_reservation_ids"] == ["b" * 64]
+    assert bound["reservation_inventory_sha256"]
+    allowances = production.remaining_allowances(
+        bound, 100, now=100, started_epoch=100, wall_now=100
+    )
+    assert allowances["max-requests"] == production.RUN_LIMITS["attempts"] - 10
+    assert allowances["max-download-bytes"] == production.RUN_LIMITS["downloaded_bytes"] - (
+        416 * 1024**2 + 64 * 1024
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"capture_id": "c" * 32},
+        {"request_id": "bad"},
+        {"reserved_bytes": True},
+        {"reserved_bytes": 384 * 1024**2 + 1},
+        {"status": 200},
+        {"acquisition_protocol": 4},
+        {"version": True},
+    ],
+)
+def test_reserved_upper_bound_rejects_untrusted_receipt_fields(production, change):
+    reservation = {
+        "capture_id": "a" * 32,
+        "request_id": "b" * 64,
+        "reserved_bytes": 1024,
+        "status": None,
+        "accounting_complete": False,
+        "acquisition_protocol": 5,
+        "version": 1,
+    }
+    reservation.update(change)
+    snapshot = {
+        "attempts": 1,
+        "downloaded_or_reserved_bytes": reservation.get("reserved_bytes", 1024),
+        "accounting_complete": False,
+        "unfinished_reservations": [reservation],
+    }
+    with pytest.raises(RuntimeError):
+        production._reserved_upper_bound(snapshot, "a" * 32)
+
+
+def test_recovery_keeps_fully_finalized_receipts_exact(production):
+    snapshot = {
+        "attempts": 7,
+        "downloaded_or_reserved_bytes": 12345,
+        "accounting_complete": True,
+        "unfinished_reservations": [],
+    }
+    recovered = production._reconciliation_accounting(snapshot, "a" * 32)
+    assert recovered["accounting_complete"] is True
+    assert recovered["accounting_basis"] == "exact"
+    assert recovered["attempts"] == 7
+    assert recovered["downloaded_bytes"] == 12345
+    assert recovered["downloaded_bytes_upper_bound"] is None
+    assert production.remaining_allowances(recovered, 100, now=160)["max-requests"] == (
+        production.RUN_LIMITS["attempts"] - 7
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "refresh failed with unknown child accounting",
+        "process-group RSS exceeded 24 GiB for 60 seconds",
+        "system compressed memory reached the conservative stop threshold",
+        "SSD free space fell below 150 GiB",
+    ],
+)
+def test_explicit_accounting_recovery_accepts_only_known_resource_stops(production, reason):
+    report = {
+        "capture_id": "a" * 32,
+        "accounting_complete": False,
+        "phase": "stopped",
+        "production_state": "not_attempted",
+        "error": reason,
+        "started_epoch": 1_000,
+        "deadline_epoch": 1_000 + production.RUN_LIMITS["session_seconds"],
+        "started_monotonic": 200,
+        "deadline_monotonic": 200 + production.RUN_LIMITS["session_seconds"],
+    }
+    saved_window = (
+        report["started_epoch"],
+        report["deadline_epoch"],
+        report["started_monotonic"],
+        report["deadline_monotonic"],
+    )
+    assert production._is_recoverable_accounting_stop(report, "a" * 32, True)
+    assert saved_window == (
+        report["started_epoch"],
+        report["deadline_epoch"],
+        report["started_monotonic"],
+        report["deadline_monotonic"],
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"error": "filesystem mount changed during the run"},
+        {"error": "resource accounting failed: malformed vm_stat"},
+        {"error": "session or workflow deadline reached termination reserve"},
+        {"phase": "complete"},
+        {"accounting_complete": True},
+        {"production_state": "verified"},
+        {"capture_id": "b" * 32},
+    ],
+)
+def test_explicit_accounting_recovery_rejects_unknown_or_ineligible_stops(production, change):
+    report = {
+        "capture_id": "a" * 32,
+        "accounting_complete": False,
+        "phase": "stopped",
+        "production_state": "not_attempted",
+        "error": "refresh failed with unknown child accounting",
+    }
+    report.update(change)
+    assert not production._is_recoverable_accounting_stop(report, "a" * 32, True)
+    assert not production._is_recoverable_accounting_stop(report, "a" * 32, False)
+
+
+def test_vm_stat_compressed_logical_pages_are_parsed_and_bounded(production, monkeypatch):
+    result = SimpleNamespace(
+        stdout=(
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            "Pages stored in compressor: 1048576.\n"
+        )
+    )
+    monkeypatch.setattr(production.subprocess, "run", lambda *a, **k: result)
+    assert production._system_compressed_bytes() == 16 * 1024**3
+
+
+@pytest.mark.parametrize("clock_source", ["monotonic", "wall"])
+def test_monitor_rechecks_both_deadlines_after_rss_before_compressor_probe(
+    production, tmp_path, monkeypatch, clock_source
+):
+    clock = {"monotonic": 100.0, "wall": 200.0}
+    terminated = []
+
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return None
+
+        def wait(self, *, timeout):
+            return -15
+
+    def advance_rss(_pid, *, timeout):
+        assert timeout == 1.0
+        clock[clock_source] += 1
+        return 0
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(production, "_process_group_rss", advance_rss)
+    monkeypatch.setattr(
+        production,
+        "_system_compressed_bytes",
+        lambda **_kw: pytest.fail("compressor probe started inside termination reserve"),
+    )
+    monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    monkeypatch.setattr(production, "_utc", lambda: "test")
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+
+    code, reason, reaped = production._monitor(
+        Process(),
+        tmp_path,
+        tmp_path / "operator",
+        {"resource_samples": [], "peak_child_process_group_rss_bytes": 0},
+        tmp_path / "session.json",
+        106,
+        wall_deadline_epoch=206,
+    )
+
+    assert code == -15
+    assert reason == "session or workflow deadline reached termination reserve"
+    assert reaped is True
+    assert terminated == [True]
+
+
+@pytest.mark.parametrize("clock_source", ["monotonic", "wall"])
+def test_monitor_clamps_compressor_timeout_to_fresh_deadline_remainder(
+    production, tmp_path, monkeypatch, clock_source
+):
+    clock = {"monotonic": 100.0, "wall": 200.0}
+    probe_timeouts = []
+
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return None
+
+        def wait(self, *, timeout):
+            return -15
+
+    def advance_rss(_pid, *, timeout):
+        assert timeout == 4.0
+        clock[clock_source] += 2
+        return 0
+
+    def compressed(*, timeout):
+        probe_timeouts.append(timeout)
+        return production.RUN_LIMITS["compressed_memory_stop_bytes"]
+
+    terminated = []
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(production, "_process_group_rss", advance_rss)
+    monkeypatch.setattr(production, "_system_compressed_bytes", compressed)
+    monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    monkeypatch.setattr(production, "_utc", lambda: "test")
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+
+    code, reason, reaped = production._monitor(
+        Process(),
+        tmp_path,
+        tmp_path / "operator",
+        {"resource_samples": [], "peak_child_process_group_rss_bytes": 0},
+        tmp_path / "session.json",
+        109,
+        wall_deadline_epoch=209,
+    )
+
+    assert code == -15
+    assert reason == "system compressed memory reached the conservative stop threshold"
+    assert reaped is True
+    assert probe_timeouts == [2.0]
+    assert terminated == [True]
+
+
+@pytest.mark.parametrize("clock_source", ["monotonic", "wall"])
+def test_monitor_preserves_deadline_reason_when_compressor_probe_times_out(
+    production, tmp_path, monkeypatch, clock_source
+):
+    clock = {"monotonic": 100.0, "wall": 200.0}
+    probe_timeouts = []
+
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return None
+
+        def wait(self, *, timeout):
+            return -15
+
+    def advance_rss(_pid, *, timeout):
+        assert timeout == 4.0
+        clock[clock_source] += 1
+        return 0
+
+    def timed_out(*, timeout):
+        probe_timeouts.append(timeout)
+        clock[clock_source] += 4
+        raise production.subprocess.TimeoutExpired("vm_stat", timeout)
+
+    terminated = []
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(production, "_process_group_rss", advance_rss)
+    monkeypatch.setattr(production, "_system_compressed_bytes", timed_out)
+    monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    monkeypatch.setattr(production, "_utc", lambda: "test")
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+
+    code, reason, reaped = production._monitor(
+        Process(),
+        tmp_path,
+        tmp_path / "operator",
+        {"resource_samples": [], "peak_child_process_group_rss_bytes": 0},
+        tmp_path / "session.json",
+        109,
+        wall_deadline_epoch=209,
+    )
+
+    assert code == -15
+    assert reason == "session or workflow deadline reached termination reserve"
+    assert reaped is True
+    assert probe_timeouts == [3.0]
+    assert terminated == [True]
+
+
 def _live_process(pid):
     result = subprocess.run(
         ["ps", "-p", str(pid), "-o", "stat="],
@@ -242,6 +563,7 @@ def test_report_failure_after_child_startup_still_terminates_the_child(
     monkeypatch.setattr(production.subprocess, "Popen", start)
     monkeypatch.setattr(production, "_atomic_report", fail_report)
     monkeypatch.setattr(production, "_process_group_rss", rss)
+    monkeypatch.setattr(production, "_system_compressed_bytes", lambda **_kw: 0)
     monkeypatch.setattr(
         production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
     )
@@ -441,6 +763,7 @@ def test_allocation_survives_parent_heartbeat_before_child_result_is_available(
 
     monkeypatch.setattr(production.subprocess, "Popen", lambda *_a, **_kw: child)
     monkeypatch.setattr(production, "_process_group_rss", allocate_during_sample)
+    monkeypatch.setattr(production, "_system_compressed_bytes", lambda **_kw: 0)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production.time, "sleep", lambda _duration: None)
     monkeypatch.setattr(

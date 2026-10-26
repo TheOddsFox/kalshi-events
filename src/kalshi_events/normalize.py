@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
+import time
 from collections.abc import Iterable, Iterator
+from contextlib import suppress
 from typing import Any
 
-from kalshi_events.common import CatalogueError, digest, json_bytes, ticker, validate_series_scope
+from kalshi_events.common import (
+    BudgetExceeded,
+    CatalogueError,
+    digest,
+    durable_mkdir,
+    json_bytes,
+    ticker,
+    validate_series_scope,
+)
 
 ENTITY_KEYS = {"series": "series_ticker", "events": "event_ticker", "markets": "market_ticker"}
 
@@ -254,6 +266,375 @@ class ParentIndex:
                 if direct is None or direct[1:] == (page_id, request_id):
                     lookups[("events", identity)] = (200, page_id, request_id)
         return events, lookups
+
+
+class DiskParentIndex:
+    """Bounded-memory SQLite inventory used while replaying full catalogue captures."""
+
+    def __init__(self, store: Any):
+        self.store = store
+        self.processed: set[str] = set()
+        tmp = store.path("tmp")
+        durable_mkdir(tmp)
+        for stale in tmp.glob("parent-index-*"):
+            store.remove(stale.relative_to(store.root).as_posix())
+        directory = f"tmp/parent-index-{os.getpid()}-{os.urandom(6).hex()}"
+        self.relative = f"{directory}/index.sqlite"
+        self.path = store.path(self.relative)
+        durable_mkdir(self.path.parent)
+        self.db = None
+        try:
+            self.db = sqlite3.connect(self.path)
+            self._initialize_db()
+        except BaseException as exc:
+            if self.db is not None:
+                self.db.close()
+                self.db = None
+            store.remove(directory)
+            if isinstance(exc, sqlite3.OperationalError) and "full" in str(exc).lower():
+                raise BudgetExceeded(
+                    "temporary storage exhausted while initializing verified-evidence index"
+                ) from exc
+            raise
+
+    def _initialize_db(self) -> None:
+        self.db.execute("pragma cache_size=-8192")
+        self.db.execute("pragma temp_store=FILE")
+        self.db.execute("pragma automatic_index=OFF")
+        self.db.execute("pragma mmap_size=0")
+        # This inventory is disposable and rebuilt from verified receipts on every operation.
+        self.db.execute("pragma journal_mode=OFF")
+        self.db.execute("pragma synchronous=OFF")
+        usage = self.store.usage()
+        remaining = min(
+            self.store.limits.max_temp_bytes - usage["temporary_bytes"],
+            self.store.limits.max_root_bytes - usage["retained_bytes"],
+        )
+        self.db.execute(f"pragma max_page_count={max(1, remaining // 4096)}")
+        self.db.executescript(
+            """create table winners(kind text,ticker text,received text,observation_id text,parent text,
+                   primary key(kind,ticker)) without rowid;
+               create index winners_parent on winners(kind,parent);
+               create table membership(scope text,generation integer,ticker text,
+                   primary key(scope,generation,ticker)) without rowid;
+               create table lookups(kind text,ticker text,status integer,page_id text,request_id text,
+                   primary key(kind,ticker)) without rowid;
+               create table candidates(batch_id text,generation integer,ticker text,received text,
+                   observation_id text,parent text,page_id text,request_id text,
+                   primary key(batch_id,generation,ticker)) without rowid;
+               create index candidates_ticker on candidates(ticker);
+               create table terminal(batch_id text,generation integer,
+                   primary key(batch_id,generation)) without rowid;"""
+        )
+        deadline = self.store.started + self.store.limits.max_duration_seconds
+        self._deadline_hit = False
+
+        def interrupt_at_deadline() -> int:
+            if time.monotonic() >= deadline:
+                self._deadline_hit = True
+                return 1
+            return 0
+
+        self.db.set_progress_handler(interrupt_at_deadline, 10_000)
+        self.db.commit()
+        self._sync()
+
+    def _translate_sql_deadline(self, exc: sqlite3.OperationalError) -> None:
+        if self._deadline_hit:
+            raise BudgetExceeded(
+                "operation deadline exhausted while indexing verified evidence"
+            ) from exc
+        if "full" in str(exc).lower():
+            raise BudgetExceeded(
+                "temporary storage exhausted while indexing verified evidence"
+            ) from exc
+        raise exc
+
+    def _sync(self) -> None:
+        self.db.commit()
+        self.store.sync_file(self.relative)
+        self.store.check_storage()
+        self.store.check_deadline()
+
+    def close(self) -> None:
+        db = getattr(self, "db", None)
+        if db is None:
+            return
+        self.db = None
+        db.close()
+        self.store.remove(self.path.parent.relative_to(self.store.root).as_posix())
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
+
+    def add_page(self, manifest: dict[str, Any], payload: Any) -> None:
+        page = ParentIndex()
+        page.add_page(manifest, payload)
+        self.merge(page)
+
+    def merge(self, page: ParentIndex) -> None:
+        try:
+            self._merge(page)
+        except sqlite3.OperationalError as exc:
+            self._translate_sql_deadline(exc)
+
+    def _merge(self, page: ParentIndex) -> None:
+        for kind in ENTITY_KEYS:
+            for identity, winner in getattr(page, kind).items():
+                parent = winner[2] if kind == "events" or kind == "markets" else None
+                if kind == "events" and not parent:
+                    parent = None
+                self.db.execute(
+                    """insert into winners values(?,?,?,?,?) on conflict(kind,ticker) do update set
+                       received=excluded.received,observation_id=excluded.observation_id,parent=excluded.parent
+                       where (excluded.received,excluded.observation_id) >
+                             (winners.received,winners.observation_id)""",
+                    [kind, identity, winner[0], winner[1], parent],
+                )
+        for scope, generations in page.scope_membership.items():
+            for generation, identities in generations.items():
+                self.db.executemany(
+                    "insert or ignore into membership values(?,?,?)",
+                    ((scope, generation, identity) for identity in identities),
+                )
+        for (kind, identity), (status, page_id, request_id) in page.parent_lookups.items():
+            self.db.execute(
+                """insert into lookups values(?,?,?,?,?) on conflict(kind,ticker) do update set
+                   status=excluded.status,page_id=excluded.page_id,request_id=excluded.request_id""",
+                [kind, identity, status, page_id, request_id],
+            )
+        for (batch_id, generation), candidates in page.parent_batch_candidates.items():
+            for identity, (winner, page_id, request_id) in candidates.items():
+                self.db.execute(
+                    """insert into candidates values(?,?,?,?,?,?,?,?) on conflict(batch_id,generation,ticker)
+                       do update set received=excluded.received,observation_id=excluded.observation_id,
+                       parent=excluded.parent,page_id=excluded.page_id,request_id=excluded.request_id
+                       where (excluded.received,excluded.observation_id) >
+                             (candidates.received,candidates.observation_id)""",
+                    [
+                        batch_id,
+                        generation,
+                        identity,
+                        winner[0],
+                        winner[1],
+                        winner[2] or None,
+                        page_id,
+                        request_id,
+                    ],
+                )
+        self.db.executemany(
+            "insert or ignore into terminal values(?,?)", page.parent_batch_terminal
+        )
+        self._sync()
+
+    def stream_winners(self, kind: str) -> Iterator[tuple[str, str, str, str | None]]:
+        yield from self.db.execute(
+            "select ticker,received,observation_id,parent from winners where kind=? order by ticker",
+            [kind],
+        )
+
+    @staticmethod
+    def _task_scopes(state: dict[str, Any]) -> dict[str, str]:
+        scopes = state.get("task_scopes")
+        if isinstance(scopes, dict) and scopes:
+            return scopes
+        inferred = {}
+        for index, work in enumerate(state.get("tasks", [])):
+            if (
+                not isinstance(work, dict)
+                or work.get("singular")
+                or work.get("parent_batch") is not None
+                or "tickers" in work.get("params", {})
+            ):
+                continue
+            endpoint = work.get("endpoint")
+            kind = work.get("kind")
+            scope = None
+            if endpoint == "/series" and kind == "series":
+                scope = "series"
+            elif endpoint == "/events" and kind == "events":
+                scope = "events_live"
+            elif endpoint == "/events/multivariate" and kind == "events":
+                scope = "events_combo"
+            elif endpoint == "/markets" and kind == "markets":
+                scope = (
+                    "markets_combo"
+                    if work.get("params", {}).get("mve_filter") == "only"
+                    else "markets_live"
+                )
+            elif endpoint == "/historical/markets" and kind == "markets":
+                scope = "markets_history"
+            if scope is not None:
+                inferred[str(index)] = scope
+        return inferred
+
+    def stream_membership(self, state: dict[str, Any]) -> Iterator[tuple[str, str]]:
+        try:
+            yield from self._stream_membership(state)
+        except sqlite3.OperationalError as exc:
+            self._translate_sql_deadline(exc)
+
+    def _stream_membership(self, state: dict[str, Any]) -> Iterator[tuple[str, str]]:
+        selected: dict[str, set[int]] = {}
+        scopes = self._task_scopes(state)
+        for index, scope in sorted(scopes.items(), key=lambda row: int(row[0])):
+            generation = int(state["tasks"][int(index)].get("restarts", 0))
+            work = state["tasks"][int(index)]
+            selected.setdefault(scope, set()).add(generation)
+            if scope == "markets_live" and not work.get("params", {}).get("mve_filter"):
+                selected.setdefault("markets_combo", set()).add(generation)
+        self.db.execute("drop table if exists selected_membership")
+        self.db.execute(
+            "create table selected_membership(scope text,ticker text,primary key(scope,ticker)) without rowid"
+        )
+        for selected_scope, generations in selected.items():
+            for generation in sorted(generations):
+                self.db.execute(
+                    "insert or ignore into selected_membership select scope,ticker from membership where scope=? and generation=?",
+                    [selected_scope, generation],
+                )
+        self._sync()
+        yield from self.db.execute(
+            "select scope,ticker from selected_membership order by scope,ticker"
+        )
+
+    def _effective_lookups(self, state: dict[str, Any]) -> None:
+        self.db.execute("drop table if exists effective_lookups")
+        self.db.execute(
+            "create table effective_lookups(kind text,ticker text,status int,page_id text,primary key(kind,ticker)) without rowid"
+        )
+        self.db.execute(
+            "insert into effective_lookups select kind,ticker,status,page_id from lookups"
+        )
+        for work in state.get("tasks", []):
+            if work.get("parent_batch") is None or not work.get("done"):
+                continue
+            batch_id = digest(
+                json_bytes(
+                    [
+                        work.get("endpoint"),
+                        work.get("params"),
+                        work.get("kind"),
+                        work.get("singular"),
+                        work.get("requested"),
+                    ]
+                )
+            )
+            generation = int(work.get("restarts", 0))
+            self.db.execute(
+                """insert or ignore into effective_lookups
+                   select 'events',c.ticker,200,c.page_id from candidates c join terminal t using(batch_id,generation)
+                   left join lookups l on l.kind='events' and l.ticker=c.ticker
+                   where c.batch_id=? and c.generation=? and
+                     (l.ticker is null or (l.page_id=c.page_id and l.request_id=c.request_id))""",
+                [batch_id, generation],
+            )
+        self._sync()
+
+    def stream_eligibility(self, state: dict[str, Any]) -> Iterator[tuple[str, str, int, str]]:
+        try:
+            yield from self._stream_eligibility(state)
+        except sqlite3.OperationalError as exc:
+            self._translate_sql_deadline(exc)
+
+    def _stream_eligibility(self, state: dict[str, Any]) -> Iterator[tuple[str, str, int, str]]:
+        self._effective_lookups(state)
+        yield from self.db.execute(
+            "select kind,ticker,status,page_id from effective_lookups order by kind,ticker"
+        )
+
+    def missing_parent_batches(self, state: dict[str, Any]) -> Iterator[tuple[str, list[str]]]:
+        try:
+            yield from self._missing_parent_batches(state)
+        except sqlite3.OperationalError as exc:
+            self._translate_sql_deadline(exc)
+
+    def _missing_parent_batches(self, state: dict[str, Any]) -> Iterator[tuple[str, list[str]]]:
+        """Stream sorted groups; table joins replace full-catalogue Python dictionaries and sets."""
+        self._effective_lookups(state)
+        self.db.execute("drop table if exists required_parents")
+        self.db.execute(
+            "create table required_parents(kind text,ticker text,primary key(kind,ticker)) without rowid"
+        )
+        self.db.execute("drop table if exists listed_union")
+        self.db.execute(
+            "create table listed_union(scope text,ticker text,primary key(scope,ticker)) without rowid"
+        )
+        self.db.execute("insert or ignore into listed_union select scope,ticker from membership")
+        self.db.execute("drop table if exists listed_final")
+        self.db.execute(
+            "create table listed_final(scope text,ticker text,primary key(scope,ticker)) without rowid"
+        )
+        for index, scope in self._task_scopes(state).items():
+            generation = int(state["tasks"][int(index)].get("restarts", 0))
+            self.db.execute(
+                "insert or ignore into listed_final select scope,ticker from membership where scope=? and generation=?",
+                [scope, generation],
+            )
+            work = state["tasks"][int(index)]
+            if scope == "markets_live" and not work.get("params", {}).get("mve_filter"):
+                self.db.execute(
+                    "insert or ignore into listed_final select scope,ticker from membership where scope='markets_combo' and generation=?",
+                    [generation],
+                )
+        # The original rules combine all-observed parent gaps with separate union and
+        # final-generation membership closures. Keep those sets separate in SQL.
+        self.db.execute("""insert or ignore into required_parents
+            select 'events',m.parent from winners m where m.kind='markets' and m.parent is not null
+              and not exists(select 1 from winners e where e.kind='events' and e.ticker=m.parent)
+              and not exists(select 1 from effective_lookups l where l.kind='events' and l.ticker=m.parent)
+            union all select 'events',c.ticker from candidates c
+              join winners m on m.kind='markets' and m.parent=c.ticker
+              where not exists(select 1 from effective_lookups l where l.kind='events' and l.ticker=c.ticker)
+            union all select 'series',e.parent from winners e where e.kind='events' and e.parent is not null and e.parent<>''
+              and not exists(select 1 from winners s where s.kind='series' and s.ticker=e.parent)
+              and not exists(select 1 from effective_lookups l where l.kind='series' and l.ticker=e.parent)""")
+        self.db.execute("""insert or ignore into required_parents
+            select 'events',m.parent from winners m
+              join listed_union mm on mm.ticker=m.ticker and mm.scope in ('markets_live','markets_combo','markets_history')
+              left join listed_union em on em.ticker=m.parent and em.scope in ('events_live','events_combo')
+              left join effective_lookups l on l.kind='events' and l.ticker=m.parent
+              where m.kind='markets' and m.parent is not null and em.ticker is null and l.ticker is null
+            union all select 'events',m.parent from winners m
+              join listed_final mm on mm.ticker=m.ticker and mm.scope in ('markets_live','markets_combo','markets_history')
+              left join listed_final em on em.ticker=m.parent and em.scope in ('events_live','events_combo')
+              left join effective_lookups l on l.kind='events' and l.ticker=m.parent
+              where m.kind='markets' and m.parent is not null and em.ticker is null and l.ticker is null
+            union all select 'series',e.parent from winners e
+              join listed_union em on em.ticker=e.ticker and em.scope in ('events_live','events_combo')
+              left join listed_union sm on sm.scope='series' and sm.ticker=e.parent
+              left join effective_lookups l on l.kind='series' and l.ticker=e.parent
+              where e.kind='events' and e.parent is not null and e.parent<>'' and sm.ticker is null and l.ticker is null
+            union all select 'series',e.parent from winners e
+              join listed_final em on em.ticker=e.ticker and em.scope in ('events_live','events_combo')
+              left join listed_final sm on sm.scope='series' and sm.ticker=e.parent
+              left join effective_lookups l on l.kind='series' and l.ticker=e.parent
+              where e.kind='events' and e.parent is not null and e.parent<>'' and sm.ticker is null and l.ticker is null
+            union all select 'series',e.parent from winners e
+              join effective_lookups l on l.kind='events' and l.ticker=e.ticker and l.status=200
+              left join listed_union sm on sm.scope='series' and sm.ticker=e.parent
+              left join effective_lookups sl on sl.kind='series' and sl.ticker=e.parent
+              where e.kind='events' and e.parent is not null and e.parent<>'' and sm.ticker is null and sl.ticker is null""")
+        self.db.execute("""insert or ignore into required_parents
+            select 'series',e.parent from winners e
+              join effective_lookups l on l.kind='events' and l.ticker=e.ticker and l.status=200
+              left join listed_final sm on sm.scope='series' and sm.ticker=e.parent
+              left join effective_lookups sl on sl.kind='series' and sl.ticker=e.parent
+              where e.kind='events' and e.parent is not null and e.parent<>'' and sm.ticker is null and sl.ticker is null""")
+        self._sync()
+        for kind in ("events", "series"):
+            cursor = self.db.execute(
+                "select ticker from required_parents where kind=? order by ticker", [kind]
+            )
+            batch: list[str] = []
+            for (identity,) in cursor:
+                batch.append(identity)
+                if len(batch) == 100:
+                    yield kind, batch
+                    batch = []
+            if batch:
+                yield kind, batch
 
 
 def observations(pages: Iterable[tuple[dict[str, Any], Any]]) -> Iterator[dict[str, Any]]:

@@ -153,10 +153,18 @@ python scripts/run-production.py \
 python scripts/run-production.py \
   --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
   --capture-id CAPTURE_ID
+# Only after a supervisor reports unknown child accounting from abrupt termination:
+python scripts/run-production.py \
+  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --capture-id CAPTURE_ID --reconcile-accounting
 # Recover activation of the current verified publication without acquisition.
 python scripts/run-production.py \
   --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" --activate-current
 ```
+
+`--reconcile-accounting` is an explicit recovery path for a stopped session whose child died before returning its counters. Under the canonical writer lock, it validates every receipt and binds each unfinished request to the exact capture task. If all durable attempts are finalized, it restores their validated exact totals. Otherwise it charges the full sealed response ceiling plus one 64 KiB HTTP read chunk per unfinished request against the original aggregate limit. The pinned HTTP core reads at most 64 KiB per chunk. In the latter case exact downloaded bytes remain unknown and the report records the conservative bound; unfinished receipts are never edited. Recovery accepts only the stopped session's exact capture, pinned HTTP runtime and original boot identity, deadlines and resource ceilings, and only after unknown-accounting, compressed-memory, process RSS, or low-disk-space stops. Current free-space and all other resource checks still run before networking; integrity, accounting, mount, and process-reaping failures remain ineligible. It records the recovery revision while preserving the original revision and source. The supervisor also stops acquisition if macOS reports 20 GiB of pages stored in the compressor, which catches compressed-memory growth that process RSS misses. A retry after any new abrupt stop needs another explicit reconciliation.
+
+Protocol-5 full-catalogue captures and builds keep identity and reconciliation indexes in disposable SQLite files under the operator's accounted temporary storage, with bounded memory caches. Recovery rebuilds these indexes from verified receipts; they are never trusted across invocations. Legacy, targeted and incremental acquisition retain their existing index behavior. Large-scale replay and build time remain unproven.
 
 The directory contains the producer-owned `operator/` root, external session evidence in `runs/`, and the consumer entry point `production.duckdb`. The runner uses catalogue v2 only, retaining all ordinary and multivariate events and live/historical markets. It requests gzip at a five-request/second ceiling with downward adjustment after HTTP 429. It never resumes automatically or publishes incomplete acquisition.
 

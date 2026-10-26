@@ -416,6 +416,14 @@ class Store:
         """Re-measure one subtree; used after third-party writers such as dlt, dbt and DuckDB."""
         self._sync_prefix(self.path(relative))
 
+    def sync_file(self, relative: str) -> None:
+        """Re-measure one regular file without rescanning the rest of a large root."""
+        path = self.path(relative)
+        if path_is_link(path) or not path.is_file():
+            raise CatalogueError("accounted file is missing or unsafe")
+        with self._lock:
+            self._record(path, path.stat().st_size)
+
     def write(self, relative: str, value: Any) -> None:
         if relative.startswith("raw/") and relative.endswith("/manifest.json"):
             phase = (

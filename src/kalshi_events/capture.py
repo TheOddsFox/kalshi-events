@@ -37,7 +37,7 @@ from kalshi_events.common import (
     ticker,
     validate_series_scope,
 )
-from kalshi_events.normalize import ParentIndex, native_identity, records
+from kalshi_events.normalize import DiskParentIndex, ParentIndex, native_identity, records
 from kalshi_events.transport import MAX_CONCURRENT_REQUESTS, PublicClient, read_page, source_url
 
 EVENT_PAGE_LIMIT = 200
@@ -1950,6 +1950,9 @@ def _commit_page_v2_measured(
 
 
 def _merge_parent_index(target: ParentIndex, source: ParentIndex) -> None:
+    if isinstance(target, DiskParentIndex):
+        target.merge(source)
+        return
     for name in ("series", "events", "markets"):
         existing = getattr(target, name)
         for identity, winner in getattr(source, name).items():
@@ -2731,6 +2734,21 @@ def _hydrate(store: Store, state: dict[str, Any], identities: ParentIndex) -> bo
 
 
 def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
+    if isinstance(identities, DiskParentIndex):
+        existing = _task_identity_set(state)
+        added: list[dict[str, Any]] = []
+        for kind, group in identities.missing_parent_batches(state):
+            planned = parent_lookup_plan(
+                state, group if kind == "events" else [], group if kind == "series" else []
+            )
+            for work in planned:
+                identity = _task_identity(work)
+                if identity not in existing:
+                    state["tasks"].append(work)
+                    existing.add(identity)
+                    added.append(work)
+        _track_added_task_identities(state, added)
+        return any(not work["done"] for work in state["tasks"])
     effective_events, effective_lookups = identities.effective_parent_evidence(state)
     events = {identity: value[2] for identity, value in effective_events.items()}
     series = identities.series
@@ -3065,8 +3083,62 @@ def _capture_locked(
     incremental: bool = False,
     _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    capture_state = None
+    if resume is not None:
+        snapshot = store.path(f"captures/{resume}/state.json")
+        if snapshot.is_file():
+            value = decode(regular_bytes(snapshot, store.limits.max_root_bytes))
+            capture_state = value.get("state", value) if isinstance(value, dict) else None
+        else:
+            records, _ = _journal_records(store, resume, repair_tail=False)
+            first = next(records, None)
+            capture_state = first[0].get("payload", {}).get("state") if first else None
+    disk_index = (
+        selected is None
+        and not incremental
+        and store.scope is None
+        and (
+            resume is None
+            or isinstance(capture_state, dict)
+            and _acquisition_protocol(capture_state) == CURRENT_ACQUISITION_PROTOCOL
+            and capture_state.get("selected") is None
+            and capture_state.get("incremental") is not True
+            and "scope" not in capture_state
+        )
+    )
+    identities: ParentIndex | DiskParentIndex = (
+        DiskParentIndex(store) if disk_index else ParentIndex()
+    )
+    try:
+        return _capture_locked_impl(
+            store,
+            selected=selected,
+            resume=resume,
+            client_factory=client_factory,
+            compression=compression,
+            rate_policy=rate_policy,
+            incremental=incremental,
+            _on_capture_id=_on_capture_id,
+            identities=identities,
+        )
+    finally:
+        if isinstance(identities, DiskParentIndex):
+            identities.close()
+
+
+def _capture_locked_impl(
+    store: Store,
+    *,
+    selected: list[str] | None = None,
+    resume: str | None = None,
+    client_factory: Any = None,
+    compression: str | None = None,
+    rate_policy: str | None = None,
+    incremental: bool = False,
+    _on_capture_id: Callable[[str], None] | None = None,
+    identities: ParentIndex | DiskParentIndex,
+) -> dict[str, Any]:
     factory = client_factory or PublicClient
-    identities = ParentIndex()
     if resume and _on_capture_id is not None:
         _on_capture_id(resume)
     state = (

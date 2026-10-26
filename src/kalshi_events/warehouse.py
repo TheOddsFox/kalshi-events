@@ -29,6 +29,8 @@ from dlt.common.data_types.type_helpers import coerce_value, py_type_to_sc_type
 
 from kalshi_events import metrics
 from kalshi_events.capture import (
+    CURRENT_ACQUISITION_PROTOCOL,
+    _acquisition_protocol,
     _complete_capture,
     capture_pages,
     page_receipts,
@@ -50,7 +52,7 @@ from kalshi_events.common import (
     regular_bytes,
     validate_series_scope,
 )
-from kalshi_events.normalize import ENTITY_KEYS, ParentIndex, observations
+from kalshi_events.normalize import ENTITY_KEYS, DiskParentIndex, ParentIndex, observations
 from kalshi_events.transport import read_page
 
 RELATIONS = {
@@ -402,7 +404,7 @@ def _land(
     directory: Path,
     *,
     verified_pages: dict[str, str] | None = None,
-    parent_index: ParentIndex | None = None,
+    parent_index: ParentIndex | DiskParentIndex | None = None,
 ) -> int:
     """Land one capture into a fresh warehouse under `directory`. Returns observation count."""
     with metrics.phase("landing"):
@@ -421,7 +423,7 @@ def _land_rows(
     directory: Path,
     *,
     verified_pages: dict[str, str] | None = None,
-    parent_index: ParentIndex | None = None,
+    parent_index: ParentIndex | DiskParentIndex | None = None,
 ) -> int:
     capture_id = state["capture_id"]
     observation_count = 0
@@ -700,7 +702,7 @@ def _capture_membership(state: dict[str, Any], index: ParentIndex) -> dict[str, 
 def _write_parent_outcomes(
     connection: duckdb.DuckDBPyConnection,
     capture_id: str,
-    index: ParentIndex,
+    index: ParentIndex | DiskParentIndex,
     state: dict[str, Any],
 ) -> None:
     connection.execute(
@@ -819,10 +821,47 @@ def _copy_closed_database(
 def _projection_membership(
     store: Store,
     state: dict[str, Any],
-    index: ParentIndex,
+    index: ParentIndex | DiskParentIndex,
     connection: duckdb.DuckDBPyConnection,
     previous_membership: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    if isinstance(index, DiskParentIndex):
+        connection.execute(
+            """create table if not exists landing.membership (
+                 scope varchar, entity_kind varchar, entity_ticker varchar)"""
+        )
+        connection.execute("delete from landing.membership")
+        batch = []
+        for scope, identity in index.stream_membership(state):
+            batch.append((scope, SCOPE_KIND[scope], identity))
+            if len(batch) == 4096:
+                connection.executemany("insert into landing.membership values (?,?,?)", batch)
+                batch.clear()
+                store.check_deadline()
+        if batch:
+            connection.executemany("insert into landing.membership values (?,?,?)", batch)
+        connection.execute(
+            """create table if not exists landing.parent_eligibility (
+                 capture_id varchar, entity_kind varchar, entity_ticker varchar,
+                 status integer, receipt varchar)"""
+        )
+        connection.execute(
+            "delete from landing.parent_eligibility where capture_id = ?", [state["capture_id"]]
+        )
+        outcomes = []
+        for kind, identity, status, page_id in index.stream_eligibility(state):
+            outcomes.append((state["capture_id"], kind, identity, status, page_id))
+            if len(outcomes) == 4096:
+                connection.executemany(
+                    "insert into landing.parent_eligibility values (?,?,?,?,?)", outcomes
+                )
+                outcomes.clear()
+                store.check_deadline()
+        if outcomes:
+            connection.executemany(
+                "insert into landing.parent_eligibility values (?,?,?,?,?)", outcomes
+            )
+        return {}, {}
     previous = previous_membership or _read_membership(connection)
     incoming = _capture_membership(state, index)
     if state.get("scope") is not None:
@@ -1313,8 +1352,9 @@ def _projection_index(
     state: dict[str, Any],
     *,
     verified_pages: dict[str, str] | None = None,
-) -> ParentIndex:
-    index = ParentIndex()
+    index: ParentIndex | DiskParentIndex | None = None,
+) -> ParentIndex | DiskParentIndex:
+    index = index or ParentIndex()
     for manifest, payload in capture_pages(store, state, evidence=verified_pages):
         index.add_page(_scope_manifest(state, manifest), payload)
     return index
@@ -1323,8 +1363,63 @@ def _projection_index(
 def _parent_closure_is_fresh(
     connection: duckdb.DuckDBPyConnection,
     state: dict[str, Any],
-    index: ParentIndex,
+    index: ParentIndex | DiskParentIndex,
 ) -> None:
+    if isinstance(index, DiskParentIndex):
+        if (
+            connection.execute(
+                "select 1 from landing.membership where scope in ('markets_live','markets_combo','markets_history') limit 1"
+            ).fetchone()
+            is None
+        ):
+            return
+        errors = connection.execute(
+            """with market_winners as (
+                 select entity_ticker,event_ticker from landing.observations
+                 where entity_kind='markets' and source_kind='direct'
+                   and entity_ticker in (select entity_ticker from landing.membership
+                     where scope in ('markets_live','markets_combo','markets_history'))
+                 qualify row_number() over(partition by entity_ticker
+                   order by received_at desc,observation_id desc)=1
+               )
+               select 1 from market_winners m
+               left join landing.membership e on e.entity_ticker=m.event_ticker
+                 and e.scope in ('events_live','events_combo')
+               left join landing.parent_eligibility p on p.capture_id=?
+                 and p.entity_kind='events' and p.entity_ticker=m.event_ticker
+               where m.event_ticker is not null and e.entity_ticker is null
+                 and p.entity_ticker is null limit 1""",
+            [state["capture_id"]],
+        ).fetchone()
+        if errors:
+            raise CatalogueError(
+                "full capture lacks fresh parent evidence for final membership; capture a new full baseline"
+            )
+        errors = connection.execute(
+            """with active_events as (
+                 select entity_ticker from landing.membership where scope in ('events_live','events_combo')
+                 union select entity_ticker from landing.parent_eligibility
+                   where capture_id=? and entity_kind='events' and status=200
+               ), event_winners as (
+                 select entity_ticker,series_ticker from landing.observations
+                 where entity_kind='events' and source_kind='direct'
+                   and entity_ticker in (select entity_ticker from active_events)
+                 qualify row_number() over(partition by entity_ticker
+                   order by received_at desc,observation_id desc)=1
+               )
+               select 1 from event_winners e
+               left join landing.membership s on s.scope='series' and s.entity_ticker=e.series_ticker
+               left join landing.parent_eligibility p on p.capture_id=?
+                 and p.entity_kind='series' and p.entity_ticker=e.series_ticker
+                 where e.series_ticker is not null and e.series_ticker<>'' and s.entity_ticker is null
+                 and p.entity_ticker is null limit 1""",
+            [state["capture_id"], state["capture_id"]],
+        ).fetchone()
+        if errors:
+            raise CatalogueError(
+                "full capture lacks fresh series evidence for final membership; capture a new full baseline"
+            )
+        return
     _, parent_lookups = index.effective_parent_evidence(state)
     listed_events = {
         identity
@@ -1411,6 +1506,11 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
     durable_mkdir(staging.parent)
     staging.mkdir()
     verified_pages: dict[str, str] = {}
+    index: ParentIndex | DiskParentIndex = (
+        DiskParentIndex(store)
+        if store.scope is None and _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
+        else ParentIndex()
+    )
     try:
         source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
         source_exists = store.scope is None and store.path(source_relative).exists()
@@ -1422,9 +1522,8 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
                 staging,
                 expected_sha256=source_receipt["warehouse_sha256"],
             )
-            index = _projection_index(store, state, verified_pages=verified_pages)
+            _projection_index(store, state, verified_pages=verified_pages, index=index)
         else:
-            index = ParentIndex()
             _land(
                 store,
                 state,
@@ -1471,6 +1570,8 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
         store.check_storage()
         return promoted
     finally:
+        if isinstance(index, DiskParentIndex):
+            index.close()
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
             fsync_directory(staging.parent)
