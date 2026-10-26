@@ -1043,6 +1043,16 @@ def _finish_retirement_plan(store: Store) -> None:
         not in {entry.get("source") for entry in entries if isinstance(entry, dict)}
     ):
         raise CatalogueError("discard plan omits its incomplete capture")
+    retired_capture_ids = {
+        Path(entry["source"]).parts[1]
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("source"), str)
+        and len(Path(entry["source"]).parts) == 2
+        and Path(entry["source"]).parts[0] == "captures"
+    }
+    if plan.get("kind") == "discard":
+        retired_capture_ids.add(plan["capture_id"])
     allowed_roots = {"captures", "raw", "builds", "builds-v2", "releases"}
     targets: set[str] = set()
     sources: set[str] = set()
@@ -1304,6 +1314,13 @@ def _finish_retirement_plan(store: Store) -> None:
             fsync_directory(trash)
     if any(trash.iterdir()):
         raise CatalogueError("prune plan left unreferenced tombstones")
+    # Keep the durable plan until every derived recovery cache is removed. If
+    # cleanup is interrupted, the next writer can derive the same capture IDs
+    # from the still-present plan and retry idempotently.
+    from kalshi_events.recovery_index import remove_capture_cache
+
+    for identity in sorted(retired_capture_ids):
+        remove_capture_cache(store, identity)
     plan_path.unlink()
     fsync_directory(store.root)
     progress_path.unlink(missing_ok=True)
@@ -1563,13 +1580,21 @@ def _prune_locked(
                 "target": f"prune-trash/{uuid.uuid4().hex}-{path.parent.name}-{path.name}",
             }
         )
+    from kalshi_events.recovery_index import remove_capture_cache
+
     if not entries:
+        # The current capture is retained by the verified publication, so its
+        # identity remains discoverable if the process stops before cleanup.
+        remove_capture_cache(store, state["capture_id"])
         return removed_captures
     # No cached proof is used after retention has selected the complete removal set.
     context.captures.clear()
     store.write("prune-plan.json", {"version": 1, "kind": "prune", "entries": entries})
     fsync_directory(store.root)
     _finish_retirement_plan(store)
+    # This capture remains reachable from the publication after the retirement
+    # plan is removed, so a later prune can retry if cleanup is interrupted.
+    remove_capture_cache(store, state["capture_id"])
     return removed_captures
 
 

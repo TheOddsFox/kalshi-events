@@ -21,6 +21,20 @@ from kalshi_events.common import (
 
 ENTITY_KEYS = {"series": "series_ticker", "events": "event_ticker", "markets": "market_ticker"}
 
+PARENT_INDEX_SCHEMA = """create table winners(kind text,ticker text,received text,observation_id text,parent text,
+       primary key(kind,ticker)) without rowid;
+   create index winners_parent on winners(kind,parent);
+   create table membership(scope text,generation integer,ticker text,
+       primary key(scope,generation,ticker)) without rowid;
+   create table lookups(kind text,ticker text,status integer,page_id text,request_id text,
+       primary key(kind,ticker)) without rowid;
+   create table candidates(batch_id text,generation integer,ticker text,received text,
+       observation_id text,parent text,page_id text,request_id text,
+       primary key(batch_id,generation,ticker)) without rowid;
+   create index candidates_ticker on candidates(ticker);
+   create table terminal(batch_id text,generation integer,
+       primary key(batch_id,generation)) without rowid;"""
+
 
 def records(payload: Any, key: str, *, singular: bool = False) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
@@ -312,21 +326,7 @@ class DiskParentIndex:
             self.store.limits.max_root_bytes - usage["retained_bytes"],
         )
         self.db.execute(f"pragma max_page_count={max(1, remaining // 4096)}")
-        self.db.executescript(
-            """create table winners(kind text,ticker text,received text,observation_id text,parent text,
-                   primary key(kind,ticker)) without rowid;
-               create index winners_parent on winners(kind,parent);
-               create table membership(scope text,generation integer,ticker text,
-                   primary key(scope,generation,ticker)) without rowid;
-               create table lookups(kind text,ticker text,status integer,page_id text,request_id text,
-                   primary key(kind,ticker)) without rowid;
-               create table candidates(batch_id text,generation integer,ticker text,received text,
-                   observation_id text,parent text,page_id text,request_id text,
-                   primary key(batch_id,generation,ticker)) without rowid;
-               create index candidates_ticker on candidates(ticker);
-               create table terminal(batch_id text,generation integer,
-                   primary key(batch_id,generation)) without rowid;"""
-        )
+        self.db.executescript(PARENT_INDEX_SCHEMA)
         deadline = self.store.started + self.store.limits.max_duration_seconds
         self._deadline_hit = False
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
+import sqlite3
 import time
 import uuid
 from collections import deque
@@ -40,6 +41,11 @@ from kalshi_events.common import (
     validate_series_scope,
 )
 from kalshi_events.normalize import DiskParentIndex, ParentIndex, native_identity, records
+from kalshi_events.recovery_index import (
+    RecoveryParentIndex,
+    _cache_corruption,
+    sealed_settings_sha256,
+)
 from kalshi_events.transport import MAX_CONCURRENT_REQUESTS, PublicClient, read_page, source_url
 
 EVENT_PAGE_LIMIT = 200
@@ -95,6 +101,8 @@ class _CaptureState(dict[str, Any]):
         self.journal_head: dict[str, Any] | None = None
         self.seen_cursors: dict[int, set[str]] = {}
         self.page_rows: list[dict[str, Any]] = []
+        self.page_anchors: dict[str, tuple[int, int, str]] = {}
+        self.genesis_anchor: tuple[int, int, str] | None = None
         self.processed: set[str] = set()
         self.request_ids: set[str] = set()
         self.journal_uncertain = False
@@ -204,6 +212,7 @@ def read_capture(
             missing_snapshot=True,
             repair_tail=_writer_resume,
             parent_index=_parent_index,
+            retain_page_anchors=_writer_resume,
         )
     snapshot_bytes = regular_bytes(state_path, store.limits.max_root_bytes)
     state = decode(snapshot_bytes)
@@ -216,6 +225,7 @@ def read_capture(
             envelope=state,
             repair_tail=_writer_resume,
             parent_index=_parent_index,
+            retain_page_anchors=_writer_resume,
         )
         recovered.verified_snapshot_sha256 = digest(snapshot_bytes)
         return recovered
@@ -1123,6 +1133,7 @@ def _read_v2(
     missing_snapshot: bool = False,
     repair_tail: bool = False,
     parent_index: ParentIndex | None = None,
+    retain_page_anchors: bool = False,
 ) -> _CaptureState:
     records, scan = _journal_records(store, capture_id, repair_tail=repair_tail)
     first_item = next(records, None)
@@ -1139,8 +1150,10 @@ def _read_v2(
     if start_payload.get("state_sha256") != initial_digest:
         raise CatalogueError("journal genesis state checksum mismatch")
     state = _CaptureState(copy.deepcopy(base))
+    genesis_anchor = (1, first_end, first["sha256"])
     seen = copy.deepcopy(initial_seen)
     page_rows: list[dict[str, Any]] = []
+    page_anchors: dict[str, tuple[int, int, str]] = {}
     processed: set[str] = set()
     transition_count = 0
     seen_request_ids: set[str] = set()
@@ -1275,6 +1288,8 @@ def _read_v2(
             seen_relatives.add(relative)
             row = {"index": index, "relative": relative, "request_id": request_id}
             page_rows.append(row)
+            if retain_page_anchors:
+                page_anchors[relative] = (record["seq"], end_offset, record["sha256"])
             if envelope is None or record["seq"] > anchor_key[0]:
                 manifest, page_payload = _replay_page(
                     store, state, seen, index, relative, request_id
@@ -1326,6 +1341,8 @@ def _read_v2(
     state = _CaptureState(state)
     state.seen_cursors = seen
     state.page_rows = page_rows
+    state.page_anchors = page_anchors
+    state.genesis_anchor = genesis_anchor
     state.processed = processed
     state.request_ids = seen_request_ids
     state.journal_head = {
@@ -1757,6 +1774,11 @@ def _initialize_v2(store: Store, raw_state: dict[str, Any]) -> _CaptureState:
         "start",
         {"state": dict(state), "seen_cursors": {}, "state_sha256": initial_digest},
     )
+    state.genesis_anchor = (
+        state.journal_head["seq"],
+        state.journal_head["offset"],
+        state.journal_head["sha256"],
+    )
     # The initial genesis record is itself the sequence-zero-transition snapshot anchor.
     _save_v2(store, state)
     return state
@@ -1932,12 +1954,16 @@ def _commit_page_v2_measured(
         "page",
         {"index": index, "relative": relative, "request_id": request_id},
     )
+    anchor = state.journal_head
+    state.page_anchors[relative] = (anchor["seq"], anchor["offset"], anchor["sha256"])
     try:
         with metrics.phase("page_application"), metrics.phase("transition_apply"):
             _apply_page_change(state, state.seen_cursors, index, change)
-            with metrics.phase("parent_index_merge"):
-                _merge_parent_index(identities, page_index)
             state.page_rows.append({"index": index, "relative": relative, "request_id": request_id})
+            with metrics.phase("parent_index_merge"):
+                _merge_parent_index(
+                    identities, page_index, relative=relative, anchor=state.page_anchors[relative]
+                )
             state.processed.add(relative)
             state.request_ids.add(request_id)
             if not getattr(identities, "defer_page_merges", False):
@@ -1952,7 +1978,20 @@ def _commit_page_v2_measured(
     return manifest, payload
 
 
-def _merge_parent_index(target: ParentIndex, source: ParentIndex) -> None:
+def _merge_parent_index(
+    target: ParentIndex,
+    source: ParentIndex,
+    *,
+    relative: str | None = None,
+    anchor: tuple[int, int, str] | None = None,
+) -> None:
+    if isinstance(target, RecoveryParentIndex):
+        if target.defer_page_merges:
+            return
+        if relative is None or anchor is None:
+            raise CatalogueError("persistent recovery index merge lacks a journal anchor")
+        target.merge_at_anchor(source, relative, anchor)
+        return
     if isinstance(target, DiskParentIndex):
         if target.defer_page_merges:
             return
@@ -2740,6 +2779,36 @@ def _hydrate(store: Store, state: dict[str, Any], identities: ParentIndex) -> bo
         return _hydrate_pages(store, state, identities)
 
 
+def _hydrate_from_recovery_hint(
+    store: Store,
+    state: _CaptureState,
+    identities: RecoveryParentIndex,
+) -> tuple[bool, bool]:
+    """Use cached rows only to plan provisional tasks; journal errors remain fatal."""
+    candidate = copy.deepcopy(dict(state))
+    try:
+        more = _hydrate_pages(store, candidate, identities)
+        changed = json_bytes(candidate) != json_bytes(dict(state))
+        if changed:
+            known = {_task_identity(work): work for work in state["tasks"]}
+            _validate_control_transition(state, candidate, "hydrate", known)
+    except BudgetExceeded:
+        raise
+    except sqlite3.DatabaseError as exc:
+        if not _cache_corruption(exc):
+            raise
+        identities.invalidate_and_reset()
+        return False, True
+    except CatalogueError:
+        # Query results and generated tasks came only from the disposable cache;
+        # validation happens before any task is durably appended.
+        identities.invalidate_and_reset()
+        return False, True
+    if changed:
+        _commit_control(store, state, "hydrate", candidate)
+    return more, False
+
+
 def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
     if isinstance(identities, DiskParentIndex):
         existing = _task_identity_set(state)
@@ -2962,7 +3031,15 @@ def _index_receipt(
         metrics.phase("page_application"),
         metrics.thread_cpu_phase("page_processing_cpu"),
     ):
-        identities.add_page(manifest, payload)
+        if isinstance(identities, RecoveryParentIndex):
+            page = ParentIndex()
+            page.add_page(manifest, payload)
+            anchor = state.page_anchors.get(relative)
+            if anchor is None:
+                raise CatalogueError("persistent recovery receipt lacks its journal anchor")
+            identities.merge_at_anchor(page, relative, anchor)
+        else:
+            identities.add_page(manifest, payload)
     identities.processed.add(relative)
     return True
 
@@ -3003,6 +3080,7 @@ def _run(
             "total_pages": len(rows),
             "indexed_pages": indexed,
             "backlog_pages": max(0, len(rows) - indexed),
+            "reused_pages": getattr(identities, "reused_pages", 0),
             "verified_pages": indexed,
         }
 
@@ -3144,6 +3222,20 @@ def _run(
                 enqueue_appended(task_count)
                 continue
             if state.get("journal_version") == JOURNAL_VERSION:
+                if isinstance(identities, RecoveryParentIndex):
+                    expected = {row["relative"] for row in state.page_rows}
+                    if (
+                        identities.defer_page_merges
+                        or identities.processed != expected
+                        or identities.watermark_pages + identities._pending_pages != len(expected)
+                    ):
+                        raise CatalogueError(
+                            "recovery index is not a fresh complete journal prefix "
+                            f"(deferred={identities.defer_page_merges}, "
+                            f"processed={len(identities.processed)}/{len(expected)}, "
+                            f"watermark={identities.watermark_pages}+{identities._pending_pages})"
+                        )
+                    identities.flush(force=True)
                 with metrics.phase("control_state_copy"):
                     candidate = copy.deepcopy(dict(state))
                 candidate.update(complete=True, completed_at=now(), error=None)
@@ -3256,8 +3348,9 @@ def _capture_locked(
     identities: ParentIndex | DiskParentIndex = (
         DiskParentIndex(store) if disk_index else ParentIndex()
     )
+    identity_holder = [identities]
     try:
-        return _capture_locked_impl(
+        result = _capture_locked_impl(
             store,
             selected=selected,
             resume=resume,
@@ -3267,10 +3360,31 @@ def _capture_locked(
             incremental=incremental,
             _on_capture_id=_on_capture_id,
             identities=identities,
+            identity_holder=identity_holder,
         )
-    finally:
-        if isinstance(identities, DiskParentIndex):
-            identities.close()
+    except BaseException:
+        active = identity_holder[0]
+        if isinstance(active, RecoveryParentIndex):
+            with suppress(Exception):
+                active.close(flush=False)
+        elif isinstance(active, DiskParentIndex):
+            with suppress(Exception):
+                active.close()
+        raise
+    else:
+        active = identity_holder[0]
+        if isinstance(active, RecoveryParentIndex):
+            # Completion has already forced a clean, anchored cache commit. On a
+            # budget stop, try to retain the latest safe prefix without hiding it.
+            try:
+                active.close(flush=not result.get("complete", False))
+            except Exception:
+                if active.db is not None:
+                    with suppress(Exception):
+                        active.close(flush=False)
+        elif isinstance(active, DiskParentIndex):
+            active.close()
+        return result
 
 
 def _capture_locked_impl(
@@ -3284,6 +3398,7 @@ def _capture_locked_impl(
     incremental: bool = False,
     _on_capture_id: Callable[[str], None] | None = None,
     identities: ParentIndex | DiskParentIndex,
+    identity_holder: list[ParentIndex | DiskParentIndex] | None = None,
 ) -> dict[str, Any]:
     factory = client_factory or PublicClient
     if resume and _on_capture_id is not None:
@@ -3312,6 +3427,46 @@ def _capture_locked_impl(
     fast_recovery = (
         defer_prefix_replay and isinstance(state, _CaptureState) and state.snapshot_seq is not None
     )
+    if (
+        isinstance(identities, DiskParentIndex)
+        and not isinstance(identities, RecoveryParentIndex)
+        and isinstance(state, _CaptureState)
+        and not state.get("complete")
+        and state.get("acquisition_protocol") == CURRENT_ACQUISITION_PROTOCOL
+        and state.get("selected") is None
+        and state.get("incremental") is not True
+        and "scope" not in state
+        and store.scope is None
+        and (resume is None or fast_recovery)
+    ):
+        logical_root_id = None
+        try:
+            identity_path = store.path("root-id.json")
+            if identity_path.is_file() and not path_is_link(identity_path):
+                from kalshi_events.incremental import root_id
+
+                logical_root_id = root_id(store)
+        except CatalogueError:
+            # Cache eligibility must not create or alter a root identity.
+            logical_root_id = None
+        genesis_anchor = state.genesis_anchor
+        if logical_root_id is not None and genesis_anchor is not None:
+            identities.close()
+            identities = RecoveryParentIndex(
+                store,
+                state["capture_id"],
+                logical_root_id,
+                sealed_settings_sha256(state),
+                page_rows=state.page_rows,
+                page_anchors=state.page_anchors,
+                genesis_anchor=genesis_anchor,
+            )
+            if identity_holder is not None:
+                identity_holder[0] = identities
+            metrics.add("recovery_cache_enabled")
+            identities.defer_page_merges = bool(fast_recovery and state.page_rows)
+            if identities.reused_pages:
+                metrics.add("recovery_cache_reused", identities.reused_pages)
     if isinstance(identities, DiskParentIndex):
         identities.defer_page_merges = bool(fast_recovery and state.page_rows)
     if isinstance(state, _CaptureState):
@@ -3323,6 +3478,7 @@ def _capture_locked_impl(
                 total_pages=len(rows),
                 indexed_pages=len(identities.processed),
                 backlog_pages=max(0, len(rows) - len(identities.processed)),
+                reused_pages=getattr(identities, "reused_pages", 0),
                 verified_pages=len(identities.processed),
             )
         except Exception:
@@ -3373,6 +3529,7 @@ def _capture_locked_impl(
             save(store, state)
     seen: dict[int, set[str]] = {}
     budget_exhausted = False
+    cache_fallback_used = False
     try:
         with (
             factory(store, budget, **client_options) as client,
@@ -3381,21 +3538,59 @@ def _capture_locked_impl(
             ) as pool,
         ):
             _settle(store, state, seen, identities)
+            if isinstance(identities, RecoveryParentIndex) and identities.cache_present:
+                try:
+                    has_pending_tasks = any(not work["done"] for work in state["tasks"])
+                    if identities.reused_pages and not has_pending_tasks:
+                        _, invalidated = _hydrate_from_recovery_hint(store, state, identities)
+                    else:
+                        invalidated = False
+                    if invalidated:
+                        cache_fallback_used = True
+                        metrics.add("recovery_cache_invalidated")
+                    else:
+                        identities.reset()
+                except sqlite3.DatabaseError as exc:
+                    if not _cache_corruption(exc):
+                        raise
+                    identities.invalidate_and_reset()
+                    identities.defer_page_merges = bool(state.page_rows)
+                    cache_fallback_used = True
+                    metrics.add("recovery_cache_invalidated")
+                else:
+                    identities.defer_page_merges = bool(fast_recovery and state.page_rows)
             if resume and not fast_recovery:
                 for row in page_receipts(store, state):
                     _index_receipt(store, state, row, identities)
             recovered = _recover_receipts(store, state) if resume else {}
-            _run(
-                store,
-                state,
-                client,
-                pool,
-                recovered,
-                seen,
-                budget,
-                identities,
-                resumed=resume is not None,
-            )
+            while True:
+                try:
+                    _run(
+                        store,
+                        state,
+                        client,
+                        pool,
+                        recovered,
+                        seen,
+                        budget,
+                        identities,
+                        resumed=resume is not None,
+                    )
+                except sqlite3.DatabaseError as exc:
+                    if (
+                        not isinstance(identities, RecoveryParentIndex)
+                        or cache_fallback_used
+                        or not _cache_corruption(exc)
+                    ):
+                        raise
+                    identities.invalidate_and_reset()
+                    identities.defer_page_merges = bool(state.page_rows)
+                    cache_fallback_used = True
+                    metrics.add("recovery_cache_invalidated")
+                    _settle(store, state, seen, identities)
+                    recovered = _recover_receipts(store, state)
+                    continue
+                break
     except (CatalogueError, OSError) as exc:
         if state.get("journal_version") != JOURNAL_VERSION:
             state["error"] = str(exc)
