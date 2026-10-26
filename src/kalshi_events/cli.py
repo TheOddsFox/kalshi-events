@@ -320,11 +320,15 @@ def main(argv: list[str] | None = None) -> int:
             _validate_metrics_output_overlap(args, metrics_path)
             if metrics_path.exists():
                 raise CatalogueError("metrics report path already exists")
+            progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
+            metrics.check_progress_path(progress_path)
             report_stream = metrics.reserve_report(metrics_path)
             operation_error: BaseException | None = None
-            with metrics.collect() as measured:
+            with report_stream, metrics.collect(progress_path=progress_path) as measured:
                 try:
                     result = execute(args)
+                    if result.get("complete") is False:
+                        measured.progress("stopped")
                 except BaseException as exc:
                     operation_error = exc
                     raise
@@ -369,8 +373,14 @@ def _refresh_main(args: argparse.Namespace) -> int:
                 raise CatalogueError("metrics report must be outside the operator root")
             if metrics_path.exists():
                 raise CatalogueError("metrics report path already exists")
+            progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
+            metrics.check_progress_path(progress_path)
             report_stream = metrics.reserve_report(metrics_path)
-        context = metrics.collect() if report_stream is not None else nullcontext(None)
+        context = (
+            metrics.collect(progress_path=progress_path)
+            if report_stream is not None
+            else nullcontext(None)
+        )
         with context as measured:
             store = Store(
                 root,
@@ -414,7 +424,9 @@ def _refresh_main(args: argparse.Namespace) -> int:
     finally:
         if report_stream is not None:
             try:
-                metrics.write_report(args.metrics_file, measured, report_stream)
+                if measured is not None:
+                    measured.progress("complete" if exit_code == 0 else "stopped")
+                    metrics.write_report(args.metrics_file, measured, report_stream)
             except Exception as exc:
                 result["complete"] = False
                 result["error"] = result["error"] or f"metrics report failed: {exc}"

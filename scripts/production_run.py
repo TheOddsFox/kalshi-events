@@ -1024,11 +1024,13 @@ def _prepare_run_paths(directory: Path, report_path: Path) -> dict[str, Path]:
     run_root = report_path.parent
     logs = run_root / "logs" / f"invocation-{uuid.uuid4().hex}"
     logs.mkdir(parents=True)
+    metrics_path = run_root / f"metrics-{uuid.uuid4().hex}.json"
     return {
         "directory": directory,
         "report": report_path,
         "logs": logs,
-        "metrics": run_root / f"metrics-{uuid.uuid4().hex}.json",
+        "metrics": metrics_path,
+        "metrics_progress": metrics_path.with_name(f"{metrics_path.name}.progress.json"),
         "capture_notification": run_root / "capture-notification.json",
     }
 
@@ -1064,15 +1066,20 @@ def _resource_guard(
     capture_id: str | None = None,
 ) -> dict[str, Any]:
     """Run Store's only full accounting walk in a supervised boundary child."""
-    snapshot = _child_accounting(
-        operator,
-        deadline,
-        paths,
-        report,
-        require_complete=require_complete_accounting,
-        workflow_deadline=workflow_deadline,
-        capture_id=capture_id,
-    )
+    started = time.monotonic()
+    try:
+        snapshot = _child_accounting(
+            operator,
+            deadline,
+            paths,
+            report,
+            require_complete=require_complete_accounting,
+            workflow_deadline=workflow_deadline,
+            capture_id=capture_id,
+        )
+    finally:
+        phases = report.setdefault("phase_seconds", {})
+        phases["accounting"] = phases.get("accounting", 0) + time.monotonic() - started
     external = _external_bytes(directory)
     storage = snapshot.get("storage")
     if not isinstance(storage, dict):
@@ -1248,6 +1255,7 @@ def run_production(
     reconcile_accounting: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded full refresh/resume or verify-and-activate current v2."""
+    preflight_started = time.monotonic()
     mode = validate_mode(full, capture_id, activate_only)
     if reconcile_accounting and mode != "resume":
         raise RunnerError("accounting reconciliation requires --capture-id resume")
@@ -1277,12 +1285,16 @@ def run_production(
                 }
             paths = _prepare_run_paths(directory, report_path)
             report["metrics_file"] = str(paths["metrics"])
+            report["metrics_progress_file"] = str(paths["metrics_progress"])
             if report.get("root_id") is None:
                 raise RunnerError("resume root identity was not durably recorded")
         else:
             report_path, report, paths = _session_report(directory, mode)
             paths = _prepare_run_paths(directory, report_path)
             report["metrics_file"] = str(paths["metrics"])
+            report["metrics_progress_file"] = str(paths["metrics_progress"])
+        phases = report.setdefault("phase_seconds", {})
+        phases["preflight"] = phases.get("preflight", 0) + time.monotonic() - preflight_started
         result: dict[str, Any] = report
         if mode == "activate-current":
             report["requests"] = None
@@ -2064,9 +2076,11 @@ def _refresh_worker_main(
         )
         compression = values["compression"]
         rate_policy = values["rate-policy"]
+        progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
+        metrics.check_progress_path(progress_path)
         stream = metrics.reserve_report(metrics_path)
         exit_code = 1
-        with metrics.collect() as measured:
+        with metrics.collect(progress_path=progress_path) as measured:
             store = None
             try:
                 store = Store(operator, limits)
@@ -2100,13 +2114,19 @@ def _refresh_worker_main(
                         result["accounting_complete"] = False
                         exit_code = 3
                 try:
+                    measured.progress(
+                        "complete"
+                        if exit_code == 0 and result.get("complete") is True
+                        else "stopped"
+                    )
                     metrics.write_report(metrics_path, measured, stream)
                 finally:
                     stream.close()
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return exit_code
     except Exception as exc:
-        result["error"] = str(exc)
+        result["complete"] = False
+        result["error"] = result.get("error") or str(exc)
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return 1
 

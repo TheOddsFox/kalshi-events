@@ -8,11 +8,14 @@ import os
 import re
 import resource
 import sys
+import tempfile
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, TextIO
 
 _active: contextvars.ContextVar[Metrics | None] = contextvars.ContextVar(
@@ -38,6 +41,31 @@ _ENDPOINT_FAMILIES = frozenset(
     }
 )
 _TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()\- ]{0,254}[A-Za-z0-9._()\-])?\Z")
+_PROGRESS_INTERVAL_SECONDS = 15.0
+_PROGRESS_PHASES = frozenset(
+    {
+        "preflight",
+        "recovery_validation",
+        "first_new_request",
+        "index_replay",
+        "closure",
+        "complete",
+        "stopped",
+    }
+)
+_PROGRESS_INTEGER_COUNTERS = frozenset(
+    {
+        "journal_records",
+        "total_pages",
+        "indexed_pages",
+        "backlog_pages",
+        "reused_pages",
+        "verified_pages",
+    }
+)
+_PROGRESS_ELAPSED_COUNTERS = frozenset(
+    {"first_data_request_elapsed_seconds", "first_data_page_elapsed_seconds"}
+)
 
 
 def endpoint_family(endpoint: str) -> str:
@@ -133,7 +161,7 @@ def _increment(values: dict[str, int], key: str) -> None:
 
 
 class Metrics:
-    def __init__(self) -> None:
+    def __init__(self, progress_path: str | os.PathLike[str] | None = None) -> None:
         self.started = time.perf_counter()
         self._lock = threading.Lock()
         self.timings: dict[str, float] = defaultdict(float)
@@ -144,6 +172,19 @@ class Metrics:
         self.active_http_requests = 0
         self.endpoint_families: dict[str, dict[str, Any]] = {}
         self.rate_policy: dict[str, Any] | None = None
+        self._progress_path = (
+            _checked_progress_path(progress_path) if progress_path is not None else None
+        )
+        self._progress_started = time.monotonic() if self._progress_path is not None else 0.0
+        self._progress_phase = "preflight"
+        self._progress_counters: dict[str, int | float | None] = {
+            **dict.fromkeys(_PROGRESS_INTEGER_COUNTERS, 0),
+            **dict.fromkeys(_PROGRESS_ELAPSED_COUNTERS, None),
+        }
+        self._progress_last_write: float | None = None
+        self._progress_written_phase: str | None = None
+        self._progress_identity: tuple[int, int] | None = None
+        self._progress_lock = threading.Lock()
 
     def add(self, name: str, value: int = 1) -> None:
         with self._lock:
@@ -152,6 +193,115 @@ class Metrics:
     def peak(self, name: str, value: int) -> None:
         with self._lock:
             self.high_water[name] = max(self.high_water[name], value)
+
+    def progress(self, phase: str | None = None, **counters: int | float) -> None:
+        """Write only fixed-phase, aggregate recovery progress when it changes or is due."""
+        if self._progress_path is None:
+            return
+        if phase is not None and phase not in _PROGRESS_PHASES:
+            raise ValueError("unknown recovery progress phase")
+        for name, value in counters.items():
+            if name in _PROGRESS_INTEGER_COUNTERS:
+                if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                    raise ValueError(f"invalid recovery progress counter: {name}")
+            elif name in _PROGRESS_ELAPSED_COUNTERS:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not 0 <= value <= 2**31
+                ):
+                    raise ValueError(f"invalid recovery progress counter: {name}")
+                counters[name] = round(float(value), 6)
+            else:
+                raise ValueError(f"unknown recovery progress counter: {name}")
+
+        with self._progress_lock:
+            if phase is not None:
+                self._progress_phase = phase
+            self._progress_counters.update(counters)
+            now = time.monotonic()
+            phase_changed = self._progress_phase != self._progress_written_phase
+            if self._progress_path is None or (
+                not phase_changed
+                and self._progress_last_write is not None
+                and now - self._progress_last_write < _PROGRESS_INTERVAL_SECONDS
+            ):
+                return
+            self._write_progress(now)
+
+    def _finish_progress(self, failed: bool) -> None:
+        if self._progress_path is None:
+            return
+        with self._progress_lock:
+            if failed:
+                self._progress_phase = "stopped"
+            elif self._progress_phase != "stopped":
+                self._progress_phase = "complete"
+            self._write_progress(time.monotonic())
+
+    def _write_progress(self, now: float) -> None:
+        from kalshi_events.common import safe_path
+
+        path = safe_path(self._progress_path)
+        if not path.parent.is_dir():
+            raise OSError(f"metrics progress directory is missing: {path.parent}")
+        identity = None
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or not path.is_file():
+                raise OSError("metrics progress path is not a regular file")
+            info = path.stat()
+            identity = (info.st_dev, info.st_ino)
+            if self._progress_identity is None or identity != self._progress_identity:
+                raise FileExistsError(
+                    f"metrics progress path is not owned by this collection: {path}"
+                )
+
+        report = {
+            "version": 1,
+            "phase": self._progress_phase,
+            "elapsed_seconds": round(max(0.0, now - self._progress_started), 6),
+            "updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "counters": dict(self._progress_counters),
+        }
+        temporary: Path | None = None
+        primary_error: BaseException | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=".metrics-progress-", suffix=".tmp", dir=path.parent, delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write((json.dumps(report, sort_keys=True, allow_nan=False) + "\n").encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            if self._progress_identity is None:
+                os.link(temporary, path, follow_symlinks=False)
+            else:
+                if identity != self._progress_identity:
+                    raise FileExistsError(
+                        f"metrics progress path changed during collection: {path}"
+                    )
+                os.replace(temporary, path)
+            info = path.stat()
+            self._progress_identity = (info.st_dev, info.st_ino)
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            self._progress_last_write = now
+            self._progress_written_phase = self._progress_phase
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    if primary_error is None:
+                        raise
 
     def report(self) -> dict[str, Any]:
         def peak_rss(who: int) -> int:
@@ -192,14 +342,50 @@ def _endpoint_report(row: dict[str, Any]) -> dict[str, Any]:
 
 
 @contextmanager
-def collect() -> Iterator[Metrics]:
+def collect(progress_path: str | os.PathLike[str] | None = None) -> Iterator[Metrics]:
     """Enable measurements only inside this context; inactive hooks are a no-op."""
-    metrics = Metrics()
+    metrics = Metrics(progress_path)
     token = _active.set(metrics)
+    operation_failed = False
     try:
+        if progress_path is not None:
+            metrics._write_progress(time.monotonic())
         yield metrics
+    except BaseException:
+        operation_failed = True
+        raise
     finally:
-        _active.reset(token)
+        try:
+            metrics._finish_progress(operation_failed)
+        except BaseException:
+            if not operation_failed:
+                raise
+        finally:
+            _active.reset(token)
+
+
+def _checked_progress_path(path: str | os.PathLike[str]) -> Path:
+    from kalshi_events.common import CatalogueError, safe_path
+
+    try:
+        destination = safe_path(Path(path))
+    except CatalogueError as exc:
+        raise OSError("metrics progress path cannot contain symlinks") from exc
+    if destination.exists():
+        raise FileExistsError(f"metrics progress path already exists: {destination}")
+    return destination
+
+
+def check_progress_path(path: str | os.PathLike[str]) -> Path:
+    """Reject an unsafe or pre-existing progress companion before reserving its report."""
+    return _checked_progress_path(path)
+
+
+def progress(phase: str | None = None, **counters: int | float) -> None:
+    """Update optional aggregate recovery progress for the active collection."""
+    current = _active.get()
+    if current is not None:
+        current.progress(phase, **counters)
 
 
 @contextmanager
