@@ -282,6 +282,98 @@ def test_poisoned_parent_cache_rows_are_rebuilt_before_completion(tmp_path, monk
         ).fetchone()
 
 
+def test_live_cache_corruption_replays_committed_page_in_same_capture(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    store = Store(root)
+    with store.writer_guard():
+        store.write("root-id.json", {"version": 1, "root_id": "c" * 32})
+
+    capture_ids: list[str] = []
+    requested: list[str] = []
+    injected: list[str] = []
+    original_merge = RecoveryParentIndex.merge_at_anchor
+
+    class RecordingClient(FakeClient):
+        def get(self, endpoint, params=None, context=None):
+            requested.append(context["request_id"])
+            return super().get(endpoint, params, context)
+
+    def corrupt_once(index, page, relative, anchor):
+        if not injected and not index.defer_page_merges:
+            injected.append(relative)
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return original_merge(index, page, relative, anchor)
+
+    monkeypatch.setattr(RecoveryParentIndex, "merge_at_anchor", corrupt_once)
+    result = capture.capture(
+        store,
+        client_factory=RecordingClient,
+        _on_capture_id=capture_ids.append,
+    )
+
+    assert result["complete"] is True
+    assert len(injected) == 1
+    with store.writer_guard():
+        state = capture.read_capture(store, capture_ids[0], _writer_resume=True)
+    rows = capture.page_receipts(store, state)
+    injected_rows = [row for row in rows if row["relative"] == injected[0]]
+    assert len(injected_rows) == 1
+    assert requested.count(injected_rows[0]["request_id"]) == 1
+    assert len(requested) == len(set(requested))
+    assert state["complete"] is True
+
+
+def test_shared_group_recovery_cache_parent_uses_ephemeral_index(tmp_path):
+    root = tmp_path / "root"
+    store = Store(root)
+    with store.writer_guard():
+        store.write("root-id.json", {"version": 1, "root_id": "d" * 32})
+    cache_parent = store.path("tmp/recovery-index")
+    cache_parent.mkdir(parents=True)
+    cache_parent.chmod(0o775)
+    requested: list[str] = []
+
+    class RecordingClient(FakeClient):
+        def get(self, endpoint, params=None, context=None):
+            requested.append(endpoint)
+            return super().get(endpoint, params, context)
+
+    result = capture.capture(store, client_factory=RecordingClient)
+
+    assert result["complete"] is True
+    assert requested
+    assert cache_parent.stat().st_mode & 0o777 == 0o775
+    assert not store.path(f"tmp/recovery-index/{result['capture_id']}").exists()
+    recovery_index.remove_capture_cache(store, result["capture_id"])
+    assert not list(store.path("tmp").glob("parent-index-*"))
+
+
+def test_shared_group_parent_does_not_hide_existing_unsafe_cache(tmp_path):
+    root = tmp_path / "root"
+    capture_id = build_recovery_root(root, "primary", repeats=1)
+    store = Store(root)
+    cache_parent = store.path("tmp/recovery-index")
+    cache_parent.mkdir(parents=True)
+    cache_parent.chmod(0o775)
+    cache_directory = cache_parent / capture_id
+    cache_directory.mkdir(mode=0o700)
+    marker = cache_directory / "untrusted-marker"
+    marker.write_bytes(b"keep")
+
+    requested: list[str] = []
+
+    class RecordingClient(FakeClient):
+        def get(self, endpoint, params=None, context=None):
+            requested.append(endpoint)
+            return super().get(endpoint, params, context)
+
+    with pytest.raises(CatalogueError, match="parent permissions are unsafe"):
+        capture.capture(store, resume=capture_id, client_factory=RecordingClient)
+
+    assert requested == []
+    assert marker.read_bytes() == b"keep"
+
+
 def test_partial_recovery_merge_rolls_back_without_reissuing_committed_page(tmp_path, monkeypatch):
     root = tmp_path / "root"
     capture_id = build_recovery_root(root, "primary", repeats=1)

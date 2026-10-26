@@ -315,12 +315,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
             metrics_path = safe_path(args.metrics_file)
-            if metrics_path.is_relative_to(root):
-                raise CatalogueError("metrics report must be outside the operator root")
-            _validate_metrics_output_overlap(args, metrics_path)
+            progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
+            _validate_metrics_root_overlap(root, metrics_path, progress_path)
+            _validate_metrics_output_overlap(args, metrics_path, progress_path)
             if metrics_path.exists():
                 raise CatalogueError("metrics report path already exists")
-            progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
             metrics.check_progress_path(progress_path)
             report_stream = metrics.reserve_report(metrics_path)
             operation_error: BaseException | None = None
@@ -369,11 +368,10 @@ def _refresh_main(args: argparse.Namespace) -> int:
             raise CatalogueError("a new series root requires --series-ticker")
         if args.metrics_file is not None:
             metrics_path = safe_path(args.metrics_file)
-            if metrics_path.is_relative_to(root):
-                raise CatalogueError("metrics report must be outside the operator root")
+            progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
+            _validate_metrics_root_overlap(root, metrics_path, progress_path)
             if metrics_path.exists():
                 raise CatalogueError("metrics report path already exists")
-            progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
             metrics.check_progress_path(progress_path)
             report_stream = metrics.reserve_report(metrics_path)
         context = (
@@ -413,6 +411,8 @@ def _refresh_main(args: argparse.Namespace) -> int:
                         result["error"] or f"final storage reconciliation failed: {exc}"
                     )
                     exit_code = EXIT_INCOMPLETE if isinstance(exc, BudgetExceeded) else 1
+            if measured is not None:
+                measured.progress("complete" if exit_code == 0 else "stopped")
     except BudgetExceeded as exc:
         result["complete"] = False
         result["error"] = result["error"] or str(exc)
@@ -441,16 +441,27 @@ def _refresh_main(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def _validate_metrics_output_overlap(args: argparse.Namespace, metrics_path: Path) -> None:
+def _validate_metrics_output_overlap(
+    args: argparse.Namespace, metrics_path: Path, progress_path: Path
+) -> None:
     outputs: list[Path] = []
     if args.command == "verify":
         outputs.append(safe_path(args.release))
     elif args.command == "metadata":
         outputs.append(safe_path(args.output))
 
-    for output in outputs:
-        if metrics_path.is_relative_to(output) or output.is_relative_to(metrics_path):
-            raise CatalogueError("metrics report must not overlap a verified or metadata bundle")
+    for metrics_output in (metrics_path, progress_path):
+        for output in outputs:
+            if metrics_output.is_relative_to(output) or output.is_relative_to(metrics_output):
+                raise CatalogueError(
+                    "metrics report or progress file must not overlap a verified or metadata bundle"
+                )
+
+
+def _validate_metrics_root_overlap(root: Path, metrics_path: Path, progress_path: Path) -> None:
+    for metrics_output in (metrics_path, progress_path):
+        if metrics_output.is_relative_to(root) or root.is_relative_to(metrics_output):
+            raise CatalogueError("metrics report must be outside the operator root")
 
 
 if __name__ == "__main__":

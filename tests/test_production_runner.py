@@ -404,6 +404,86 @@ def test_monitor_clamps_compressor_timeout_to_fresh_deadline_remainder(
     assert terminated == [True]
 
 
+@pytest.mark.parametrize(
+    ("clock_source", "advance", "wall_deadline", "expect_stop"),
+    [
+        ("monotonic", 5, 210, True),
+        ("wall", 5, 210, True),
+        ("wall", 1, 210, False),
+    ],
+)
+def test_monitor_rechecks_deadlines_after_successful_compressor_probe_before_persisting(
+    production, tmp_path, monkeypatch, clock_source, advance, wall_deadline, expect_stop
+):
+    clock = {"monotonic": 100.0, "wall": 200.0}
+    terminated = []
+    persisted = []
+
+    class Process:
+        pid = 123
+
+        def __init__(self):
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            if not expect_stop and self.polls > 1:
+                return 0
+            return None
+
+        def wait(self, *, timeout):
+            return -15 if expect_stop else 0
+
+    def compressed(*, timeout):
+        assert timeout == 5.0
+        clock[clock_source] += advance
+        return 0
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(
+        production.time,
+        "sleep",
+        lambda delay: clock.__setitem__("monotonic", clock["monotonic"] + delay),
+    )
+    monkeypatch.setattr(production, "_process_group_rss", lambda _pid, **_kw: 0)
+    monkeypatch.setattr(production, "_system_compressed_bytes", compressed)
+    monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: persisted.append(True))
+    monkeypatch.setattr(production, "_utc", lambda: "test")
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+    report = {"resource_samples": [], "peak_child_process_group_rss_bytes": 0}
+
+    code, reason, reaped = production._monitor(
+        Process(),
+        tmp_path,
+        tmp_path / "operator",
+        report,
+        tmp_path / "session.json",
+        110,
+        wall_deadline_epoch=wall_deadline,
+    )
+
+    if expect_stop:
+        assert code == -15
+        assert reason == "session or workflow deadline reached termination reserve"
+        assert reaped is True
+        assert terminated == [True]
+        assert report["resource_samples"] == []
+        assert persisted == []
+    else:
+        assert code == 0
+        assert reason is None
+        assert reaped is True
+        assert terminated == []
+        assert len(report["resource_samples"]) == 1
+        assert persisted == [True]
+
+
 @pytest.mark.parametrize("clock_source", ["monotonic", "wall"])
 def test_monitor_preserves_deadline_reason_when_compressor_probe_times_out(
     production, tmp_path, monkeypatch, clock_source
@@ -1061,6 +1141,7 @@ def test_environment_report_uses_the_installed_distribution_name(production, mon
     monkeypatch.setattr(importlib.metadata, "version", version)
     versions = production._package_versions()
     assert versions["oddsfox-kalshi-events"] == "test-version"
+    assert versions["httpcore"] == "test-version"
     assert "kalshi-events" not in requested
 
 

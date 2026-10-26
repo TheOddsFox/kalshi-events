@@ -364,7 +364,15 @@ def _package_versions() -> dict[str, str | None]:
     from importlib.metadata import PackageNotFoundError, version
 
     result = {}
-    for package in ("oddsfox-kalshi-events", "duckdb", "dlt", "dbt-core", "pyarrow", "httpx"):
+    for package in (
+        "oddsfox-kalshi-events",
+        "duckdb",
+        "dlt",
+        "dbt-core",
+        "pyarrow",
+        "httpx",
+        "httpcore",
+    ):
         try:
             result[package] = version(package)
         except PackageNotFoundError:
@@ -514,6 +522,13 @@ def _monitor(
                         max(0.01, remaining - float(RUN_LIMITS["terminate_seconds"])),
                     )
                 )
+                if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
+                    RUN_LIMITS["terminate_seconds"]
+                ):
+                    stop_reason = "session or workflow deadline reached termination reserve"
+                    reaped = _terminate(process)
+                    terminated = True
+                    break
             except (OSError, subprocess.SubprocessError, RunnerError) as exc:
                 if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
                     RUN_LIMITS["terminate_seconds"]
@@ -1274,6 +1289,7 @@ def run_production(
             if reconcile_accounting:
                 report.setdefault("original_revision", report.get("revision"))
                 report.setdefault("original_source_root", report.get("source_root"))
+                report.setdefault("original_system", report.get("system"))
                 report["recovery_revision"] = _revision()
                 report["recovery_source_root"] = str(SOURCE_ROOT)
                 report["accounting_reconciliation"] = {
@@ -1842,11 +1858,34 @@ def _load_resume(
         report.get("production_state") == "verified"
     ):
         raise RunnerError("resume accounting is unknown or production activation already succeeded")
-    if reconcile_accounting and (
-        report.get("system", {}).get("package_versions", {}).get("httpx") != "0.28.1"
-        or report.get("system", {}).get("uv_lock_sha256") != RECONCILIATION_UV_LOCK_SHA256
-    ):
-        raise RunnerError("the stopped session's HTTP chunk bound cannot be verified")
+    if reconcile_accounting:
+        saved_system = report.get("system")
+        saved_versions = (
+            saved_system.get("package_versions") if isinstance(saved_system, dict) else None
+        )
+        if not isinstance(saved_versions, dict):
+            raise RunnerError("the stopped session's HTTP chunk bound cannot be verified")
+        if (
+            saved_versions.get("httpx") != "0.28.1"
+            or ("httpcore" in saved_versions and saved_versions["httpcore"] != "1.0.9")
+            or saved_system.get("uv_lock_sha256") != RECONCILIATION_UV_LOCK_SHA256
+        ):
+            raise RunnerError("the stopped session's HTTP chunk bound cannot be verified")
+        try:
+            current_lock_sha256 = hashlib.sha256((SOURCE_ROOT / "uv.lock").read_bytes()).hexdigest()
+        except OSError as exc:
+            raise RunnerError(
+                "current HTTP runtime and source uv.lock must match the pinned reconciliation environment"
+            ) from exc
+        current_versions = _package_versions()
+        if (
+            current_versions.get("httpx") != "0.28.1"
+            or current_versions.get("httpcore") != "1.0.9"
+            or current_lock_sha256 != RECONCILIATION_UV_LOCK_SHA256
+        ):
+            raise RunnerError(
+                "current HTTP runtime and source uv.lock must match the pinned reconciliation environment"
+            )
     if report.get("active_process_group") is not None:
         raise RunnerError(
             "session records an unreconciled child process group; explicit recovery is required"

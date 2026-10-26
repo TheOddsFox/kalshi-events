@@ -11,7 +11,8 @@ import threading
 import time
 import uuid
 import zlib
-from contextlib import ExitStack
+from collections.abc import Callable
+from contextlib import ExitStack, suppress
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
@@ -308,6 +309,7 @@ class PublicClient:
         self.base_url = source_url()
         self.rate_policy = rate_policy
         self.limiter = RateLimiter(store.limits.max_rate, rate_policy=rate_policy)
+        self._attempt_observer: Callable[[str], None] | None = None
         self.client = httpx.Client(
             trust_env=False,
             follow_redirects=False,
@@ -323,6 +325,10 @@ class PublicClient:
 
     def __exit__(self, *args: Any) -> None:
         self.client.close()
+
+    def _set_attempt_observer(self, observer: Callable[[str], None] | None) -> None:
+        """Install a private callback for request attempts immediately before HTTP."""
+        self._attempt_observer = observer
 
     def get(
         self,
@@ -375,11 +381,16 @@ class PublicClient:
                     metrics.http_request(),
                     ExitStack() as stack,
                 ):
+                    timeout = min(30, self.budget.remaining)
+                    if self._attempt_observer is not None:
+                        # Observability must never prevent or replace the HTTP attempt.
+                        with suppress(Exception):
+                            self._attempt_observer(endpoint)
                     request = self.client.stream(
                         "GET",
                         self.base_url + endpoint,
                         params=params,
-                        timeout=min(30, self.budget.remaining),
+                        timeout=timeout,
                     )
                     with metrics.phase("http_header_wait"):
                         response = stack.enter_context(request)

@@ -43,6 +43,7 @@ from kalshi_events.common import (
 from kalshi_events.normalize import DiskParentIndex, ParentIndex, native_identity, records
 from kalshi_events.recovery_index import (
     RecoveryParentIndex,
+    UnsafeRecoveryIndexPermissions,
     _cache_corruption,
     sealed_settings_sha256,
 )
@@ -112,7 +113,47 @@ class _CaptureState(dict[str, Any]):
         self.verified_journal_sha256: str | None = None
         self.verified_snapshot_sha256: str | None = None
         self.cutoff_monotonic: dict[int, float] = {}
+        self.first_data_timing: _FirstDataTiming | None = None
         self.task_identities = {_task_identity(work) for work in self.get("tasks", [])}
+
+
+class _FirstDataTiming:
+    """Invocation-local timing for the first non-cutoff HTTP attempt and page commit."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._request_started: float | None = None
+        self._page_committed_at: float | None = None
+        self._request_reported = False
+        self._page_reported = False
+
+    def observe_attempt(self, endpoint: str) -> None:
+        if endpoint == CUTOFF_ENDPOINT:
+            return
+        with self._lock:
+            if self._request_started is None:
+                self._request_started = time.monotonic()
+
+    def observe_page_commit(self, endpoint: str) -> None:
+        if endpoint == CUTOFF_ENDPOINT:
+            return
+        with self._lock:
+            if self._page_committed_at is None:
+                self._page_committed_at = time.monotonic()
+
+    def request_elapsed(self, started: float) -> float | None:
+        with self._lock:
+            if self._request_started is None or self._request_reported:
+                return None
+            self._request_reported = True
+            return self._request_started - started
+
+    def page_elapsed(self, started: float) -> float | None:
+        with self._lock:
+            if self._page_committed_at is None or self._page_reported:
+                return None
+            self._page_reported = True
+            return self._page_committed_at - started
 
 
 def task(
@@ -1923,9 +1964,19 @@ def _commit_page_v2(
     relative: str,
     request_id: str,
     identities: ParentIndex,
+    *,
+    first_data_timing: _FirstDataTiming | None = None,
 ) -> tuple[dict[str, Any], Any]:
     with metrics.thread_cpu_phase("page_processing_cpu"):
-        return _commit_page_v2_measured(store, state, index, relative, request_id, identities)
+        return _commit_page_v2_measured(
+            store,
+            state,
+            index,
+            relative,
+            request_id,
+            identities,
+            first_data_timing=first_data_timing,
+        )
 
 
 def _commit_page_v2_measured(
@@ -1935,6 +1986,8 @@ def _commit_page_v2_measured(
     relative: str,
     request_id: str,
     identities: ParentIndex,
+    *,
+    first_data_timing: _FirstDataTiming | None = None,
 ) -> tuple[dict[str, Any], Any]:
     if state.get("complete"):
         raise CatalogueError("capture cannot accept pages after completion")
@@ -1954,6 +2007,8 @@ def _commit_page_v2_measured(
         "page",
         {"index": index, "relative": relative, "request_id": request_id},
     )
+    if first_data_timing is not None:
+        first_data_timing.observe_page_commit(manifest["endpoint"])
     anchor = state.journal_head
     state.page_anchors[relative] = (anchor["seq"], anchor["offset"], anchor["sha256"])
     try:
@@ -2675,13 +2730,23 @@ def _apply(
 
 
 def _stage(
-    store: Store, state: dict[str, Any], index: int, relative: str, identities: ParentIndex
+    store: Store,
+    state: dict[str, Any],
+    index: int,
+    relative: str,
+    identities: ParentIndex,
 ) -> None:
     """Commit a raw receipt to its traversal before it is applied: checkpoint, then journal."""
     if state.get("journal_version") == JOURNAL_VERSION:
         context = _request_context(state, index)
         manifest, payload = _commit_page_v2(
-            store, state, index, relative, context["request_id"], identities
+            store,
+            state,
+            index,
+            relative,
+            context["request_id"],
+            identities,
+            first_data_timing=getattr(state, "first_data_timing", None),
         )
         state.recent_page = (relative, manifest, payload)
         return
@@ -3055,6 +3120,7 @@ def _run(
     identities: ParentIndex,
     *,
     resumed: bool = False,
+    first_data_timing: _FirstDataTiming | None = None,
 ) -> None:
     running: dict[Future, int] = {}
     data_request_ids: dict[Future, str] = {}
@@ -3064,13 +3130,16 @@ def _run(
     metrics.add("tasks_enqueued", len(ready))
     failure: Exception | None = None
     resume_cutoffs_pending = resumed and _checkpoint_policy(state)
-    first_data_request_at: float | None = None
-    first_data_request_reported = False
-    first_data_page_reported = False
+    first_data_timing = first_data_timing or _FirstDataTiming()
+    if isinstance(state, _CaptureState):
+        state.first_data_timing = first_data_timing
     first_data_response_committed = False
-    data_request_lock = Lock()
     recovery_cursor = 0
     progress_timing_enabled = isinstance(store, Store) and isinstance(state, _CaptureState)
+    attempt_observer_setter = getattr(client, "_set_attempt_observer", None)
+    observes_http_attempts = progress_timing_enabled and callable(attempt_observer_setter)
+    if observes_http_attempts:
+        attempt_observer_setter(first_data_timing.observe_attempt)
 
     def progress_counts() -> dict[str, int]:
         rows = state.page_rows if isinstance(state, _CaptureState) else []
@@ -3093,25 +3162,29 @@ def _run(
                 metrics.add("progress_write_failures")
 
     def issue_request(endpoint: str, params: dict[str, Any], context: dict[str, Any]) -> str:
-        nonlocal first_data_request_at
-        if progress_timing_enabled and endpoint != CUTOFF_ENDPOINT:
-            with data_request_lock:
-                if first_data_request_at is None:
-                    first_data_request_at = time.monotonic()
+        if progress_timing_enabled and not observes_http_attempts:
+            first_data_timing.observe_attempt(endpoint)
         return client.get(endpoint, params, context=context)
 
     def report_first_data_request() -> None:
-        nonlocal first_data_request_reported
         if not progress_timing_enabled:
             return
-        with data_request_lock:
-            started = first_data_request_at
-        if started is not None and not first_data_request_reported:
+        elapsed = first_data_timing.request_elapsed(store.started)
+        if elapsed is not None:
             report_progress(
                 "first_new_request",
-                first_data_request_elapsed_seconds=started - store.started,
+                first_data_request_elapsed_seconds=elapsed,
             )
-            first_data_request_reported = True
+
+    def report_first_data_page() -> None:
+        if not progress_timing_enabled:
+            return
+        elapsed = first_data_timing.page_elapsed(store.started)
+        if elapsed is not None:
+            report_progress(
+                "first_new_request",
+                first_data_page_elapsed_seconds=elapsed,
+            )
 
     def advance_index() -> bool:
         nonlocal recovery_cursor
@@ -3165,7 +3238,15 @@ def _run(
                         if relative is not None:
                             endpoint, _, _, _ = _plan(work, _phase(work))
                             task_count = len(state["tasks"])
-                            _stage(store, state, index, relative, identities)
+                            if isinstance(state, _CaptureState):
+                                first_data_timing = state.first_data_timing
+                                state.first_data_timing = None
+                                try:
+                                    _stage(store, state, index, relative, identities)
+                                finally:
+                                    state.first_data_timing = first_data_timing
+                            else:
+                                _stage(store, state, index, relative, identities)
                             _consume(store, state, index, relative, seen, identities)
                             metrics.endpoint_page(endpoint, recovered=True)
                             enqueue_appended(task_count)
@@ -3247,6 +3328,7 @@ def _run(
             else:
                 state.update(complete=True, completed_at=now(), error=None)
                 save(store, state)
+            report_first_data_page()
             report_progress("complete")
             return
         advanced_index = False
@@ -3299,15 +3381,10 @@ def _run(
             try:
                 task_count = len(state["tasks"])
                 _stage(store, state, index, relative, identities)
-                _consume(store, state, index, relative, seen, identities)
                 if request_id is not None:
                     first_data_response_committed = True
-                    if progress_timing_enabled and not first_data_page_reported:
-                        report_progress(
-                            "first_new_request",
-                            first_data_page_elapsed_seconds=(time.monotonic() - store.started),
-                        )
-                        first_data_page_reported = True
+                    report_first_data_page()
+                _consume(store, state, index, relative, seen, identities)
                 enqueue_appended(task_count)
                 enqueue(index)
             except Exception as exc:
@@ -3455,21 +3532,34 @@ def _capture_locked_impl(
         genesis_anchor = state.genesis_anchor
         if logical_root_id is not None and genesis_anchor is not None:
             identities.close()
-            identities = RecoveryParentIndex(
-                store,
-                state["capture_id"],
-                logical_root_id,
-                sealed_settings_sha256(state),
-                page_rows=state.page_rows,
-                page_anchors=state.page_anchors,
-                genesis_anchor=genesis_anchor,
-            )
+            try:
+                identities = RecoveryParentIndex(
+                    store,
+                    state["capture_id"],
+                    logical_root_id,
+                    sealed_settings_sha256(state),
+                    page_rows=state.page_rows,
+                    page_anchors=state.page_anchors,
+                    genesis_anchor=genesis_anchor,
+                )
+            except UnsafeRecoveryIndexPermissions:
+                # The persistent index is optional. Keep the ordinary bounded-memory path
+                # when shared or otherwise non-private directory permissions reject its cache.
+                cache_directory = store.path(f"tmp/recovery-index/{state['capture_id']}")
+                try:
+                    cache_directory.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise
+                identities = DiskParentIndex(store)
             if identity_holder is not None:
                 identity_holder[0] = identities
-            metrics.add("recovery_cache_enabled")
-            identities.defer_page_merges = bool(fast_recovery and state.page_rows)
-            if identities.reused_pages:
-                metrics.add("recovery_cache_reused", identities.reused_pages)
+            if isinstance(identities, RecoveryParentIndex):
+                metrics.add("recovery_cache_enabled")
+                identities.defer_page_merges = bool(fast_recovery and state.page_rows)
+                if identities.reused_pages:
+                    metrics.add("recovery_cache_reused", identities.reused_pages)
     if isinstance(identities, DiskParentIndex):
         identities.defer_page_merges = bool(fast_recovery and state.page_rows)
     if isinstance(state, _CaptureState):
@@ -3566,6 +3656,7 @@ def _capture_locked_impl(
                 for row in page_receipts(store, state):
                     _index_receipt(store, state, row, identities)
             recovered = _recover_receipts(store, state) if resume else {}
+            first_data_timing = _FirstDataTiming()
             while True:
                 try:
                     _run(
@@ -3578,6 +3669,7 @@ def _capture_locked_impl(
                         budget,
                         identities,
                         resumed=resume is not None,
+                        first_data_timing=first_data_timing,
                     )
                 except sqlite3.DatabaseError as exc:
                     if (
@@ -3587,6 +3679,14 @@ def _capture_locked_impl(
                     ):
                         raise
                     identities.invalidate_and_reset()
+                    # A live page may already be durably journaled when the derived
+                    # index fails. Rebuild logical state from that journal before retrying;
+                    # the in-memory state is intentionally marked uncertain in that case.
+                    state = read_capture(store, state["capture_id"], _writer_resume=True)
+                    identities.page_rows = state.page_rows
+                    identities.page_anchors = state.page_anchors
+                    identities.genesis_anchor = state.genesis_anchor
+                    seen = {}
                     identities.defer_page_merges = bool(state.page_rows)
                     cache_fallback_used = True
                     metrics.add("recovery_cache_invalidated")

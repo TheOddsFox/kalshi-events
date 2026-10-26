@@ -257,6 +257,44 @@ def test_retry_after_is_honored_and_recorded_on_the_attempt_receipt(store, monke
     assert throttled["retry_delay_seconds"] == 7.0
 
 
+def test_attempt_observer_runs_after_rate_wait_and_cannot_block_http(store, monkeypatch):
+    clock = {"now": 0.0}
+    monkeypatch.setattr("kalshi_events.transport.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "kalshi_events.transport.time.sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+    store.started = 0.0
+    attempts = []
+
+    def handler(request):
+        attempts.append((str(request.url), clock["now"]))
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=httpx.ByteStream(b'{"series":[]}'),
+        )
+
+    with PublicClient(store, Budget(store)) as client:
+        client.client.close()
+        client.client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+        client.limiter.defer(5)
+        observed = []
+        client._set_attempt_observer(lambda endpoint: observed.append((endpoint, clock["now"])))
+        client.get("/series")
+
+        assert observed == [("/series", 5.0)]
+        assert attempts[0][1] == 5.0
+
+        def broken_observer(_endpoint):
+            raise RuntimeError("observer failure")
+
+        client._set_attempt_observer(broken_observer)
+        client.get("/series")
+
+    assert len(attempts) == 2
+
+
 def test_four_attempts_then_bounded_failure(store, monkeypatch):
     clock = {"now": 0.0}
     monkeypatch.setattr("kalshi_events.transport.time.monotonic", lambda: clock["now"])

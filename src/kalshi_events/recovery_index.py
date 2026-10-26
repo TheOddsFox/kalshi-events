@@ -39,6 +39,10 @@ _SIDECARS = ("index.sqlite-journal", "index.sqlite-wal", "index.sqlite-shm")
 _ALLOWED_FILES = {"index.sqlite", *_SIDECARS}
 
 
+class UnsafeRecoveryIndexPermissions(CatalogueError):
+    """The persistent cache is unavailable under the current directory permissions."""
+
+
 def _owned_by_current_user(details: os.stat_result) -> bool:
     return not hasattr(os, "geteuid") or details.st_uid == os.geteuid()
 
@@ -145,6 +149,10 @@ class RecoveryParentIndex(DiskParentIndex):
             raise CatalogueError("recovery index directory is unsafe")
         if not directory.exists():
             durable_mkdir(directory.parent)
+            # Check every ancestor before creating the capture-specific leaf. An unsafe
+            # shared parent is an eligibility limit, and must not leave a cache directory
+            # that later retirement cannot safely remove.
+            self._validate_parent_layout(directory.parent)
             try:
                 directory.mkdir(mode=0o700)
             except FileExistsError:
@@ -158,21 +166,8 @@ class RecoveryParentIndex(DiskParentIndex):
             raise CatalogueError("recovery index directory is unsafe")
         details = directory.stat(follow_symlinks=False)
         if not _owned_by_current_user(details) or stat.S_IMODE(details.st_mode) & 0o077:
-            raise CatalogueError("recovery index directory permissions are unsafe")
-        parent = directory.parent
-        while parent != self.store.root:
-            if parent.is_symlink() or not parent.is_dir():
-                raise CatalogueError("recovery index parent directory is unsafe")
-            parent_details = parent.stat(follow_symlinks=False)
-            if (
-                not _owned_by_current_user(parent_details)
-                or stat.S_IMODE(parent_details.st_mode) & 0o022
-            ):
-                raise CatalogueError("recovery index parent permissions are unsafe")
-            parent = parent.parent
-        root_details = self.store.root.stat(follow_symlinks=False)
-        if not _owned_by_current_user(root_details) or stat.S_IMODE(root_details.st_mode) & 0o022:
-            raise CatalogueError("operator root permissions are unsafe for a recovery index")
+            raise UnsafeRecoveryIndexPermissions("recovery index directory permissions are unsafe")
+        self._validate_parent_layout(directory.parent)
         try:
             entries = {entry.name for entry in directory.iterdir()}
         except OSError:
@@ -187,13 +182,27 @@ class RecoveryParentIndex(DiskParentIndex):
                 details = path.stat(follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            if (
-                not stat.S_ISREG(details.st_mode)
-                or details.st_nlink != 1
-                or not _owned_by_current_user(details)
-                or stat.S_IMODE(details.st_mode) & 0o077
-            ):
+            if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
                 raise CatalogueError("recovery index file is unsafe")
+            if not _owned_by_current_user(details) or stat.S_IMODE(details.st_mode) & 0o077:
+                raise UnsafeRecoveryIndexPermissions("recovery index file permissions are unsafe")
+
+    def _validate_parent_layout(self, parent: Path) -> None:
+        while parent != self.store.root:
+            if parent.is_symlink() or not parent.is_dir():
+                raise CatalogueError("recovery index parent directory is unsafe")
+            parent_details = parent.stat(follow_symlinks=False)
+            if (
+                not _owned_by_current_user(parent_details)
+                or stat.S_IMODE(parent_details.st_mode) & 0o022
+            ):
+                raise UnsafeRecoveryIndexPermissions("recovery index parent permissions are unsafe")
+            parent = parent.parent
+        root_details = self.store.root.stat(follow_symlinks=False)
+        if not _owned_by_current_user(root_details) or stat.S_IMODE(root_details.st_mode) & 0o022:
+            raise UnsafeRecoveryIndexPermissions(
+                "operator root permissions are unsafe for a recovery index"
+            )
 
     def _existing_sidecars(self) -> bool:
         directory = self.store.path(self.directory_relative)
