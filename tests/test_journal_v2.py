@@ -532,7 +532,7 @@ def test_usable_receipt_orphan_is_recovered_without_reissuing_its_request(store)
     assert_chain_and_anchor(store, identity)
 
 
-def test_writer_resume_decodes_prefix_and_post_snapshot_suffix_bodies_once(store, monkeypatch):
+def test_writer_resume_decodes_prefix_once_and_suffix_twice(store, monkeypatch):
     original_append = store.append
     committed = 0
     issued = []
@@ -563,10 +563,20 @@ def test_writer_resume_decodes_prefix_and_post_snapshot_suffix_bodies_once(store
         with pytest.raises(PowerLoss):
             acquisition.capture(store, client_factory=PaginatedClient)
     identity = capture_id(store)
-    assert (
-        json.loads(snapshot_path(store, identity).read_text())["_journal"]["transition_count"]
-        == 100
-    )
+    snapshot = json.loads(snapshot_path(store, identity).read_text())
+    assert snapshot["_journal"]["transition_count"] == 100
+    anchor_seq = snapshot["_journal"]["seq"]
+    suffix_relatives = {
+        record["payload"]["relative"]
+        for record in map(
+            json.loads, store.path(f"captures/{identity}/pages.jsonl").read_bytes().splitlines()
+        )
+        if record["seq"] > anchor_seq and record["op"] == "page"
+    }
+    old_relatives = {
+        row["relative"]
+        for row in acquisition.page_receipts(store, acquisition.read_capture(store, identity))
+    }
     counts = Counter()
     original_read = acquisition.read_page
 
@@ -579,8 +589,11 @@ def test_writer_resume_decodes_prefix_and_post_snapshot_suffix_bodies_once(store
         resumed = acquisition.capture(store, resume=identity, client_factory=PaginatedClient)
     assert resumed["complete"]
     assert len(issued) == len(set(issued)) == 117
-    expected = {row["relative"]: 1 for row in acquisition.page_receipts(store, resumed)}
-    assert counts == expected
+    all_relatives = {row["relative"] for row in acquisition.page_receipts(store, resumed)}
+    assert set(counts) == all_relatives
+    for relative in old_relatives:
+        assert counts[relative] == (2 if relative in suffix_relatives else 1)
+    assert all(counts[relative] in {1, 2} for relative in all_relatives - old_relatives)
     assert_chain_and_anchor(store, identity)
 
 

@@ -14,9 +14,11 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import suppress
 from contextvars import copy_context
 from datetime import datetime, timedelta
 from itertools import chain
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -1938,7 +1940,8 @@ def _commit_page_v2_measured(
             state.page_rows.append({"index": index, "relative": relative, "request_id": request_id})
             state.processed.add(relative)
             state.request_ids.add(request_id)
-            identities.processed.add(relative)
+            if not getattr(identities, "defer_page_merges", False):
+                identities.processed.add(relative)
             metrics.endpoint_page(manifest["endpoint"])
             _after_transition(store, state)
         metrics.add("page_transitions_applied")
@@ -1951,6 +1954,8 @@ def _commit_page_v2_measured(
 
 def _merge_parent_index(target: ParentIndex, source: ParentIndex) -> None:
     if isinstance(target, DiskParentIndex):
+        if target.defer_page_merges:
+            return
         target.merge(source)
         return
     for name in ("series", "events", "markets"):
@@ -2667,7 +2672,9 @@ def _consume(
         recent = state.recent_page
         if recent is not None and recent[0] == relative:
             _, manifest, payload = recent
-            if relative not in identities.processed:
+            if relative not in identities.processed and not getattr(
+                identities, "defer_page_merges", False
+            ):
                 identities.add_page(manifest, payload)
                 identities.processed.add(relative)
             state.recent_page = None
@@ -2921,6 +2928,45 @@ def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
     return recovered
 
 
+def _index_receipt(
+    store: Store,
+    state: dict[str, Any],
+    row: dict[str, Any],
+    identities: ParentIndex | DiskParentIndex,
+) -> bool:
+    """Add one committed receipt to the derived index after binding it to its journal task."""
+    # shortcut: reread deferred bodies in order; persistent ordered checkpoints can avoid it.
+    relative = row["relative"]
+    if relative in identities.processed:
+        return False
+    decoded_ceiling = state.get("max_decoded_response_bytes", state["max_response_bytes"])
+    with (
+        metrics.phase("page_validation"),
+        metrics.thread_cpu_phase("page_processing_cpu"),
+    ):
+        manifest, payload = read_page(
+            store,
+            relative,
+            state["max_response_bytes"],
+            decoded_ceiling,
+        )
+    if manifest.get("capture_id") != state["capture_id"]:
+        raise CatalogueError("raw evidence belongs to another capture")
+    if not _receipt_matches_state_protocol(manifest, state):
+        raise CatalogueError("raw receipt protocol differs from its capture")
+    if _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL and (
+        _batched_parent_policy(state) or _checkpoint_policy(state)
+    ):
+        _validate_receipt_task_binding(manifest, state, row)
+    with (
+        metrics.phase("page_application"),
+        metrics.thread_cpu_phase("page_processing_cpu"),
+    ):
+        identities.add_page(manifest, payload)
+    identities.processed.add(relative)
+    return True
+
+
 def _run(
     store: Store,
     state: dict[str, Any],
@@ -2934,12 +2980,72 @@ def _run(
     resumed: bool = False,
 ) -> None:
     running: dict[Future, int] = {}
+    data_request_ids: dict[Future, str] = {}
     busy: set[int] = set()
     ready = deque(index for index, work in enumerate(state["tasks"]) if not work["done"])
     queued = set(ready)
     metrics.add("tasks_enqueued", len(ready))
     failure: Exception | None = None
     resume_cutoffs_pending = resumed and _checkpoint_policy(state)
+    first_data_request_at: float | None = None
+    first_data_request_reported = False
+    first_data_page_reported = False
+    first_data_response_committed = False
+    data_request_lock = Lock()
+    recovery_cursor = 0
+
+    def progress_counts() -> dict[str, int]:
+        rows = state.page_rows if isinstance(state, _CaptureState) else []
+        head = state.journal_head if isinstance(state, _CaptureState) else None
+        indexed = len(identities.processed)
+        return {
+            "journal_records": head["seq"] if head is not None else 0,
+            "total_pages": len(rows),
+            "indexed_pages": indexed,
+            "backlog_pages": max(0, len(rows) - indexed),
+            "verified_pages": indexed,
+        }
+
+    def report_progress(phase: str, **counters: int | float) -> None:
+        if isinstance(state, _CaptureState):
+            try:
+                metrics.progress(phase, **progress_counts(), **counters)
+            except Exception:
+                metrics.add("progress_write_failures")
+
+    def issue_request(endpoint: str, params: dict[str, Any], context: dict[str, Any]) -> str:
+        nonlocal first_data_request_at
+        if endpoint != CUTOFF_ENDPOINT:
+            with data_request_lock:
+                if first_data_request_at is None:
+                    first_data_request_at = time.monotonic()
+        return client.get(endpoint, params, context=context)
+
+    def report_first_data_request() -> None:
+        nonlocal first_data_request_reported
+        with data_request_lock:
+            started = first_data_request_at
+        if started is not None and not first_data_request_reported:
+            report_progress(
+                "first_new_request",
+                first_data_request_elapsed_seconds=started - store.started,
+            )
+            first_data_request_reported = True
+
+    def advance_index() -> bool:
+        nonlocal recovery_cursor
+        if not getattr(identities, "defer_page_merges", False):
+            return False
+        if recovery_cursor >= len(state.page_rows):
+            identities.defer_page_merges = False
+            return False
+        with metrics.phase("index_replay"):
+            _index_receipt(store, state, state.page_rows[recovery_cursor], identities)
+        recovery_cursor += 1
+        if recovery_cursor >= len(state.page_rows):
+            identities.defer_page_merges = False
+        report_progress("index_replay")
+        return True
 
     def enqueue(index: int) -> None:
         if index not in busy and index not in queued and not state["tasks"][index]["done"]:
@@ -3011,15 +3117,16 @@ def _run(
                                 "selected market batch exceeds the initial URL limit"
                             )
                         busy.add(index)
-                        running[
-                            pool.submit(
-                                copy_context().run,
-                                client.get,
-                                endpoint,
-                                params,
-                                context=context,
-                            )
-                        ] = index
+                        future = pool.submit(
+                            copy_context().run,
+                            issue_request,
+                            endpoint,
+                            params,
+                            context,
+                        )
+                        running[future] = index
+                        if endpoint != CUTOFF_ENDPOINT:
+                            data_request_ids[future] = context["request_id"]
                         metrics.add("futures_submitted")
                         metrics.submitted_futures(len(running))
             except Exception as exc:
@@ -3029,6 +3136,9 @@ def _run(
                 raise failure
             if ready:
                 continue
+            if advance_index():
+                continue
+            report_progress("closure")
             task_count = len(state["tasks"])
             if _hydrate(store, state, identities):
                 enqueue_appended(task_count)
@@ -3042,18 +3152,47 @@ def _run(
             else:
                 state.update(complete=True, completed_at=now(), error=None)
                 save(store, state)
+            report_progress("complete")
             return
+        advanced_index = False
+        if (
+            failure is None
+            and not ready
+            and first_data_response_committed
+            and getattr(identities, "defer_page_merges", False)
+            and not any(future.done() for future in running)
+        ):
+            try:
+                advanced_index = advance_index()
+            except Exception as exc:
+                failure = failure or exc
+        catchup_pending = (
+            failure is None
+            and not ready
+            and first_data_response_committed
+            and getattr(identities, "defer_page_merges", False)
+        )
         with metrics.phase("scheduler_wait"):
-            finished, _ = wait(running, return_when=FIRST_COMPLETED)
+            finished, _ = wait(
+                running,
+                return_when=FIRST_COMPLETED,
+                timeout=0 if advanced_index and catchup_pending else None,
+            )
+        if not finished:
+            continue
         for future in sorted(finished, key=lambda item: running[item]):
             index = running.pop(future)
+            request_id = data_request_ids.pop(future, None)
             busy.discard(index)
             metrics.add("futures_completed")
             try:
                 relative = future.result()
             except Exception as exc:
                 failure = failure or exc
+                with suppress(Exception):
+                    report_first_data_request()
                 continue
+            report_first_data_request()
             if isinstance(state, _CaptureState) and state.journal_uncertain:
                 # The durable journal may include a record this process did not apply. Leave
                 # completed receipts orphaned; the next locked resume reconciles them.
@@ -3066,6 +3205,14 @@ def _run(
                 task_count = len(state["tasks"])
                 _stage(store, state, index, relative, identities)
                 _consume(store, state, index, relative, seen, identities)
+                if request_id is not None:
+                    first_data_response_committed = True
+                    if not first_data_page_reported:
+                        report_progress(
+                            "first_new_request",
+                            first_data_page_elapsed_seconds=(time.monotonic() - store.started),
+                        )
+                        first_data_page_reported = True
                 enqueue_appended(task_count)
                 enqueue(index)
             except Exception as exc:
@@ -3141,12 +3288,16 @@ def _capture_locked_impl(
     factory = client_factory or PublicClient
     if resume and _on_capture_id is not None:
         _on_capture_id(resume)
+    snapshot_present = bool(resume and store.path(f"captures/{resume}/state.json").is_file())
+    defer_prefix_replay = bool(
+        resume and snapshot_present and isinstance(identities, DiskParentIndex)
+    )
     state = (
         read_capture(
             store,
             resume,
             _writer_resume=True,
-            _parent_index=identities,
+            _parent_index=None if defer_prefix_replay else identities,
         )
         if resume
         else new_capture(
@@ -3158,6 +3309,24 @@ def _capture_locked_impl(
             _on_capture_id=_on_capture_id,
         )
     )
+    fast_recovery = (
+        defer_prefix_replay and isinstance(state, _CaptureState) and state.snapshot_seq is not None
+    )
+    if isinstance(identities, DiskParentIndex):
+        identities.defer_page_merges = bool(fast_recovery and state.page_rows)
+    if isinstance(state, _CaptureState):
+        rows = state.page_rows
+        try:
+            metrics.progress(
+                "recovery_validation",
+                journal_records=state.journal_head["seq"] if state.journal_head is not None else 0,
+                total_pages=len(rows),
+                indexed_pages=len(identities.processed),
+                backlog_pages=max(0, len(rows) - len(identities.processed)),
+                verified_pages=len(identities.processed),
+            )
+        except Exception:
+            metrics.add("progress_write_failures")
     if resume and incremental and not state.get("incremental"):
         raise CatalogueError("cannot resume a full capture as incremental")
     if state.get("incremental"):
@@ -3212,34 +3381,9 @@ def _capture_locked_impl(
             ) as pool,
         ):
             _settle(store, state, seen, identities)
-            if resume:
+            if resume and not fast_recovery:
                 for row in page_receipts(store, state):
-                    if row["relative"] in identities.processed:
-                        continue
-                    with (
-                        metrics.phase("page_validation"),
-                        metrics.thread_cpu_phase("page_processing_cpu"),
-                    ):
-                        manifest, payload = read_page(
-                            store,
-                            row["relative"],
-                            state["max_response_bytes"],
-                            decoded_ceiling,
-                        )
-                    if manifest.get("capture_id") != state["capture_id"]:
-                        raise CatalogueError("raw evidence belongs to another capture")
-                    if not _receipt_matches_state_protocol(manifest, state):
-                        raise CatalogueError("raw receipt protocol differs from its capture")
-                    if _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL and (
-                        _batched_parent_policy(state) or _checkpoint_policy(state)
-                    ):
-                        _validate_receipt_task_binding(manifest, state, row)
-                    with (
-                        metrics.phase("page_application"),
-                        metrics.thread_cpu_phase("page_processing_cpu"),
-                    ):
-                        identities.add_page(manifest, payload)
-                    identities.processed.add(row["relative"])
+                    _index_receipt(store, state, row, identities)
             recovered = _recover_receipts(store, state) if resume else {}
             _run(
                 store,
@@ -3264,6 +3408,20 @@ def _capture_locked_impl(
                 # Preserve the original operation failure; resume will replay any durable suffix.
                 state.journal_uncertain = True
         state["error"] = str(exc)
+        if isinstance(state, _CaptureState):
+            try:
+                metrics.progress(
+                    "stopped",
+                    journal_records=state.journal_head["seq"]
+                    if state.journal_head is not None
+                    else 0,
+                    total_pages=len(state.page_rows),
+                    indexed_pages=len(identities.processed),
+                    backlog_pages=max(0, len(state.page_rows) - len(identities.processed)),
+                    verified_pages=len(identities.processed),
+                )
+            except Exception:
+                metrics.add("progress_write_failures")
         if not isinstance(exc, BudgetExceeded):
             raise
         budget_exhausted = True

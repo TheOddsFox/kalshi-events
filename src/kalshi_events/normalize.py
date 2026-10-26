@@ -274,6 +274,7 @@ class DiskParentIndex:
     def __init__(self, store: Any):
         self.store = store
         self.processed: set[str] = set()
+        self.defer_page_merges = False
         tmp = store.path("tmp")
         durable_mkdir(tmp)
         for stale in tmp.glob("parent-index-*"):
