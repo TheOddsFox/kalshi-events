@@ -162,6 +162,15 @@ def main() -> int:
                 candidate_environment,
             ),
             (
+                "candidate frozen v1 public-schema handoff",
+                interpreters["candidate"],
+                (
+                    "tests/test_duckdb_upgrade.py::"
+                    "test_candidate_rebuild_preserves_reference_v1_public_schemas",
+                ),
+                candidate_environment,
+            ),
+            (
                 "candidate native storage conversion",
                 interpreters["candidate"],
                 ("tests/test_duckdb_storage.py",),

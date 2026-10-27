@@ -62,7 +62,18 @@ def catalogue(tmp_path_factory):
 
 def test_every_narrow_ordered_export_matches_legacy_bytes_and_schema(catalogue, tmp_path):
     _, _, release, database, native_market, native_combo = catalogue
-    with duckdb.connect(str(database), read_only=True) as connection:
+    connection = duckdb.connect(
+        ":memory:",
+        config={
+            "disabled_optimizers": "statistics_propagation",
+            "memory_limit": warehouse.DBT_MEMORY_LIMIT,
+            "threads": str(warehouse.DBT_THREADS),
+        },
+    )
+    try:
+        database_literal = str(database).replace("'", "''")
+        connection.execute(f"ATTACH '{database_literal}' AS source (READ_ONLY)")
+        connection.execute("USE source")
         for name, relation in warehouse.RELATIONS.items():
             legacy = tmp_path / f"{name}.parquet"
             connection.execute(
@@ -72,6 +83,9 @@ def test_every_narrow_ordered_export_matches_legacy_bytes_and_schema(catalogue, 
             exported = Path(release["output"]) / f"{name}.parquet"
             assert exported.read_bytes() == legacy.read_bytes(), name
             assert pq.read_schema(exported).equals(pq.read_schema(legacy), check_metadata=True)
+            assert all(field.nullable for field in pq.read_schema(exported)), name
+    finally:
+        connection.close()
 
     markets = pq.read_table(Path(release["output"]) / "markets.parquet").to_pylist()
     market = next(row for row in markets if row["market_ticker"] == "MARKET")

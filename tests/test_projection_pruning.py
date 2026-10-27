@@ -37,12 +37,71 @@ def explain_json(connection, sql):
 
 
 def operators(plan, operator_type):
+    if isinstance(plan, list):
+        return [operator for node in plan for operator in operators(node, operator_type)]
+    if not isinstance(plan, dict):
+        return []
     found = []
-    if plan.get("operator_type") == operator_type:
+    if plan.get("operator_type", plan.get("type")) == operator_type:
         found.append(plan)
-    for child in plan.get("children", []):
+    children = plan.get("children", [])
+    nested_operators = plan.get("operator", [])
+    for child in [*children, *nested_operators]:
         found.extend(operators(child, operator_type))
     return found
+
+
+def operator_cardinality(operator):
+    if "operator_cardinality" in operator:
+        return operator["operator_cardinality"]
+    if "intermediate_rows" in operator:
+        return operator["intermediate_rows"]
+    raise AssertionError("EXPLAIN operator is missing its cardinality metric")
+
+
+def test_explain_operators_support_duckdb_15_json_shape():
+    plan = {
+        "operator_type": "QUERY",
+        "children": [
+            {
+                "operator_type": "WINDOW",
+                "children": [{"operator_type": "TABLE_SCAN", "operator_cardinality": 4}],
+            }
+        ],
+    }
+
+    window = operators(plan, "WINDOW")[0]
+
+    assert operator_cardinality(window["children"][0]) == 4
+
+
+def test_explain_operators_support_duckdb_20_json_shape_and_zero_rows():
+    plan = {
+        "operator": [
+            {
+                "type": "QUERY",
+                "children": [
+                    {
+                        "type": "WINDOW",
+                        "children": [{"type": "TABLE_SCAN", "intermediate_rows": 0}],
+                    }
+                ],
+            }
+        ]
+    }
+
+    window = operators(plan, "WINDOW")[0]
+
+    assert operator_cardinality(window["children"][0]) == 0
+
+
+def test_operator_cardinality_fails_when_plan_has_no_cardinality_metric():
+    try:
+        operator_cardinality({"type": "TABLE_SCAN"})
+    except AssertionError as error:
+        assert "missing its cardinality metric" in str(error)
+    else:
+        raise AssertionError("missing EXPLAIN cardinality should fail closed")
 
 
 def test_incremental_current_projections_match_full_results_and_prune_history_windows():
@@ -170,7 +229,7 @@ def test_incremental_current_projections_match_full_results_and_prune_history_wi
             for child in window.get("children", [])
         ]
         assert window_children
-        history_input = min(child["operator_cardinality"] for child in window_children)
+        history_input = min(operator_cardinality(child) for child in window_children)
         assert history_input <= 4
 
     assert next(iter(expected["current_events"]))[0] == "E1"

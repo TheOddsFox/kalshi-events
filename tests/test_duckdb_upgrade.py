@@ -4,17 +4,20 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 from decimal import Decimal
 from pathlib import Path
 
 import dlt
 import duckdb
+import pyarrow.parquet as pq
 import pytest
 from test_arrow_landing import _row
 from test_incremental_catalogue import BASE_TIME, Snapshot, build_delta, capture_at, relation
 
+from kalshi_events import capture as acquisition
 from kalshi_events import publish as publishing
-from kalshi_events import warehouse
+from kalshi_events import recovery, warehouse
 from kalshi_events.common import Store
 
 _ROOT_ENV = "KALSHI_DUCKDB_UPGRADE_ROOT"
@@ -97,6 +100,52 @@ def _database_storage_version(path: Path) -> str:
         return connection.execute(
             "select tags['storage_version'] from duckdb_databases() where not internal"
         ).fetchone()[0]
+
+
+def _capture_input_hashes(store: Store, capture_id: str) -> dict[str, str]:
+    state = acquisition.read_capture(store, capture_id)
+    paths = {
+        store.path(f"captures/{capture_id}/state.json"),
+        store.path(f"captures/{capture_id}/pages.jsonl"),
+    }
+    receipts = acquisition.page_receipts(store, state)
+    assert receipts
+    receipt_paths = []
+    for receipt in receipts:
+        manifest = store.path(receipt["relative"])
+        body = manifest.parent / "body.bin"
+        assert manifest.is_file() and body.is_file()
+        receipt_paths.extend((manifest, body))
+    paths.update(receipt_paths)
+    hashes = {
+        str(path.relative_to(store.root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(paths)
+        if path.is_file()
+    }
+    for receipt in receipts:
+        manifest_relative = receipt["relative"]
+        body_relative = (store.path(manifest_relative).parent / "body.bin").relative_to(store.root)
+        assert hashes[str(manifest_relative)]
+        assert hashes[str(body_relative)]
+    return hashes
+
+
+def _schema_receipt(schema):
+    def metadata_receipt(metadata):
+        return {key.hex(): value.hex() for key, value in sorted((metadata or {}).items())}
+
+    return {
+        "fields": [
+            {
+                "name": field.name,
+                "type": str(field.type),
+                "nullable": field.nullable,
+                "metadata": metadata_receipt(field.metadata),
+            }
+            for field in schema
+        ],
+        "metadata": metadata_receipt(schema.metadata),
+    }
 
 
 def test_write_reference_dictionary_baseline(monkeypatch, tmp_path):
@@ -272,6 +321,87 @@ def test_candidate_bootstraps_v2_and_deltas_reference_baselines(monkeypatch, tmp
     delta_release = publishing.publish(v2_store, delta["capture_id"], catalogue_version=2)
     assert _database_hash(v2_store, "builds-v2", receipts["series-v2"]) == v2_hash
     _assert_series_output(v2_store, delta["capture_id"], delta_release)
+
+
+def test_candidate_rebuild_preserves_reference_v1_public_schemas(monkeypatch, tmp_path):
+    root = _upgrade_root()
+    assert duckdb.__version__ == "2.0.0"
+    monkeypatch.chdir(tmp_path)
+
+    reference_store = Store(root / "series-v1")
+    reference_release = publishing.current(reference_store)
+    assert reference_release["contract"] == publishing.CONTRACT
+    capture_id = reference_release["capture_id"]
+    reference_release_path = Path(reference_release["output"])
+    reference_manifest_path = reference_release_path / "manifest.json"
+    reference_manifest_bytes = reference_manifest_path.read_bytes()
+    reference_pointer_path = reference_store.path("current.json")
+    reference_pointer_bytes = reference_pointer_path.read_bytes()
+    reference_database = reference_store.path(f"builds/{capture_id}/warehouse.duckdb")
+    assert _database_storage_version(reference_database).startswith("v1.")
+    reference_database_sha256 = hashlib.sha256(reference_database.read_bytes()).hexdigest()
+    reference_receipts = _capture_input_hashes(reference_store, capture_id)
+
+    candidate_root = root / "series-v1-candidate"
+    shutil.copytree(reference_store.root, candidate_root)
+    candidate_store = Store(candidate_root)
+    assert publishing.current(candidate_store)["capture_id"] == capture_id
+    assert _capture_input_hashes(candidate_store, capture_id) == reference_receipts
+
+    rebuilt = recovery.rebuild(candidate_store)
+    assert rebuilt["capture_id"] == capture_id
+    assert _capture_input_hashes(reference_store, capture_id) == reference_receipts
+    assert _capture_input_hashes(candidate_store, capture_id) == reference_receipts
+    candidate_database = candidate_store.path(f"builds/{capture_id}/warehouse.duckdb")
+    assert _database_storage_version(candidate_database).startswith("v2.0.0+")
+    candidate_release = publishing.publish(candidate_store, capture_id, catalogue_version=1)
+    assert candidate_release["contract"] == publishing.CONTRACT
+    assert candidate_release["capture_id"] == capture_id
+
+    expected_files = {f"{name}.parquet" for name in (*warehouse.RELATIONS, "coverage")}
+    assert expected_files == publishing.FILES
+    comparison = {
+        "capture_id": capture_id,
+        "reference_release_id": reference_release["source_release_id"],
+        "candidate_release_id": candidate_release["source_release_id"],
+        "reference_build_sha256": reference_database_sha256,
+        "candidate_build_sha256": hashlib.sha256(candidate_database.read_bytes()).hexdigest(),
+        "reference_manifest_sha256": hashlib.sha256(reference_manifest_bytes).hexdigest(),
+        "reference_pointer_sha256": hashlib.sha256(reference_pointer_bytes).hexdigest(),
+        "files": {},
+    }
+    report_path = root / "series-v1-public-schema-comparison.json"
+    candidate_release_path = Path(candidate_release["output"])
+    for filename in sorted(expected_files):
+        reference_path = reference_release_path / filename
+        candidate_path = candidate_release_path / filename
+        reference_table = pq.read_table(reference_path)
+        candidate_table = pq.read_table(candidate_path)
+        schemas_equal = reference_table.schema.equals(candidate_table.schema, check_metadata=True)
+        reference_rows = reference_table.to_pylist()
+        candidate_rows = candidate_table.to_pylist()
+        rows_equal = reference_rows == candidate_rows
+        comparison["files"][filename] = {
+            "reference_sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
+            "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+            "row_count": len(reference_rows),
+            "schemas_equal": schemas_equal,
+            "ordered_values_equal": rows_equal,
+            "reference_schema": _schema_receipt(reference_table.schema),
+            "candidate_schema": _schema_receipt(candidate_table.schema),
+        }
+        report_path.write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n")
+        assert schemas_equal, (
+            f"{filename} Arrow schema differs between DuckDB 1.5.6 and 2.0.0:\n"
+            f"reference: {reference_table.schema!r}\n"
+            f"candidate: {candidate_table.schema!r}"
+        )
+        assert rows_equal, f"{filename} ordered values differ"
+
+    assert _capture_input_hashes(candidate_store, capture_id) == reference_receipts
+    assert hashlib.sha256(reference_database.read_bytes()).hexdigest() == reference_database_sha256
+    assert reference_manifest_path.read_bytes() == reference_manifest_bytes
+    assert reference_pointer_path.read_bytes() == reference_pointer_bytes
 
 
 def test_reference_reader_rejects_candidate_native_v2_baseline(monkeypatch, tmp_path):

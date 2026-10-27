@@ -59,6 +59,32 @@ Refresh comparisons use `--profile no-change`, `sparse-change` or `all-change`. 
 
 Trading values stay fixed in refresh fixtures. Current relation comparison excludes only source observation/capture identifiers and observation time; separate assertions check carried T0 and refreshed T1 provenance, exact baseline history retention and expected new observations. Composed history intentionally contains more observations than a fresh full release. These comparisons do not establish universal change-feed completeness or current trading-value equivalence.
 
+### DuckDB 2 query profiles
+
+Add `--duckdb-profile-json` to a supported build profile to collect DuckDB 2 JSON metrics for the compiled `current_markets`, `combo_legs` and `relationships` SQL:
+
+```sh
+uv run --locked python scripts/benchmark-pipeline.py \
+  --profile full --warmups 1 --runs 3 --duckdb-profile-json \
+  --report-dir "$bench_dir/duckdb-profile-full"
+```
+
+The option is supported for `full`, `resume`, `baseline-v2-setup`, `no-change`, `sparse-change`, `all-change`, `history-sparse` and `frozen-v2-build`; it is rejected for capture-only and profiles without a warehouse build. Each measured run is profiled after its benchmark timing in a separate supervised child with a 180-second limit; warm-ups are not profiled. Output lives under `duckdb-profiles/<label>-pair-<n>/` and includes `summary.json`, model profile JSON and a profile for a copied database checkpoint. The child reads compiled SQL from `build-artifacts.json` against a copy of the built database. This is query-only replay: it excludes dbt materialization, installation and publication, and it does not change the benchmark's artifact gates or timings.
+
+Summaries record the engine and storage versions, `PRAGMA database_size`, open/checkpoint durations, available and tracked metrics, per-model unavailable metric names, DuckDB buffer and temporary memory, and process peak RSS separately. The checkpoint is taken on the disposable copy after the build, so its duration is not the build-time checkpoint cost. A 4 GB DuckDB-managed memory limit does not cap process RSS; the separate 4 GiB `max_temp_directory_size` limits DuckDB spill files only. DuckDB 1.5.6 reports tracked-metrics profiling as unavailable. Metric names and setting semantics follow the [DuckDB metrics documentation](https://www.duckdb.org/docs/2.0/dev/metrics).
+
+### DuckDB 2 storage compatibility and rollout
+
+Cross-version acceptance compares logical rows, schemas, exact values, payload text, provenance, membership and ordering. DuckDB 1.5.6 and 2.0 may produce different Parquet bytes and release IDs; existing releases remain immutable. Comparisons between unoptimized and optimized 2.0 implementations require identical public bytes and release IDs. Run different engines in their separate environments; a same-interpreter source comparison does not measure an engine upgrade.
+
+The DuckDB 2 export uses a private in-memory database instance, a read-only warehouse attachment and `statistics_propagation` disabled within that instance to preserve the existing nullable Parquet fields. This is a compatibility guard; its export cost is unmeasured, and no SQL-model optimization shipped.
+
+The producer pins DuckDB 2.0.0, dlt 1.31.0, dbt-duckdb 1.11.1 and dbt-core 1.12.5; the lock resolves PyArrow 26.0.0 from the declared `>=17` range. The app's dlt compatibility claim is limited to its tested Arrow landing path. The [DuckDB release calendar](https://duckdb.org/release_calendar) identifies 2.0.0 as LTS, and its [migration guide](https://duckdb.org/docs/2.0/operations_manual/migration) and [Python migration guide](https://duckdb.org/docs/2.0/clients/python/migration) describe the storage and API boundary. [dlt PR 4601](https://github.com/dlt-hub/dlt/pull/4601) tracks upstream DuckDB 2 compatibility work; this repository's narrow application path does not establish general upstream support.
+
+The serial `scripts/check-duckdb-upgrade.py` workflow seeds dictionary-landed and scoped legacy warehouses with the DuckDB 1.5.6 reference environment, verifies reference reads and recovery, replays the legacy dictionary warehouse with the DuckDB 2 candidate, exercises native conversion and series lineage, and confirms that the legacy reader rejects a native DuckDB 2 file. Keep reference and candidate sources immutable and put fixture roots and logs outside the repository. Before rollout, require the canonical verification, distribution and installed-wheel checks plus the reference-to-candidate workflow and an actual installed producer/consumer handoff. Metadata Parquet exchange is a separate compatibility check; consumers that open the native production database require DuckDB 2.0 or newer.
+
+On 2026-10-27, the focused migration-interruption checks passed (20 tests, 22.52 seconds), and the DuckDB profiling tests passed (99 tests, 6.32 seconds). These targeted results do not replace the rollout checks or establish a speedup. Production SQL is unchanged; the 20% affected-phase improvement threshold for a SQL rewrite remains unproven. The current DuckDB 1.5.6 worker is unchanged; any switch requires later explicit authorization, no active writer, and compatible native-database consumers first. Preserve the matching old runtime, publication and evidence for rollback.
+
 ## Interpret reports
 
 `pipeline_elapsed_seconds` measures native capture/build/publication after imports, excluding separately prepared baseline setup, output comparison and standalone verification. `worker_wall_seconds` includes process startup and post-run checks. Phase timings are inclusive and can overlap; do not add them. Compare medians of at least three paired runs after one warm-up, and inspect individual pairs for variance.

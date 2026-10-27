@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +40,13 @@ from kalshi_events.common import (
     regular_bytes,
     safe_path,
 )
-from kalshi_events.warehouse import RELATIONS, build_directory, certified
+from kalshi_events.warehouse import (
+    DBT_MEMORY_LIMIT,
+    DBT_THREADS,
+    RELATIONS,
+    build_directory,
+    certified,
+)
 
 CONTRACT = "oddsfox.kalshi.catalogue.v1"
 CONTRACT_V2 = "oddsfox.kalshi.catalogue.v2"
@@ -64,6 +71,58 @@ V2_LINEAGE_FIELDS = (
     "membership_sha256",
 )
 MAX_COVERAGE_BINDING_BYTES = 1024**2
+
+
+@contextmanager
+def _export_connection(store: Store, database: Path, temporary: Path) -> Any:
+    relative_temporary = temporary.relative_to(store.root).as_posix()
+    usage = store.usage()
+    spill_budget = min(
+        store.limits.max_temp_bytes - usage["temporary_bytes"],
+        store.limits.max_root_bytes - usage["retained_bytes"],
+    )
+    if spill_budget < 1:
+        raise BudgetExceeded("no bounded temporary storage is available for publication export")
+    store.reserve_storage(spill_budget)
+
+    spill_directory = temporary / "duckdb-spill"
+    connection = None
+    try:
+        spill_directory.mkdir()
+        store.check_deadline()
+        connection = duckdb.connect(
+            ":memory:",
+            config={
+                # DuckDB 2.x inference otherwise changes the public Parquet nullability schema.
+                "disabled_optimizers": "statistics_propagation",
+                "memory_limit": DBT_MEMORY_LIMIT,
+                "threads": str(DBT_THREADS),
+                "temp_directory": str(spill_directory),
+                "max_temp_directory_size": f"{spill_budget}B",
+            },
+        )
+        database_literal = str(database).replace("'", "''")
+        try:
+            with interrupt_at_deadline(store, connection.interrupt):
+                connection.execute(f"ATTACH '{database_literal}' AS source (READ_ONLY)")
+                connection.execute("USE source")
+                store.check_deadline()
+                yield connection
+        except duckdb.InterruptException as exc:
+            raise BudgetExceeded("operation deadline exhausted during publication export") from exc
+    finally:
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            try:
+                if spill_directory.exists():
+                    shutil.rmtree(spill_directory)
+            finally:
+                try:
+                    store.sync(relative_temporary)
+                finally:
+                    store.release_storage(spill_budget)
 
 
 def inventory(directory: Path, names: set[str], limit: int) -> dict[str, dict[str, Any]]:
@@ -375,27 +434,20 @@ def _publish(
     temporary.mkdir()
     fsync_directory(temporary.parent)
     try:
-        with (
-            duckdb.connect(str(warehouse), read_only=True) as connection,
-            interrupt_at_deadline(store, connection.interrupt),
-            metrics.phase("export"),
-        ):
+        with _export_connection(store, warehouse, temporary) as connection, metrics.phase("export"):
             for name, table in RELATIONS.items():
                 store.check_deadline()
                 destination = temporary / (name + ".parquet")
                 # DuckDB's path parameter keeps the operator path out of SQL syntax.
-                try:
-                    keys = ORDER_KEYS[name]
-                    if connection.execute(
-                        f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
-                    ).fetchone():
-                        raise CatalogueError(f"non-unique publication ordering key: {name}")
-                    connection.execute(
-                        f"copy (select * from main.{table} order by {keys}) to ? (format parquet)",
-                        [str(destination)],
-                    )
-                except duckdb.InterruptException as exc:
-                    raise BudgetExceeded("operation deadline exhausted") from exc
+                keys = ORDER_KEYS[name]
+                if connection.execute(
+                    f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
+                ).fetchone():
+                    raise CatalogueError(f"non-unique publication ordering key: {name}")
+                connection.execute(
+                    f"copy (select * from main.{table} order by {keys}) to ? (format parquet)",
+                    [str(destination)],
+                )
         coverage_row = {
             "capture_id": state["capture_id"],
             "coverage_scope": "series" if store.scope is not None else "catalogue",

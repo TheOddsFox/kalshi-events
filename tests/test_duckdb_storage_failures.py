@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -78,6 +79,22 @@ def _assert_catalogue(path: Path) -> None:
         assert connection.execute("select * from ledger.active_records").fetchall() == [
             (1, Decimal("123456789012345678.123456789"), "Unicode 🌉")
         ]
+
+
+def _interrupt_deadline_at(monkeypatch, target_call: int) -> list[int]:
+    original = warehouse.interrupt_at_deadline
+    calls = [0]
+
+    @contextmanager
+    def interrupted(store, callback):
+        calls[0] += 1
+        with original(store, callback):
+            yield
+        if calls[0] == target_call:
+            raise duckdb.InterruptException("injected DuckDB interrupt")
+
+    monkeypatch.setattr(warehouse, "interrupt_at_deadline", interrupted)
+    return calls
 
 
 def test_native_storage_copy_keeps_certified_bytes_and_catalogue(tmp_path):
@@ -259,6 +276,37 @@ def test_copy_obeys_an_expired_operation_deadline(tmp_path):
     with pytest.raises(BudgetExceeded, match="deadline"):
         _copy(store, relative, source)
 
+    assert store._storage_reservations == 0
+
+
+def test_copy_maps_source_storage_probe_interrupt_to_budget_exceeded(tmp_path, monkeypatch):
+    store, relative, source = _source_store(tmp_path)
+    source_bytes = source.read_bytes()
+    calls = _interrupt_deadline_at(monkeypatch, target_call=1)
+
+    with pytest.raises(BudgetExceeded, match="source storage probe"):
+        _copy(store, relative, source)
+
+    assert calls == [1]
+    assert source.read_bytes() == source_bytes
+    assert not store.path("tmp/storage-copy/warehouse.duckdb").exists()
+    assert store._storage_reservations == 0
+
+
+def test_copy_maps_destination_storage_probe_interrupt_and_cleans_staging(tmp_path, monkeypatch):
+    store, relative, source = _source_store(tmp_path, compatibility_version="v1.0.0")
+    source_bytes = source.read_bytes()
+    calls = _interrupt_deadline_at(monkeypatch, target_call=3)
+
+    with pytest.raises(BudgetExceeded, match="destination storage verification"):
+        _copy(store, relative, source)
+
+    destination = store.path("tmp/storage-copy/warehouse.duckdb")
+    assert calls == [3]
+    assert source.read_bytes() == source_bytes
+    assert not destination.exists()
+    assert not destination.with_name(destination.name + ".wal").exists()
+    assert not list(store.path("tmp").glob("database-copy-*"))
     assert store._storage_reservations == 0
 
 

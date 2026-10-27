@@ -910,6 +910,8 @@ def _copy_closed_database_impl(
                 "select tags['storage_version'] from duckdb_databases() where database_name = ?",
                 [source_alias],
             ).fetchone()[0]
+    except duckdb.InterruptException as exc:
+        raise BudgetExceeded("operation deadline exhausted during source storage probe") from exc
     finally:
         probe.close()
     store.check_deadline()
@@ -1091,6 +1093,10 @@ def _copy_closed_database_impl(
                         "where database_name = ?",
                         [destination_alias],
                     ).fetchone()[0]
+            except duckdb.InterruptException as exc:
+                raise BudgetExceeded(
+                    "operation deadline exhausted during destination storage verification"
+                ) from exc
             finally:
                 verify.close()
             store.check_deadline()

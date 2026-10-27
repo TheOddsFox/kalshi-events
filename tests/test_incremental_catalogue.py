@@ -1228,6 +1228,7 @@ def test_corrupt_present_v2_pointer_never_falls_back_to_a_valid_v1_baseline(base
 
 def test_eight_deltas_are_allowed_and_ninth_requires_a_new_full_rebase(baseline):
     store, base_id, _, _ = baseline
+    legacy_pointer = store.path("current.json").read_bytes()
     for number in range(1, 9):
         timestamp = (datetime.fromisoformat(BASE_TIME) + timedelta(days=number)).isoformat()
         delta = build_delta(store, Snapshot(), timestamp)
@@ -1242,9 +1243,21 @@ def test_eight_deltas_are_allowed_and_ninth_requires_a_new_full_rebase(baseline)
     assert snapshot.requests == []
 
     full = capture_at(store, Snapshot(), "2026-01-10T12:00:00+00:00")
-    warehouse.build(store, full["capture_id"])
+    assert not store.path(f"builds/{full['capture_id']}").exists()
+    assert store.path("current-v2.json").read_bytes() == pointer
     publishing.publish(store, full["capture_id"], catalogue_version=2)
-    assert capture_at(store, Snapshot(), "2026-01-11T12:00:00+00:00", incremental=True)["complete"]
+    assert not store.path(f"builds/{full['capture_id']}").exists()
+    assert store.path("current.json").read_bytes() == legacy_pointer
+    assert store.path("current-v2.json").read_bytes() != pointer
+    published = publishing.current(store, catalogue_version=2)
+    assert published["capture_id"] == full["capture_id"]
+    assert published["delta_depth"] == 0
+    assert published["baseline_release_id"] is None
+    assert store.path(f"builds-v2/{full['capture_id']}/warehouse.duckdb").is_file()
+
+    next_delta = capture_at(store, Snapshot(), "2026-01-11T12:00:00+00:00", incremental=True)
+    assert next_delta["complete"]
+    assert next_delta["incremental"] is True
 
 
 def test_discard_accepts_only_unreferenced_incomplete_captures(baseline, capsys):
