@@ -9,13 +9,13 @@ from contextlib import suppress
 
 import httpx
 import pytest
-from conftest import EVENTS, HISTORICAL, MARKET, FakeClient
+from conftest import COMBO, EVENTS, HISTORICAL, MARKET, FakeClient
 
 from kalshi_events import capture as acquisition
 from kalshi_events import cli, warehouse
 from kalshi_events.cli import main
 from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store, json_bytes
-from kalshi_events.normalize import project_pages
+from kalshi_events.normalize import observation, project_pages
 from kalshi_events.transport import PublicClient
 
 
@@ -504,32 +504,88 @@ def test_raw_body_without_usable_receipt_is_retried_after_process_death(store, m
     assert_chain_and_anchor(store, identity)
 
 
-def test_usable_receipt_orphan_is_recovered_without_reissuing_its_request(store):
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_usable_receipt_orphan_is_recovered_without_reissuing_its_request(store, uppercase):
     issued = []
     interrupted = False
     guard = threading.Lock()
 
     class OrphanedClient(FakeClient):
+        def response(self, endpoint, params):
+            status, payload = super().response(endpoint, params)
+            if uppercase and endpoint == "/markets":
+                payload = copy.deepcopy(payload)
+                combo = next(row for row in payload["markets"] if row["ticker"] == COMBO["ticker"])
+                leg = combo["mve_selected_legs"][0]
+                combo["mve_selected_legs"] = [
+                    {**leg, "side": "YES"},
+                    {**leg, "side": "NO"},
+                ]
+            return status, payload
+
         def get(self, endpoint, params=None, context=None):
             nonlocal interrupted
             with guard:
-                issued.append((context or {}).get("request_id"))
+                request_id = (context or {}).get("request_id")
+                issued.append(request_id)
             relative = super().get(endpoint, params, context)
-            with guard:
-                crash = not interrupted
-                interrupted = True
-            if crash:
-                raise PowerLoss("usable receipt committed before traversal attachment")
+            if not uppercase or endpoint == "/markets":
+                with guard:
+                    crash = not interrupted
+                    interrupted = True
+                if crash:
+                    raise PowerLoss("usable receipt committed before traversal attachment")
             return relative
 
     with pytest.raises(PowerLoss):
         acquisition.capture(store, client_factory=OrphanedClient)
     identity = capture_id(store)
+    if uppercase:
+        state = acquisition.read_capture(store, identity)
+        orphan = next(
+            path
+            for path in store.path("raw").glob("*/manifest.json")
+            if json.loads(path.read_text())["endpoint"] == "/markets"
+        )
+        orphan_manifest = json.loads(orphan.read_text())
+        orphan_relative = orphan.relative_to(store.root).as_posix()
+        assert orphan_relative not in {
+            row["relative"] for row in acquisition.page_receipts(store, state)
+        }
     resumed = acquisition.capture(store, resume=identity, client_factory=OrphanedClient)
     assert resumed["complete"]
-    assert len(issued) == len(set(issued)) == 9
     assert len(acquisition.page_receipts(store, resumed)) == 9
+    if uppercase:
+        assert issued.count(orphan_manifest["request_id"]) == 1
+        assert orphan_relative in {
+            row["relative"] for row in acquisition.page_receipts(store, resumed)
+        }
+        projected = project_pages(acquisition.capture_pages(store, resumed))
+        legs = [
+            row for row in projected["combo_legs"] if row["combo_market_ticker"] == COMBO["ticker"]
+        ]
+        assert [row["side"] for row in legs] == ["YES", "NO"]
+    else:
+        assert len(issued) == len(set(issued)) == 9
     assert_chain_and_anchor(store, identity)
+
+
+def test_combo_side_case_does_not_change_native_observation_identity():
+    provenance = {"page_id": "a" * 32, "received_at": "2026-01-01T00:00:00Z"}
+    lower = observation("markets", COMBO, provenance, "/markets/0")
+    upper = observation(
+        "markets",
+        {
+            **COMBO,
+            "mve_selected_legs": [{**COMBO["mve_selected_legs"][0], "side": "YES"}],
+        },
+        provenance,
+        "/markets/0",
+    )
+
+    assert lower["observation_id"] == upper["observation_id"]
+    assert json.loads(lower["payload_json"])["mve_selected_legs"][0]["side"] == "yes"
+    assert json.loads(upper["payload_json"])["mve_selected_legs"][0]["side"] == "YES"
 
 
 def test_writer_resume_decodes_prefix_once_and_suffix_twice(store, monkeypatch):
@@ -597,7 +653,10 @@ def test_writer_resume_decodes_prefix_once_and_suffix_twice(store, monkeypatch):
     assert_chain_and_anchor(store, identity)
 
 
-@pytest.mark.parametrize("invalid", ["ticker", "combo_side"])
+@pytest.mark.parametrize(
+    "invalid",
+    ["ticker", "combo_side", "combo_side_case", "combo_side_nonstring", "combo_side_unhashable"],
+)
 def test_native_validation_failure_never_commits_or_applies_the_page(store, monkeypatch, invalid):
     native = (
         {**MARKET, "ticker": "../bad"}
@@ -605,7 +664,16 @@ def test_native_validation_failure_never_commits_or_applies_the_page(store, monk
         else {
             **MARKET,
             "mve_selected_legs": [
-                {"event_ticker": "EVENT", "market_ticker": "MARKET", "side": "maybe"}
+                {
+                    "event_ticker": "EVENT",
+                    "market_ticker": "MARKET",
+                    "side": {
+                        "combo_side": "maybe",
+                        "combo_side_case": "Yes",
+                        "combo_side_nonstring": 1,
+                        "combo_side_unhashable": [],
+                    }[invalid],
+                }
             ],
         }
     )
@@ -618,7 +686,10 @@ def test_native_validation_failure_never_commits_or_applies_the_page(store, monk
 
     with monkeypatch.context() as count_reads:
         count_reads.setattr(acquisition, "read_page", counted_read)
-        with pytest.raises(CatalogueError):
+        with pytest.raises(
+            CatalogueError,
+            match="malformed native combo side" if invalid != "ticker" else "invalid native ticker",
+        ):
             acquisition.capture(
                 store,
                 client_factory=lambda s, b, **_options: FakeClient(

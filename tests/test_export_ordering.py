@@ -28,6 +28,8 @@ def catalogue(tmp_path_factory):
         "mve_selected_legs": [
             COMBO["mve_selected_legs"][0],
             {**COMBO["mve_selected_legs"][0], "side": "no"},
+            {**COMBO["mve_selected_legs"][0], "side": "YES"},
+            {**COMBO["mve_selected_legs"][0], "side": "NO"},
         ],
     }
     responses = {
@@ -55,11 +57,11 @@ def catalogue(tmp_path_factory):
     warehouse.build(store, state["capture_id"])
     release = publish.publish(store, state["capture_id"])
     database = store.path(f"builds/{state['capture_id']}/warehouse.duckdb")
-    return store, state, release, database, market
+    return store, state, release, database, market, combo
 
 
 def test_every_narrow_ordered_export_matches_legacy_bytes_and_schema(catalogue, tmp_path):
-    _, _, release, database, native_market = catalogue
+    _, _, release, database, native_market, native_combo = catalogue
     with duckdb.connect(str(database), read_only=True) as connection:
         for name, relation in warehouse.RELATIONS.items():
             legacy = tmp_path / f"{name}.parquet"
@@ -77,14 +79,22 @@ def test_every_narrow_ordered_export_matches_legacy_bytes_and_schema(catalogue, 
     assert market["volume_fp"] == Decimal("12.3456789")
     assert market["open_interest_fp"] == Decimal("2.125")
     assert json.loads(market["payload_json"]) == native_market
+    combo_market = next(row for row in markets if row["market_ticker"] == "COMBO-MARKET")
+    assert json.loads(combo_market["payload_json"]) == native_combo
     legs = pq.read_table(Path(release["output"]) / "combo_legs.parquet").to_pylist()
-    assert [row["leg_index"] for row in legs] == [0, 1]
-    assert [row["side"] for row in legs] == ["yes", "no"]
+    assert [row["leg_index"] for row in legs] == [0, 1, 2, 3]
+    assert [row["side"] for row in legs] == ["yes", "no", "YES", "NO"]
+    assert [json.loads(row["payload_json"])["side"] for row in legs] == [
+        "yes",
+        "no",
+        "YES",
+        "NO",
+    ]
     assert all(row["yes_settlement_value_dollars"] == Decimal("0.00001") for row in legs)
 
 
 def test_repeated_publication_preserves_every_file_and_release_identity(catalogue):
-    store, state, release, _, _ = catalogue
+    store, state, release, _, _, _ = catalogue
     repeated = publish.publish(store, state["capture_id"])
     assert repeated["source_release_id"] == release["source_release_id"]
     assert repeated["files"] == release["files"]
@@ -99,7 +109,7 @@ def test_repeated_publication_preserves_every_file_and_release_identity(catalogu
     ],
 )
 def test_dbt_rejects_duplicate_composite_export_keys(catalogue, relation, predicate):
-    store, _, _, source, _ = catalogue
+    store, _, _, source, _, _ = catalogue
     original_digest = hashlib.sha256(source.read_bytes()).hexdigest()
     relative = (
         f"tmp/duplicate-{relation}-{'null' if predicate.endswith('is null') else 'normal'}.duckdb"
@@ -142,7 +152,7 @@ def test_dbt_rejects_duplicate_composite_export_keys(catalogue, relation, predic
 def test_publication_rejects_legacy_duplicate_keys_before_pointer_change(
     catalogue, tmp_path, monkeypatch, relation, replacement
 ):
-    source_store, state, _, _, _ = catalogue
+    source_store, state, _, _, _, _ = catalogue
     certified = warehouse.certified(source_store, state["capture_id"])
     root = tmp_path / "legacy-producer-root"
     shutil.copytree(source_store.root, root)

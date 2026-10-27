@@ -31,4 +31,4 @@ models:
         data_tests:
           - accepted_values:
               arguments:
-                values: ['yes', 'no']
+                values: ['yes', 'no', 'YES', 'NO']

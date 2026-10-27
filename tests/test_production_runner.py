@@ -226,6 +226,7 @@ def test_recovery_keeps_fully_finalized_receipts_exact(production):
     "reason",
     [
         "refresh failed with unknown child accounting",
+        "resumed child did not report exact invocation accounting",
         "process-group RSS exceeded 24 GiB for 60 seconds",
         "system compressed memory reached the conservative stop threshold",
         "SSD free space fell below 150 GiB",
@@ -281,6 +282,54 @@ def test_explicit_accounting_recovery_rejects_unknown_or_ineligible_stops(produc
     report.update(change)
     assert not production._is_recoverable_accounting_stop(report, "a" * 32, True)
     assert not production._is_recoverable_accounting_stop(report, "a" * 32, False)
+
+
+def test_missing_delta_stop_requires_explicit_reconciliation(production):
+    report = {
+        "capture_id": "a" * 32,
+        "accounting_complete": False,
+        "phase": "stopped",
+        "production_state": "not_attempted",
+        "error": "resumed child did not report exact invocation accounting",
+    }
+    assert production._is_recoverable_accounting_stop(report, "a" * 32, True)
+    assert not production._is_recoverable_accounting_stop(report, "a" * 32, False)
+
+
+def test_effective_session_deadline_clamps_wall_and_monotonic_stages(production, monkeypatch):
+    monkeypatch.setattr(production.time, "monotonic", lambda: 301)
+    monkeypatch.setattr(production.time, "time", lambda: 10003)
+    report = {
+        "started_monotonic": 100,
+        "started_epoch": 1000,
+        "time_budget_started_monotonic": 300,
+        "time_budget_started_epoch": 10000,
+        "deadline_monotonic": 350,
+        "deadline_epoch": 10090,
+    }
+    assert production._monitor_deadline(report, workflow=False) == 350
+    assert production._child_wall_deadline_epoch(report, 500) == 10090
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {"started_monotonic": 100, "started_epoch": 100, "time_budget_started_epoch": "bad"},
+        {
+            "started_monotonic": 100,
+            "started_epoch": 100,
+            "time_budget_started_epoch": float("inf"),
+        },
+        {
+            "started_monotonic": 100,
+            "started_epoch": 100,
+            "deadline_epoch": float("nan"),
+        },
+    ],
+)
+def test_invalid_effective_time_fields_fail_closed(production, report):
+    with pytest.raises(production.RunnerError, match="time budget"):
+        production._monitor_deadline(report, workflow=True)
 
 
 def test_vm_stat_compressed_logical_pages_are_parsed_and_bounded(production, monkeypatch):

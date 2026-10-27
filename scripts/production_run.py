@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -64,6 +65,7 @@ DEADLINE_STOP_REASONS = frozenset(
 RECOVERABLE_ACCOUNTING_STOP_REASONS = frozenset(
     {
         "refresh failed with unknown child accounting",
+        "resumed child did not report exact invocation accounting",
         "process-group RSS exceeded 24 GiB for 60 seconds",
         "system compressed memory reached the conservative stop threshold",
         "SSD free space fell below 150 GiB",
@@ -159,6 +161,38 @@ def remaining_allowances(
         "compression": str(RUN_LIMITS["compression"]),
         "rate-policy": str(RUN_LIMITS["rate_policy"]),
     }
+
+
+def _time_budget_started(report: dict[str, Any], clock: str) -> float:
+    key = f"time_budget_started_{clock}"
+    value = report.get(key, report.get(f"started_{clock}"))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RunnerError("session time budget start is invalid")
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise RunnerError("session time budget start is invalid") from exc
+    if not math.isfinite(value):
+        raise RunnerError("session time budget start is invalid")
+    return value
+
+
+def _time_budget_deadline(report: dict[str, Any], clock: str) -> float:
+    start = _time_budget_started(report, clock)
+    key = f"deadline_{clock}"
+    value = report.get(key, start + float(RUN_LIMITS["session_seconds"]))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RunnerError("session time budget deadline is invalid")
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise RunnerError("session time budget deadline is invalid") from exc
+    if not math.isfinite(value):
+        raise RunnerError("session time budget deadline is invalid")
+    derived = start + float(RUN_LIMITS["session_seconds"])
+    if not math.isfinite(derived):
+        raise RunnerError("session time budget deadline is invalid")
+    return min(value, derived)
 
 
 def rss_limit_exceeded(
@@ -1164,30 +1198,41 @@ def _monitor_deadline(report: dict[str, Any], *, workflow: bool) -> float:
     ceiling = float(
         RUN_LIMITS["workflow_seconds"] if workflow else RUN_LIMITS["active_cutoff_seconds"]
     )
-    monotonic_deadline = float(report["started_monotonic"]) + ceiling
-    wall_remaining = float(report["started_epoch"]) + ceiling - time.time()
+    monotonic_deadline = min(
+        _time_budget_started(report, "monotonic") + ceiling,
+        _time_budget_deadline(report, "monotonic"),
+    )
+    wall_deadline = min(
+        _time_budget_started(report, "epoch") + ceiling,
+        _time_budget_deadline(report, "epoch"),
+    )
+    wall_remaining = wall_deadline - time.time()
     return min(monotonic_deadline, time.monotonic() + max(0.0, wall_remaining))
 
 
 def _child_wall_deadline_epoch(
     report: dict[str, Any], monotonic_deadline: float, *, workflow_deadline: bool = False
 ) -> float | None:
-    """Seal a child wall deadline from the original session and active-stage caps."""
-    started = report.get("started_epoch")
-    if isinstance(started, bool) or not isinstance(started, (int, float)):
-        return None
+    """Seal a child wall deadline from the effective session and active-stage caps."""
+    if "time_budget_started_epoch" in report:
+        started = _time_budget_started(report, "epoch")
+    else:
+        value = report.get("started_epoch")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value):
+            raise RunnerError("session time budget start is invalid")
+        started = float(value)
     stage_seconds = float(
         RUN_LIMITS["workflow_seconds"] if workflow_deadline else RUN_LIMITS["active_cutoff_seconds"]
     )
     wall_now = time.time()
     deadlines = [
-        float(started) + stage_seconds,
-        float(started) + float(RUN_LIMITS["active_cutoff_seconds"]),
+        started + stage_seconds,
+        started + float(RUN_LIMITS["active_cutoff_seconds"]),
         wall_now + max(0.0, monotonic_deadline - time.monotonic()),
     ]
-    session_deadline = report.get("deadline_epoch")
-    if isinstance(session_deadline, (int, float)) and not isinstance(session_deadline, bool):
-        deadlines.append(float(session_deadline))
+    deadlines.append(_time_budget_deadline(report, "epoch"))
     return min(deadlines)
 
 
@@ -1268,12 +1313,15 @@ def run_production(
     capture_id: str | None = None,
     activate_only: bool = False,
     reconcile_accounting: bool = False,
+    extend_session: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded full refresh/resume or verify-and-activate current v2."""
     preflight_started = time.monotonic()
     mode = validate_mode(full, capture_id, activate_only)
     if reconcile_accounting and mode != "resume":
         raise RunnerError("accounting reconciliation requires --capture-id resume")
+    if extend_session and (mode != "resume" or not reconcile_accounting):
+        raise RunnerError("session extension requires --capture-id and --reconcile-accounting")
     directory = prepare_directory(directory, mode)
     operator = directory / "operator"
     if mode == "full":
@@ -1284,7 +1332,10 @@ def run_production(
     with lock_context:
         if mode == "resume":
             report_path, report, paths = _load_resume(
-                directory, str(capture_id), reconcile_accounting=reconcile_accounting
+                directory,
+                str(capture_id),
+                reconcile_accounting=reconcile_accounting,
+                extend_session=extend_session,
             )
             if reconcile_accounting:
                 report.setdefault("original_revision", report.get("revision"))
@@ -1391,8 +1442,8 @@ def run_production(
                         }
                         remaining_allowances(
                             prior,
-                            started_at=float(report["started_monotonic"]),
-                            started_epoch=float(report["started_epoch"]),
+                            started_at=_time_budget_started(report, "monotonic"),
+                            started_epoch=_time_budget_started(report, "epoch"),
                             wall_now=time.time(),
                             external_reserved_bytes=_external_bytes(directory),
                         )
@@ -1422,9 +1473,9 @@ def run_production(
                     )
                 allowances = remaining_allowances(
                     prior,
-                    started_at=float(report["started_monotonic"]),
+                    started_at=_time_budget_started(report, "monotonic"),
                     external_reserved_bytes=_external_bytes(directory),
-                    started_epoch=float(report["started_epoch"]),
+                    started_epoch=_time_budget_started(report, "epoch"),
                     wall_now=time.time(),
                 )
                 duration = min(
@@ -1517,10 +1568,23 @@ def run_production(
                 ):
                     raise RunnerError("durable receipt accounting decreased during the invocation")
                 if reconcile_accounting:
+                    if snapshot.get("root_id") != report.get("root_id"):
+                        raise RunnerError("operator root identity changed since this session began")
                     if (
                         cli_result.get("requests") is None
                         or cli_result.get("downloaded_bytes") is None
                     ):
+                        durable = _reconciliation_accounting(snapshot, str(capture_id))
+                        report["requests"] = durable["attempts"]
+                        report["downloaded_bytes"] = durable.get("downloaded_bytes")
+                        report["downloaded_bytes_upper_bound"] = durable.get(
+                            "downloaded_bytes_upper_bound"
+                        )
+                        report["accounting_complete"] = durable["accounting_complete"]
+                        report["accounting_basis"] = durable["accounting_basis"]
+                        report["accounting_bound_verified"] = durable["accounting_bound_verified"]
+                        report["unfinished_reservation_ids"] = durable["unfinished_reservation_ids"]
+                        report["consumption_state"] = durable["accounting_basis"]
                         raise RunnerError(
                             "resumed child did not report exact invocation accounting"
                         )
@@ -1728,7 +1792,7 @@ def run_production(
             return result, (
                 3
                 if isinstance(exc, (BudgetStop, RunnerInterrupted))
-                or time.time() >= float(report["deadline_epoch"])
+                or time.time() >= _time_budget_deadline(report, "epoch")
                 else 1
             )
         finally:
@@ -1763,9 +1827,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="resume only after charging unfinished requests at their full durable reservation",
     )
+    parser.add_argument(
+        "--extend-session",
+        action="store_true",
+        help="consume one new 48-hour window for an exact reconciled capture",
+    )
     args = parser.parse_args(argv)
     if args.reconcile_accounting and not args.capture_id:
         parser.error("--reconcile-accounting requires --capture-id")
+    if args.extend_session and (not args.capture_id or not args.reconcile_accounting):
+        parser.error("--extend-session requires --capture-id and --reconcile-accounting")
     try:
         with _graceful_stop_handlers():
             result, code = run_production(
@@ -1774,6 +1845,7 @@ def main(argv: list[str] | None = None) -> int:
                 capture_id=args.capture_id,
                 activate_only=args.activate_current,
                 reconcile_accounting=args.reconcile_accounting,
+                extend_session=args.extend_session,
             )
     except (BudgetStop, RunnerInterrupted) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
@@ -1809,6 +1881,8 @@ def _session_report(
         "deadline_epoch": now + float(RUN_LIMITS["session_seconds"]),
         "started_monotonic": mono,
         "deadline_monotonic": mono + float(RUN_LIMITS["session_seconds"]),
+        "time_budget_started_epoch": now,
+        "time_budget_started_monotonic": mono,
         "last_observed_at": _utc(),
         "boot_stamp": _boot_stamp(),
         "revision": _revision(),
@@ -1836,8 +1910,14 @@ def _session_report(
 
 
 def _load_resume(
-    directory: Path, capture_id: str, *, reconcile_accounting: bool = False
+    directory: Path,
+    capture_id: str,
+    *,
+    reconcile_accounting: bool = False,
+    extend_session: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Path]]:
+    if extend_session and not reconcile_accounting:
+        raise RunnerError("session extension requires --reconcile-accounting")
     matches = []
     run_root = directory / "runs"
     if run_root.is_dir():
@@ -1893,9 +1973,9 @@ def _load_resume(
     now = time.time()
     if now < float(report.get("last_observed_epoch", report["started_epoch"])):
         raise RunnerError("wall clock moved backward since the last durable session report")
-    if time.monotonic() >= float(report["deadline_monotonic"]):
+    if time.monotonic() >= _time_budget_deadline(report, "monotonic") and not extend_session:
         raise RunnerError("48-hour session expired; networking resume is prohibited")
-    if time.time() >= float(report["deadline_epoch"]):
+    if now >= _time_budget_deadline(report, "epoch") and not extend_session:
         raise RunnerError("48-hour wall-clock session expired; networking resume is prohibited")
     if report.get("boot_stamp") != _boot_stamp():
         raise RunnerError("Mac restarted; original bounded session cannot resume")
@@ -1911,6 +1991,38 @@ def _load_resume(
         "metrics": run_root / f"metrics-resume-{uuid.uuid4().hex}.json",
         "capture_notification": run_root / "capture-notification.json",
     }
+    if extend_session:
+        if report.get("phase") != "stopped":
+            raise RunnerError("session extension requires a stopped capture")
+        history = report.get("session_extension_history", [])
+        if not isinstance(history, list):
+            raise RunnerError("session extension history is invalid")
+        if history:
+            raise RunnerError("the one-time session extension has already been used")
+        old_deadline_epoch = _time_budget_deadline(report, "epoch")
+        old_deadline_monotonic = _time_budget_deadline(report, "monotonic")
+        now = time.time()
+        mono = time.monotonic()
+        deadline_epoch = now + float(RUN_LIMITS["session_seconds"])
+        deadline_monotonic = mono + float(RUN_LIMITS["session_seconds"])
+        granting_revision = _revision()
+        report["time_budget_started_epoch"] = now
+        report["time_budget_started_monotonic"] = mono
+        report["deadline_epoch"] = deadline_epoch
+        report["deadline_monotonic"] = deadline_monotonic
+        report["session_extension_history"] = [
+            {
+                "action": "--extend-session",
+                "capture_id": capture_id,
+                "granted_at": _utc(),
+                "source_revision": granting_revision,
+                "prior_deadline_epoch": old_deadline_epoch,
+                "prior_deadline_monotonic": old_deadline_monotonic,
+                "deadline_epoch": deadline_epoch,
+                "deadline_monotonic": deadline_monotonic,
+            }
+        ]
+        _atomic_report(report_path, report)
     return report_path, report, paths
 
 

@@ -86,7 +86,8 @@ def native_identity(kind: str, native: dict[str, Any]) -> tuple[str, Any]:
         for leg in legs:
             ticker(leg.get("event_ticker"))
             ticker(leg.get("market_ticker"))
-            if leg.get("side") not in {"yes", "no"}:
+            side = leg.get("side")
+            if not isinstance(side, str) or side not in ("yes", "no", "YES", "NO"):
                 raise CatalogueError("malformed native combo side")
     return identity, parent
 
