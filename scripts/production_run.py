@@ -29,6 +29,15 @@ GIB = 1024**3
 MIB = 1024**2
 HTTPX_MAX_RAW_CHUNK_BYTES = 64 * 1024
 RECONCILIATION_UV_LOCK_SHA256 = "9a802ab62302a6ec0d8db5a3c602552892c9370c33c4edc098a0501a192d1d17"
+SUPPORTED_RUNTIME_VERSIONS = {
+    "duckdb": "2.0.0",
+    "dlt": "1.31.0",
+    "dbt-core": "1.12.5",
+    "dbt-duckdb": "1.11.1",
+    "pyarrow": "26.0.0",
+    "httpx": "0.28.1",
+    "httpcore": "1.0.9",
+}
 RUN_LIMITS: dict[str, int | float | str] = {
     "session_seconds": 48 * 3600,
     "workflow_seconds": 46 * 3600,
@@ -405,6 +414,7 @@ def _package_versions() -> dict[str, str | None]:
         "duckdb",
         "dlt",
         "dbt-core",
+        "dbt-duckdb",
         "pyarrow",
         "httpx",
         "httpcore",
@@ -414,6 +424,16 @@ def _package_versions() -> dict[str, str | None]:
         except PackageNotFoundError:
             result[package] = None
     return result
+
+
+def _validate_runtime_versions(versions: dict[str, str | None]) -> None:
+    unsupported = [
+        f"{package}={versions.get(package)!r} (requires {expected})"
+        for package, expected in SUPPORTED_RUNTIME_VERSIONS.items()
+        if versions.get(package) != expected
+    ]
+    if unsupported:
+        raise RunnerError("unsupported installed package stack: " + ", ".join(unsupported))
 
 
 def _system_info(directory: Path) -> dict[str, Any]:
@@ -1351,6 +1371,7 @@ def run_production(
     """Run one bounded full refresh/resume or verify-and-activate current v2."""
     preflight_started = time.monotonic()
     mode = validate_mode(full, capture_id, activate_only)
+    _validate_runtime_versions(_package_versions())
     if reconcile_accounting and mode != "resume":
         raise RunnerError("accounting reconciliation requires --capture-id resume")
     if extend_session and (mode != "resume" or not reconcile_accounting):

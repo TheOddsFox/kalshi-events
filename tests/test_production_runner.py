@@ -1420,6 +1420,7 @@ def test_environment_report_uses_the_installed_distribution_name(production, mon
     versions = production._package_versions()
     assert versions["oddsfox-kalshi-events"] == "test-version"
     assert versions["httpcore"] == "test-version"
+    assert versions["dbt-duckdb"] == "test-version"
     assert "kalshi-events" not in requested
 
 

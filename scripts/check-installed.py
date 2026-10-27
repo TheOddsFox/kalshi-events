@@ -81,6 +81,29 @@ def main():
             env=environment,
             check=True,
         )
+        runtime_packages = (
+            "duckdb",
+            "dlt",
+            "dbt-duckdb",
+            "dbt-core",
+            "pyarrow",
+            "httpx",
+            "httpcore",
+        )
+        runtime_check = """import importlib.metadata, sys, tomllib
+from pathlib import Path
+lock = tomllib.loads(Path(sys.argv[1]).read_text())
+names = sys.argv[2:]
+expected = {p["name"]: p["version"] for p in lock["package"] if p["name"] in names}
+actual = {name: importlib.metadata.version(name) for name in names}
+assert expected == actual, (expected, actual)
+"""
+        subprocess.run(
+            [str(python), "-c", runtime_check, str(repository / "uv.lock"), *runtime_packages],
+            cwd=directory,
+            env=environment,
+            check=True,
+        )
         subprocess.run(
             [str(venv_executable(venv, "kalshi-events")), "dbt", "--", "parse"],
             cwd=directory,
