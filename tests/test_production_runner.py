@@ -227,6 +227,8 @@ def test_recovery_keeps_fully_finalized_receipts_exact(production):
     [
         "refresh failed with unknown child accounting",
         "resumed child did not report exact invocation accounting",
+        "resource accounting failed: Command '['ps', '-axo', 'pgid=,rss=']' timed out after 5.0 seconds",
+        "resource accounting failed: process-group RSS sampling timed out",
         "process-group RSS exceeded 24 GiB for 60 seconds",
         "system compressed memory reached the conservative stop threshold",
         "SSD free space fell below 150 GiB",
@@ -264,6 +266,10 @@ def test_explicit_accounting_recovery_accepts_only_known_resource_stops(producti
     [
         {"error": "filesystem mount changed during the run"},
         {"error": "resource accounting failed: malformed vm_stat"},
+        {"error": "resource accounting failed: process-group RSS sampling timed out after retry"},
+        {
+            "error": "resource accounting failed: Command '['ps', '-axo', 'pgid=,rss=']' timed out after 5.1 seconds"
+        },
         {"error": "session or workflow deadline reached termination reserve"},
         {"phase": "complete"},
         {"accounting_complete": True},
@@ -341,6 +347,229 @@ def test_vm_stat_compressed_logical_pages_are_parsed_and_bounded(production, mon
     )
     monkeypatch.setattr(production.subprocess, "run", lambda *a, **k: result)
     assert production._system_compressed_bytes() == 16 * 1024**3
+
+
+def test_process_group_rss_retries_one_timeout_within_the_same_budget(production, monkeypatch):
+    clock = [100.0]
+    timeouts = []
+
+    def run(command, *, timeout, **_kwargs):
+        assert command == ["ps", "-g", "123", "-o", "pgid=,rss="]
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired(command, timeout)
+        return SimpleNamespace(stdout="123 2\n123 3\n")
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(production.subprocess, "run", run)
+
+    assert production._process_group_rss(123) == 5 * 1024
+    assert timeouts == [2.5, 2.5]
+
+
+def test_process_group_rss_retry_gets_only_the_fresh_budget_remainder(production, monkeypatch):
+    clock = [100.0]
+    timeouts = []
+
+    def run(command, *, timeout, **_kwargs):
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            clock[0] += 1.25
+            raise subprocess.TimeoutExpired(command, timeout)
+        return SimpleNamespace(stdout="123 2\n")
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(production.subprocess, "run", run)
+
+    assert production._process_group_rss(123, timeout=4.0) == 2 * 1024
+    assert timeouts == [2.0, 2.75]
+
+
+def test_process_group_rss_repeated_timeout_fails_with_a_stable_reason(production, monkeypatch):
+    clock = [100.0]
+    timeouts = []
+
+    def run(command, *, timeout, **_kwargs):
+        timeouts.append(timeout)
+        clock[0] += timeout
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(production.subprocess, "run", run)
+
+    with pytest.raises(production.RunnerError, match="process-group RSS sampling timed out"):
+        production._process_group_rss(123)
+    assert timeouts == [2.5, 2.5]
+
+
+def test_process_group_rss_does_not_retry_after_the_total_budget_is_spent(production, monkeypatch):
+    clock = [100.0]
+    timeouts = []
+
+    def run(command, *, timeout, **_kwargs):
+        timeouts.append(timeout)
+        clock[0] += 0.5
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(production.subprocess, "run", run)
+
+    with pytest.raises(production.RunnerError, match="process-group RSS sampling timed out"):
+        production._process_group_rss(123, timeout=0.25)
+    assert timeouts == [0.125]
+
+
+def test_monitor_stops_and_reaps_after_persistent_rss_sampling_timeouts(
+    production, tmp_path, monkeypatch
+):
+    clock = [100.0]
+    calls = []
+    terminated = []
+
+    class Child:
+        pid = 123
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, *, timeout):
+            return self.returncode
+
+    child = Child()
+
+    def run(command, *, timeout, **_kwargs):
+        calls.append(timeout)
+        clock[0] += timeout
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    def terminate(actual):
+        assert actual is child
+        child.returncode = -15
+        terminated.append(True)
+        return True
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(production.subprocess, "run", run)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    monkeypatch.setattr(production, "_terminate", terminate)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_args: None)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_args: None)
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+    report = {"resource_samples": [], "peak_child_process_group_rss_bytes": 0}
+
+    code, reason, reaped = production._monitor(
+        child,
+        tmp_path,
+        tmp_path / "operator",
+        report,
+        tmp_path / "session.json",
+        200,
+    )
+
+    assert code == -15
+    assert reason == "resource accounting failed: process-group RSS sampling timed out"
+    assert reaped is True
+    assert calls == [2.5, 2.5]
+    assert terminated == [True]
+    assert report["resource_samples"] == []
+
+
+@pytest.mark.parametrize("stdout", ["bad output\n", "123 10\n456 20\n", "123 10\nbroken\n"])
+def test_process_group_rss_rejects_malformed_or_unscoped_rows_without_retry(
+    production, monkeypatch, stdout
+):
+    calls = []
+
+    def run(*_args, **_kwargs):
+        calls.append(True)
+        return SimpleNamespace(stdout=stdout)
+
+    monkeypatch.setattr(production.subprocess, "run", run)
+    with pytest.raises(production.RunnerError):
+        production._process_group_rss(123)
+    assert calls == [True]
+
+
+def test_process_group_rss_does_not_retry_os_errors(production, monkeypatch):
+    calls = []
+
+    def run(*_args, **_kwargs):
+        calls.append(True)
+        raise OSError("ps unavailable")
+
+    monkeypatch.setattr(production.subprocess, "run", run)
+    with pytest.raises(OSError, match="ps unavailable"):
+        production._process_group_rss(123)
+    assert calls == [True]
+
+
+def test_process_group_rss_accepts_no_process_only_when_group_is_absent(production, monkeypatch):
+    monkeypatch.setattr(
+        production.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=""),
+    )
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    assert production._process_group_rss(123) == 0
+
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: True)
+    with pytest.raises(production.RunnerError, match="no processes for a live process group"):
+        production._process_group_rss(123)
+
+
+def test_process_group_rss_accepts_ps_exit_one_only_when_group_is_absent(production, monkeypatch):
+    def run(command, **_kwargs):
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(production.subprocess, "run", run)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    assert production._process_group_rss(123) == 0
+
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: True)
+    with pytest.raises(subprocess.CalledProcessError):
+        production._process_group_rss(123)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ps -g selects process-group leaders")
+def test_process_group_rss_includes_real_descendants_in_the_group(production, monkeypatch):
+    real_run = subprocess.run
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); print('ready', flush=True); time.sleep(60)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        observed_rows = []
+
+        def capture_rows(command, **kwargs):
+            result = real_run(command, **kwargs)
+            if command == ["ps", "-g", str(child.pid), "-o", "pgid=,rss="]:
+                observed_rows.extend(line.split() for line in result.stdout.splitlines())
+            return result
+
+        monkeypatch.setattr(production.subprocess, "run", capture_rows)
+        total = production._process_group_rss(child.pid)
+        rows = observed_rows
+        assert len(rows) >= 2
+        assert all(len(row) == 2 and int(row[0]) == child.pid for row in rows)
+        assert total == sum(int(row[1]) * 1024 for row in rows)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait(timeout=5)
+        if child.stdout is not None:
+            child.stdout.close()
 
 
 @pytest.mark.parametrize("clock_source", ["monotonic", "wall"])

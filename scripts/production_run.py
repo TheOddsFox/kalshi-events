@@ -66,6 +66,8 @@ RECOVERABLE_ACCOUNTING_STOP_REASONS = frozenset(
     {
         "refresh failed with unknown child accounting",
         "resumed child did not report exact invocation accounting",
+        "resource accounting failed: Command '['ps', '-axo', 'pgid=,rss=']' timed out after 5.0 seconds",
+        "resource accounting failed: process-group RSS sampling timed out",
         "process-group RSS exceeded 24 GiB for 60 seconds",
         "system compressed memory reached the conservative stop threshold",
         "SSD free space fell below 150 GiB",
@@ -442,19 +444,50 @@ def _boot_stamp() -> str:
 
 
 def _process_group_rss(group: int, timeout: float = 5.0) -> int:
-    result = subprocess.run(
-        ["ps", "-axo", "pgid=,rss="], check=True, capture_output=True, text=True, timeout=timeout
-    )
+    command = ["ps", "-g", str(group), "-o", "pgid=,rss="]
+    deadline = time.monotonic() + timeout
+    try:
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout / 2,
+            )
+        except subprocess.TimeoutExpired as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunnerError("process-group RSS sampling timed out") from exc
+            try:
+                result = subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=remaining,
+                )
+            except subprocess.TimeoutExpired as retry_exc:
+                raise RunnerError("process-group RSS sampling timed out") from retry_exc
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 1 and not _process_group_exists(group):
+            return 0
+        raise
+    if not isinstance(result.stdout, str):
+        raise RunnerError("malformed process-group RSS output")
+    lines = result.stdout.splitlines()
+    if not lines and not _process_group_exists(group):
+        return 0
     total = 0
-    for line in result.stdout.splitlines():
+    for line in lines:
         fields = line.split()
-        if (
-            len(fields) == 2
-            and fields[0].isdigit()
-            and int(fields[0]) == group
-            and fields[1].isdigit()
-        ):
-            total += int(fields[1]) * 1024
+        if len(fields) != 2 or any(not field.isascii() or not field.isdigit() for field in fields):
+            raise RunnerError("malformed process-group RSS output")
+        if int(fields[0]) != group:
+            raise RunnerError("ps returned a process outside the requested group")
+        total += int(fields[1]) * 1024
+    if not lines:
+        raise RunnerError("ps returned no processes for a live process group")
     return total
 
 
