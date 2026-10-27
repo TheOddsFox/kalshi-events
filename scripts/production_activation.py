@@ -28,8 +28,10 @@ def activate_current(
     from kalshi_events.common import (
         Limits,
         Store,
+        digest,
         file_digest,
         fsync_directory,
+        regular_bytes,
         safe_path,
     )
 
@@ -65,27 +67,44 @@ def activate_current(
             capture_id = current.get("capture_id")
             if expected_release_id is not None and release_id != expected_release_id:
                 raise RuntimeError("current v2 publication changed after standalone verification")
+            manifest_body = regular_bytes(Path(current["output"]) / "manifest.json", 1024**2)
+            manifest_sha256 = digest(manifest_body)
             if standalone_verified is None:
                 standalone_verified = publish.verify_release(
                     Path(current["output"]), limits.max_root_bytes
                 )
-            if standalone_verified.get("source_release_id") != release_id:
+            published_manifest = {key: value for key, value in current.items() if key != "output"}
+            if standalone_verified != published_manifest:
                 raise RuntimeError("standalone verification does not match the current publication")
             receipt = warehouse.certified(
                 store, capture_id, catalogue_version=2, _context=verification
             )
             checksum = receipt.get("warehouse_sha256")
-            if checksum != current.get("warehouse_sha256"):
-                raise RuntimeError("certified warehouse checksum differs from the release manifest")
+            manifest_checksum = current.get("warehouse_sha256")
+            if manifest_checksum == checksum:
+                verification_mode = "warehouse_hash"
+            else:
+                pin = {
+                    "catalogue_version": 2,
+                    "source_release_id": release_id,
+                    "manifest_sha256": manifest_sha256,
+                    "capture_id": capture_id,
+                    "root_id": current.get("root_id"),
+                    "delta_depth": current.get("delta_depth"),
+                    "series_scope": current.get("series_scope"),
+                }
+                verification_mode = "semantic"
+                with incremental._baseline_data(store, capture_id, 2, pin, _context=verification):
+                    pass
             state = capture.read_capture(store, capture_id)
             pruned = incremental.prune(store, state, release_id, 2, _context=verification)
             # Recheck the current release and certification after cleanup, before the
             # external production path can change.
-            current = publish.current(store, catalogue_version=2)
-            if (
-                current.get("source_release_id") != release_id
-                or current.get("capture_id") != capture_id
-            ):
+            rechecked = publish.current(store, catalogue_version=2)
+            rechecked_manifest_sha256 = digest(
+                regular_bytes(Path(rechecked["output"]) / "manifest.json", 1024**2)
+            )
+            if rechecked != current or rechecked_manifest_sha256 != manifest_sha256:
                 raise RuntimeError("current v2 publication changed during retention cleanup")
             receipt = warehouse.certified(
                 store, capture_id, catalogue_version=2, _context=verification
@@ -96,13 +115,18 @@ def activate_current(
             source_info = source.lstat()
             if not stat.S_ISREG(source_info.st_mode) or source.is_symlink():
                 raise RuntimeError("certified warehouse is not a regular file")
+            source_checksum, _ = file_digest(source, limits.max_database_bytes)
+            if source_checksum != checksum:
+                raise RuntimeError("certified warehouse changed before production linking")
+            if alias.is_symlink():
+                raise RuntimeError("production database path cannot be a symlink")
+            if alias.exists() and not stat.S_ISREG(alias.lstat().st_mode):
+                raise RuntimeError("existing production database is not a regular file")
             if (
                 source.with_name(source.name + ".wal").exists()
                 or alias.with_name(alias.name + ".wal").exists()
             ):
                 raise RuntimeError("an uncheckpointed production DuckDB WAL exists")
-            if alias.exists() and not stat.S_ISREG(alias.lstat().st_mode):
-                raise RuntimeError("existing production database is not a regular file")
             if source_info.st_dev != directory.stat().st_dev:
                 raise RuntimeError(
                     "production database and warehouse must be on the same filesystem"
@@ -156,6 +180,8 @@ def activate_current(
                 "source_release_id": release_id,
                 "capture_id": capture_id,
                 "warehouse_sha256": checksum,
+                "manifest_warehouse_sha256": manifest_checksum,
+                "verification_mode": verification_mode,
                 "database_bytes": alias_info.st_size,
                 "pruned_artifacts": pruned,
                 "production_readback": {"current_markets": market_count, "read_only": True},

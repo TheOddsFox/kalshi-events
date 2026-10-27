@@ -28,7 +28,26 @@ sys.path.insert(0, str(SOURCE_ROOT / "src"))
 GIB = 1024**3
 MIB = 1024**2
 HTTPX_MAX_RAW_CHUNK_BYTES = 64 * 1024
-RECONCILIATION_UV_LOCK_SHA256 = "9a802ab62302a6ec0d8db5a3c602552892c9370c33c4edc098a0501a192d1d17"
+LEGACY_RECONCILIATION_UV_LOCK_SHA256 = (
+    "9a802ab62302a6ec0d8db5a3c602552892c9370c33c4edc098a0501a192d1d17"
+)
+RECONCILIATION_UV_LOCK_SHA256 = "79ceef4ec550fcb4f83aa53d3eb140175df78374c21356243831c725ea65c421"
+# Binds the raw-response implementation used to establish the 64 KiB allowance.
+RECONCILIATION_TRANSPORT_SHA256 = "5c4727b4653c4d201302407b25fc0b914f54ad561961209d3f51524524e91849"
+LEGACY_RECONCILIATION_RUNTIME_VERSIONS = {
+    "duckdb": "1.5.6",
+    "dlt": "1.31.0",
+    "dbt-core": "1.12.5",
+    "dbt-duckdb": "1.11.0",
+    "pyarrow": "26.0.0",
+    "httpx": "0.28.1",
+    "httpcore": "1.0.9",
+}
+_RECONCILIATION_LOCK_TRANSITIONS = {
+    (LEGACY_RECONCILIATION_UV_LOCK_SHA256, RECONCILIATION_UV_LOCK_SHA256),
+    (RECONCILIATION_UV_LOCK_SHA256, RECONCILIATION_UV_LOCK_SHA256),
+}
+_LEGACY_MISSING_RUNTIME_VERSIONS = frozenset({"dbt-duckdb", "httpcore"})
 SUPPORTED_RUNTIME_VERSIONS = {
     "duckdb": "2.0.0",
     "dlt": "1.31.0",
@@ -436,6 +455,42 @@ def _validate_runtime_versions(versions: dict[str, str | None]) -> None:
         raise RunnerError("unsupported installed package stack: " + ", ".join(unsupported))
 
 
+def _validate_reconciliation_versions(versions: Any, lock_sha256: str, *, saved: bool) -> bool:
+    expected = (
+        LEGACY_RECONCILIATION_RUNTIME_VERSIONS
+        if lock_sha256 == LEGACY_RECONCILIATION_UV_LOCK_SHA256
+        else SUPPORTED_RUNTIME_VERSIONS
+        if lock_sha256 == RECONCILIATION_UV_LOCK_SHA256
+        else None
+    )
+    if not isinstance(versions, dict) or expected is None:
+        return False
+    for package, version in expected.items():
+        if (
+            saved
+            and lock_sha256 == LEGACY_RECONCILIATION_UV_LOCK_SHA256
+            and package in _LEGACY_MISSING_RUNTIME_VERSIONS
+            and package not in versions
+        ):
+            continue
+        if versions.get(package) != version:
+            return False
+    return True
+
+
+def _supported_reconciliation_lock_transition(saved_lock: str, current_lock: str) -> bool:
+    return (saved_lock, current_lock) in _RECONCILIATION_LOCK_TRANSITIONS
+
+
+def _transport_source_sha256() -> str:
+    try:
+        from kalshi_events import transport
+
+        return hashlib.sha256(Path(transport.__file__).resolve().read_bytes()).hexdigest()
+    except (ImportError, OSError, AttributeError, TypeError) as exc:
+        raise RunnerError("current HTTP transport source cannot be verified") from exc
+
+
 def _system_info(directory: Path) -> dict[str, Any]:
     usage = shutil.disk_usage(directory)
     stat = directory.stat()
@@ -450,6 +505,7 @@ def _system_info(directory: Path) -> dict[str, Any]:
         "package_versions": _package_versions(),
         "package_origin": str(Path(sys.modules["kalshi_events"].__file__).resolve()),
         "uv_lock_sha256": hashlib.sha256((SOURCE_ROOT / "uv.lock").read_bytes()).hexdigest(),
+        "transport_sha256": _transport_source_sha256(),
     }
 
 
@@ -1392,9 +1448,10 @@ def run_production(
                 extend_session=extend_session,
             )
             if reconcile_accounting:
+                saved_system = report["system"]
                 report.setdefault("original_revision", report.get("revision"))
                 report.setdefault("original_source_root", report.get("source_root"))
-                report.setdefault("original_system", report.get("system"))
+                report.setdefault("original_system", saved_system)
                 report["recovery_revision"] = _revision()
                 report["recovery_source_root"] = str(SOURCE_ROOT)
                 report["accounting_reconciliation"] = {
@@ -1403,6 +1460,9 @@ def run_production(
                     "prior_exactness_preserved": False,
                     "prior_error": report.get("error"),
                     "prior_recovery_instructions": report.get("recovery"),
+                    "runtime_transition": {
+                        "from_uv_lock_sha256": saved_system["uv_lock_sha256"],
+                    },
                 }
             paths = _prepare_run_paths(directory, report_path)
             report["metrics_file"] = str(paths["metrics"])
@@ -1429,6 +1489,15 @@ def run_production(
         report["revision"] = _revision()
         report["source_root"] = str(SOURCE_ROOT)
         report["system"] = _system_info(directory)
+        if reconcile_accounting:
+            report["accounting_reconciliation"]["runtime_transition"].update(
+                {
+                    "to_uv_lock_sha256": hashlib.sha256(
+                        (SOURCE_ROOT / "uv.lock").read_bytes()
+                    ).hexdigest(),
+                    "transport_sha256": _transport_source_sha256(),
+                }
+            )
         from kalshi_events.transport import BASE_URL, source_url
 
         report["api_origin"] = source_url()
@@ -1997,28 +2066,47 @@ def _load_resume(
         saved_versions = (
             saved_system.get("package_versions") if isinstance(saved_system, dict) else None
         )
-        if not isinstance(saved_versions, dict):
-            raise RunnerError("the stopped session's HTTP chunk bound cannot be verified")
-        if (
-            saved_versions.get("httpx") != "0.28.1"
-            or ("httpcore" in saved_versions and saved_versions["httpcore"] != "1.0.9")
-            or saved_system.get("uv_lock_sha256") != RECONCILIATION_UV_LOCK_SHA256
+        saved_lock_sha256 = (
+            saved_system.get("uv_lock_sha256") if isinstance(saved_system, dict) else None
+        )
+        if not isinstance(saved_lock_sha256, str) or not _validate_reconciliation_versions(
+            saved_versions, saved_lock_sha256, saved=True
         ):
-            raise RunnerError("the stopped session's HTTP chunk bound cannot be verified")
+            raise RunnerError(
+                "the stopped session's HTTP chunk bound or locked package stack cannot be verified"
+            )
         try:
             current_lock_sha256 = hashlib.sha256((SOURCE_ROOT / "uv.lock").read_bytes()).hexdigest()
         except OSError as exc:
             raise RunnerError(
-                "current HTTP runtime and source uv.lock must match the pinned reconciliation environment"
+                "current HTTP runtime and source uv.lock must match "
+                "an approved reconciliation stack"
             ) from exc
         current_versions = _package_versions()
-        if (
-            current_versions.get("httpx") != "0.28.1"
-            or current_versions.get("httpcore") != "1.0.9"
-            or current_lock_sha256 != RECONCILIATION_UV_LOCK_SHA256
+        if not _supported_reconciliation_lock_transition(
+            saved_lock_sha256, current_lock_sha256
+        ) or not _validate_reconciliation_versions(
+            current_versions, current_lock_sha256, saved=False
         ):
             raise RunnerError(
-                "current HTTP runtime and source uv.lock must match the pinned reconciliation environment"
+                "current HTTP runtime and source uv.lock must match "
+                "an approved reconciliation stack"
+            )
+        saved_transport_sha256 = saved_system.get("transport_sha256")
+        if (
+            HTTPX_MAX_RAW_CHUNK_BYTES != 64 * 1024
+            or _transport_source_sha256() != RECONCILIATION_TRANSPORT_SHA256
+            or (
+                "transport_sha256" not in saved_system
+                and saved_lock_sha256 != LEGACY_RECONCILIATION_UV_LOCK_SHA256
+            )
+            or (
+                "transport_sha256" in saved_system
+                and saved_transport_sha256 != RECONCILIATION_TRANSPORT_SHA256
+            )
+        ):
+            raise RunnerError(
+                "current HTTP transport source and 64 KiB raw chunk bound cannot be verified"
             )
     if report.get("active_process_group") is not None:
         raise RunnerError(

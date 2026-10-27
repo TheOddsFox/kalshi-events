@@ -15,7 +15,7 @@ import pytest
 from conftest import FakeClient
 
 from kalshi_events import capture, incremental, publish
-from kalshi_events.common import CatalogueError, Store
+from kalshi_events.common import CatalogueError, Store, digest, file_digest, regular_bytes
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "production_run.py"
 
@@ -86,9 +86,36 @@ def activate(production, candidate, **kwargs):
     )
 
 
+def update_manifest(candidate, change):
+    _directory, root, _warehouse, manifest = candidate
+    store = Store(root)
+    relative = f"releases/{manifest['source_release_id']}/manifest.json"
+    value = json.loads(regular_bytes(store.path(relative), 1024**2))
+    change(value)
+    store.write(relative, value)
+    pointer = json.loads(store.path("current-v2.json").read_text())
+    pointer["manifest_sha256"] = digest(regular_bytes(store.path(relative), 1024**2))
+    store.write("current-v2.json", pointer)
+    return value, regular_bytes(store.path(relative), 1024**2)
+
+
+def rewrite_warehouse(candidate, statement):
+    _directory, root, warehouse_path, manifest = candidate
+    with duckdb.connect(str(warehouse_path)) as connection:
+        connection.execute(statement)
+        connection.execute("checkpoint")
+    store = Store(root)
+    build = f"builds-v2/{manifest['capture_id']}/build.json"
+    receipt = json.loads(store.path(build).read_text())
+    receipt["warehouse_sha256"] = file_digest(warehouse_path, store.limits.max_database_bytes)[0]
+    store.write(build, receipt)
+
+
 def test_verified_activation_is_a_shared_inode_and_queries_read_only(production, candidate):
     directory, _root, warehouse, _manifest = candidate
-    activate(production, candidate)
+    result = activate(production, candidate)
+    assert result["verification_mode"] == "warehouse_hash"
+    assert result["warehouse_sha256"] == result["manifest_warehouse_sha256"]
     alias = directory / "production.duckdb"
     assert alias.is_file() and not alias.is_symlink()
     assert alias.stat().st_ino == warehouse.stat().st_ino
@@ -102,6 +129,116 @@ def test_verified_activation_is_a_shared_inode_and_queries_read_only(production,
         with pytest.raises(duckdb.InvalidInputException):
             consumer.execute("create table unverified_write as select 1")
     assert not alias.with_name(alias.name + ".wal").exists()
+
+
+@pytest.mark.parametrize("hint", ["stale", "missing"])
+def test_semantic_activation_accepts_an_equivalent_rebuilt_warehouse_without_changing_manifest(
+    production, candidate, hint
+):
+    _directory, _root, warehouse_path, manifest = candidate
+    if hint == "missing":
+        _, frozen_manifest = update_manifest(candidate, lambda value: value.pop("warehouse_sha256"))
+        expected_manifest_hash = None
+    else:
+        expected_manifest_hash = manifest["warehouse_sha256"]
+        frozen_manifest = regular_bytes(
+            _root / "releases" / manifest["source_release_id"] / "manifest.json", 1024**2
+        )
+    rewrite_warehouse(candidate, "create table main.physical_rebuild_marker as select 123 as value")
+
+    result = activate(production, candidate)
+
+    assert result["verification_mode"] == "semantic"
+    assert result["warehouse_sha256"] != expected_manifest_hash
+    assert result["manifest_warehouse_sha256"] == expected_manifest_hash
+    assert (
+        _root / "releases" / manifest["source_release_id"] / "manifest.json"
+    ).read_bytes() == frozen_manifest
+    assert (candidate[0] / "production.duckdb").stat().st_ino == warehouse_path.stat().st_ino
+
+
+@pytest.mark.parametrize(
+    ("mutation", "statement"),
+    [
+        ("schema", "alter table main.current_markets add column activation_extra integer"),
+        (
+            "rows",
+            "update main.current_markets set last_price_dollars = 0.999 where market_ticker = 'MARKET'",
+        ),
+        ("membership", "delete from landing.membership"),
+    ],
+)
+def test_semantic_activation_rejects_schema_rows_or_membership_changes(
+    production, candidate, mutation, statement
+):
+    directory, _root, _warehouse, _manifest = candidate
+    rewrite_warehouse(candidate, statement)
+
+    with pytest.raises((CatalogueError, ValueError, RuntimeError)):
+        activate(production, candidate)
+
+    assert not (directory / "production.duckdb").exists(), mutation
+
+
+@pytest.mark.parametrize("field", ["capture_id", "root_id"])
+def test_activation_rejects_a_manifest_bound_to_another_capture_or_root(
+    production, candidate, field
+):
+    directory, _root, _warehouse, manifest = candidate
+    other_identity = "0" * 32 if manifest[field] != "0" * 32 else "f" * 32
+    update_manifest(candidate, lambda value: value.update({field: other_identity}))
+
+    with pytest.raises((CatalogueError, OSError, ValueError, RuntimeError)):
+        activate(production, candidate)
+
+    assert not (directory / "production.duckdb").exists()
+
+
+def test_activation_rechecks_the_current_manifest_pointer_after_cleanup(
+    production, candidate, monkeypatch
+):
+    directory, _root, _warehouse, _manifest = candidate
+    rewrite_warehouse(candidate, "create table main.physical_rebuild_marker as select 123 as value")
+    alias = directory / "production.duckdb"
+    alias.write_bytes(b"previous production bytes")
+    before = alias.read_bytes()
+    original_prune = incremental.prune
+
+    def change_pointer_after_prune(store, *args, **kwargs):
+        result = original_prune(store, *args, **kwargs)
+        pointer = json.loads(store.path("current-v2.json").read_text())
+        pointer["manifest_sha256"] = "0" * 64
+        store.write("current-v2.json", pointer)
+        return result
+
+    monkeypatch.setattr(incremental, "prune", change_pointer_after_prune)
+    with pytest.raises((CatalogueError, ValueError, RuntimeError)):
+        activate(production, candidate)
+
+    assert alias.read_bytes() == before
+
+
+def test_activation_rehashes_the_source_after_cleanup_before_link(
+    production, candidate, monkeypatch
+):
+    directory, _root, warehouse_path, _manifest = candidate
+    rewrite_warehouse(candidate, "create table main.physical_rebuild_marker as select 123 as value")
+    alias = directory / "production.duckdb"
+    alias.write_bytes(b"previous production bytes")
+    before = alias.read_bytes()
+    original_prune = incremental.prune
+
+    def change_source_after_prune(store, *args, **kwargs):
+        result = original_prune(store, *args, **kwargs)
+        with warehouse_path.open("ab") as stream:
+            stream.write(b"changed after semantic verification")
+        return result
+
+    monkeypatch.setattr(incremental, "prune", change_source_after_prune)
+    with pytest.raises((CatalogueError, ValueError, RuntimeError)):
+        activate(production, candidate)
+
+    assert alias.read_bytes() == before
 
 
 def test_active_database_survives_pruning_of_the_original_path(production, candidate):

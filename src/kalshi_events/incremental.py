@@ -242,11 +242,16 @@ def _rows(connection: duckdb.DuckDBPyConnection, table: str) -> list[dict[str, A
 
 @contextmanager
 def _baseline_data_impl(
-    store: Store, capture_id: str, version: int, pin: dict[str, Any] | None = None
+    store: Store,
+    capture_id: str,
+    version: int,
+    pin: dict[str, Any] | None = None,
+    *,
+    _context: Any = None,
 ) -> Iterator[duckdb.DuckDBPyConnection]:
     from kalshi_events.warehouse import certified
 
-    receipt = certified(store, capture_id, catalogue_version=version)
+    receipt = certified(store, capture_id, catalogue_version=version, _context=_context)
     if not isinstance(pin, dict):
         raise CatalogueError("baseline semantic verification requires its release pin")
     from kalshi_events import publish
@@ -257,6 +262,21 @@ def _baseline_data_impl(
         "manifest_sha256"
     ):
         raise CatalogueError("pinned release manifest changed")
+    if (
+        manifest.get("source_release_id") != pin.get("source_release_id")
+        or manifest.get("capture_id") != capture_id
+        or pin.get("capture_id") != capture_id
+        or (
+            version == 2
+            and (
+                manifest.get("root_id") != pin.get("root_id")
+                or pin.get("root_id") != root_id(store)
+                or manifest.get("delta_depth") != pin.get("delta_depth")
+                or manifest.get("series_scope") != pin.get("series_scope")
+            )
+        )
+    ):
+        raise CatalogueError("pinned release identity or lineage changed")
     relative = build_directory(capture_id, version) + "/warehouse.duckdb"
     database = store.path(relative)
     if store.path(relative + ".wal").exists():
@@ -346,11 +366,16 @@ def _baseline_data_impl(
 
 @contextmanager
 def _baseline_data(
-    store: Store, capture_id: str, version: int, pin: dict[str, Any] | None = None
+    store: Store,
+    capture_id: str,
+    version: int,
+    pin: dict[str, Any] | None = None,
+    *,
+    _context: Any = None,
 ) -> Iterator[duckdb.DuckDBPyConnection]:
     with (
         metrics.phase("baseline_verification"),
-        _baseline_data_impl(store, capture_id, version, pin) as connection,
+        _baseline_data_impl(store, capture_id, version, pin, _context=_context) as connection,
     ):
         yield connection
 
