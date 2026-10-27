@@ -37,6 +37,44 @@ FIXTURE_VARIANTS = {"frozen", "combo-heavy"}
 COMBO_HEAVY_FIXTURE_LABEL = "combo-heavy"
 BENCHMARK_CHILD_TIMEOUT_SECONDS = 180
 BENCHMARK_TERMINATION_RESERVE_SECONDS = 5
+DUCKDB_PROFILE_MODEL_NAMES = {"current_markets", "combo_legs", "relationships"}
+DUCKDB_PROFILE_METRIC_PREFIXES = (
+    "query.",
+    "operator.",
+    "io.",
+    "storage.",
+    "system.",
+    "parser.",
+    "optimizer.",
+    "planner.",
+    "physical_planner.",
+)
+DUCKDB_PROFILE_SUMMARY_METRICS = (
+    "query.total_time",
+    "query.cpu_time",
+    "query.total_rows_scanned",
+    "query.total_row_groups_scanned",
+    "io.total_bytes_read",
+    "io.total_bytes_written",
+    "operator.intermediate_rows",
+    "operator.rows_scanned",
+    "operator.row_groups_scanned",
+    "system.peak_buffer_memory",
+    "system.peak_temp_dir_size",
+    "system.total_memory_allocated",
+    "storage.checkpoint_latency",
+)
+DUCKDB_PROFILE_MAX_TEMP_BYTES = 4 * 1024**3
+DUCKDB_PROFILE_BENCHMARKS = {
+    "full",
+    "resume",
+    "baseline-v2-setup",
+    "no-change",
+    "sparse-change",
+    "all-change",
+    "history-sparse",
+    "frozen-v2-build",
+}
 _request_id = contextvars.ContextVar("fixture_request_id")
 _page_request = contextvars.ContextVar("benchmark_page_request", default=None)
 _inside_page_read = contextvars.ContextVar("benchmark_inside_page_read", default=False)
@@ -1680,6 +1718,7 @@ def _run_frozen_v2_build(
     pair_label: str,
     frozen_root: Path,
     capture_id: str,
+    duckdb_profile_json: bool = False,
 ) -> dict[str, Any]:
     clone = report_dir / f"frozen-v2-root-{label}-{pair_label}"
     result_path = report_dir / f"frozen-v2-result-{label}-{pair_label}.json"
@@ -1697,6 +1736,10 @@ def _run_frozen_v2_build(
         result = json.loads(result_path.read_text(encoding="utf-8"))
         result["worker_wall_seconds"] = round(time.perf_counter() - worker_started, 6)
         result["role"] = label
+        if duckdb_profile_json:
+            result["duckdb_profile_json"] = _run_duckdb_profile_json(
+                source_root, report_dir, clone, capture_id, 2, label, pair_label
+            )
         return result
     except _UnreapedWorkerGroup:
         cleanup_safe = False
@@ -1739,6 +1782,7 @@ def _run_frozen_v2_comparison(
     report_dir: Path,
     warmups: int,
     runs: int,
+    duckdb_profile_json: bool = False,
 ) -> dict[str, Any]:
     inventory_started = time.perf_counter()
     before = _root_inventory(frozen_root)
@@ -1758,7 +1802,13 @@ def _run_frozen_v2_comparison(
         paired: dict[str, dict[str, Any]] = {}
         for label, root in ordered:
             result = _run_frozen_v2_build(
-                root, report_dir, label, f"pair-{pair}", frozen_root, capture_id
+                root,
+                report_dir,
+                label,
+                f"pair-{pair}",
+                frozen_root,
+                capture_id,
+                duckdb_profile_json,
             )
             results[label].append(result)
             paired[label] = result
@@ -2309,6 +2359,7 @@ def _run_one(
     role: str = "reference",
     prepared_baseline: tuple[Path, dict[str, Any], float] | None = None,
     fixture_variant: str = "frozen",
+    duckdb_profile_json: bool = False,
 ) -> dict[str, Any]:
     import shutil
 
@@ -2371,12 +2422,450 @@ def _run_one(
     if profile == "history-sparse":
         result["baseline_upgrade_seconds"] = baseline_upgrade_seconds
         result["baseline_upgrade"] = baseline_upgrade
+    if duckdb_profile_json:
+        catalogue_version = (
+            2
+            if profile == "baseline-v2-setup"
+            or scenario != "full"
+            and refresh_mode == "incremental"
+            else 1
+        )
+        result["duckdb_profile_json"] = _run_duckdb_profile_json(
+            source_root,
+            report_dir,
+            root,
+            result["capture_id"],
+            catalogue_version,
+            label,
+            pair,
+        )
     shutil.rmtree(root)
     if baseline_root is not None and (scenario == "full" or remove_baseline):
         shutil.rmtree(baseline_root)
     if result.get("profile") in TARGETED_PROFILES:
         shutil.rmtree(result_path.with_suffix(".metadata"), ignore_errors=True)
     return result
+
+
+def _dbt_profile_model_sql(artifacts: dict[str, Any]) -> list[dict[str, str]]:
+    manifest = artifacts.get("manifest.json", {}).get("content", {})
+    nodes = manifest.get("nodes", {}) if isinstance(manifest, dict) else {}
+    models = [
+        {
+            "name": node["name"],
+            "unique_id": unique_id,
+            "compiled_code": node["compiled_code"],
+        }
+        for unique_id, node in nodes.items()
+        if isinstance(node, dict)
+        and node.get("resource_type") == "model"
+        and node.get("package_name") == "kalshi_events"
+        and node.get("name") in DUCKDB_PROFILE_MODEL_NAMES
+        and isinstance(node.get("compiled_code"), str)
+        and node["compiled_code"].strip()
+    ]
+    if not models:
+        raise RuntimeError("dbt build artifacts do not contain compiled hotspot model SQL")
+    missing = DUCKDB_PROFILE_MODEL_NAMES - {model["name"] for model in models}
+    if missing:
+        raise RuntimeError(f"dbt build artifacts lack compiled hotspot SQL: {sorted(missing)}")
+    return sorted(models, key=lambda model: model["name"])
+
+
+def _profile_metric_value(profile: dict[str, Any], metric: str) -> Any:
+    group, name = metric.split(".", 1)
+    section = profile.get(group)
+    if group == "operator" and isinstance(section, list):
+        values = []
+        pending = list(section)
+        while pending:
+            node = pending.pop()
+            if not isinstance(node, dict):
+                continue
+            if name in node:
+                values.append(node[name])
+            children = node.get("children")
+            if isinstance(children, list):
+                pending.extend(children)
+        return values or None
+    return section.get(name) if isinstance(section, dict) else None
+
+
+def _duckdb_profile_summary_metrics(profile: dict[str, Any]) -> dict[str, Any]:
+    values = {
+        metric: _profile_metric_value(profile, metric) for metric in DUCKDB_PROFILE_SUMMARY_METRICS
+    }
+    return {
+        "values": values,
+        "unavailable_metrics": [metric for metric, value in values.items() if value is None],
+    }
+
+
+def _duckdb_tracked_metrics_supported(version: str) -> bool:
+    major = version.split(".", 1)[0]
+    return major.isdigit() and int(major) >= 2
+
+
+def _process_peak_rss_bytes() -> int | None:
+    try:
+        import resource
+
+        value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(value if sys.platform == "darwin" else value * 1024)
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _remove_duckdb_profile_copy(database_path: Path) -> None:
+    database_path.unlink(missing_ok=True)
+    database_path.with_name(database_path.name + ".wal").unlink(missing_ok=True)
+    (database_path.parent / "profiling-init.txt").unlink(missing_ok=True)
+
+
+def _duckdb_profile_worker(
+    database_path: Path,
+    artifacts_path: Path,
+    report_root: Path,
+    output_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    import shutil
+
+    if output_dir.is_symlink():
+        raise ValueError("DuckDB profile output cannot be a symlink")
+    profile_database = output_dir / "warehouse.duckdb"
+    if profile_database.exists() or profile_database.is_symlink():
+        raise ValueError(f"DuckDB profile copy already exists: {profile_database}")
+    profile_wal = profile_database.with_name(profile_database.name + ".wal")
+    if profile_wal.exists() or profile_wal.is_symlink():
+        raise ValueError(f"DuckDB profile WAL already exists: {profile_wal}")
+    spill_directory = output_dir / "duckdb-temp"
+    if spill_directory.exists() or spill_directory.is_symlink():
+        raise ValueError(f"DuckDB profile temp directory already exists: {spill_directory}")
+    init_output = output_dir / "profiling-init.txt"
+    if init_output.exists() or init_output.is_symlink():
+        raise ValueError(f"DuckDB profile initialization output already exists: {init_output}")
+    try:
+        return _duckdb_profile_worker_impl(
+            database_path, artifacts_path, report_root, output_dir, source_root
+        )
+    finally:
+        _remove_duckdb_profile_copy(profile_database)
+        if output_dir.exists() and not output_dir.is_symlink():
+            shutil.rmtree(spill_directory, ignore_errors=True)
+
+
+def _duckdb_profile_worker_impl(
+    database_path: Path,
+    artifacts_path: Path,
+    report_root: Path,
+    output_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    """Profile copied benchmark model SQL; never open the benchmark warehouse for writing."""
+    import shutil
+
+    import duckdb
+
+    if database_path.is_symlink() or artifacts_path.is_symlink() or output_dir.is_symlink():
+        raise ValueError("DuckDB profile paths cannot be symlinks")
+    report_root = report_root.resolve()
+    database_path = database_path.resolve()
+    artifacts_path = artifacts_path.resolve()
+    output_dir = output_dir.resolve()
+    if (
+        not database_path.is_relative_to(report_root)
+        or not artifacts_path.is_relative_to(report_root)
+        or not output_dir.is_relative_to(report_root)
+    ):
+        raise ValueError(
+            "DuckDB profiles, inputs, and copies must stay inside the external report directory"
+        )
+    if not database_path.is_file() or not artifacts_path.is_file():
+        raise FileNotFoundError("DuckDB profile requires a benchmark database and dbt artifacts")
+    if (
+        output_dir == database_path.parent
+        or output_dir.is_relative_to(database_path.parent)
+        or database_path.parent.is_relative_to(output_dir)
+    ):
+        raise ValueError("DuckDB profile output must be separate from its benchmark warehouse")
+    if database_path.with_name(database_path.name + ".wal").exists():
+        raise RuntimeError("refusing to profile a benchmark warehouse with an uncheckpointed WAL")
+    summary_path = output_dir / "summary.json"
+    _validate_worker_destinations(output_dir, summary_path, source_root)
+    if any(
+        report_root == checkout
+        or report_root.is_relative_to(checkout)
+        or checkout.is_relative_to(report_root)
+        for checkout in (_script_checkout(), source_root.resolve())
+    ):
+        raise ValueError("DuckDB profile report directory must be disjoint from source checkouts")
+    if output_dir.exists():
+        entries = list(output_dir.iterdir())
+        if {entry.name for entry in entries} not in (set(), {"tmp", "dlt-data"}) or any(
+            entry.is_symlink() or not entry.is_dir() or any(entry.iterdir()) for entry in entries
+        ):
+            raise ValueError("DuckDB profile output must be a fresh directory with empty temp dirs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts = json.loads(artifacts_path.read_text(encoding="utf-8"))
+    models = _dbt_profile_model_sql(artifacts)
+    source_size = database_path.stat().st_size
+    profile_database = output_dir / "warehouse.duckdb"
+    if profile_database.exists() or profile_database.is_symlink():
+        raise ValueError(f"DuckDB profile copy already exists: {profile_database}")
+    shutil.copy2(database_path, profile_database)
+    copied_size = profile_database.stat().st_size
+    spill_directory = output_dir / "duckdb-temp"
+    spill_directory.mkdir()
+    connection_config = {
+        "memory_limit": "4GB",
+        "temp_directory": str(spill_directory),
+        "max_temp_directory_size": f"{DUCKDB_PROFILE_MAX_TEMP_BYTES}B",
+        "threads": 4,
+    }
+
+    def database_size(connection: Any) -> dict[str, Any]:
+        cursor = connection.execute("PRAGMA database_size")
+        return dict(
+            zip((column[0] for column in cursor.description), cursor.fetchone(), strict=True)
+        )
+
+    def storage_version(connection: Any) -> str | None:
+        row = connection.execute(
+            "SELECT tags['storage_version'] FROM duckdb_databases() WHERE NOT internal"
+        ).fetchone()
+        return row[0] if row else None
+
+    def enable_profile(connection: Any, path: Path) -> None:
+        connection.execute("PRAGMA disable_profiling")
+        connection.execute("SET profiling_coverage = 'ALL'")
+        path_literal = "'" + str(path).replace("'", "''") + "'"
+        connection.execute(f"SET profiling_output = {path_literal}")
+        connection.execute("SET enable_profiling = 'json'")
+
+    checkpoint_path = output_dir / "checkpoint.json"
+    checkpoint_started = time.perf_counter()
+    connection = duckdb.connect(str(profile_database), config=connection_config)
+    database_open_seconds = round(time.perf_counter() - checkpoint_started, 6)
+    try:
+        version = duckdb.__version__
+        if _duckdb_tracked_metrics_supported(version):
+            available_rows = connection.execute(
+                "SELECT metric_name, metric_type, unit FROM duckdb_available_metrics()"
+            ).fetchall()
+            available_metrics = {
+                name: {"type": metric_type, "unit": unit}
+                for name, metric_type, unit in available_rows
+            }
+            tracked_metrics = sorted(
+                name
+                for name in available_metrics
+                if name.startswith(DUCKDB_PROFILE_METRIC_PREFIXES)
+            )
+            metric_list = ", ".join("'" + name.replace("'", "''") + "'" for name in tracked_metrics)
+            init_output = "'" + str(output_dir / "profiling-init.txt").replace("'", "''") + "'"
+            connection.execute(f"SET profiling_output = {init_output}")
+            connection.execute("SET enable_profiling = 'json'")
+            connection.execute("PRAGMA disable_profiling")
+            connection.execute(f"SET tracked_metrics = [{metric_list}]")
+            supported = True
+        else:
+            version = duckdb.__version__
+            available_metrics = {}
+            tracked_metrics = []
+            supported = False
+
+        if supported:
+            enable_profile(connection, checkpoint_path)
+        else:
+            connection.execute("PRAGMA disable_profiling")
+        checkpoint_started = time.perf_counter()
+        connection.execute("CHECKPOINT")
+        checkpoint_seconds = round(time.perf_counter() - checkpoint_started, 6)
+        connection.execute("PRAGMA disable_profiling")
+        checkpoint_profile = (
+            json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if checkpoint_path.is_file()
+            else {}
+        )
+        database_size_values = database_size(connection)
+        database_storage_version = storage_version(connection)
+    finally:
+        connection.close()
+
+    summary: dict[str, Any] = {
+        "status": "profiled" if supported else "unavailable",
+        "reason": None
+        if supported
+        else f"DuckDB {version} does not support 2.x tracked_metrics JSON profiling",
+        "duckdb_version": version,
+        "python_executable": sys.executable,
+        "execution_contract": (
+            "compiled dbt SELECT query-only replay; excludes dbt materialization, table install, and publication"
+        ),
+        "database": {
+            "storage_version": database_storage_version,
+            "source_file_bytes": source_size,
+            "profile_copy_file_bytes_before_checkpoint": copied_size,
+            "profile_copy_file_bytes_after_checkpoint": profile_database.stat().st_size,
+            "database_open_seconds": database_open_seconds,
+            "checkpoint_wall_seconds": checkpoint_seconds,
+            "checkpoint_contract": "checkpoint of the disposable copy after build; not build-time checkpoint cost",
+            "database_size": database_size_values,
+            "checkpoint_profile_metrics": _duckdb_profile_summary_metrics(checkpoint_profile)[
+                "values"
+            ],
+        },
+        "tracked_metrics": tracked_metrics,
+        "available_metrics": available_metrics,
+        "limits": {
+            "memory_limit": "4GB",
+            "memory_limit_scope": "DuckDB-managed allocations; not a process RSS cap",
+            "max_temp_directory_size_bytes": DUCKDB_PROFILE_MAX_TEMP_BYTES,
+            "threads": 4,
+        },
+        "unavailable_metric_groups": [
+            prefix
+            for prefix in DUCKDB_PROFILE_METRIC_PREFIXES
+            if not any(name.startswith(prefix) for name in available_metrics)
+        ],
+        "process_peak_rss_bytes": None,
+        "models": [],
+    }
+    summary["database"]["checkpoint_profile_unavailable_metrics"] = _duckdb_profile_summary_metrics(
+        checkpoint_profile
+    )["unavailable_metrics"]
+
+    if supported:
+        connection_started = time.perf_counter()
+        connection = duckdb.connect(str(profile_database), read_only=True, config=connection_config)
+        summary["database"]["query_connection_open_seconds"] = round(
+            time.perf_counter() - connection_started, 6
+        )
+        try:
+            metric_list = ", ".join("'" + name.replace("'", "''") + "'" for name in tracked_metrics)
+            init_output = "'" + str(output_dir / "profiling-init.txt").replace("'", "''") + "'"
+            connection.execute(f"SET profiling_output = {init_output}")
+            connection.execute("SET enable_profiling = 'json'")
+            connection.execute("PRAGMA disable_profiling")
+            connection.execute(f"SET tracked_metrics = [{metric_list}]")
+            summary["database"]["database_size"] = database_size(connection)
+            summary["database"]["storage_version"] = storage_version(connection)
+            for model in models:
+                profile_path = output_dir / f"{model['name']}.json"
+                enable_profile(connection, profile_path)
+                cursor = connection.execute(model["compiled_code"])
+                result_rows = 0
+                while rows := cursor.fetchmany(1024):
+                    result_rows += len(rows)
+                connection.execute("PRAGMA disable_profiling")
+                profile = json.loads(profile_path.read_text(encoding="utf-8"))
+                summary["models"].append(
+                    {
+                        "name": model["name"],
+                        "unique_id": model["unique_id"],
+                        "compiled_sql_sha256": hashlib.sha256(
+                            model["compiled_code"].encode()
+                        ).hexdigest(),
+                        "result_rows_consumed": result_rows,
+                        "profile_file": profile_path.name,
+                        "metrics": _duckdb_profile_summary_metrics(profile),
+                    }
+                )
+        finally:
+            connection.close()
+        summary["checkpoint_profile_file"] = checkpoint_path.name
+    summary["process_peak_rss_bytes"] = _process_peak_rss_bytes()
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return summary
+
+
+def _run_duckdb_profile_json(
+    source_root: Path,
+    report_dir: Path,
+    run_root: Path,
+    capture_id: str,
+    catalogue_version: int,
+    label: str,
+    pair: int | str,
+) -> dict[str, Any]:
+    import shutil
+
+    build_dir = "builds-v2" if catalogue_version == 2 else "builds"
+    build_root = run_root / build_dir / capture_id
+    database = build_root / "warehouse.duckdb"
+    artifacts = build_root / "build-artifacts.json"
+    profile_dir = report_dir / "duckdb-profiles" / f"{label}-pair-{pair}"
+    profile_dir.mkdir(parents=True, exist_ok=False)
+    temporary_directory = profile_dir / "tmp"
+    temporary_directory.mkdir()
+    dlt_directory = profile_dir / "dlt-data"
+    dlt_directory.mkdir()
+    environment = os.environ.copy()
+    environment["TMPDIR"] = str(temporary_directory)
+    environment["DLT_DATA_DIR"] = str(dlt_directory)
+    command = [
+        sys.executable,
+        __file__,
+        "--worker-duckdb-profile",
+        "--profile-database",
+        str(database),
+        "--profile-artifacts",
+        str(artifacts),
+        "--profile-report-root",
+        str(report_dir),
+        "--profile-output-dir",
+        str(profile_dir),
+        "--source-root",
+        str(source_root),
+    ]
+    profile_database = profile_dir / "warehouse.duckdb"
+    try:
+        completed = _run_supervised(
+            command,
+            timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _remove_duckdb_profile_copy(profile_database)
+        shutil.rmtree(profile_dir / "duckdb-temp", ignore_errors=True)
+        shutil.rmtree(temporary_directory, ignore_errors=True)
+        shutil.rmtree(dlt_directory, ignore_errors=True)
+        stdout = (
+            exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
+        )
+        stderr = (
+            exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+        )
+        (profile_dir / "stdout.log").write_text(stdout or "", encoding="utf-8")
+        (profile_dir / "stderr.log").write_text(
+            (stderr or "") + f"\nChild timed out after {BENCHMARK_CHILD_TIMEOUT_SECONDS}s.\n",
+            encoding="utf-8",
+        )
+        raise
+    _remove_duckdb_profile_copy(profile_database)
+    shutil.rmtree(profile_dir / "duckdb-temp", ignore_errors=True)
+    shutil.rmtree(temporary_directory, ignore_errors=True)
+    shutil.rmtree(dlt_directory, ignore_errors=True)
+    (profile_dir / "stdout.log").write_text(completed.stdout or "", encoding="utf-8")
+    (profile_dir / "stderr.log").write_text(completed.stderr or "", encoding="utf-8")
+    if completed.returncode:
+        raise RuntimeError(
+            f"external DuckDB profiler failed with exit {completed.returncode}; logs: {profile_dir}"
+        )
+    summary = json.loads((profile_dir / "summary.json").read_text(encoding="utf-8"))
+    return {
+        "status": summary["status"],
+        "duckdb_version": summary["duckdb_version"],
+        "summary_file": str(profile_dir / "summary.json"),
+        "profile_files": [model["profile_file"] for model in summary["models"]],
+        "checkpoint_profile_file": summary.get("checkpoint_profile_file"),
+        "execution_contract": summary["execution_contract"],
+    }
 
 
 @_cleanup_on_sigterm
@@ -2880,6 +3369,11 @@ def main() -> int:
     )
     parser.add_argument("--capture-id", help="capture to build in frozen-v2-build mode")
     parser.add_argument(
+        "--duckdb-profile-json",
+        action="store_true",
+        help="write bounded DuckDB 2.x tracked_metrics JSON profiles for compiled dbt hotspots",
+    )
+    parser.add_argument(
         "--profile",
         choices=(
             "full",
@@ -2909,9 +3403,14 @@ def main() -> int:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-frozen-v2-build", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-duckdb-profile", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--capture-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--result", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--profile-database", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--profile-artifacts", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--profile-report-root", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--profile-output-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--worker-profile",
         choices=(
@@ -2942,6 +3441,25 @@ def main() -> int:
     )
     parser.add_argument("--baseline-capture-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.worker_duckdb_profile:
+        required = (
+            args.profile_database,
+            args.profile_artifacts,
+            args.profile_report_root,
+            args.profile_output_dir,
+        )
+        if any(value is None for value in required):
+            parser.error(
+                "DuckDB profile worker requires database, artifacts, report root, and output dir"
+            )
+        _duckdb_profile_worker(
+            args.profile_database,
+            args.profile_artifacts,
+            args.profile_report_root,
+            args.profile_output_dir,
+            args.source_root.resolve(),
+        )
+        return 0
     if args.worker_frozen_v2_build:
         if (
             args.frozen_root is None
@@ -2986,7 +3504,15 @@ def main() -> int:
         return 0
     if args.runs < 1 or args.warmups < 0:
         parser.error("--runs must be positive and --warmups nonnegative")
+    if args.duckdb_profile_json and args.profile not in DUCKDB_PROFILE_BENCHMARKS:
+        parser.error(
+            "--duckdb-profile-json requires a benchmark profile that builds a warehouse with compiled dbt models"
+        )
     if args.prepare_frozen_capture is not None:
+        if args.duckdb_profile_json:
+            parser.error(
+                "--duckdb-profile-json requires a benchmark build, not capture preparation"
+            )
         if args.fixture != COMBO_HEAVY_FIXTURE_LABEL or args.profile != "full":
             parser.error("--prepare-frozen-capture requires --fixture combo-heavy --profile full")
         if args.compare_root or args.frozen_root or args.capture_id:
@@ -3063,6 +3589,7 @@ def main() -> int:
             report_dir,
             args.warmups,
             args.runs,
+            args.duckdb_profile_json,
         )
         report = report_dir / "benchmark-summary.json"
         report.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -3177,6 +3704,7 @@ def main() -> int:
                     role,
                     prepared_baselines.get(label),
                     args.fixture,
+                    duckdb_profile_json=args.duckdb_profile_json,
                 )
             )
     combo_summary = _fixture_combo_summary(markets, args.profile, args.fixture)

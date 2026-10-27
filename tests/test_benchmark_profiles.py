@@ -340,6 +340,331 @@ def test_logical_lineage_comparison_ignores_but_validates_physical_warehouse_has
     assert not benchmark._logical_lineage_match(reference, candidate)
 
 
+def _dbt_profile_artifacts(sql: str) -> dict:
+    return {
+        "manifest.json": {
+            "content": {
+                "nodes": {
+                    f"model.kalshi_events.{name}": {
+                        "name": name,
+                        "package_name": "kalshi_events",
+                        "resource_type": "model",
+                        "compiled_code": sql,
+                    }
+                    for name in benchmark.DUCKDB_PROFILE_MODEL_NAMES
+                }
+            }
+        }
+    }
+
+
+def _write_duckdb_profile_build(build: Path, sql: str) -> None:
+    import duckdb
+
+    build.mkdir(parents=True)
+    with duckdb.connect(str(build / "warehouse.duckdb")) as connection:
+        connection.execute("CREATE TABLE source_rows AS SELECT * FROM range(8)")
+    (build / "build-artifacts.json").write_text(json.dumps(_dbt_profile_artifacts(sql)))
+
+
+def test_duckdb_profile_runs_compiled_hotspot_sql_on_a_copy(tmp_path: Path):
+    duckdb = pytest.importorskip("duckdb")
+    if not benchmark._duckdb_tracked_metrics_supported(duckdb.__version__):
+        pytest.skip("DuckDB 2.x tracked_metrics is required")
+
+    report_dir = tmp_path / "report"
+    run_root = report_dir / "root-candidate-0"
+    build = run_root / "builds" / "capture-1"
+    build.mkdir(parents=True)
+    database = build / "warehouse.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("CREATE TABLE source_rows AS SELECT * FROM range(8)")
+    sql = "SELECT count(*) AS row_count FROM main.source_rows"
+    artifacts = build / "build-artifacts.json"
+    artifacts.write_text(json.dumps(_dbt_profile_artifacts(sql)))
+    original_sha256 = hashlib.sha256(database.read_bytes()).hexdigest()
+
+    profile = benchmark._run_duckdb_profile_json(
+        SCRIPT.parents[1], report_dir, run_root, "capture-1", 1, "candidate", 0
+    )
+
+    assert profile["status"] == "profiled"
+    assert profile["duckdb_version"] == duckdb.__version__
+    assert set(profile["profile_files"]) == {
+        f"{name}.json" for name in benchmark.DUCKDB_PROFILE_MODEL_NAMES
+    }
+    assert Path(profile["summary_file"]).is_relative_to(report_dir)
+    assert profile["checkpoint_profile_file"] == "checkpoint.json"
+    assert (Path(profile["summary_file"]).parent / profile["checkpoint_profile_file"]).is_file()
+    profile_dir = Path(profile["summary_file"]).parent
+    assert not (profile_dir / "warehouse.duckdb").exists()
+    assert not (profile_dir / "warehouse.duckdb.wal").exists()
+    assert not (profile_dir / "duckdb-temp").exists()
+    assert not (profile_dir / "profiling-init.txt").exists()
+    assert not (profile_dir / "tmp").exists()
+    assert not (profile_dir / "dlt-data").exists()
+    assert {path.name for path in profile_dir.iterdir()} == {
+        "summary.json",
+        "checkpoint.json",
+        "current_markets.json",
+        "combo_legs.json",
+        "relationships.json",
+        "stdout.log",
+        "stderr.log",
+    }
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == original_sha256
+    summary = json.loads(Path(profile["summary_file"]).read_text())
+    assert summary["execution_contract"].startswith("compiled dbt SELECT query-only replay")
+    assert summary["database"]["source_file_bytes"] == database.stat().st_size
+    assert (
+        summary["database"]["profile_copy_file_bytes_before_checkpoint"] == database.stat().st_size
+    )
+    assert summary["database"]["database_open_seconds"] >= 0
+    assert summary["database"]["checkpoint_wall_seconds"] >= 0
+    assert summary["database"]["database_size"]["database_size"]
+    assert summary["database"]["storage_version"].startswith("v2.")
+    assert summary["database"]["query_connection_open_seconds"] >= 0
+    assert "not build-time checkpoint cost" in summary["database"]["checkpoint_contract"]
+    assert summary["limits"]["max_temp_directory_size_bytes"] == 4 * 1024**3
+    assert summary["process_peak_rss_bytes"] is None or summary["process_peak_rss_bytes"] > 0
+    for model in summary["models"]:
+        output = Path(profile["summary_file"]).parent / model["profile_file"]
+        query_profile = json.loads(output.read_text())
+        assert query_profile["query"]["sql"] == sql
+        metrics = model["metrics"]["values"]
+        assert metrics["query.total_time"] is not None
+        assert metrics["system.peak_buffer_memory"] is None or isinstance(
+            metrics["system.peak_buffer_memory"], int
+        )
+        assert "system.peak_buffer_memory" in summary["tracked_metrics"]
+        assert "system.peak_buffer_memory" in metrics
+
+
+def test_duckdb_156_profile_report_marks_tracked_metrics_unavailable(tmp_path: Path, monkeypatch):
+    class Cursor:
+        def __init__(self, description, row):
+            self.description = description
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        @staticmethod
+        def execute(sql):
+            if sql == "PRAGMA database_size":
+                return Cursor([("database_size",), ("memory_usage",)], ("1 MiB", "0 bytes"))
+            if "duckdb_databases()" in sql:
+                return Cursor([("storage_version",)], ("v1.5.6+",))
+            return Cursor([], ())
+
+        @staticmethod
+        def close():
+            pass
+
+    fake_duckdb = SimpleNamespace(
+        __version__="1.5.6", connect=lambda *_args, **_kwargs: Connection()
+    )
+    monkeypatch.setitem(sys.modules, "duckdb", fake_duckdb)
+    report_dir = tmp_path / "report"
+    build = report_dir / "root" / "builds" / "capture-1"
+    build.mkdir(parents=True)
+    database = build / "warehouse.duckdb"
+    database.write_bytes(b"disposable")
+    artifacts = build / "build-artifacts.json"
+    artifacts.write_text(json.dumps(_dbt_profile_artifacts("SELECT 1")))
+    profile_dir = report_dir / "duckdb-profiles" / "reference-pair-0"
+
+    summary = benchmark._duckdb_profile_worker(
+        database, artifacts, report_dir, profile_dir, SCRIPT.parents[1]
+    )
+
+    assert summary["status"] == "unavailable"
+    assert "DuckDB 1.5.6" in summary["reason"]
+    assert summary["tracked_metrics"] == []
+    assert summary["database"]["database_open_seconds"] >= 0
+    assert summary["database"]["checkpoint_wall_seconds"] >= 0
+    assert summary["database"]["storage_version"] == "v1.5.6+"
+    assert summary["database"]["checkpoint_profile_metrics"]["storage.checkpoint_latency"] is None
+    assert summary["database"]["checkpoint_profile_unavailable_metrics"]
+    assert summary["models"] == []
+
+
+def test_duckdb_profile_worker_rejects_non_report_inputs(tmp_path: Path):
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    database = tmp_path / "outside.duckdb"
+    artifacts = report_dir / "build-artifacts.json"
+    with pytest.raises(ValueError, match="inside the external report directory"):
+        benchmark._duckdb_profile_worker(
+            database, artifacts, report_dir, report_dir / "profiles", SCRIPT.parents[1]
+        )
+
+
+def test_duckdb_profile_worker_validates_output_before_creating_it():
+    repository = SCRIPT.parents[1]
+    output_dir = repository / "tests" / "must-not-create-dbt-profile"
+    with pytest.raises(ValueError, match="source checkout"):
+        benchmark._duckdb_profile_worker(SCRIPT, SCRIPT, repository, output_dir, repository)
+    assert not output_dir.exists()
+
+
+def test_duckdb_profile_worker_preserves_preexisting_initialization_marker(tmp_path: Path):
+    report_dir = tmp_path / "report"
+    output_dir = report_dir / "duckdb-profiles" / "test-pair-0"
+    output_dir.mkdir(parents=True)
+    marker = output_dir / "profiling-init.txt"
+    marker.write_text("preserve me")
+
+    with pytest.raises(ValueError, match="initialization output already exists"):
+        benchmark._duckdb_profile_worker(
+            report_dir / "warehouse.duckdb",
+            report_dir / "build-artifacts.json",
+            report_dir,
+            output_dir,
+            SCRIPT.parents[1],
+        )
+
+    assert marker.read_text() == "preserve me"
+
+
+def test_duckdb_profile_worker_rejects_output_symlink_without_touching_target(tmp_path: Path):
+    report_dir = tmp_path / "report"
+    build = report_dir / "root" / "builds" / "capture-1"
+    build.mkdir(parents=True)
+    database = build / "warehouse.duckdb"
+    database.write_bytes(b"disposable")
+    artifacts = build / "build-artifacts.json"
+    artifacts.write_text(json.dumps(_dbt_profile_artifacts("SELECT 1")))
+    profile_dir = report_dir / "duckdb-profiles" / "reference-pair-0"
+    (profile_dir / "tmp").mkdir(parents=True)
+    (profile_dir / "dlt-data").mkdir()
+    target = tmp_path / "protected-summary.json"
+    target.write_text("leave this alone")
+    (profile_dir / "summary.json").symlink_to(target)
+
+    with pytest.raises(ValueError, match="fresh directory"):
+        benchmark._duckdb_profile_worker(
+            database, artifacts, report_dir, profile_dir, SCRIPT.parents[1]
+        )
+
+    assert target.read_text() == "leave this alone"
+    assert (profile_dir / "summary.json").is_symlink()
+
+
+def test_duckdb_profile_worker_preserves_preexisting_wal_marker(tmp_path: Path):
+    report_dir = tmp_path / "report"
+    build = report_dir / "root" / "builds" / "capture-1"
+    build.mkdir(parents=True)
+    database = build / "warehouse.duckdb"
+    database.write_bytes(b"disposable")
+    artifacts = build / "build-artifacts.json"
+    artifacts.write_text(json.dumps(_dbt_profile_artifacts("SELECT 1")))
+    profile_dir = report_dir / "duckdb-profiles" / "reference-pair-0"
+    profile_dir.mkdir(parents=True)
+    wal = profile_dir / "warehouse.duckdb.wal"
+    wal.write_bytes(b"preserve me")
+
+    with pytest.raises(ValueError, match="profile WAL already exists"):
+        benchmark._duckdb_profile_worker(
+            database, artifacts, report_dir, profile_dir, SCRIPT.parents[1]
+        )
+
+    assert wal.read_bytes() == b"preserve me"
+
+
+def test_duckdb_profile_worker_removes_copy_after_compiled_query_failure(tmp_path: Path):
+    duckdb = pytest.importorskip("duckdb")
+    if not benchmark._duckdb_tracked_metrics_supported(duckdb.__version__):
+        pytest.skip("DuckDB 2.x tracked_metrics is required")
+    report_dir = tmp_path / "report"
+    build = report_dir / "root" / "builds" / "capture-1"
+    build.mkdir(parents=True)
+    database = build / "warehouse.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("CREATE TABLE source_rows AS SELECT * FROM range(8)")
+    artifacts = build / "build-artifacts.json"
+    artifacts.write_text(json.dumps(_dbt_profile_artifacts("SELECT * FROM missing_table")))
+    profile_dir = report_dir / "duckdb-profiles" / "failure-pair-0"
+    original_sha256 = hashlib.sha256(database.read_bytes()).hexdigest()
+
+    with pytest.raises(duckdb.CatalogException):
+        benchmark._duckdb_profile_worker(
+            database, artifacts, report_dir, profile_dir, SCRIPT.parents[1]
+        )
+
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == original_sha256
+    assert not (profile_dir / "warehouse.duckdb").exists()
+    assert not (profile_dir / "warehouse.duckdb.wal").exists()
+    assert not (profile_dir / "duckdb-temp").exists()
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_build_dir"),
+    [
+        ("full", "builds"),
+        ("resume", "builds"),
+        ("sparse-change", "builds-v2"),
+        ("all-change", "builds-v2"),
+    ],
+)
+def test_benchmark_profile_uses_compiled_sql_from_its_build(
+    tmp_path: Path, monkeypatch, profile: str, expected_build_dir: str
+):
+    duckdb = pytest.importorskip("duckdb")
+    if not benchmark._duckdb_tracked_metrics_supported(duckdb.__version__):
+        pytest.skip("DuckDB 2.x tracked_metrics is required")
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    baseline_root = report_dir / "baseline"
+    baseline_root.mkdir()
+    worker = {}
+
+    def worker_command(
+        _source, root, result_path, _markets, profile, _scenario, refresh_mode, *_args
+    ):
+        worker.update(
+            root=root, result_path=result_path, profile=profile, refresh_mode=refresh_mode
+        )
+        return ["synthetic-worker"]
+
+    run_supervised_real = benchmark._run_supervised
+
+    def run_supervised(command, **kwargs):
+        if "--worker-duckdb-profile" in command:
+            return run_supervised_real(command, **kwargs)
+        build = worker["root"] / expected_build_dir / "capture-1"
+        _write_duckdb_profile_build(build, "SELECT count(*) FROM main.source_rows")
+        worker["result_path"].write_text(
+            json.dumps(
+                {
+                    "capture_id": "capture-1",
+                    "profile": worker["profile"],
+                    "refresh_mode": worker["refresh_mode"],
+                }
+            )
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(benchmark, "_worker_command", worker_command)
+    monkeypatch.setattr(benchmark, "_run_supervised", run_supervised)
+    result = benchmark._run_one(
+        SCRIPT.parents[1],
+        report_dir,
+        "candidate",
+        0,
+        1,
+        profile,
+        "candidate",
+        (baseline_root, {"capture_id": "capture-1"}, 0.0),
+        duckdb_profile_json=True,
+    )
+
+    assert worker["refresh_mode"] == benchmark._paired_refresh_mode(profile, "candidate")
+    assert result["duckdb_profile_json"]["status"] == "profiled"
+    assert not (report_dir / "root-candidate-0").exists()
+
+
 @pytest.mark.parametrize(
     ("clock_values", "group_survives_kill", "expected_result"),
     [
@@ -1393,6 +1718,27 @@ def test_frozen_v2_cli_requires_an_explicit_prepared_capture(tmp_path: Path):
     )
     assert result.returncode == 2
     assert "requires --compare-root, --frozen-root, and --capture-id" in result.stderr
+
+
+def test_duckdb_profile_flag_rejects_profiles_without_dbt_warehouses(tmp_path: Path):
+    report_dir = tmp_path / "report"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--profile",
+            "targeted",
+            "--duckdb-profile-json",
+            "--report-dir",
+            str(report_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "requires a benchmark profile that builds a warehouse" in result.stderr
+    assert not report_dir.exists()
 
 
 def test_capture_preparation_cli_requires_combo_heavy_fixture(tmp_path: Path):
