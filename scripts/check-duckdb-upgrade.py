@@ -162,6 +162,12 @@ def main() -> int:
                 candidate_environment,
             ),
             (
+                "candidate native storage conversion",
+                interpreters["candidate"],
+                ("tests/test_duckdb_storage.py",),
+                candidate_environment,
+            ),
+            (
                 "candidate series handoff",
                 interpreters["candidate"],
                 (
@@ -169,6 +175,15 @@ def main() -> int:
                     "test_candidate_bootstraps_v2_and_deltas_reference_baselines",
                 ),
                 candidate_environment,
+            ),
+            (
+                "reference native storage rejection",
+                interpreters["reference"],
+                (
+                    "tests/test_duckdb_upgrade.py::"
+                    "test_reference_reader_rejects_candidate_native_v2_baseline",
+                ),
+                reference_environment,
             ),
             (
                 "candidate compatibility",

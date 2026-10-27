@@ -92,6 +92,13 @@ def _database_hash(store, directory: str, capture_id: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _database_storage_version(path: Path) -> str:
+    with duckdb.connect(str(path), read_only=True) as connection:
+        return connection.execute(
+            "select tags['storage_version'] from duckdb_databases() where not internal"
+        ).fetchone()[0]
+
+
 def test_write_reference_dictionary_baseline(monkeypatch, tmp_path):
     root = _upgrade_root()
     assert duckdb.__version__ == "1.5.6"
@@ -248,7 +255,11 @@ def test_candidate_bootstraps_v2_and_deltas_reference_baselines(monkeypatch, tmp
     v1_store = Store(root / "series-v1")
     v1_capture_id = receipts["series-v1"]
     v1_hash = _database_hash(v1_store, "builds", v1_capture_id)
+    legacy_path = v1_store.path(f"builds/{v1_capture_id}/warehouse.duckdb")
+    assert _database_storage_version(legacy_path).startswith("v1.")
     bootstrap = warehouse.build_v2_full(v1_store, v1_capture_id)
+    native_path = v1_store.path(f"builds-v2/{v1_capture_id}/warehouse.duckdb")
+    assert _database_storage_version(native_path) == "v2.0.0+"
     assert warehouse.certified(v1_store, v1_capture_id, catalogue_version=2) == bootstrap
     bootstrap_release = publishing.publish(v1_store, v1_capture_id, catalogue_version=2)
     assert _database_hash(v1_store, "builds", v1_capture_id) == v1_hash
@@ -261,6 +272,18 @@ def test_candidate_bootstraps_v2_and_deltas_reference_baselines(monkeypatch, tmp
     delta_release = publishing.publish(v2_store, delta["capture_id"], catalogue_version=2)
     assert _database_hash(v2_store, "builds-v2", receipts["series-v2"]) == v2_hash
     _assert_series_output(v2_store, delta["capture_id"], delta_release)
+
+
+def test_reference_reader_rejects_candidate_native_v2_baseline(monkeypatch, tmp_path):
+    root = _upgrade_root()
+    assert duckdb.__version__ == "1.5.6"
+    monkeypatch.chdir(tmp_path)
+    receipts = json.loads((root / "series-receipt.json").read_text())
+    path = root / "series-v1" / "builds-v2" / receipts["series-v1"] / "warehouse.duckdb"
+    assert path.is_file()
+
+    with pytest.raises(duckdb.Error):
+        duckdb.connect(str(path), read_only=True)
 
 
 def test_harness_preserves_venv_symlink_and_resolves_relative_paths(tmp_path):

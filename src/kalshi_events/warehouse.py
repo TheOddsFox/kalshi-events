@@ -777,29 +777,362 @@ def _copy_closed_database_impl(
     expected_sha256: str,
 ) -> None:
     source = store.path(source_relative)
-    if store.path(source_relative + ".wal").exists():
-        raise CatalogueError("baseline warehouse has an uncheckpointed WAL")
-    size = source.stat().st_size
-    if store.usage()["database_bytes"] + size > store.limits.max_database_bytes:
-        raise CatalogueError("baseline copy exceeds the configured database storage limit")
-    store.reserve_storage(size)
+    source_wal = store.path(source_relative + ".wal")
     try:
-        destination = staging / "warehouse.duckdb"
-        copied = 0
-        with source.open("rb") as input_stream, destination.open("wb") as output_stream:
-            while chunk := input_stream.read(1024 * 1024):
+        staging_relative = str(staging.relative_to(store.root))
+    except ValueError as exc:
+        raise CatalogueError("database staging directory is outside the operator root") from exc
+    staging = store.path(staging_relative)
+    destination_relative = str(Path(staging_relative) / "warehouse.duckdb")
+    destination = store.path(destination_relative)
+    destination_wal = store.path(destination_relative + ".wal")
+    if destination.exists() or destination_wal.exists():
+        raise CatalogueError("staged warehouse already exists")
+    if source_wal.exists():
+        raise CatalogueError("baseline warehouse has an uncheckpointed WAL")
+
+    def closed_digest(path: Path) -> tuple[str, int]:
+        if path.is_symlink() or not path.is_file():
+            raise CatalogueError("baseline warehouse is not a regular file")
+        initial_size = path.stat().st_size
+        if initial_size > store.limits.max_database_bytes:
+            raise CatalogueError("baseline warehouse exceeds the configured database limit")
+        checksum = hashlib.sha256()
+        size = 0
+        metrics.add("hashes")
+        metrics.add("file_reads")
+        with metrics.phase("hashing"), path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
                 store.check_deadline()
-                output_stream.write(chunk)
-                copied += len(chunk)
-        if copied != size:
-            raise CatalogueError("baseline warehouse changed while it was copied")
-        if file_digest(destination, store.limits.max_database_bytes)[0] != expected_sha256:
-            raise CatalogueError("copied baseline warehouse differs from its certified identity")
-        fsync_file(destination)
-        fsync_directory(staging)
-        store.sync(str(staging.relative_to(store.root)))
+                size += len(chunk)
+                if size > store.limits.max_database_bytes:
+                    raise CatalogueError("baseline warehouse grew beyond the database limit")
+                checksum.update(chunk)
+                metrics.add("hash_bytes", len(chunk))
+        if size != initial_size or path.stat().st_size != initial_size:
+            raise CatalogueError("baseline warehouse changed while it was read")
+        return checksum.hexdigest(), size
+
+    def inventory(connection: duckdb.DuckDBPyConnection, database: str) -> dict[str, list[tuple]]:
+        queries = {
+            "schemas": (
+                "select schema_name, parent_schema, comment, tags, sql from duckdb_schemas() "
+                "where database_name = ? and not internal order by schema_name"
+            ),
+            "tables": (
+                "select schema_name, table_name, comment, tags, sql from duckdb_tables() "
+                "where database_name = ? and not internal and not temporary "
+                "order by schema_name, table_name"
+            ),
+            "columns": (
+                "select schema_name, table_name, column_name, column_index, comment, tags, "
+                "column_default, is_nullable, data_type, data_type_id, "
+                "character_maximum_length, numeric_precision, numeric_precision_radix, "
+                "numeric_scale, is_generated, generation_expression "
+                "from duckdb_columns() where database_name = ? and not internal "
+                "order by schema_name, table_name, column_index"
+            ),
+            "views": (
+                "select schema_name, view_name, comment, tags, sql from duckdb_views() "
+                "where database_name = ? and not internal and not temporary "
+                "order by schema_name, view_name"
+            ),
+            "indexes": (
+                "select schema_name, index_name, table_name, comment, tags, is_unique, "
+                "is_primary, expressions, sql from duckdb_indexes() where database_name = ? "
+                "order by schema_name, index_name"
+            ),
+            "constraints": (
+                "select schema_name, table_name, constraint_type, constraint_text, "
+                "expression, constraint_column_indexes, "
+                "constraint_column_names, constraint_name, referenced_table, "
+                "referenced_column_names "
+                "from duckdb_constraints() where database_name = ? "
+                "order by schema_name, table_name, constraint_name, constraint_type, "
+                "constraint_text, constraint_column_names"
+            ),
+            "sequences": (
+                "select schema_name, sequence_name, comment, tags, start_value, min_value, "
+                "max_value, increment_by, cycle, last_value, sql from duckdb_sequences() "
+                "where database_name = ? order by schema_name, sequence_name"
+            ),
+            "types": (
+                "select schema_name, type_name, comment, tags, logical_type, type_category, "
+                "labels, parameters, parameter_types "
+                "from duckdb_types() where database_name = ? and not internal "
+                "order by schema_name, type_name"
+            ),
+            "macros": (
+                "select schema_name, function_name, function_type, comment, tags, "
+                "return_type, parameters, parameter_types, varargs, has_side_effects, "
+                "macro_definition from duckdb_functions() "
+                "where database_name = ? and not internal "
+                "and function_type in ('macro', 'table_macro') and schema_name <> 'temp' "
+                "order by schema_name, function_name, function_type, parameters"
+            ),
+        }
+        return {
+            name: connection.execute(query, [database]).fetchall()
+            for name, query in queries.items()
+        }
+
+    def quote_identifier(value: str) -> str:
+        return '"' + value.replace('"', '""') + '"'
+
+    source_hash, size = closed_digest(source)
+    if source_hash != expected_sha256:
+        raise CatalogueError("baseline warehouse differs from its certified identity")
+    store.check_deadline()
+    store.sync_file(source_relative)
+    store.check_deadline()
+    usage = store.usage()
+    remaining_database = store.limits.max_database_bytes - usage["database_bytes"]
+    remaining_temp = store.limits.max_temp_bytes - usage["temporary_bytes"]
+    remaining_root = store.limits.max_root_bytes - usage["retained_bytes"]
+    output_allowance = min(remaining_database, remaining_temp, remaining_root)
+    if output_allowance < size:
+        raise CatalogueError("baseline copy exceeds the remaining database storage allowance")
+
+    native_version = "v2.0.0+"
+    source_alias = "migration_source"
+    destination_alias = destination.stem
+    source_literal = "'" + str(source).replace("'", "''") + "'"
+
+    # A v2.0 file is already native, so retain the certified byte-copy fast path.
+    store.check_deadline()
+    probe = duckdb.connect(config={"memory_limit": DBT_MEMORY_LIMIT, "threads": str(DBT_THREADS)})
+    try:
+        with interrupt_at_deadline(store, probe.interrupt):
+            probe.execute(
+                f"ATTACH {source_literal} AS {quote_identifier(source_alias)} (READ_ONLY)"
+            )
+            storage_version = probe.execute(
+                "select tags['storage_version'] from duckdb_databases() where database_name = ?",
+                [source_alias],
+            ).fetchone()[0]
     finally:
-        store.release_storage(size)
+        probe.close()
+    store.check_deadline()
+    if storage_version != native_version and not (
+        isinstance(storage_version, str)
+        and storage_version.startswith("v1.")
+        and storage_version.endswith("+")
+    ):
+        raise CatalogueError("baseline warehouse uses an unsupported DuckDB storage version")
+
+    reservation = 0
+    spill_directory: Path | None = None
+    try:
+        if storage_version == native_version:
+            if usage["database_bytes"] + size > store.limits.max_database_bytes:
+                raise CatalogueError("baseline copy exceeds the configured database storage limit")
+            store.reserve_storage(size)
+            reservation = size
+            copied = 0
+            checksum = hashlib.sha256()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            metrics.add("hashes")
+            metrics.add("file_reads")
+            with (
+                metrics.phase("hashing"),
+                source.open("rb") as input_stream,
+                destination.open("xb") as output_stream,
+            ):
+                while chunk := input_stream.read(1024 * 1024):
+                    store.check_deadline()
+                    output_stream.write(chunk)
+                    checksum.update(chunk)
+                    copied += len(chunk)
+                    metrics.add("hash_bytes", len(chunk))
+            copied_hash = checksum.hexdigest()
+            if copied != size or copied_hash != expected_sha256:
+                raise CatalogueError(
+                    "copied baseline warehouse differs from its certified identity"
+                )
+        else:
+            spill_allowance = min(remaining_temp - size, remaining_root - size)
+            if spill_allowance < 1:
+                raise BudgetExceeded(
+                    "no bounded temporary storage is available for database conversion"
+                )
+            requested_reservation = size + spill_allowance
+            store.reserve_storage(requested_reservation)
+            reservation = requested_reservation
+            spill_relative = f"tmp/database-copy-{uuid.uuid4().hex}"
+            spill_directory = store.path(spill_relative)
+            durable_mkdir(spill_directory.parent)
+            spill_directory.mkdir()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            target_literal = "'" + str(destination).replace("'", "''") + "'"
+            with (
+                duckdb.connect(
+                    config={
+                        "memory_limit": DBT_MEMORY_LIMIT,
+                        "threads": str(DBT_THREADS),
+                        "temp_directory": str(spill_directory),
+                        "max_temp_directory_size": f"{spill_allowance}B",
+                    }
+                ) as connection,
+                interrupt_at_deadline(store, connection.interrupt),
+            ):
+                try:
+                    connection.execute(
+                        f"ATTACH {source_literal} AS {quote_identifier(source_alias)} (READ_ONLY)"
+                    )
+                    connection.execute(
+                        f"ATTACH {target_literal} AS {quote_identifier(destination_alias)}"
+                    )
+                    target_version = connection.execute(
+                        "select tags['storage_version'] from duckdb_databases() "
+                        "where database_name = ?",
+                        [destination_alias],
+                    ).fetchone()[0]
+                    if target_version != native_version:
+                        raise CatalogueError(
+                            "database conversion did not create DuckDB 2.0 storage"
+                        )
+                    connection.execute(
+                        "COPY FROM DATABASE "
+                        f"{quote_identifier(source_alias)} TO {quote_identifier(destination_alias)}"
+                    )
+                    source_catalog = inventory(connection, source_alias)
+                    target_catalog = inventory(connection, destination_alias)
+                    if source_catalog != target_catalog:
+                        raise CatalogueError("converted warehouse catalog differs from its source")
+                    for table_row in source_catalog["tables"]:
+                        schema, table = table_row[:2]
+                        source_table = ".".join(
+                            quote_identifier(part) for part in (source_alias, schema, table)
+                        )
+                        target_table = ".".join(
+                            quote_identifier(part) for part in (destination_alias, schema, table)
+                        )
+                        for left, right in (
+                            (source_table, target_table),
+                            (target_table, source_table),
+                        ):
+                            store.check_deadline()
+                            if connection.execute(
+                                f"select 1 from ((select * from {left}) except all "
+                                f"(select * from {right})) limit 1"
+                            ).fetchone():
+                                raise CatalogueError(
+                                    "converted warehouse table data differs from its source"
+                                )
+                    connection.execute(f"DETACH {quote_identifier(source_alias)}")
+                    for view_row in source_catalog["views"]:
+                        schema, view = view_row[:2]
+                        object_name = ".".join(
+                            quote_identifier(part) for part in (destination_alias, schema, view)
+                        )
+                        try:
+                            connection.execute(
+                                f"EXPLAIN SELECT * FROM {object_name} LIMIT 0"
+                            ).fetchall()
+                        except duckdb.InterruptException:
+                            raise
+                        except duckdb.Error as exc:
+                            raise CatalogueError(
+                                "converted warehouse contains an unresolved view"
+                            ) from exc
+                    for macro_row in source_catalog["macros"]:
+                        schema, macro, function_type = macro_row[:3]
+                        parameters = macro_row[6]
+                        object_name = ".".join(
+                            quote_identifier(part) for part in (destination_alias, schema, macro)
+                        )
+                        arguments = ", ".join("NULL" for _ in parameters)
+                        invocation = f"{object_name}({arguments})"
+                        try:
+                            if function_type == "table_macro":
+                                connection.execute(
+                                    f"EXPLAIN SELECT * FROM {invocation} LIMIT 0"
+                                ).fetchall()
+                            else:
+                                connection.execute(
+                                    f"EXPLAIN SELECT {invocation} LIMIT 0"
+                                ).fetchall()
+                        except duckdb.InterruptException:
+                            raise
+                        except duckdb.Error as exc:
+                            raise CatalogueError(
+                                "converted warehouse contains an unresolved macro"
+                            ) from exc
+                    connection.execute(f"CHECKPOINT {quote_identifier(destination_alias)}")
+                except duckdb.InterruptException as exc:
+                    raise BudgetExceeded(
+                        "operation deadline exhausted during database conversion"
+                    ) from exc
+            store.check_deadline()
+            if destination_wal.exists():
+                raise CatalogueError("converted warehouse has an uncheckpointed WAL")
+
+        if source_wal.exists():
+            raise CatalogueError("baseline warehouse gained an uncheckpointed WAL during copy")
+        after_hash, after_size = closed_digest(source)
+        if after_hash != source_hash or after_size != size:
+            raise CatalogueError("baseline warehouse changed while it was copied")
+        if destination_wal.exists():
+            raise CatalogueError("copied warehouse has an uncheckpointed WAL")
+        if storage_version != native_version:
+            store.check_deadline()
+            verify = duckdb.connect(
+                config={"memory_limit": DBT_MEMORY_LIMIT, "threads": str(DBT_THREADS)}
+            )
+            try:
+                with interrupt_at_deadline(store, verify.interrupt):
+                    target_literal = "'" + str(destination).replace("'", "''") + "'"
+                    verify.execute(
+                        f"ATTACH {target_literal} AS {quote_identifier(destination_alias)} "
+                        "(READ_ONLY)"
+                    )
+                    target_version = verify.execute(
+                        "select tags['storage_version'] from duckdb_databases() "
+                        "where database_name = ?",
+                        [destination_alias],
+                    ).fetchone()[0]
+            finally:
+                verify.close()
+            store.check_deadline()
+            if target_version != native_version:
+                raise CatalogueError("converted warehouse is not in DuckDB 2.0 storage")
+        store.check_deadline()
+        fsync_file(destination)
+        store.check_deadline()
+        fsync_directory(staging)
+        store.check_deadline()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        destination_wal.unlink(missing_ok=True)
+        raise
+    finally:
+        if spill_directory is not None:
+            shutil.rmtree(spill_directory, ignore_errors=True)
+            try:
+                store.check_deadline()
+            finally:
+                try:
+                    store.sync("tmp")
+                finally:
+                    if reservation:
+                        store.release_storage(reservation)
+                        reservation = 0
+            store.check_deadline()
+        elif reservation:
+            store.release_storage(reservation)
+
+    staging_relative = str(staging.relative_to(store.root))
+    try:
+        store.check_deadline()
+        store.sync(staging_relative)
+        store.check_deadline()
+        store.check_storage()
+        store.check_deadline()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        destination_wal.unlink(missing_ok=True)
+        store.sync(staging_relative)
+        raise
 
 
 def _copy_closed_database(
