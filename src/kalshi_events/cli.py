@@ -142,12 +142,27 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             limits,
             series_ticker=(args.series_ticker if args.series_action == "refresh" else None),
         )
+        operation_error = None
+        result = None
         try:
             if store.scope is None:
                 raise CatalogueError("series command requires a scoped operator root")
-            return _run_series(store, args)
+            result = _run_series(store, args)
+        except BaseException as exc:
+            operation_error = exc
+            raise
         finally:
-            store.reconcile()
+            try:
+                store.reconcile()
+            except BaseException as exc:
+                if operation_error is None:
+                    if isinstance(exc, BudgetExceeded) and result is not None:
+                        result["complete"] = False
+                        result["error"] = result.get("error") or str(exc)
+                    else:
+                        raise
+        assert result is not None
+        return result
     if args.command == "metadata" and args.metadata_action == "verify":
         return metadata.verify(args.output)
     if args.command == "verify":
@@ -160,11 +175,26 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             return {"returncode": result.returncode}
     root = args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data"))
     store = Store(root, limits)
+    operation_error = None
+    result = None
     try:
-        return _run(store, args)
+        result = _run(store, args)
+    except BaseException as exc:
+        operation_error = exc
+        raise
     finally:
         # One full walk at invocation start (in Store) and one at its end.
-        store.reconcile()
+        try:
+            store.reconcile()
+        except BaseException as exc:
+            if operation_error is None:
+                if isinstance(exc, BudgetExceeded) and result is not None:
+                    result["complete"] = False
+                    result["error"] = result.get("error") or str(exc)
+                else:
+                    raise
+    assert result is not None
+    return result
 
 
 def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
@@ -410,7 +440,8 @@ def _refresh_main(args: argparse.Namespace) -> int:
                     result["error"] = (
                         result["error"] or f"final storage reconciliation failed: {exc}"
                     )
-                    exit_code = EXIT_INCOMPLETE if isinstance(exc, BudgetExceeded) else 1
+                    if exit_code == 0:
+                        exit_code = EXIT_INCOMPLETE if isinstance(exc, BudgetExceeded) else 1
             if measured is not None:
                 measured.progress("complete" if exit_code == 0 else "stopped")
     except BudgetExceeded as exc:

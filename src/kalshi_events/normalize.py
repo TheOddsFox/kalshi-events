@@ -76,7 +76,9 @@ def native_identity(kind: str, native: dict[str, Any]) -> tuple[str, Any]:
     parent = None
     if kind == "events":
         parent = native.get("series_ticker")
-        if parent:
+        if parent is not None and parent != "":
+            if not isinstance(parent, str):
+                raise CatalogueError("malformed native event series ticker")
             ticker(parent)
     elif kind == "markets":
         parent = ticker(native.get("event_ticker"))

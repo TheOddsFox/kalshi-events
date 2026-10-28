@@ -32,8 +32,11 @@ LEGACY_RECONCILIATION_UV_LOCK_SHA256 = (
     "9a802ab62302a6ec0d8db5a3c602552892c9370c33c4edc098a0501a192d1d17"
 )
 RECONCILIATION_UV_LOCK_SHA256 = "79ceef4ec550fcb4f83aa53d3eb140175df78374c21356243831c725ea65c421"
-# Binds the raw-response implementation used to establish the 64 KiB allowance.
-RECONCILIATION_TRANSPORT_SHA256 = "5c4727b4653c4d201302407b25fc0b914f54ad561961209d3f51524524e91849"
+# Saved raw-response implementations accepted for the 64 KiB reconciliation allowance.
+PREVIOUS_RECONCILIATION_TRANSPORT_SHA256 = (
+    "5c4727b4653c4d201302407b25fc0b914f54ad561961209d3f51524524e91849"
+)
+RECONCILIATION_TRANSPORT_SHA256 = "c05b2e1c8492d14ae437e11b9b408f82684fba95fdb77b0d66c44084dcab1a55"
 LEGACY_RECONCILIATION_RUNTIME_VERSIONS = {
     "duckdb": "1.5.6",
     "dlt": "1.31.0",
@@ -90,10 +93,18 @@ DEADLINE_STOP_REASONS = frozenset(
         "insufficient wall-clock time remains to start and reap a child",
     }
 )
+NO_CHILD_START_REASONS = frozenset(
+    {
+        "insufficient time remains to start and reap a child",
+        "insufficient wall-clock time remains to start and reap a child",
+    }
+)
 RECOVERABLE_ACCOUNTING_STOP_REASONS = frozenset(
     {
         "refresh failed with unknown child accounting",
         "resumed child did not report exact invocation accounting",
+        "insufficient time remains to start and reap a child",
+        "insufficient wall-clock time remains to start and reap a child",
         "resource accounting failed: Command '['ps', '-axo', 'pgid=,rss=']' timed out after 5.0 seconds",
         "resource accounting failed: process-group RSS sampling timed out",
         "process-group RSS exceeded 24 GiB for 60 seconds",
@@ -803,6 +814,8 @@ def _invoke(
                     shell=False,
                     start_new_session=True,
                 )
+                report["active_process_group"] = process.pid
+                _atomic_report(report_path, report)
             finally:
                 _SPAWNING_CHILD = False
             if _PENDING_STOP_SIGNAL is not None:
@@ -811,8 +824,6 @@ def _invoke(
                 raise RunnerInterrupted(
                     f"received {signal.Signals(signum).name}; stopping supervised work"
                 )
-            report["active_process_group"] = process.pid
-            _atomic_report(report_path, report)
             result = _monitor(
                 process,
                 directory,
@@ -1638,6 +1649,26 @@ def run_production(
                 report["refresh_result"] = cli_result
                 report["refresh_logs"] = {"stdout": str(stdout_path), "stderr": str(stderr_path)}
                 report["acquisition_metrics"] = _strict_json(paths["metrics"])
+                if code is None and reaped and stop_reason in NO_CHILD_START_REASONS:
+                    report.update(
+                        requests=prior["attempts"],
+                        downloaded_bytes=prior.get("downloaded_bytes"),
+                        downloaded_bytes_upper_bound=prior.get("downloaded_bytes_upper_bound"),
+                        accounting_complete=prior["accounting_complete"],
+                        accounting_basis=prior.get("accounting_basis", "exact"),
+                        accounting_bound_verified=prior.get("accounting_bound_verified", False),
+                        unfinished_reservation_ids=prior.get("unfinished_reservation_ids", []),
+                        consumption_state=prior.get("accounting_basis", "verified"),
+                        network_activity_this_invocation={
+                            "requests": 0,
+                            "downloaded_bytes": 0,
+                            "accounting_complete": True,
+                        },
+                        error=stop_reason,
+                        phase="stopped",
+                    )
+                    _atomic_report(report_path, report)
+                    return result, 3
                 if not reaped:
                     stop_reason = "refresh subprocess could not be reaped within five seconds"
                 if stop_reason or cli_result is None or code not in {0, 1, 3}:
@@ -2102,7 +2133,14 @@ def _load_resume(
             )
             or (
                 "transport_sha256" in saved_system
-                and saved_transport_sha256 != RECONCILIATION_TRANSPORT_SHA256
+                and (
+                    not isinstance(saved_transport_sha256, str)
+                    or saved_transport_sha256
+                    not in (
+                        PREVIOUS_RECONCILIATION_TRANSPORT_SHA256,
+                        RECONCILIATION_TRANSPORT_SHA256,
+                    )
+                )
             )
         ):
             raise RunnerError(

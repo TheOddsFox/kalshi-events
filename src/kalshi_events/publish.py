@@ -594,6 +594,8 @@ def current(store: Store, *, catalogue_version: int = 1) -> dict[str, Any]:
         raise CatalogueError("invalid current release identity")
     directory = store.path(f"releases/{release_id}")
     manifest = verify_release(directory, store.limits.max_root_bytes)
+    if manifest.get("source_release_id") != release_id:
+        raise CatalogueError("current pointer release identity mismatch")
     if manifest.get("contract") != expected_contract:
         raise CatalogueError("current pointer references a different catalogue contract")
     if digest(regular_bytes(directory / "manifest.json")) != pointer.get("manifest_sha256"):

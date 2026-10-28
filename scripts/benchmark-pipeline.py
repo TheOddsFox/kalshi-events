@@ -197,7 +197,7 @@ def _run_supervised(
                 f"benchmark worker descendants remain after timeout: {command!r}"
             ) from exc
         raise subprocess.TimeoutExpired(
-            command, timeout, output=output, stderr=error_output
+            command, timeout, output=exc.output, stderr=exc.stderr
         ) from exc
     except BaseException as exc:
         if (

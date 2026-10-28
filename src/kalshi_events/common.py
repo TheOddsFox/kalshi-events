@@ -407,9 +407,9 @@ class Store:
     def reconcile(self) -> dict[str, int]:
         """Full directory walk. Called once at invocation start and once at its end."""
         with self._lock:
-            self._sizes.clear()
-            self._usage = {key: 0 for key in self._usage}
-            self._sync_prefix(self.root)
+            self.check_deadline()
+            self._sync_prefix(self.root, check_deadline=True, require_path=True)
+            self.check_deadline()
             return dict(self._usage)
 
     def sync(self, relative: str) -> None:
@@ -623,23 +623,63 @@ class Store:
         self.require_writable()
 
     @metrics.phase("metadata_scan")
-    def _sync_prefix(self, path: Path) -> None:
+    def _sync_prefix(
+        self,
+        path: Path,
+        *,
+        check_deadline: bool = False,
+        require_path: bool = False,
+    ) -> None:
         metrics.add("metadata_scans")
         prefix = str(path)
         present: dict[str, int] = {}
-        if path.is_file():
-            present[prefix] = path.stat().st_size
-        elif path.is_dir():
-            for base, dirs, files in os.walk(path, followlinks=False):
+        if check_deadline:
+            self.check_deadline()
+        try:
+            info = path.stat()
+        except FileNotFoundError as exc:
+            if require_path:
+                raise CatalogueError("operator root disappeared during reconciliation") from exc
+            info = None
+        except OSError as exc:
+            raise CatalogueError(f"cannot stat operator root path: {path}") from exc
+        if require_path and (info is None or not stat.S_ISDIR(info.st_mode)):
+            raise CatalogueError("operator root is not a directory during reconciliation")
+        if info is not None and stat.S_ISREG(info.st_mode):
+            present[prefix] = info.st_size
+        elif info is not None and stat.S_ISDIR(info.st_mode):
+
+            def scan_error(error: OSError) -> None:
+                raise CatalogueError(f"cannot scan operator root path: {error}") from error
+
+            for base, dirs, files in os.walk(path, followlinks=False, onerror=scan_error):
+                if check_deadline:
+                    self.check_deadline()
                 for name in dirs:
+                    if check_deadline:
+                        self.check_deadline()
                     child = Path(base) / name
-                    if path_is_link(child):
-                        raise CatalogueError(f"symlink inside operator root: {child}")
+                    try:
+                        if path_is_link(child):
+                            raise CatalogueError(f"symlink inside operator root: {child}")
+                    except OSError as exc:
+                        raise CatalogueError(f"cannot stat operator root entry: {child}") from exc
                 for name in files:
                     child = Path(base) / name
-                    if path_is_link(child):
-                        raise CatalogueError(f"symlink inside operator root: {child}")
-                    present[str(child)] = child.stat().st_size
+                    try:
+                        if path_is_link(child):
+                            raise CatalogueError(f"symlink inside operator root: {child}")
+                    except OSError as exc:
+                        raise CatalogueError(f"cannot stat operator root entry: {child}") from exc
+                    try:
+                        size = child.stat().st_size
+                    except OSError as exc:
+                        raise CatalogueError(f"cannot stat operator root file: {child}") from exc
+                    if check_deadline:
+                        self.check_deadline()
+                    present[str(child)] = size
+        if check_deadline:
+            self.check_deadline()
         with self._lock:
             for key in [k for k in self._sizes if k == prefix or k.startswith(prefix + os.sep)]:
                 if key not in present:

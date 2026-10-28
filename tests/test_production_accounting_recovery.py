@@ -292,6 +292,72 @@ def test_reconcile_allows_new_lock_to_new_lock_only_with_complete_saved_metadata
     assert workflow.commands == []
 
 
+@pytest.mark.parametrize("saved_lock", ["legacy", "target"])
+@pytest.mark.parametrize("saved_hash", ["previous", "current"])
+def test_reconcile_accepts_approved_saved_transport_hashes_with_current_source(
+    production, workflow, monkeypatch, saved_lock, saved_hash
+):
+    stopped, report_path, report = _stopped_capture_with_unknown_accounting(production, workflow)
+    if saved_lock == "target":
+        report = _mark_target_runtime(production, report_path)
+    report["system"]["transport_sha256"] = (
+        production.PREVIOUS_RECONCILIATION_TRANSPORT_SHA256
+        if saved_hash == "previous"
+        else production.RECONCILIATION_TRANSPORT_SHA256
+    )
+    report_path.write_text(json.dumps(report))
+    workflow.commands.clear()
+    monkeypatch.setattr(production, "_package_versions", lambda: _target_versions())
+
+    _path, resumed, _paths = production._load_resume(
+        workflow.directory, stopped["capture_id"], reconcile_accounting=True
+    )
+
+    assert resumed["system"]["transport_sha256"] == report["system"]["transport_sha256"]
+    assert workflow.commands == []
+
+
+@pytest.mark.parametrize("saved_transport", ["f" * 64, ["not", "a", "hash"]])
+def test_reconcile_rejects_unrecognized_saved_transport_before_mutation_or_child_start(
+    production, workflow, monkeypatch, saved_transport
+):
+    stopped, report_path, report = _stopped_capture_with_unknown_accounting(production, workflow)
+    report = _mark_target_runtime(production, report_path)
+    report["system"]["transport_sha256"] = saved_transport
+    report_path.write_text(json.dumps(report))
+    workflow.commands.clear()
+    before = report_path.read_bytes()
+    monkeypatch.setattr(production, "_package_versions", lambda: _target_versions())
+
+    with pytest.raises(production.RunnerError, match="transport source"):
+        production._load_resume(
+            workflow.directory, stopped["capture_id"], reconcile_accounting=True
+        )
+
+    assert report_path.read_bytes() == before
+    assert workflow.commands == []
+
+
+def test_reconcile_rejects_missing_transport_hash_for_target_lock(
+    production, workflow, monkeypatch
+):
+    stopped, report_path, report = _stopped_capture_with_unknown_accounting(production, workflow)
+    report = _mark_target_runtime(production, report_path)
+    report["system"].pop("transport_sha256")
+    report_path.write_text(json.dumps(report))
+    workflow.commands.clear()
+    before = report_path.read_bytes()
+    monkeypatch.setattr(production, "_package_versions", lambda: _target_versions())
+
+    with pytest.raises(production.RunnerError, match="transport source"):
+        production._load_resume(
+            workflow.directory, stopped["capture_id"], reconcile_accounting=True
+        )
+
+    assert report_path.read_bytes() == before
+    assert workflow.commands == []
+
+
 @pytest.mark.parametrize("missing", ["dbt-duckdb", "httpcore"])
 def test_reconcile_rejects_missing_metadata_for_new_lock(
     production, workflow, monkeypatch, missing

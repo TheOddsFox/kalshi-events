@@ -346,7 +346,6 @@ class PublicClient:
             raise CatalogueError("invalid source endpoint")
         for attempt in range(MAX_ATTEMPTS):
             last = attempt == MAX_ATTEMPTS - 1
-            rate_generation = self.limiter.acquire(self.budget)
             allowance = self.budget.reserve()
             attempt_id = uuid.uuid4().hex
             relative = f"raw/{attempt_id}/manifest.json"
@@ -376,6 +375,7 @@ class PublicClient:
                 self.store.write(relative, reservation)
                 metrics.add("requests")
                 spool = self.store.spool(f"raw/{attempt_id}/body.bin")
+                rate_generation = self.limiter.acquire(self.budget)
                 with (
                     metrics.phase("request"),
                     metrics.http_request(),

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Reject task-mismatched receipts during replay, malformed event-parent identifiers and inconsistent current-release identities.
+- Fail closed on incomplete storage inventories and enforce accounting deadlines. Pace HTTP dispatch after durable request preparation.
+- Preserve known production accounting when no child starts, and persist child process-group handles before honoring deferred stop signals.
+- Distinguish unreaped probe workers from confirmed termination and retain partial benchmark output after timeouts.
+
 ## 1.0.0
 
 Captures now run at a configurable 10 requests per second by default, shared by all five traversals, and a budget stop exits with code 3 and `complete: false` so the capture can resume. Each build and release comes from exactly one complete catalogue capture, and superseded captures, their raw evidence, builds and releases are pruned only after the new release verifies. The backup and restore commands are removed; `rebuild` and `replay` operate on the current capture.

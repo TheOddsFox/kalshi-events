@@ -1448,6 +1448,10 @@ def _read_page_change(
         or not _receipt_matches_context(manifest, context)
     ):
         raise CatalogueError("journal receipt does not match its traversal")
+    if _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL and (
+        _batched_parent_policy(state) or _checkpoint_policy(state)
+    ):
+        _validate_receipt_task_binding(manifest, state, {"index": index, "request_id": request_id})
     return manifest, payload, _derive_page_change(state, seen, index, manifest, payload)
 
 

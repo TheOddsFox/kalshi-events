@@ -492,17 +492,17 @@ def _sample(
 
     stop_reason = None
     if timed_out:
-        stop_reason = "sample deadline exceeded; child terminated"
+        stop_reason = (
+            "child could not be reaped within the termination grace"
+            if returncode is None
+            else "sample deadline exceeded; child terminated"
+        )
     elif not trusted_worker:
         stop_reason = "worker did not exit cleanly or returned untrusted accounting"
     elif returncode not in {0, 3}:
         stop_reason = "capture worker reported an unexpected failure"
     elif accounting_result is None or sample["accounting"] != "verified":
-        stop_reason = (
-            "child could not be reaped within the termination grace"
-            if timed_out and returncode is None
-            else "accounting or storage usage is unknown"
-        )
+        stop_reason = "accounting or storage usage is unknown"
     elif (
         accounting_result["attempts"] > remaining_attempts
         or accounting_result["downloaded_or_reserved_bytes"] > remaining_download
