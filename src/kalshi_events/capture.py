@@ -1223,7 +1223,6 @@ def _read_v2(
     processed: set[str] = set()
     transition_count = 0
     seen_request_ids: set[str] = set()
-    seen_relatives: set[str] = set()
     known_tasks = {_task_identity(work): work for work in base["tasks"]}
     complete_seen = False
     anchor_key = (1, first_end, first["sha256"], 0)
@@ -1348,10 +1347,9 @@ def _read_v2(
             ):
                 raise CatalogueError("invalid journal page reference")
             store.path(relative)
-            if request_id in seen_request_ids or relative in seen_relatives:
+            if request_id in seen_request_ids or relative in processed:
                 raise CatalogueError("journal contains a duplicate page receipt")
             seen_request_ids.add(request_id)
-            seen_relatives.add(relative)
             row = {"index": index, "relative": relative, "request_id": request_id}
             page_rows.append(row)
             if retain_page_anchors:
@@ -3081,7 +3079,11 @@ def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex)
 
 def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
     """Find committed raw receipts that no journal entry or checkpoint references yet."""
-    logged = {row["relative"] for row in page_receipts(store, state)}
+    logged = (
+        state.processed
+        if isinstance(state, _CaptureState) and state.get("journal_version") == JOURNAL_VERSION
+        else {row["relative"] for row in page_receipts(store, state)}
+    )
     recovered: dict[str, str] = {}
     for path in store.path("raw").glob("*/manifest.json"):
         relative = path.relative_to(store.root).as_posix()

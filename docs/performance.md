@@ -477,6 +477,14 @@ External reports distinguish capture, publication and production activation, inc
 
 Acceptance requires a completed full capture, certified catalogue v2 publication, successful independent release verification and readback of the activated `production.duckdb`. The 163,000-page/scale run, the five-minute first-request target and completed supervised production acceptance remain open gates. Until acceptance passes, no full-catalogue production dataset or performance percentage is claimed. The previous eight-hour attempt remains historical evidence rather than successful production acceptance.
 
+## Recovery metadata memory (2026-10-28)
+
+The latest production stop occurred with about 0.95 GiB of process-group resident memory and 20.72 GiB of logical pages in the system-wide macOS compressor. The latter includes other applications and is not Kalshi's private memory usage. The stopped process cannot be profiled retrospectively, so these samples do not establish which process owned the compressed pages or prove a continuous Kalshi leak. The existing resource safeguards remain unchanged.
+
+Recovery now reuses its validated journal receipt-membership set instead of retaining a second duplicate set or cloning every page row to construct another set during orphan reconciliation. Public receipt-list copy semantics, duplicate detection, orphan validation and durability ordering are unchanged. A pinned CPython 3.12.13 microbenchmark with 25,000 synthetic receipts, one warm-up and three alternating measured pairs reduced incremental Python allocation for the orphan-membership setup from a median 7,440,824 bytes to 56 bytes. This measures one metadata setup phase with an empty raw directory, not total RSS, live recovery duration or compressor savings. Authoritative journal metadata and file accounting still grow with saved evidence; the small fix does not establish that another system-wide memory stop is prevented.
+
+The external investigation, fixture identities and reproduction script are retained under `/Volumes/Mac SSD/oddsfox-data/runtime/memory-investigation-bff5f9c/`. No production files were modified by the investigation. A later explicitly resumed attempt must reconcile accounting and retain the original capture, deadlines and cumulative allowances.
+
 ## Acceptance and remaining costs
 
 The parsing gate requires at least 50% fewer counted first-party in-process JSON decodes on the fixed full fixture, using the scope defined above. It does not establish a reduction across unobserved third-party or subprocess parsers. The scale target is at least 25% lower median pipeline time with equal work and limits. A missed time target remains an open performance result. Reproducible small or targeted median regressions above 10% require investigation.
