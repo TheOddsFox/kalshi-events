@@ -148,6 +148,19 @@ def test_native_ticker_accepts_printable_ascii_punctuation_and_roundtrips():
     assert ticker_from_path_segment("A%2FB") != ticker_from_path_segment("A%252FB")
 
 
+def test_native_ticker_accepts_printable_ascii_prefix_punctuation():
+    prefixes = [
+        chr(code)
+        for code in range(33, 127)
+        if chr(code).isalnum() is False and chr(code) not in ",/?#\\"
+    ]
+    for prefix in prefixes:
+        native = f"{prefix}A"
+        assert ticker_from_path_segment(ticker_path_segment(native)) == native
+    assert ticker(".EVENT") == ".EVENT"
+    assert ticker("(EVENT)") == "(EVENT)"
+
+
 @pytest.mark.parametrize(
     ("native", "encoded"),
     [
@@ -155,6 +168,7 @@ def test_native_ticker_accepts_printable_ascii_punctuation_and_roundtrips():
         ("FEDDECISION-23SEP-H>25", "FEDDECISION-23SEP-H%3E25"),
         ("FEDDECISION-23SEP-H<25", "FEDDECISION-23SEP-H%3C25"),
         ("GPT%-23DEC31", "GPT%25-23DEC31"),
+        ("-23MAR-T3", "-23MAR-T3"),
     ],
 )
 def test_native_ticker_singular_path_and_metrics_are_bounded(store, native, encoded):
@@ -235,6 +249,8 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         "FEDDECISION-23SEP-H>25",
         "FEDDECISION-23SEP-C>25",
         "GPT%-23DEC31",
+        "-23MAR-T3",
+        "-23MAR-T2",
     ]
     markets = [
         {
@@ -286,8 +302,7 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         123,
         b"EVENT(NY)",
         "",
-        "(EVENT)",
-        ".EVENT(NY)",
+        "/EVENT",
         "EVENT(NY)\\OTHER",
         "EVENT(NY),OTHER",
         "EVENT(NY)?x=1",
@@ -306,19 +321,19 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         "ÉVENT(NY)",
     ],
 )
-def test_parentheses_do_not_admit_other_invalid_native_values(value):
+def test_native_ticker_rejects_reserved_and_non_ascii_values(value):
     with pytest.raises(CatalogueError, match="invalid native ticker"):
         ticker(value)
 
 
-def test_printable_punctuation_identities_survive_verified_v2_publication(store):
+@pytest.mark.parametrize("market_ticker", ["MKT%'\";--", "-23MAR-T3"])
+def test_printable_punctuation_identities_survive_verified_v2_publication(store, market_ticker):
     series = "KX%'\";--"
     event = "EVT%'\";--"
-    market = "MKT%'\";--"
     series_row = {"ticker": series, "title": "Native series"}
     event_row = {"event_ticker": event, "series_ticker": series, "title": "Native event"}
     market_row = {
-        "ticker": market,
+        "ticker": market_ticker,
         "event_ticker": event,
         "status": "active",
         "last_price_dollars": "0.123456789",
@@ -353,7 +368,7 @@ def test_printable_punctuation_identities_survive_verified_v2_publication(store)
         assert connection.execute(
             "select market_ticker, event_ticker, last_price_dollars from read_parquet(?)",
             [str(base / "markets.parquet")],
-        ).fetchall() == [(market, event, Decimal("0.123456789"))]
+        ).fetchall() == [(market_ticker, event, Decimal("0.123456789"))]
 
 
 @pytest.mark.parametrize(
