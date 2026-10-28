@@ -26,7 +26,7 @@ from filelock import FileLock, Timeout
 from kalshi_events import metrics
 
 MAX_BUNDLE_BYTES = 128 * 1024**2
-TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()<>\-/ ]{0,254}[A-Za-z0-9._()<>\-])?\Z")
+TICKER = re.compile(r"[A-Za-z0-9][\x20-\x7e]{0,255}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
 CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 5}
 PREVIOUS_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
@@ -194,6 +194,8 @@ def ticker(value: Any) -> str:
     if (
         not isinstance(value, str)
         or not TICKER.fullmatch(value)
+        or any(char in value for char in ",?#\\")
+        or value.endswith((" ", "/"))
         or any(part in {"", ".", ".."} for part in value.split("/"))
     ):
         raise CatalogueError("invalid native ticker")

@@ -134,12 +134,27 @@ def test_slash_ticker_is_valid_but_path_traversal_forms_are_not():
         ticker_from_path_segment("GTEMP-24-1.02%2f23")
 
 
+def test_native_ticker_accepts_printable_ascii_punctuation_and_roundtrips():
+    punctuation = "".join(
+        chr(code) for code in range(33, 127) if not chr(code).isalnum() and chr(code) not in ",?#\\"
+    )
+    native = f"A{punctuation} Z"
+    assert ticker(native) == native
+    assert selections([native]) == [native]
+    assert ticker_from_path_segment(ticker_path_segment(native)) == native
+    assert ticker("A..B") == "A..B"
+    assert ticker_from_path_segment("A%2FB") == "A/B"
+    assert ticker_from_path_segment("A%252FB") == "A%2FB"
+    assert ticker_from_path_segment("A%2FB") != ticker_from_path_segment("A%252FB")
+
+
 @pytest.mark.parametrize(
     ("native", "encoded"),
     [
         ("GTEMP-24-1.02/23", "GTEMP-24-1.02%2F23"),
         ("FEDDECISION-23SEP-H>25", "FEDDECISION-23SEP-H%3E25"),
         ("FEDDECISION-23SEP-H<25", "FEDDECISION-23SEP-H%3C25"),
+        ("GPT%-23DEC31", "GPT%25-23DEC31"),
     ],
 )
 def test_native_ticker_singular_path_and_metrics_are_bounded(store, native, encoded):
@@ -215,7 +230,12 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
     class PowerLoss(BaseException):
         pass
 
-    natives = ["GTEMP-24-1.02/23", "FEDDECISION-23SEP-H>25", "FEDDECISION-23SEP-C>25"]
+    natives = [
+        "GTEMP-24-1.02/23",
+        "FEDDECISION-23SEP-H>25",
+        "FEDDECISION-23SEP-C>25",
+        "GPT%-23DEC31",
+    ]
     markets = [
         {
             "ticker": native,
@@ -270,7 +290,6 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         ".EVENT(NY)",
         "EVENT(NY)\\OTHER",
         "EVENT(NY),OTHER",
-        "EVENT(NY)%2FOTHER",
         "EVENT(NY)?x=1",
         "EVENT(NY)#OTHER",
         "EVENT(NY)\x00",
@@ -284,20 +303,57 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         "GDP-232022\tQ4",
         "GDP-232022\r\nQ4",
         "GDP-232022\u00a0Q4",
-        "EVENT(NY)+OTHER",
-        "EVENT(NY);OTHER",
-        "EVENT(NY)'OTHER",
-        'EVENT(NY)"OTHER',
-        "EVENT(NY):OTHER",
-        "EVENT(NY)@OTHER",
-        "EVENT(NY)[OTHER]",
-        "EVENT(NY){OTHER}",
         "ÉVENT(NY)",
     ],
 )
 def test_parentheses_do_not_admit_other_invalid_native_values(value):
     with pytest.raises(CatalogueError, match="invalid native ticker"):
         ticker(value)
+
+
+def test_printable_punctuation_identities_survive_verified_v2_publication(store):
+    series = "KX%'\";--"
+    event = "EVT%'\";--"
+    market = "MKT%'\";--"
+    series_row = {"ticker": series, "title": "Native series"}
+    event_row = {"event_ticker": event, "series_ticker": series, "title": "Native event"}
+    market_row = {
+        "ticker": market,
+        "event_ticker": event,
+        "status": "active",
+        "last_price_dollars": "0.123456789",
+    }
+    responses = {
+        "/historical/cutoff": (200, CUTOFF),
+        "/series": (200, {"series": [series_row], "cursor": ""}),
+        "/events": (200, {"events": [event_row], "cursor": ""}),
+        "/events/multivariate": (200, {"events": [], "cursor": ""}),
+        "/markets": (200, {"markets": [market_row], "cursor": ""}),
+        "/historical/markets": (200, {"markets": [], "cursor": ""}),
+        f"/series/{ticker_path_segment(series)}": (200, {"series": series_row}),
+        f"/events/{ticker_path_segment(event)}": (200, {"event": event_row}),
+    }
+    state = capture.capture(
+        store,
+        client_factory=lambda s, b, **options: FakeClient(s, b, responses, **options),
+    )
+    assert state["complete"]
+    release = publish(store, state["capture_id"], catalogue_version=2)
+    assert verify_release(Path(release["output"]))["capture_id"] == state["capture_id"]
+    with duckdb.connect() as connection:
+        base = Path(release["output"])
+        assert connection.execute(
+            "select series_ticker from read_parquet(?)",
+            [str(base / "series.parquet")],
+        ).fetchall() == [(series,)]
+        assert connection.execute(
+            "select event_ticker, series_ticker from read_parquet(?)",
+            [str(base / "events.parquet")],
+        ).fetchall() == [(event, series)]
+        assert connection.execute(
+            "select market_ticker, event_ticker, last_price_dollars from read_parquet(?)",
+            [str(base / "markets.parquet")],
+        ).fetchall() == [(market, event, Decimal("0.123456789"))]
 
 
 @pytest.mark.parametrize(

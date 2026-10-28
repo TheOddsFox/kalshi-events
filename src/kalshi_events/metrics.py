@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextvars
 import json
 import os
-import re
 import resource
 import sys
 import tempfile
@@ -17,7 +16,6 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import unquote
 
 _active: contextvars.ContextVar[Metrics | None] = contextvars.ContextVar(
     "kalshi_events_metrics", default=None
@@ -41,7 +39,6 @@ _ENDPOINT_FAMILIES = frozenset(
         "/historical/markets/{ticker}",
     }
 )
-_TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()<>\-/ ]{0,254}[A-Za-z0-9._()<>\-])?\Z")
 _PROGRESS_INTERVAL_SECONDS = 15.0
 _PROGRESS_PHASES = frozenset(
     {
@@ -69,6 +66,16 @@ _PROGRESS_ELAPSED_COUNTERS = frozenset(
 )
 
 
+def _is_ticker_path(parts: list[str], start: int) -> bool:
+    from kalshi_events.common import CatalogueError, ticker_from_path_segment
+
+    try:
+        ticker_from_path_segment("/".join(parts[start:]))
+    except CatalogueError:
+        return False
+    return True
+
+
 def endpoint_family(endpoint: str) -> str:
     """Return a fixed-cardinality family label without preserving request identifiers."""
     path = endpoint.split("?", 1)[0].split("#", 1)[0]
@@ -78,21 +85,17 @@ def endpoint_family(endpoint: str) -> str:
     if (
         len(parts) >= 3
         and parts[1] in {"series", "events", "markets"}
-        and _TICKER.fullmatch(unquote("/".join(parts[2:])))
+        and _is_ticker_path(parts, 2)
     ):
         candidate = f"/{parts[1]}/{{ticker}}"
         if candidate in _ENDPOINT_FAMILIES:
             return candidate
-    if (
-        len(parts) >= 4
-        and parts[1:3] == ["historical", "markets"]
-        and _TICKER.fullmatch(unquote("/".join(parts[3:])))
-    ):
+    if len(parts) >= 4 and parts[1:3] == ["historical", "markets"] and _is_ticker_path(parts, 3):
         return "/historical/markets/{ticker}"
     if (
         len(parts) >= 3
         and parts[1] == "multivariate_event_collections"
-        and _TICKER.fullmatch(unquote("/".join(parts[2:])))
+        and _is_ticker_path(parts, 2)
     ):
         return "/multivariate_event_collections/{ticker}"
     return "other"
