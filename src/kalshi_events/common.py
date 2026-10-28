@@ -194,7 +194,7 @@ def ticker(value: Any) -> str:
     if (
         not isinstance(value, str)
         or not TICKER.fullmatch(value)
-        or any(char in value for char in ",?#\\")
+        or "\\" in value
         or value.startswith(" ")
         or value.endswith((" ", "/"))
         or any(part in {"", ".", ".."} for part in value.split("/"))

@@ -127,7 +127,7 @@ def test_slash_ticker_is_valid_but_path_traversal_forms_are_not():
     assert series_scope(native)["series_ticker"] == native
     assert ticker_path_segment(native) == "GTEMP-24-1.02%2F23"
     assert ticker_from_path_segment("GTEMP-24-1.02%2F23") == native
-    for invalid in ("../A", "A/../B", "A//B", "A/.", "A/", "A\\B", "A?B", "A#B"):
+    for invalid in ("../A", "A/../B", "A//B", "A/.", "A/", "A\\B"):
         with pytest.raises(CatalogueError, match="invalid native ticker"):
             ticker(invalid)
     with pytest.raises(CatalogueError, match="invalid native ticker path segment"):
@@ -136,7 +136,7 @@ def test_slash_ticker_is_valid_but_path_traversal_forms_are_not():
 
 def test_native_ticker_accepts_printable_ascii_punctuation_and_roundtrips():
     punctuation = "".join(
-        chr(code) for code in range(33, 127) if not chr(code).isalnum() and chr(code) not in ",?#\\"
+        chr(code) for code in range(33, 127) if not chr(code).isalnum() and chr(code) != "\\"
     )
     native = f"A{punctuation} Z"
     assert ticker(native) == native
@@ -152,7 +152,7 @@ def test_native_ticker_accepts_printable_ascii_prefix_punctuation():
     prefixes = [
         chr(code)
         for code in range(33, 127)
-        if chr(code).isalnum() is False and chr(code) not in ",/?#\\"
+        if chr(code).isalnum() is False and chr(code) not in "/\\"
     ]
     for prefix in prefixes:
         native = f"{prefix}A"
@@ -304,9 +304,6 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         "",
         "/EVENT",
         "EVENT(NY)\\OTHER",
-        "EVENT(NY),OTHER",
-        "EVENT(NY)?x=1",
-        "EVENT(NY)#OTHER",
         "EVENT(NY)\x00",
         "EVENT(NY)\n",
         "EVENT(NY)\r",
@@ -440,6 +437,40 @@ def test_parenthesized_singular_request_retains_approved_origin_and_exact_identi
     assert manifest["endpoint"] == f"/events/{EVENT}"
     assert payload["event"]["event_ticker"] == EVENT
     assert set(measured.report()["endpoint_families"]) == {"/events/{ticker}"}
+
+
+def test_comma_query_and_fragment_punctuation_is_encoded_as_path_data(store):
+    native = "A,B?C#D"
+    endpoint = f"/events/{ticker_path_segment(native)}"
+    requests = []
+
+    def source(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(
+                json_bytes({"event": {"event_ticker": native, "series_ticker": "SERIES"}})
+            ),
+        )
+
+    with PublicClient(store, Budget(store)) as client:
+        client.client.close()
+        client.client = httpx.Client(transport=httpx.MockTransport(source), trust_env=False)
+        manifest, payload = read_page(store, client.get(endpoint))
+    assert len(requests) == 1
+    assert requests[0].url.raw_path.endswith(endpoint.encode("ascii"))
+    assert requests[0].url.query == b""
+    assert manifest["endpoint"] == endpoint
+    assert payload["event"]["event_ticker"] == native
+
+
+@pytest.mark.parametrize("endpoint", ["/events/A?B", "/events/A#B"])
+def test_raw_endpoint_query_and_fragment_injection_remains_rejected(store, endpoint):
+    with (
+        PublicClient(store, Budget(store)) as client,
+        pytest.raises(CatalogueError, match="invalid source endpoint"),
+    ):
+        client.get(endpoint)
 
 
 @pytest.mark.parametrize("multivariate", [False, True])

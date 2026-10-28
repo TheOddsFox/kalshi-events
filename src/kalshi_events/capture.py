@@ -595,6 +595,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         raise CatalogueError("invalid scoped capture settings")
     identities: set[str] = set()
     batch_values: list[str] = []
+    comma_values: list[str] = []
     has_batches = False
     for work in state["tasks"]:
         if not isinstance(work, dict) or not isinstance(work.get("endpoint"), str):
@@ -621,6 +622,20 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             expected_task_fields | _PARENT_BATCH_FIELDS
         ):
             raise CatalogueError("invalid journal traversal state")
+        if work["endpoint"].startswith("/markets/"):
+            segment = work["endpoint"][len("/markets/") :]
+            if "," in segment or "%2c" in segment.lower():
+                native = ticker_from_path_segment(segment)
+                if "," in native:
+                    if (
+                        _acquisition_protocol(state) == 2
+                        or work.get("kind") != "markets"
+                        or not work.get("singular")
+                        or work.get("params") != {}
+                        or work.get("requested") != native
+                    ):
+                        raise CatalogueError("invalid comma market selection task")
+                    comma_values.append(native)
         if (
             not isinstance(work.get("endpoint"), str)
             or not work["endpoint"].startswith("/")
@@ -730,10 +745,18 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
                 raise CatalogueError("selected market batch differs from its capture selection")
             batch_values.extend(batch)
         identities.add(_task_identity(work))
-    if has_batches and (
-        len(batch_values) != len(set(batch_values)) or set(batch_values) != set(state["selected"])
+    selected = state.get("selected")
+    selected_commas = (
+        [value for value in selections(selected) if "," in value]
+        if isinstance(selected, list) and _acquisition_protocol(state) != 2
+        else []
+    )
+    if (has_batches or selected_commas or comma_values) and (
+        not isinstance(selected, list)
+        or len(batch_values + comma_values) != len(set(batch_values + comma_values))
+        or set(batch_values + comma_values) != set(selections(selected))
     ):
-        raise CatalogueError("selected market batches do not partition the capture selection")
+        raise CatalogueError("selected market requests do not partition the capture selection")
     if _is_scoped_capture(state):
         _validate_series_task_plan(state)
     # Reuse legacy sealed-limit validation without serializing runtime metadata.
@@ -2225,8 +2248,12 @@ def _validate_receipt_task_binding(
 
 def _selected_market_batches(values: list[str]) -> list[list[str]]:
     batches: list[list[str]] = []
+    comma_groups: list[list[str]] = []
     current: list[str] = []
     for value in values:
+        if "," in value:
+            comma_groups.append([value])
+            continue
         candidate = [*current, value]
         if (
             len(candidate) > MAX_SELECTION_BATCH
@@ -2242,6 +2269,7 @@ def _selected_market_batches(values: list[str]) -> list[list[str]]:
             current = candidate
     if current:
         batches.append(current)
+    batches.extend(comma_groups)
     return batches
 
 
@@ -2261,8 +2289,12 @@ def _event_parent_batches(values: set[str] | list[str], *, multivariate: bool) -
     """Partition deterministically; small or URL-constrained groups use singular lookups."""
     ordered = sorted({ticker(value) for value in values})
     groups: list[list[str]] = []
+    comma_groups: list[list[str]] = []
     current: list[str] = []
     for value in ordered:
+        if "," in value:
+            comma_groups.append([value])
+            continue
         candidate = [*current, value]
         if (
             len(candidate) > MAX_SELECTION_BATCH
@@ -2285,6 +2317,7 @@ def _event_parent_batches(values: set[str] | list[str], *, multivariate: bool) -
         groups.append(current)
     else:
         groups.extend([[item] for item in current])
+    groups.extend(comma_groups)
     return groups
 
 
@@ -2458,14 +2491,25 @@ def new_capture(
             task("/historical/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
         ]
     elif scope is None:
-        work += [
-            task(
-                "/markets",
-                "markets",
-                params={"limit": MARKET_PAGE_LIMIT, "tickers": ",".join(batch)},
-            )
-            for batch in _selected_market_batches(selections(selected))
-        ]
+        for batch in _selected_market_batches(selections(selected)):
+            if len(batch) == 1 and "," in batch[0]:
+                native = batch[0]
+                work.append(
+                    task(
+                        f"/markets/{ticker_path_segment(native)}",
+                        "markets",
+                        singular=True,
+                        requested=native,
+                    )
+                )
+            else:
+                work.append(
+                    task(
+                        "/markets",
+                        "markets",
+                        params={"limit": MARKET_PAGE_LIMIT, "tickers": ",".join(batch)},
+                    )
+                )
     if scope is None:
         scopes = {}
         for index, item in enumerate(work):
