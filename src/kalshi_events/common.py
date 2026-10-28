@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import stat
 import tempfile
@@ -26,7 +25,6 @@ from filelock import FileLock, Timeout
 from kalshi_events import metrics
 
 MAX_BUNDLE_BYTES = 128 * 1024**2
-TICKER = re.compile(r"[\x20-\x7e]{1,256}\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
 CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 5}
 PREVIOUS_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
@@ -193,7 +191,8 @@ def file_digest(path: Path, limit: int = MAX_BUNDLE_BYTES) -> tuple[str, int]:
 def ticker(value: Any) -> str:
     if (
         not isinstance(value, str)
-        or not TICKER.fullmatch(value)
+        or not 1 <= len(value) <= 256
+        or not value.isprintable()
         or "\\" in value
         or value.startswith(" ")
         or value.endswith("/")

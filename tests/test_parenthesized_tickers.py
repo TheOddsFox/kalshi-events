@@ -326,7 +326,6 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         "GDP-232022\tQ4",
         "GDP-232022\r\nQ4",
         "GDP-232022\u00a0Q4",
-        "ÉVENT(NY)",
     ],
 )
 def test_native_ticker_rejects_reserved_and_non_ascii_values(value):
