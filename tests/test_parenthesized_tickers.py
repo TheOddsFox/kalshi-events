@@ -104,6 +104,18 @@ def test_native_ticker_accepts_exact_length_boundary_and_terminal_punctuation():
     assert ticker(spaced_longest) == spaced_longest
     with pytest.raises(CatalogueError, match="invalid native ticker"):
         ticker(spaced_longest + "A")
+    for native in ("A ", "A  ", "A" * 254 + "  "):
+        assert len(native) <= 256
+        assert ticker(native) == native
+        encoded = ticker_path_segment(native)
+        assert encoded == native.rstrip(" ") + "%20" * (len(native) - len(native.rstrip(" ")))
+        assert ticker_from_path_segment(encoded) == native
+    assert len("A" * 254 + "  ") == 256
+    assert ticker_path_segment("GDP-232022 Q4") == "GDP-232022 Q4"
+    assert ticker_path_segment("A%20") == "A%2520"
+    assert ticker_path_segment("A ") != ticker_path_segment("A%20")
+    assert ticker_from_path_segment("A%20") == "A "
+    assert ticker_from_path_segment("A%2520") == "A%20"
     assert ticker("A") == "A"
     assert ticker("A1") == "A1"
     assert ticker("A-") == "A-"
@@ -251,6 +263,7 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         "GPT%-23DEC31",
         "-23MAR-T3",
         "-23MAR-T2",
+        "VAXX-22MAR30-T255.25 ",
     ]
     markets = [
         {
@@ -309,9 +322,7 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
         "EVENT(NY)\r",
         "EVENT(NY)\t",
         " EVENT(NY)",
-        "EVENT(NY) ",
         " GDP-232022 Q4",
-        "GDP-232022 Q4 ",
         "GDP-232022\tQ4",
         "GDP-232022\r\nQ4",
         "GDP-232022\u00a0Q4",
@@ -323,7 +334,7 @@ def test_native_ticker_rejects_reserved_and_non_ascii_values(value):
         ticker(value)
 
 
-@pytest.mark.parametrize("market_ticker", ["MKT%'\";--", "-23MAR-T3"])
+@pytest.mark.parametrize("market_ticker", ["MKT%'\";--", "-23MAR-T3", "VAXX-22MAR30-T255.25 "])
 def test_printable_punctuation_identities_survive_verified_v2_publication(store, market_ticker):
     series = "KX%'\";--"
     event = "EVT%'\";--"
@@ -414,6 +425,33 @@ def test_native_singular_request_preserves_identity_and_encodes_path_and_query(
         assert b"+" in requests[0].url.query
     assert manifest["endpoint"] == f"/events/{native}"
     assert manifest["params"] == {"series_ticker": native}
+    assert body["event"]["event_ticker"] == native
+
+
+def test_trailing_space_ticker_is_encoded_in_raw_httpx_path(store):
+    native = "VAXX-22MAR30-T255.25 "
+    endpoint = f"/events/{ticker_path_segment(native)}"
+    requests = []
+
+    def source(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(
+                json_bytes({"event": {"event_ticker": native, "series_ticker": "SERIES"}})
+            ),
+        )
+
+    with PublicClient(store, Budget(store)) as client:
+        client.client.close()
+        client.client = httpx.Client(transport=httpx.MockTransport(source), trust_env=False)
+        manifest, body = read_page(store, client.get(endpoint))
+
+    assert len(requests) == 1
+    assert requests[0].url.raw_path.endswith(b"/events/VAXX-22MAR30-T255.25%20")
+    assert requests[0].url.query == b""
+    assert ticker_from_path_segment("VAXX-22MAR30-T255.25%20") == native
+    assert manifest["endpoint"] == endpoint
     assert body["event"]["event_ticker"] == native
 
 

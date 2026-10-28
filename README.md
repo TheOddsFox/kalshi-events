@@ -98,7 +98,7 @@ A full `build --capture-id` lands a fresh warehouse in staging from that one com
 
 `publish` promotes only a certified, complete catalogue build. It writes the immutable `oddsfox.kalshi.catalogue.v1` release and atomically promotes `current.json`. After publication and verification both succeed, obsolete catalogue captures, raw evidence, builds and releases may be pruned. Both publication pointers and every incomplete capture retain their complete dependency closure. A failed publish or verification prunes nothing.
 
-Native tickers preserve their exact identifiers, including punctuation. Singular lookup URLs encode each ticker as one path segment. Comma-containing tickers such as `JOBLESS-22SEP10-C220,000` use singular selected-market and parent lookups; other selected markets retain automatic bounded batching. Pass a leading-hyphen ticker with an equals sign, for example `--market-ticker=-23MAR-T3`.
+Native tickers preserve their exact identifiers, including punctuation. Singular lookup URLs encode each ticker as one path segment. Trailing U+0020 spaces remain part of the native identity and become `%20` at the end of a lookup URL. Comma-containing tickers such as `JOBLESS-22SEP10-C220,000` use singular selected-market and parent lookups; other selected markets retain automatic bounded batching. Pass a leading-hyphen ticker with an equals sign, for example `--market-ticker=-23MAR-T3`.
 
 Native payloads remain in `payload_json`. Commonly queried prices and fractional quantities are exact `DECIMAL(38,18)` columns. Current rows are the latest observed native entities, ordered deterministically by receipt time and observation identity. Provider updates do not establish historical rule applicability.
 

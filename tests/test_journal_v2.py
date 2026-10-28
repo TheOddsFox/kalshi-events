@@ -527,7 +527,7 @@ def test_usable_receipt_orphan_is_recovered_without_reissuing_its_request(store,
             nonlocal interrupted
             with guard:
                 request_id = (context or {}).get("request_id")
-                issued.append(request_id)
+                issued.append((request_id, endpoint, dict(context or {})))
             relative = super().get(endpoint, params, context)
             if not uppercase or endpoint == "/markets":
                 with guard:
@@ -552,21 +552,70 @@ def test_usable_receipt_orphan_is_recovered_without_reissuing_its_request(store,
         assert orphan_relative not in {
             row["relative"] for row in acquisition.page_receipts(store, state)
         }
+    resume_start = len(issued)
     resumed = acquisition.capture(store, resume=identity, client_factory=OrphanedClient)
     assert resumed["complete"]
-    assert len(acquisition.page_receipts(store, resumed)) == 9
-    if uppercase:
-        assert issued.count(orphan_manifest["request_id"]) == 1
-        assert orphan_relative in {
-            row["relative"] for row in acquisition.page_receipts(store, resumed)
+    receipts = acquisition.page_receipts(store, resumed)
+    pages = list(acquisition.capture_pages(store, resumed))
+    manifests = [manifest for manifest, _ in pages]
+    issued_ids = [request_id for request_id, _, _ in issued]
+    receipt_ids = [manifest["request_id"] for manifest in manifests]
+    assert Counter(issued_ids) == Counter(receipt_ids)
+    assert Counter(
+        manifest["endpoint"]
+        for manifest in manifests
+        if manifest["endpoint"] != "/historical/cutoff"
+    ) == Counter(
+        {
+            "/series": 1,
+            "/events": 1,
+            "/events/multivariate": 1,
+            "/markets": 1,
+            "/historical/markets": 1,
         }
-        projected = project_pages(acquisition.capture_pages(store, resumed))
+    )
+    cutoffs = [manifest for manifest in manifests if manifest["endpoint"] == "/historical/cutoff"]
+    assert (
+        sum(
+            manifest.get("task_index") == 0 and manifest.get("phase") == "page"
+            for manifest in cutoffs
+        )
+        == 1
+    )
+    assert sum(manifest.get("cutoff_reason") == "start" for manifest in cutoffs) == 1
+    assert sum(manifest.get("cutoff_reason") == "terminal" for manifest in cutoffs) == 1
+
+    resume_requests = issued[resume_start:]
+    resume_history_requests = [
+        index
+        for index, (_, endpoint, context) in enumerate(resume_requests)
+        if endpoint == "/historical/markets" and context.get("phase") == "page"
+    ]
+    resume_cutoffs = [
+        (endpoint, context)
+        for _, endpoint, context in resume_requests
+        if endpoint == "/historical/cutoff" and context.get("cutoff_reason") == "resume"
+    ]
+    assert len(resume_cutoffs) <= 1
+    for history_index in resume_history_requests:
+        task_index = resume_requests[history_index][2]["task_index"]
+        assert any(
+            endpoint == "/historical/cutoff"
+            and context.get("task_index") == task_index
+            and context.get("cutoff_reason") in {"start", "resume"}
+            for _, endpoint, context in resume_requests[:history_index]
+        )
+    if not resume_history_requests:
+        assert not resume_cutoffs
+    assert len(receipts) == 8 + len(resume_cutoffs)
+    if uppercase:
+        assert issued_ids.count(orphan_manifest["request_id"]) == 1
+        assert orphan_relative in {row["relative"] for row in receipts}
+        projected = project_pages(pages)
         legs = [
             row for row in projected["combo_legs"] if row["combo_market_ticker"] == COMBO["ticker"]
         ]
         assert [row["side"] for row in legs] == ["YES", "NO"]
-    else:
-        assert len(issued) == len(set(issued)) == 9
     assert_chain_and_anchor(store, identity)
 
 

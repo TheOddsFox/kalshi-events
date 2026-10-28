@@ -196,7 +196,7 @@ def ticker(value: Any) -> str:
         or not TICKER.fullmatch(value)
         or "\\" in value
         or value.startswith(" ")
-        or value.endswith((" ", "/"))
+        or value.endswith("/")
         or any(part in {"", ".", ".."} for part in value.split("/"))
     ):
         raise CatalogueError("invalid native ticker")
@@ -204,10 +204,13 @@ def ticker(value: Any) -> str:
 
 
 def ticker_path_segment(value: Any) -> str:
-    """Quote a native ticker as one path segment, preserving prior spellings."""
-    return quote(
-        ticker(value), safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._()- "
+    """Quote a ticker path, retaining old interior-space spellings."""
+    native = ticker(value)
+    encoded = quote(
+        native, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._()- "
     )
+    trailing_spaces = len(native) - len(native.rstrip(" "))
+    return encoded[:-trailing_spaces] + "%20" * trailing_spaces if trailing_spaces else encoded
 
 
 def ticker_from_path_segment(value: str) -> str:
