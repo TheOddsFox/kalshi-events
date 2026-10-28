@@ -138,6 +138,7 @@ def test_volume_metadata_failure_cannot_select_a_filesystem(
     directory.mkdir()
     outside = tmp_path / "different-volume"
     outside.mkdir()
+    monkeypatch.setattr(production.os.path, "ismount", lambda path: path == tmp_path)
     info = {"VolumeUUID": VOLUME_UUID, "MountPoint": str(tmp_path)}
     if invalid == "bad_uuid":
         info["VolumeUUID"] = "invalid"
@@ -154,6 +155,8 @@ def test_volume_metadata_failure_cannot_select_a_filesystem(
 
 
 def test_volume_metadata_timeout_is_fail_closed(production, tmp_path, monkeypatch):
+    monkeypatch.setattr(production.os.path, "ismount", lambda path: path == tmp_path)
+
     def timeout(command, **kwargs):
         assert kwargs["timeout"] == 5
         raise production.subprocess.TimeoutExpired(command, kwargs["timeout"])
@@ -166,6 +169,7 @@ def test_volume_metadata_timeout_is_fail_closed(production, tmp_path, monkeypatc
 def test_volume_uuid_is_bound_to_containing_mount(production, tmp_path, monkeypatch):
     directory = tmp_path / "production"
     directory.mkdir()
+    monkeypatch.setattr(production.os.path, "ismount", lambda path: path == tmp_path)
     info = {"VolumeUUID": VOLUME_UUID.lower(), "MountPoint": str(tmp_path)}
     monkeypatch.setattr(
         production.subprocess,
@@ -173,3 +177,25 @@ def test_volume_uuid_is_bound_to_containing_mount(production, tmp_path, monkeypa
         lambda *_args, **_kwargs: SimpleNamespace(stdout=plistlib.dumps(info)),
     )
     assert production._volume_uuid(directory) == VOLUME_UUID
+
+
+def test_volume_lookup_queries_mount_instead_of_nested_production_directory(
+    production, tmp_path, monkeypatch
+):
+    volume = tmp_path / "volume"
+    directory = volume / "oddsfox-data" / "kalshi-production"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(production.os.path, "ismount", lambda path: path == volume)
+    commands = []
+
+    def diskutil(command, **kwargs):
+        commands.append(command)
+        assert command == ["diskutil", "info", "-plist", str(volume)]
+        assert kwargs["timeout"] == 5
+        return SimpleNamespace(
+            stdout=plistlib.dumps({"VolumeUUID": VOLUME_UUID, "MountPoint": str(volume)})
+        )
+
+    monkeypatch.setattr(production.subprocess, "run", diskutil)
+    assert production._volume_uuid(directory) == VOLUME_UUID
+    assert len(commands) == 1

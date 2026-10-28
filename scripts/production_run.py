@@ -532,9 +532,15 @@ def _boot_stamp() -> str:
 
 
 def _volume_uuid(path: Path) -> str:
+    resolved = path.resolve(strict=True)
+    mount = next(
+        (parent for parent in (resolved, *resolved.parents) if os.path.ismount(parent)), None
+    )
+    if mount is None:
+        raise RunnerError("production path is not on a mounted filesystem")
     try:
         result = subprocess.run(
-            ["diskutil", "info", "-plist", str(path)],
+            ["diskutil", "info", "-plist", str(mount)],
             check=True,
             capture_output=True,
             timeout=5,
@@ -552,8 +558,9 @@ def _volume_uuid(path: Path) -> str:
         raise RunnerError("filesystem volume has no valid UUID")
     if not isinstance(mountpoint, str):
         raise RunnerError("filesystem volume has no valid mount point")
-    resolved = path.resolve(strict=True)
     mounted = Path(mountpoint).resolve(strict=True)
+    if mounted != mount:
+        raise RunnerError("diskutil returned a different filesystem mount point")
     try:
         resolved.relative_to(mounted)
     except ValueError as exc:
