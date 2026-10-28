@@ -29,7 +29,7 @@ New database files created by DuckDB 2 use its native v2.0 format, which DuckDB 
 
 Conversion uses the operation's existing storage allowances. DuckDB's `max_temp_directory_size` caps spill files, not the destination database or WAL; output growth is checked after `COPY`, so configured root, temporary or database soft limits can be exceeded before cleanup. No hard conversion quota is added; the separate dlt post-load quota work remains tracked by `WORK-42`.
 
-The existing DuckDB 1.5.6 production worker is unchanged. A runtime switch requires later explicit operator authorization, no active writer, and DuckDB 2-compatible direct-database consumers before native activation. Keep the matching legacy runtime, publication and evidence available for rollback; never open a DuckDB 2-native file with a 1.x reader.
+An isolated, locked DuckDB 2.0 runtime has been installed and verified; production ingestion remains stopped at the operator's request. A later launch requires explicit operator authorization, fresh recovery checks, no active writer, and DuckDB 2-compatible direct-database consumers before native activation. Keep the matching legacy runtime, publication and evidence available for rollback; never open a DuckDB 2-native file with a 1.x reader. See the [measured results and rollout status](docs/performance.md#duckdb-2-storage-compatibility-and-rollout).
 
 ## Capture
 
