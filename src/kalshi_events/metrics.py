@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import unquote
 
 _active: contextvars.ContextVar[Metrics | None] = contextvars.ContextVar(
     "kalshi_events_metrics", default=None
@@ -40,7 +41,7 @@ _ENDPOINT_FAMILIES = frozenset(
         "/historical/markets/{ticker}",
     }
 )
-_TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()\-/ ]{0,254}[A-Za-z0-9._()\-])?\Z")
+_TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()<>\-/ ]{0,254}[A-Za-z0-9._()<>\-])?\Z")
 _PROGRESS_INTERVAL_SECONDS = 15.0
 _PROGRESS_PHASES = frozenset(
     {
@@ -77,7 +78,7 @@ def endpoint_family(endpoint: str) -> str:
     if (
         len(parts) >= 3
         and parts[1] in {"series", "events", "markets"}
-        and _TICKER.fullmatch("/".join(parts[2:]).replace("%2F", "/"))
+        and _TICKER.fullmatch(unquote("/".join(parts[2:])))
     ):
         candidate = f"/{parts[1]}/{{ticker}}"
         if candidate in _ENDPOINT_FAMILIES:
@@ -85,13 +86,13 @@ def endpoint_family(endpoint: str) -> str:
     if (
         len(parts) >= 4
         and parts[1:3] == ["historical", "markets"]
-        and _TICKER.fullmatch("/".join(parts[3:]).replace("%2F", "/"))
+        and _TICKER.fullmatch(unquote("/".join(parts[3:])))
     ):
         return "/historical/markets/{ticker}"
     if (
         len(parts) >= 3
         and parts[1] == "multivariate_event_collections"
-        and _TICKER.fullmatch("/".join(parts[2:]).replace("%2F", "/"))
+        and _TICKER.fullmatch(unquote("/".join(parts[2:])))
     ):
         return "/multivariate_event_collections/{ticker}"
     return "other"

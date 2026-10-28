@@ -90,7 +90,7 @@ def _gdp_responses(*, full=False):
     return responses
 
 
-@pytest.mark.parametrize("native", [EVENT, GDP_EVENT])
+@pytest.mark.parametrize("native", [EVENT, GDP_EVENT, "FEDDECISION-23SEP-H>25"])
 def test_observed_native_ticker_is_preserved(native):
     assert ticker(native) == native
 
@@ -134,8 +134,16 @@ def test_slash_ticker_is_valid_but_path_traversal_forms_are_not():
         ticker_from_path_segment("GTEMP-24-1.02%2f23")
 
 
-def test_slash_ticker_singular_path_and_metrics_are_bounded(store):
-    native = "GTEMP-24-1.02/23"
+@pytest.mark.parametrize(
+    ("native", "encoded"),
+    [
+        ("GTEMP-24-1.02/23", "GTEMP-24-1.02%2F23"),
+        ("FEDDECISION-23SEP-H>25", "FEDDECISION-23SEP-H%3E25"),
+        ("FEDDECISION-23SEP-H<25", "FEDDECISION-23SEP-H%3C25"),
+    ],
+)
+def test_native_ticker_singular_path_and_metrics_are_bounded(store, native, encoded):
+    assert selections([native]) == [native]
     payload = {"event": {"event_ticker": native, "series_ticker": "KXTEMP"}}
     requests = []
 
@@ -147,8 +155,8 @@ def test_slash_ticker_singular_path_and_metrics_are_bounded(store):
         client.client.close()
         client.client = httpx.Client(transport=httpx.MockTransport(source), trust_env=False)
         manifest, body = read_page(store, client.get(f"/events/{ticker_path_segment(native)}"))
-    assert requests[0].url.raw_path.split(b"?", 1)[0].endswith(b"/events/GTEMP-24-1.02%2F23")
-    assert manifest["endpoint"] == "/events/GTEMP-24-1.02%2F23"
+    assert requests[0].url.raw_path.split(b"?", 1)[0].endswith(f"/events/{encoded}".encode("ascii"))
+    assert manifest["endpoint"] == f"/events/{encoded}"
     assert body["event"]["event_ticker"] == native
     assert set(measured.report()["endpoint_families"]) == {"/events/{ticker}"}
     index = ParentIndex()
@@ -207,17 +215,20 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
     class PowerLoss(BaseException):
         pass
 
-    native = "GTEMP-24-1.02/23"
-    market = {
-        "ticker": native,
-        "event_ticker": "HISTORY",
-        "status": "finalized",
-        "result": "no",
-        "settlement_ts": "2025-01-01T00:00:00Z",
-        "settlement_value_dollars": "0.0000",
-    }
+    natives = ["GTEMP-24-1.02/23", "FEDDECISION-23SEP-H>25", "FEDDECISION-23SEP-C>25"]
+    markets = [
+        {
+            "ticker": native,
+            "event_ticker": "HISTORY",
+            "status": "finalized",
+            "result": "no",
+            "settlement_ts": "2025-01-01T00:00:00Z",
+            "settlement_value_dollars": "0.0000",
+        }
+        for native in natives
+    ]
     responses = {
-        "/historical/markets": (200, {"markets": [market], "cursor": ""}),
+        "/historical/markets": (200, {"markets": markets, "cursor": ""}),
     }
     calls = []
     allocated = []
@@ -243,7 +254,7 @@ def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_reques
     pages = list(capture.capture_pages(Store(store.root), resumed))
     receipt = next(page for page, _ in pages if page.get("request_id") == orphan[0][1])
     assert receipt["endpoint"] == "/historical/markets"
-    assert any(row.get("market_ticker") == native for row in observations(pages))
+    assert set(natives) <= {row.get("market_ticker") for row in observations(pages)}
 
 
 @pytest.mark.parametrize(
@@ -579,8 +590,8 @@ def test_native_orphan_parent_receipt_resumes_without_reissuing_request(store, s
 
 
 @pytest.mark.parametrize("status", [200, 404])
-def test_slash_parent_lookup_is_indexed_by_native_identity(status):
-    native = "GTEMP-24-1.02/23"
+@pytest.mark.parametrize("native", ["GTEMP-24-1.02/23", "FEDDECISION-23SEP-H>25"])
+def test_native_parent_lookup_is_indexed_by_native_identity(status, native):
     manifest = {
         "entity_kind": "events",
         "singular": True,
