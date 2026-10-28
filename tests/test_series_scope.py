@@ -28,7 +28,7 @@ def test_protocol_four_requires_an_exact_series_scope():
         None,
         {**scope, "include_multivariate": True},
         {**scope, "extra": "value"},
-        {**scope, "series_ticker": "bad/ticker"},
+        {**scope, "series_ticker": "bad/../ticker"},
     ):
         with pytest.raises(CatalogueError):
             capture._acquisition_protocol({"acquisition_protocol": 4, "scope": malformed})

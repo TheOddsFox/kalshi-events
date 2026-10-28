@@ -19,6 +19,7 @@ from kalshi_events.common import (
     digest,
     json_bytes,
     ticker,
+    ticker_path_segment,
 )
 from kalshi_events.normalize import native_identity, records
 from kalshi_events.transport import PublicClient, read_page
@@ -74,7 +75,7 @@ def preflight_collections(
             continue
         selected = ticker(partition.get("ticker"))
         relative = client.get(
-            f"/multivariate_event_collections/{selected}",
+            f"/multivariate_event_collections/{ticker_path_segment(selected)}",
             context={
                 "diagnostic_id": diagnostic_id,
                 "diagnostic_kind": "collection_definition",

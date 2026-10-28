@@ -16,6 +16,7 @@ from kalshi_events.common import (
     durable_mkdir,
     json_bytes,
     ticker,
+    ticker_from_path_segment,
     validate_series_scope,
 )
 
@@ -127,7 +128,7 @@ class ParentIndex:
             endpoint = manifest.get("endpoint", "")
             prefix = "/events/" if kind == "events" else "/series/"
             if endpoint.startswith(prefix):
-                identity = endpoint[len(prefix) :]
+                identity = ticker_from_path_segment(endpoint[len(prefix) :])
                 self.parent_lookups[(kind, identity)] = (
                     manifest.get("status", 0),
                     manifest.get("page_id", ""),

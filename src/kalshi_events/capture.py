@@ -38,6 +38,8 @@ from kalshi_events.common import (
     regular_bytes,
     selections,
     ticker,
+    ticker_from_path_segment,
+    ticker_path_segment,
     validate_series_scope,
 )
 from kalshi_events.normalize import DiskParentIndex, ParentIndex, native_identity, records
@@ -452,7 +454,7 @@ def _is_scoped_capture(state: dict[str, Any]) -> bool:
 def _series_tasks(series: str) -> list[dict[str, Any]]:
     return [
         task(CUTOFF_ENDPOINT, None, singular=True),
-        task(f"/series/{series}", "series", singular=True),
+        task(f"/series/{ticker_path_segment(series)}", "series", singular=True),
         task(
             "/events",
             "events",
@@ -542,7 +544,7 @@ def _validate_series_task_plan(state: dict[str, Any]) -> None:
             or work.get("cutoff_due")
         ):
             raise CatalogueError("scoped capture contains a non-parent traversal")
-        parent = ticker(endpoint[len(prefix) :])
+        parent = ticker_from_path_segment(endpoint[len(prefix) :])
         if parent in parent_tickers:
             raise CatalogueError("scoped capture duplicates a parent lookup")
         parent_tickers.add(parent)
@@ -793,7 +795,7 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
         expected = {
             "series": endpoint
             == (
-                f"/series/{state['scope']['series_ticker']}"
+                f"/series/{ticker_path_segment(state['scope']['series_ticker'])}"
                 if _is_scoped_capture(state)
                 else "/series"
             ),
@@ -979,7 +981,7 @@ def _apply_control_record(
                 or work["cutoff_due"]
             ):
                 raise CatalogueError("invalid hydration task state")
-            ticker(endpoint[len(expected_prefix) :])
+            ticker_from_path_segment(endpoint[len(expected_prefix) :])
             if identity in known_tasks or identity in identities:
                 raise CatalogueError("hydration control duplicates a traversal")
             identities.add(identity)
@@ -1524,7 +1526,7 @@ def _derive_page_change(
             if work["endpoint"].startswith("/markets/"):
                 change["tasks"].append(
                     task(
-                        f"/historical/markets/{selected}",
+                        f"/historical/markets/{ticker_path_segment(selected)}",
                         "markets",
                         singular=True,
                         requested=selected,
@@ -1575,7 +1577,14 @@ def _derive_page_change(
                 batch_found.add(value)
         if work["singular"]:
             key = "event_ticker" if work["kind"] == "events" else "ticker"
-            if rows[0].get(key) != work["endpoint"].rsplit("/", 1)[1]:
+            prefix = (
+                "/historical/markets/"
+                if work["kind"] == "markets" and work["endpoint"].startswith("/historical/markets/")
+                else {"events": "/events/", "markets": "/markets/", "series": "/series/"}[
+                    work["kind"]
+                ]
+            )
+            if rows[0].get(key) != ticker_from_path_segment(work["endpoint"][len(prefix) :]):
                 raise CatalogueError("direct lookup returned a different native identity")
             updated["done"] = True
         elif work["endpoint"] == "/series":
@@ -1611,7 +1620,7 @@ def _derive_page_change(
                         for value in addition["params"]["tickers"].split(",")
                     }
                     scheduled.update(
-                        addition["endpoint"].rsplit("/", 1)[-1]
+                        ticker_from_path_segment(addition["endpoint"][len("/events/") :])
                         for addition in multivariate
                         if addition.get("singular") and addition["endpoint"].startswith("/events/")
                     )
@@ -1619,7 +1628,7 @@ def _derive_page_change(
                         change["tasks"].append(
                             _protocol_task(
                                 state,
-                                f"/events/{value}",
+                                f"/events/{ticker_path_segment(value)}",
                                 "events",
                                 singular=True,
                                 params={"exclude_markets": "true"},
@@ -1630,7 +1639,7 @@ def _derive_page_change(
                         change["tasks"].append(
                             _protocol_task(
                                 state,
-                                f"/events/{value}",
+                                f"/events/{ticker_path_segment(value)}",
                                 "events",
                                 singular=True,
                                 params={"exclude_markets": "true"},
@@ -1660,7 +1669,12 @@ def _derive_page_change(
                         == "found"
                     ):
                         continue
-                    lookup = task(f"/markets/{value}", "markets", singular=True, requested=value)
+                    lookup = task(
+                        f"/markets/{ticker_path_segment(value)}",
+                        "markets",
+                        singular=True,
+                        requested=value,
+                    )
                     identity = _task_identity(lookup)
                     if identity not in identities and identity not in added_identities:
                         change["tasks"].append(lookup)
@@ -2304,7 +2318,7 @@ def parent_lookup_plan(
                     result.append(
                         _protocol_task(
                             state,
-                            f"{endpoint}/{ticker(group[0])}",
+                            f"{endpoint}/{ticker_path_segment(group[0])}",
                             kind,
                             singular=True,
                             params={"exclude_markets": "true"},
@@ -2326,7 +2340,7 @@ def parent_lookup_plan(
                 result.append(
                     _protocol_task(
                         state,
-                        f"{endpoint}/{ticker(identity)}",
+                        f"{endpoint}/{ticker_path_segment(identity)}",
                         kind,
                         singular=True,
                         params=params,
@@ -2360,7 +2374,7 @@ def multivariate_parent_plan(
             result.extend(
                 _protocol_task(
                     state,
-                    f"/events/{ticker(identity)}",
+                    f"/events/{ticker_path_segment(identity)}",
                     "events",
                     singular=True,
                     params={"exclude_markets": "true"},

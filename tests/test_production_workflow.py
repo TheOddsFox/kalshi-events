@@ -32,6 +32,7 @@ def workflow(production, certified_production_root, tmp_path, monkeypatch):
         "storage": Store(source).usage(),
         "root_id": json.loads((source / "root-id.json").read_text())["root_id"],
     }
+    state.snapshot = snapshot
 
     class Awake:
         pid = 424242
@@ -350,6 +351,120 @@ def test_invalid_recovery_context_never_starts_another_child(production, workflo
     with pytest.raises(production.RunnerError):
         production.run_production(workflow.directory, capture_id=partial["capture_id"])
     assert workflow.events == prior_events
+
+
+def test_explicit_reboot_recovery_rebases_monotonic_caps_without_extending_wall_time(
+    production, workflow, monkeypatch
+):
+    workflow.outcomes = [{"returncode": 3, "complete": False, "publication_state": "unknown"}]
+    partial, code = production.run_production(workflow.directory, full=True)
+    assert code == 3
+    path = next((workflow.directory / "runs").glob("*/session.json"))
+    saved = json.loads(path.read_text())
+    saved["system"]["package_versions"] = production.LEGACY_RECONCILIATION_RUNTIME_VERSIONS
+    saved["system"]["uv_lock_sha256"] = production.LEGACY_RECONCILIATION_UV_LOCK_SHA256
+    saved["system"]["filesystem_device"] += 1
+    assert production._validate_reconciliation_versions(
+        saved["system"]["package_versions"],
+        saved["system"]["uv_lock_sha256"],
+        saved=True,
+    )
+    saved["boot_stamp"] = "previous boot"
+    saved["deadline_monotonic"] = production.time.monotonic() - 10_000
+    saved["session_extension_history"] = [{"action": "already-used", "deadline_epoch": 99}]
+    path.write_text(json.dumps(saved))
+    monkeypatch.setattr(production, "_boot_stamp", lambda: "current boot")
+    volume_uuid = "ACAD66E7-42DA-426B-B20D-FB87A453396B"
+    monkeypatch.setattr(production, "_volume_uuid", lambda _path: volume_uuid)
+    monkeypatch.setattr(
+        production,
+        "_system_info",
+        lambda directory: {
+            "filesystem_device": directory.stat().st_dev,
+            "package_versions": production._package_versions(),
+            "uv_lock_sha256": production.RECONCILIATION_UV_LOCK_SHA256,
+            "transport_sha256": production.RECONCILIATION_TRANSPORT_SHA256,
+        },
+    )
+    workflow.snapshot["accounting_complete"] = True
+    workflow.snapshot["attempts"] = partial["requests"]
+    workflow.snapshot["downloaded_or_reserved_bytes"] = partial["downloaded_bytes"]
+    workflow.snapshot["unfinished_reservations"] = []
+    workflow.outcomes = [
+        {
+            "returncode": 3,
+            "complete": False,
+            "publication_state": "unknown",
+            "requests": 0,
+            "downloaded_bytes": 0,
+        }
+    ]
+
+    resumed, code = production.run_production(
+        workflow.directory,
+        capture_id=partial["capture_id"],
+        reconcile_accounting=True,
+        recover_reboot=True,
+        recovery_volume_uuid=volume_uuid,
+    )
+
+    assert code == 3, resumed.get("error")
+    assert "refresh" in workflow.events
+    assert resumed["deadline_epoch"] == saved["deadline_epoch"]
+    assert resumed["started_epoch"] == saved["started_epoch"]
+    assert resumed["time_budget_started_epoch"] == saved["time_budget_started_epoch"]
+    assert resumed["limits"] == saved["limits"]
+    assert resumed["requests"] == workflow.snapshot["attempts"]
+    assert resumed["session_extension_history"] == saved["session_extension_history"]
+    assert resumed["boot_stamp"] == "current boot"
+    assert resumed["deadline_monotonic"] > production.time.monotonic()
+    assert resumed["reboot_recovery_history"][-1]["previous_boot_stamp"] == "previous boot"
+    assert resumed["reboot_recovery_history"][-1]["volume_uuid"] == volume_uuid
+    assert resumed["system"]["filesystem_volume_uuid"] == volume_uuid
+    assert (
+        resumed["reboot_recovery_history"][-1]["wall_deadlines_preserved"]["deadline_epoch"]
+        == saved["deadline_epoch"]
+    )
+    workflow.outcomes = [
+        {
+            "returncode": 3,
+            "complete": False,
+            "publication_state": "unknown",
+            "requests": 0,
+            "downloaded_bytes": 0,
+        }
+    ]
+    retried, code = production.run_production(
+        workflow.directory,
+        capture_id=partial["capture_id"],
+        reconcile_accounting=True,
+        recover_reboot=True,
+        recovery_volume_uuid=volume_uuid,
+    )
+    assert code == 3
+    assert retried["deadline_epoch"] == saved["deadline_epoch"]
+    assert len(retried["reboot_recovery_history"]) == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"recover_reboot": True},
+        {"capture_id": "a" * 32, "recover_reboot": True},
+        {
+            "capture_id": "a" * 32,
+            "reconcile_accounting": True,
+            "extend_session": True,
+            "recover_reboot": True,
+            "recovery_volume_uuid": "ACAD66E7-42DA-426B-B20D-FB87A453396B",
+        },
+    ],
+)
+def test_reboot_recovery_requires_exact_capture_and_cannot_extend_session(
+    production, workflow, kwargs
+):
+    with pytest.raises(production.RunnerError):
+        production.run_production(workflow.directory, **kwargs)
 
 
 def test_missing_child_result_preserves_uncertainty_about_consumption_and_promotion(

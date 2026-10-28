@@ -136,7 +136,7 @@ def test_nonempty_unowned_directory_cannot_become_series_root(tmp_path):
     assert not (root / "root.json").exists()
 
 
-@pytest.mark.parametrize("value", [True, False, "", "../KXCPI", "KXCPI,KXFED", "KXCPI/OTHER"])
+@pytest.mark.parametrize("value", [True, False, "", "../KXCPI", "KXCPI,KXFED", "KXCPI/../OTHER"])
 def test_invalid_series_selection_is_rejected(tmp_path, value):
     with pytest.raises(CatalogueError):
         Store(tmp_path / "invalid", series_ticker=value)

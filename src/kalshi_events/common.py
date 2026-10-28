@@ -19,13 +19,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 from filelock import FileLock, Timeout
 
 from kalshi_events import metrics
 
 MAX_BUNDLE_BYTES = 128 * 1024**2
-TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()\- ]{0,254}[A-Za-z0-9._()\-])?\Z")
+TICKER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._()\-/ ]{0,254}[A-Za-z0-9._()\-])?\Z")
 OWNER_MARKER = {"owner": "oddsfox.kalshi.events.v1"}
 CURRENT_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 5}
 PREVIOUS_ROOT_MARKER = {**OWNER_MARKER, "storage_version": 2}
@@ -190,9 +191,28 @@ def file_digest(path: Path, limit: int = MAX_BUNDLE_BYTES) -> tuple[str, int]:
 
 
 def ticker(value: Any) -> str:
-    if not isinstance(value, str) or not TICKER.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or not TICKER.fullmatch(value)
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
         raise CatalogueError("invalid native ticker")
     return value
+
+
+def ticker_path_segment(value: Any) -> str:
+    """Quote a native ticker as one path segment, preserving prior spellings."""
+    return quote(
+        ticker(value), safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._()- "
+    )
+
+
+def ticker_from_path_segment(value: str) -> str:
+    """Decode and validate the canonical path spelling of a native ticker."""
+    decoded = unquote(value)
+    if ticker_path_segment(decoded) != value:
+        raise CatalogueError("invalid native ticker path segment")
+    return decoded
 
 
 def selections(values: list[str]) -> list[str]:

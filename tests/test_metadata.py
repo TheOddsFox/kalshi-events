@@ -106,7 +106,7 @@ def test_metadata_above_old_32mib_file_ceiling(store, tmp_path):
     verify(output)
 
 
-@pytest.mark.parametrize("values", [[], ["A"] * 2, ["A"] * 101, ["../bad"], ["bad/value"]])
+@pytest.mark.parametrize("values", [[], ["A"] * 2, ["A"] * 101, ["../bad"], ["bad/../value"]])
 def test_selection_trust_boundary(values):
     with pytest.raises(CatalogueError):
         selections(values)

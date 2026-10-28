@@ -10,6 +10,7 @@ import json
 import math
 import os
 import platform
+import plistlib
 import re
 import shutil
 import signal
@@ -528,6 +529,38 @@ def _boot_stamp() -> str:
     except (OSError, subprocess.SubprocessError) as exc:
         raise RunnerError("cannot verify Mac boot identity; refusing a resumable session") from exc
     return result.stdout.strip()
+
+
+def _volume_uuid(path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["diskutil", "info", "-plist", str(path)],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if len(result.stdout) > 1024 * 1024:
+            raise RunnerError("filesystem volume information is oversized")
+        info = plistlib.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException) as exc:
+        raise RunnerError("cannot verify external SSD volume identity") from exc
+    volume_uuid = info.get("VolumeUUID") if isinstance(info, dict) else None
+    mountpoint = info.get("MountPoint") if isinstance(info, dict) else None
+    if not isinstance(volume_uuid, str) or not re.fullmatch(
+        r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}", volume_uuid
+    ):
+        raise RunnerError("filesystem volume has no valid UUID")
+    if not isinstance(mountpoint, str):
+        raise RunnerError("filesystem volume has no valid mount point")
+    resolved = path.resolve(strict=True)
+    mounted = Path(mountpoint).resolve(strict=True)
+    try:
+        resolved.relative_to(mounted)
+    except ValueError as exc:
+        raise RunnerError("production directory is outside the selected volume mount") from exc
+    if not resolved.is_dir() or resolved.stat().st_dev != mounted.stat().st_dev:
+        raise RunnerError("production path and volume mount are on different filesystems")
+    return volume_uuid.upper()
 
 
 def _process_group_rss(group: int, timeout: float = 5.0) -> int:
@@ -1434,6 +1467,8 @@ def run_production(
     activate_only: bool = False,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
+    recover_reboot: bool = False,
+    recovery_volume_uuid: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded full refresh/resume or verify-and-activate current v2."""
     preflight_started = time.monotonic()
@@ -1443,6 +1478,18 @@ def run_production(
         raise RunnerError("accounting reconciliation requires --capture-id resume")
     if extend_session and (mode != "resume" or not reconcile_accounting):
         raise RunnerError("session extension requires --capture-id and --reconcile-accounting")
+    if recover_reboot and (
+        mode != "resume"
+        or not reconcile_accounting
+        or extend_session
+        or recovery_volume_uuid is None
+    ):
+        raise RunnerError(
+            "reboot recovery requires --capture-id, --reconcile-accounting and "
+            "--recovery-volume-uuid, and cannot extend the session"
+        )
+    if recovery_volume_uuid is not None and not recover_reboot:
+        raise RunnerError("--recovery-volume-uuid requires --recover-reboot")
     directory = prepare_directory(directory, mode)
     operator = directory / "operator"
     if mode == "full":
@@ -1457,6 +1504,8 @@ def run_production(
                 str(capture_id),
                 reconcile_accounting=reconcile_accounting,
                 extend_session=extend_session,
+                recover_reboot=recover_reboot,
+                recovery_volume_uuid=recovery_volume_uuid,
             )
             if reconcile_accounting:
                 saved_system = report["system"]
@@ -1499,7 +1548,12 @@ def run_production(
             }
         report["revision"] = _revision()
         report["source_root"] = str(SOURCE_ROOT)
+        prior_volume_uuid = report.get("system", {}).get("filesystem_volume_uuid")
         report["system"] = _system_info(directory)
+        if recovery_volume_uuid is not None and recover_reboot:
+            report["system"]["filesystem_volume_uuid"] = recovery_volume_uuid.upper()
+        elif isinstance(prior_volume_uuid, str):
+            report["system"]["filesystem_volume_uuid"] = prior_volume_uuid
         if reconcile_accounting:
             report["accounting_reconciliation"]["runtime_transition"].update(
                 {
@@ -1986,11 +2040,33 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="consume one new 48-hour window for an exact reconciled capture",
     )
+    parser.add_argument(
+        "--recover-reboot",
+        action="store_true",
+        help="reconcile accounting and resume an exact stopped capture after a Mac reboot",
+    )
+    parser.add_argument(
+        "--recovery-volume-uuid",
+        help="explicit APFS volume UUID to verify when recovering after reboot",
+    )
     args = parser.parse_args(argv)
     if args.reconcile_accounting and not args.capture_id:
         parser.error("--reconcile-accounting requires --capture-id")
     if args.extend_session and (not args.capture_id or not args.reconcile_accounting):
         parser.error("--extend-session requires --capture-id and --reconcile-accounting")
+    if args.recover_reboot and (
+        not args.capture_id
+        or not args.reconcile_accounting
+        or args.extend_session
+        or not args.recovery_volume_uuid
+    ):
+        parser.error(
+            "--recover-reboot requires --capture-id, --reconcile-accounting and "
+            "--recovery-volume-uuid; "
+            "it cannot be combined with --extend-session"
+        )
+    if args.recovery_volume_uuid and not args.recover_reboot:
+        parser.error("--recovery-volume-uuid requires --recover-reboot")
     try:
         with _graceful_stop_handlers():
             result, code = run_production(
@@ -2000,6 +2076,8 @@ def main(argv: list[str] | None = None) -> int:
                 activate_only=args.activate_current,
                 reconcile_accounting=args.reconcile_accounting,
                 extend_session=args.extend_session,
+                recover_reboot=args.recover_reboot,
+                recovery_volume_uuid=args.recovery_volume_uuid,
             )
     except (BudgetStop, RunnerInterrupted) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
@@ -2069,9 +2147,17 @@ def _load_resume(
     *,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
+    recover_reboot: bool = False,
+    recovery_volume_uuid: str | None = None,
 ) -> tuple[Path, dict[str, Any], dict[str, Path]]:
     if extend_session and not reconcile_accounting:
         raise RunnerError("session extension requires --reconcile-accounting")
+    if recover_reboot and (
+        not reconcile_accounting or extend_session or recovery_volume_uuid is None
+    ):
+        raise RunnerError(
+            "reboot recovery requires accounting reconciliation and a verified volume UUID"
+        )
     matches = []
     run_root = directory / "runs"
     if run_root.is_dir():
@@ -2153,16 +2239,84 @@ def _load_resume(
     now = time.time()
     if now < float(report.get("last_observed_epoch", report["started_epoch"])):
         raise RunnerError("wall clock moved backward since the last durable session report")
-    if time.monotonic() >= _time_budget_deadline(report, "monotonic") and not extend_session:
+    current_boot = _boot_stamp()
+    rebooted = report.get("boot_stamp") != current_boot
+    if rebooted and not recover_reboot:
+        raise RunnerError("Mac restarted; explicit reconciled reboot recovery is required")
+    if (
+        not rebooted
+        and time.monotonic() >= _time_budget_deadline(report, "monotonic")
+        and not extend_session
+    ):
         raise RunnerError("48-hour session expired; networking resume is prohibited")
     if now >= _time_budget_deadline(report, "epoch") and not extend_session:
         raise RunnerError("48-hour wall-clock session expired; networking resume is prohibited")
-    if report.get("boot_stamp") != _boot_stamp():
-        raise RunnerError("Mac restarted; original bounded session cannot resume")
+    if rebooted and report.get("phase") != "stopped":
+        raise RunnerError("reboot recovery requires a durably stopped session")
     if not isinstance(report.get("root_id"), str) or _owner_root_id(directory) != report["root_id"]:
         raise RunnerError("session logical root differs from production ownership marker")
-    if report.get("system", {}).get("filesystem_device") != directory.stat().st_dev:
+    saved_system = report.get("system", {})
+    saved_device = saved_system.get("filesystem_device") if isinstance(saved_system, dict) else None
+    current_device = directory.stat().st_dev
+    saved_volume_uuid = (
+        saved_system.get("filesystem_volume_uuid") if isinstance(saved_system, dict) else None
+    )
+    current_volume_uuid = None
+    if recover_reboot:
+        if not re.fullmatch(
+            r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}",
+            str(recovery_volume_uuid),
+        ):
+            raise RunnerError("recovery volume UUID must be a canonical UUID")
+        current_volume_uuid = _volume_uuid(directory)
+        if current_volume_uuid != str(recovery_volume_uuid).upper():
+            raise RunnerError("mounted production volume does not match --recovery-volume-uuid")
+        if saved_volume_uuid is not None and current_volume_uuid != saved_volume_uuid:
+            raise RunnerError("production volume UUID differs from the saved session")
+        operator_path = directory / "operator"
+        if operator_path.exists() and operator_path.stat().st_dev != current_device:
+            raise RunnerError("production operator directory is on another filesystem")
+    if not rebooted and saved_device != current_device:
         raise RunnerError("production filesystem changed since the original session")
+    if rebooted:
+        old_deadlines = {
+            "started_monotonic": report.get("started_monotonic"),
+            "time_budget_started_monotonic": _time_budget_started(report, "monotonic"),
+            "deadline_monotonic": _time_budget_deadline(report, "monotonic"),
+        }
+        # Anchor monotonic time to the existing wall clock; never grant new time.
+        mono_sample = time.monotonic()
+        wall_sample = time.time()
+        offset = mono_sample - wall_sample
+        report["started_monotonic"] = offset + float(report["started_epoch"])
+        report["time_budget_started_monotonic"] = offset + _time_budget_started(report, "epoch")
+        report["deadline_monotonic"] = offset + _time_budget_deadline(report, "epoch")
+        history = report.setdefault("reboot_recovery_history", [])
+        if not isinstance(history, list):
+            raise RunnerError("reboot recovery history is invalid")
+        history.append(
+            {
+                "recovered_at": _utc(),
+                "previous_boot_stamp": report.get("boot_stamp"),
+                "boot_stamp": current_boot,
+                "previous_filesystem_device": saved_device,
+                "filesystem_device": current_device,
+                "volume_uuid": current_volume_uuid,
+                "prior_volume_uuid_available": saved_volume_uuid is not None,
+                "previous_monotonic": old_deadlines,
+                "wall_deadlines_preserved": {
+                    "started_epoch": report.get("started_epoch"),
+                    "time_budget_started_epoch": _time_budget_started(report, "epoch"),
+                    "deadline_epoch": _time_budget_deadline(report, "epoch"),
+                },
+                "accounting_reconciliation_required": True,
+            }
+        )
+        report.setdefault("original_system", dict(saved_system))
+        saved_system["filesystem_device"] = current_device
+        saved_system["filesystem_volume_uuid"] = current_volume_uuid
+        report["boot_stamp"] = current_boot
+        _atomic_report(report_path, report)
     run_root = report_path.parent
     paths = {
         "directory": directory,

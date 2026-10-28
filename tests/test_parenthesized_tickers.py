@@ -22,6 +22,8 @@ from kalshi_events.common import (
     selections,
     series_scope,
     ticker,
+    ticker_from_path_segment,
+    ticker_path_segment,
 )
 from kalshi_events.normalize import ParentIndex, observations
 from kalshi_events.publish import publish, verify_release
@@ -118,6 +120,132 @@ def test_operator_selections_preserve_native_spaces_exactly():
     assert selections(values) == values
 
 
+def test_slash_ticker_is_valid_but_path_traversal_forms_are_not():
+    native = "GTEMP-24-1.02/23"
+    assert ticker(native) == native
+    assert selections([native]) == [native]
+    assert series_scope(native)["series_ticker"] == native
+    assert ticker_path_segment(native) == "GTEMP-24-1.02%2F23"
+    assert ticker_from_path_segment("GTEMP-24-1.02%2F23") == native
+    for invalid in ("../A", "A/../B", "A//B", "A/.", "A/", "A\\B", "A?B", "A#B"):
+        with pytest.raises(CatalogueError, match="invalid native ticker"):
+            ticker(invalid)
+    with pytest.raises(CatalogueError, match="invalid native ticker path segment"):
+        ticker_from_path_segment("GTEMP-24-1.02%2f23")
+
+
+def test_slash_ticker_singular_path_and_metrics_are_bounded(store):
+    native = "GTEMP-24-1.02/23"
+    payload = {"event": {"event_ticker": native, "series_ticker": "KXTEMP"}}
+    requests = []
+
+    def source(request):
+        requests.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(json_bytes(payload)))
+
+    with metrics.collect() as measured, PublicClient(store, Budget(store)) as client:
+        client.client.close()
+        client.client = httpx.Client(transport=httpx.MockTransport(source), trust_env=False)
+        manifest, body = read_page(store, client.get(f"/events/{ticker_path_segment(native)}"))
+    assert requests[0].url.raw_path.split(b"?", 1)[0].endswith(b"/events/GTEMP-24-1.02%2F23")
+    assert manifest["endpoint"] == "/events/GTEMP-24-1.02%2F23"
+    assert body["event"]["event_ticker"] == native
+    assert set(measured.report()["endpoint_families"]) == {"/events/{ticker}"}
+    index = ParentIndex()
+    index.add_page(manifest | {"entity_kind": "events", "singular": True}, body)
+    assert index.events[native][2] == "KXTEMP"
+    assert index.parent_lookups[("events", native)][0] == 200
+
+
+def test_slash_ticker_orphan_parent_receipt_resumes_without_reissuing_request(store):
+    class PowerLoss(BaseException):
+        pass
+
+    native = "GTEMP-24-1.02/23"
+    market = {"ticker": "GTEMP-MARKET", "event_ticker": native}
+    event = {"event_ticker": native, "series_ticker": "KXTEMP"}
+    event_endpoint = f"/events/{ticker_path_segment(native)}"
+    responses = {
+        "/historical/cutoff": (200, CUTOFF),
+        "/markets": (200, {"markets": [market], "cursor": ""}),
+        event_endpoint: (200, {"event": event}),
+        "/series/KXTEMP": (200, {"series": {"ticker": "KXTEMP"}}),
+    }
+    calls = []
+    allocated = []
+    orphan = []
+
+    class Client(FakeClient):
+        def __init__(self, store, budget, **options):
+            super().__init__(store, budget, responses, **options)
+
+        def get(self, endpoint, params=None, context=None):
+            calls.append((endpoint, (context or {}).get("request_id")))
+            receipt = super().get(endpoint, params, context)
+            if endpoint == event_endpoint and not orphan:
+                orphan.append((receipt, context["request_id"]))
+                raise PowerLoss("parent receipt finalized before page journal append")
+            return receipt
+
+    with pytest.raises(PowerLoss):
+        capture.capture(
+            store,
+            selected=[market["ticker"]],
+            client_factory=Client,
+            _on_capture_id=allocated.append,
+        )
+    resumed = capture.capture(Store(store.root), resume=allocated[0], client_factory=Client)
+    assert resumed["complete"]
+    assert Counter(request_id for _, request_id in calls)[orphan[0][1]] == 1
+    pages = list(capture.capture_pages(Store(store.root), resumed))
+    parent = next(page for page, _ in pages if page.get("request_id") == orphan[0][1])
+    assert parent["endpoint"] == event_endpoint
+    assert any(row.get("event_ticker") == native for row in observations(pages))
+
+
+def test_slash_historical_market_orphan_receipt_resumes_without_reissuing_request(store):
+    class PowerLoss(BaseException):
+        pass
+
+    native = "GTEMP-24-1.02/23"
+    market = {
+        "ticker": native,
+        "event_ticker": "HISTORY",
+        "status": "finalized",
+        "result": "no",
+        "settlement_ts": "2025-01-01T00:00:00Z",
+        "settlement_value_dollars": "0.0000",
+    }
+    responses = {
+        "/historical/markets": (200, {"markets": [market], "cursor": ""}),
+    }
+    calls = []
+    allocated = []
+    orphan = []
+
+    class Client(FakeClient):
+        def __init__(self, store, budget, **options):
+            super().__init__(store, budget, responses, **options)
+
+        def get(self, endpoint, params=None, context=None):
+            calls.append((endpoint, (context or {}).get("request_id")))
+            receipt = super().get(endpoint, params, context)
+            if endpoint == "/historical/markets" and not orphan:
+                orphan.append((receipt, context["request_id"]))
+                raise PowerLoss("historical receipt finalized before page journal append")
+            return receipt
+
+    with pytest.raises(PowerLoss):
+        capture.capture(store, client_factory=Client, _on_capture_id=allocated.append)
+    resumed = capture.capture(Store(store.root), resume=allocated[0], client_factory=Client)
+    assert resumed["complete"]
+    assert Counter(request_id for _, request_id in calls)[orphan[0][1]] == 1
+    pages = list(capture.capture_pages(Store(store.root), resumed))
+    receipt = next(page for page, _ in pages if page.get("request_id") == orphan[0][1])
+    assert receipt["endpoint"] == "/historical/markets"
+    assert any(row.get("market_ticker") == native for row in observations(pages))
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -129,7 +257,6 @@ def test_operator_selections_preserve_native_spaces_exactly():
         "",
         "(EVENT)",
         ".EVENT(NY)",
-        "EVENT(NY)/OTHER",
         "EVENT(NY)\\OTHER",
         "EVENT(NY),OTHER",
         "EVENT(NY)%2FOTHER",
@@ -449,6 +576,25 @@ def test_native_orphan_parent_receipt_resumes_without_reissuing_request(store, s
         row["entity_kind"] == "events" and row["event_ticker"] == event
         for row in observations(pages)
     )
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_slash_parent_lookup_is_indexed_by_native_identity(status):
+    native = "GTEMP-24-1.02/23"
+    manifest = {
+        "entity_kind": "events",
+        "singular": True,
+        "status": status,
+        "endpoint": f"/events/{ticker_path_segment(native)}",
+        "page_id": "a" * 32,
+        "request_id": "b" * 64,
+        "received_at": "2026-01-01T00:00:00Z",
+    }
+    index = ParentIndex()
+    index.add_page(manifest, {"event": {"event_ticker": native, "series_ticker": "KXTEMP"}})
+    assert index.parent_lookups[("events", native)][0] == status
+    if status == 200:
+        assert index.events[native][2] == "KXTEMP"
 
 
 def test_parenthesized_identity_survives_verified_full_v2_publication(store):
