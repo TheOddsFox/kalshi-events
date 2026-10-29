@@ -22,6 +22,7 @@ from kalshi_events.capture import (
     _complete_capture,
     latest_catalogue_capture,
     page_receipts,
+    read_capture,
 )
 from kalshi_events.common import (
     BudgetExceeded,
@@ -40,6 +41,12 @@ from kalshi_events.common import (
     regular_bytes,
     safe_path,
 )
+from kalshi_events.historical import (
+    HISTORICAL_CONTRACT,
+    historical_selection,
+    historical_task_indices,
+    is_historical_capture,
+)
 from kalshi_events.warehouse import (
     DBT_MEMORY_LIMIT,
     DBT_THREADS,
@@ -51,6 +58,17 @@ from kalshi_events.warehouse import (
 CONTRACT = "oddsfox.kalshi.catalogue.v1"
 CONTRACT_V2 = "oddsfox.kalshi.catalogue.v2"
 SERIES_CONTRACT = "oddsfox.kalshi.series.v1"
+HISTORICAL_COVERAGE_FIELDS = (
+    "historical_contract",
+    "included_scopes_json",
+    "omitted_scopes_json",
+    "selected_task_indices_json",
+    "selected_task_generations_json",
+    "source_capture_complete",
+    "root_id",
+    "warehouse_sha256",
+)
+HISTORICAL_OMITTED_SCOPES = ["events_combo", "markets_live", "markets_combo"]
 FILES = {name + ".parquet" for name in (*RELATIONS, "coverage")}
 ORDER_KEYS = {
     "series": "series_ticker",
@@ -148,6 +166,7 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
             CONTRACT,
             CONTRACT_V2,
             SERIES_CONTRACT,
+            HISTORICAL_CONTRACT,
         )
         or not isinstance(manifest.get("files"), dict)
         or set(manifest["files"]) != FILES
@@ -155,14 +174,17 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
         raise CatalogueError("invalid catalogue contract or relation inventory")
     contract = manifest["contract"]
     series = contract == SERIES_CONTRACT
+    historical = contract == HISTORICAL_CONTRACT
     catalogue_v2 = contract in {CONTRACT_V2, SERIES_CONTRACT}
-    expected_scope = "series" if series else "catalogue"
+    expected_scope = "series" if series else "historical" if historical else "catalogue"
     if not _hex_id(manifest.get("capture_id"), 32):
         raise CatalogueError("invalid catalogue capture identity")
     if manifest.get("coverage_scope") != expected_scope:
         raise CatalogueError("catalogue contract and coverage scope disagree")
     if catalogue_v2:
         _validate_v2_manifest(manifest, series=series)
+    if historical:
+        _validate_historical_manifest(manifest)
     if {p.name for p in directory.iterdir()} != FILES | {"manifest.json"}:
         raise CatalogueError("release contains unexpected or missing files")
     actual = inventory(directory, FILES, limit)
@@ -180,6 +202,7 @@ def _verify_release(directory: Path, limit: int = 64 * 1024**3) -> dict[str, Any
         manifest,
         catalogue_v2=catalogue_v2,
         series=series,
+        historical=historical,
     )
     return manifest
 
@@ -245,12 +268,53 @@ def _validate_v2_manifest(manifest: dict[str, Any], *, series: bool = False) -> 
             raise CatalogueError("catalogue-v2 watermark moves backwards")
 
 
+def _validate_historical_manifest(manifest: dict[str, Any]) -> None:
+    if (
+        manifest.get("historical_contract") != HISTORICAL_CONTRACT
+        or not _hex_id(manifest.get("root_id"), 32)
+        or not _hex_id(manifest.get("warehouse_sha256"), 64)
+        or type(manifest.get("source_capture_complete")) is not bool
+    ):
+        raise CatalogueError("invalid historical release provenance")
+    decoded: dict[str, Any] = {}
+    for name in HISTORICAL_COVERAGE_FIELDS[1:5]:
+        value = manifest.get(name)
+        if not isinstance(value, str):
+            raise CatalogueError("invalid historical release coverage binding")
+        try:
+            decoded[name] = decode(value.encode())
+        except Exception as exc:
+            raise CatalogueError("invalid historical release coverage binding") from exc
+        if json_bytes(decoded[name]).decode().strip() != value:
+            raise CatalogueError("non-canonical historical release coverage binding")
+    indices = decoded["selected_task_indices_json"]
+    generations = decoded["selected_task_generations_json"]
+    if (
+        decoded["included_scopes_json"] != ["events_live", "markets_history", "series"]
+        or decoded["omitted_scopes_json"] != HISTORICAL_OMITTED_SCOPES
+        or not isinstance(indices, list)
+        or not indices
+        or any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices
+        )
+        or indices != sorted(set(indices))
+        or not isinstance(generations, dict)
+        or set(generations) != {str(index) for index in indices}
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in generations.values()
+        )
+    ):
+        raise CatalogueError("invalid historical release selection")
+
+
 def _validate_coverage(
     path: Path,
     manifest: dict[str, Any],
     *,
     catalogue_v2: bool = False,
     series: bool = False,
+    historical: bool = False,
 ) -> None:
     fields = ("capture_id", "coverage_scope")
     expected = {name: manifest.get(name) for name in fields}
@@ -260,6 +324,9 @@ def _validate_coverage(
     if series:
         fields = (*fields, "series_ticker", "include_multivariate")
         expected.update({name: manifest.get(name) for name in fields if name not in expected})
+    if historical:
+        fields = (*fields, *HISTORICAL_COVERAGE_FIELDS)
+        expected.update({name: manifest.get(name) for name in HISTORICAL_COVERAGE_FIELDS})
     try:
         parquet = pq.ParquetFile(
             path,
@@ -356,11 +423,49 @@ def _utc_timestamp(value: Any) -> bool:
     )
 
 
+def _historical_coverage_fields(state: dict[str, Any]) -> dict[str, Any]:
+    selection = historical_selection(state, allow_legacy_incomplete=True)
+    indices = sorted(historical_task_indices(state, allow_legacy_incomplete=True))
+    generations = {str(index): state["tasks"][index].get("restarts") for index in indices}
+    if any(
+        isinstance(generation, bool) or not isinstance(generation, int) or generation < 0
+        for generation in generations.values()
+    ) or any(
+        generations[str(scope["task_index"])] != scope["final_generation"]
+        for scope in selection.values()
+    ):
+        raise CatalogueError("historical selection generation differs from its task state")
+    return {
+        "historical_contract": HISTORICAL_CONTRACT,
+        "coverage_scope": "historical",
+        "included_scopes_json": json_bytes(sorted(selection)).decode().strip(),
+        "omitted_scopes_json": json_bytes(HISTORICAL_OMITTED_SCOPES).decode().strip(),
+        "selected_task_indices_json": json_bytes(indices).decode().strip(),
+        "selected_task_generations_json": json_bytes(generations).decode().strip(),
+        "source_capture_complete": state.get("complete") is True,
+    }
+
+
+def _historical_release_fields(
+    store: Store, state: dict[str, Any], receipt: dict[str, Any]
+) -> dict[str, Any]:
+    from kalshi_events.incremental import root_id
+
+    warehouse_sha256 = receipt.get("warehouse_sha256")
+    if not _hex_id(warehouse_sha256, 64):
+        raise CatalogueError("historical build lacks its warehouse checksum")
+    return {
+        **_historical_coverage_fields(state),
+        "root_id": root_id(store, create=True),
+        "warehouse_sha256": warehouse_sha256,
+    }
+
+
 def publish(
     store: Store, capture_id: str | None = None, *, catalogue_version: int = 1
 ) -> dict[str, Any]:
-    if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2):
-        raise CatalogueError("catalogue version must be 1 or 2")
+    if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2, 3):
+        raise CatalogueError("catalogue version must be 1, 2, or 3")
     _profile(store, catalogue_version)
     with store.writer_guard():
         return _publish(store, capture_id, catalogue_version)
@@ -386,12 +491,24 @@ def _publish(
 
     incremental.finish_pending_retirement(store)
     explicit_capture_id = bool(capture_id)
+    if catalogue_version == 3 and not explicit_capture_id:
+        raise CatalogueError("historical publication requires an explicit capture ID")
     if store.scope is not None and not explicit_capture_id:
         raise CatalogueError("series publication requires an explicit capture ID")
     capture_id = capture_id or latest_catalogue_capture(store)
-    state = _complete_capture(store, capture_id)
+    state = (
+        read_capture(store, capture_id)
+        if catalogue_version == 3
+        else _complete_capture(store, capture_id)
+    )
     if state.get("scope") != store.scope:
         raise CatalogueError("capture scope does not match the publication root")
+    if catalogue_version == 3:
+        if store.scope is not None:
+            raise CatalogueError("historical publication requires a catalogue root")
+        historical_selection(state, allow_legacy_incomplete=True)
+    elif is_historical_capture(state):
+        raise CatalogueError("historical captures can only publish as catalogue version 3")
     if catalogue_version == 1 and state.get("incremental") is True:
         raise CatalogueError("incremental captures can only publish as catalogue version 2")
     if catalogue_version == 2 and state.get("incremental") is True and not explicit_capture_id:
@@ -412,8 +529,16 @@ def _publish(
 
             if not store.path(f"{build_directory(capture_id, 2)}/build.json").exists():
                 build_v2_full(store, capture_id)
+    elif catalogue_version == 3:
+        if not store.path(f"{build_directory(capture_id, 3)}/build.json").exists():
+            from kalshi_events.warehouse import build_historical
+
+            build_historical(store, capture_id)
     cutoffs: list[dict[str, Any]] = []
     rows = page_receipts(store, state)
+    if catalogue_version == 3:
+        selected_indices = historical_task_indices(state, allow_legacy_incomplete=True)
+        rows = [row for row in rows if row["index"] in selected_indices]
     receipt = certified(
         store,
         capture_id,
@@ -423,7 +548,13 @@ def _publish(
         _page_rows=rows,
         _context=_context,
     )
-    expected_build_scope = "series" if store.scope is not None else "catalogue"
+    expected_build_scope = (
+        "historical"
+        if catalogue_version == 3
+        else "series"
+        if store.scope is not None
+        else "catalogue"
+    )
     if receipt["scope"] != expected_build_scope:
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
     store.check_deadline()
@@ -450,7 +581,7 @@ def _publish(
                 )
         coverage_row = {
             "capture_id": state["capture_id"],
-            "coverage_scope": "series" if store.scope is not None else "catalogue",
+            "coverage_scope": expected_build_scope,
             "started_at": state["started_at"],
             "completed_at": state["completed_at"],
             "atomic_snapshot": False,
@@ -465,6 +596,9 @@ def _publish(
             coverage_row.update(
                 {key: value for key, value in release_metadata.items() if key != "series_scope"}
             )
+        elif catalogue_version == 3:
+            release_metadata = _historical_release_fields(store, state, receipt)
+            coverage_row.update(release_metadata)
         coverage = [coverage_row]
         store.check_deadline()
         pq.write_table(pa.Table.from_pylist(coverage), temporary / "coverage.parquet")
@@ -519,8 +653,8 @@ def _publish(
         pointer_name = _profile(store, catalogue_version)[0]
         # A delta may be retried after pointer promotion and before pruning completed.
         already_current = False
-        if catalogue_version == 2 and store.path(pointer_name).exists():
-            existing_current = current(store, catalogue_version=2)
+        if catalogue_version in {2, 3} and store.path(pointer_name).exists():
+            existing_current = current(store, catalogue_version=catalogue_version)
             already_current = (
                 existing_current["source_release_id"] == release_id
                 and existing_current["capture_id"] == capture_id
@@ -583,8 +717,8 @@ def prune_superseded(
 
 
 def current(store: Store, *, catalogue_version: int = 1) -> dict[str, Any]:
-    if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2):
-        raise CatalogueError("catalogue version must be 1 or 2")
+    if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2, 3):
+        raise CatalogueError("catalogue version must be 1, 2, or 3")
     pointer_name, expected_contract = _profile(store, catalogue_version)[:2]
     pointer = decode(regular_bytes(store.path(pointer_name), 1024**2))
     if not isinstance(pointer, dict):
@@ -607,6 +741,11 @@ def current(store: Store, *, catalogue_version: int = 1) -> dict[str, Any]:
             raise CatalogueError("v2 release belongs to a different logical operator root")
         if store.scope is not None and manifest.get("series_scope") != store.scope:
             raise CatalogueError("series release belongs to a different operator scope")
+    elif catalogue_version == 3:
+        from kalshi_events.incremental import root_id
+
+        if manifest.get("root_id") != root_id(store):
+            raise CatalogueError("historical release belongs to a different logical operator root")
     return {"output": str(directory), **manifest}
 
 
@@ -619,4 +758,6 @@ def _profile(store: Store, catalogue_version: int) -> tuple[str, str]:
         return "current.json", CONTRACT
     if catalogue_version == 2:
         return "current-v2.json", CONTRACT_V2
-    raise CatalogueError("catalogue version must be 1 or 2")
+    if catalogue_version == 3:
+        return "current-historical.json", HISTORICAL_CONTRACT
+    raise CatalogueError("catalogue version must be 1, 2, or 3")

@@ -19,11 +19,12 @@ def activate_current(
     *,
     expected_release_id: str | None = None,
     standalone_verified: dict[str, Any] | None = None,
+    catalogue_version: int = 2,
     link_fn: Any = None,
     replace_fn: Any = None,
     sync_fn: Any = None,
 ) -> dict[str, Any]:
-    """Certify the v2 warehouse, then atomically expose a hard link outside its root."""
+    """Certify the selected warehouse, then atomically expose its hard link."""
     from kalshi_events import capture, incremental, publish, warehouse
     from kalshi_events.common import (
         Limits,
@@ -42,6 +43,8 @@ def activate_current(
     root = safe_path(Path(operator_root))
     if not directory.is_dir() or root != directory / "operator":
         raise RuntimeError("activation paths do not match the production layout")
+    if isinstance(catalogue_version, bool) or catalogue_version not in {2, 3}:
+        raise RuntimeError("production activation supports catalogue versions 2 and 3")
     alias = directory / "production.duckdb"
     if alias.is_symlink():
         raise RuntimeError("production database path cannot be a symlink")
@@ -62,11 +65,11 @@ def activate_current(
     with store.lock():
         incremental.finish_pending_retirement(store)
         with warehouse.operation_context(store) as verification:
-            current = publish.current(store, catalogue_version=2)
+            current = publish.current(store, catalogue_version=catalogue_version)
             release_id = current.get("source_release_id")
             capture_id = current.get("capture_id")
             if expected_release_id is not None and release_id != expected_release_id:
-                raise RuntimeError("current v2 publication changed after standalone verification")
+                raise RuntimeError("current publication changed after standalone verification")
             manifest_body = regular_bytes(Path(current["output"]) / "manifest.json", 1024**2)
             manifest_sha256 = digest(manifest_body)
             if standalone_verified is None:
@@ -77,7 +80,7 @@ def activate_current(
             if standalone_verified != published_manifest:
                 raise RuntimeError("standalone verification does not match the current publication")
             receipt = warehouse.certified(
-                store, capture_id, catalogue_version=2, _context=verification
+                store, capture_id, catalogue_version=catalogue_version, _context=verification
             )
             checksum = receipt.get("warehouse_sha256")
             manifest_checksum = current.get("warehouse_sha256")
@@ -85,7 +88,7 @@ def activate_current(
                 verification_mode = "warehouse_hash"
             else:
                 pin = {
-                    "catalogue_version": 2,
+                    "catalogue_version": catalogue_version,
                     "source_release_id": release_id,
                     "manifest_sha256": manifest_sha256,
                     "capture_id": capture_id,
@@ -94,24 +97,30 @@ def activate_current(
                     "series_scope": current.get("series_scope"),
                 }
                 verification_mode = "semantic"
-                with incremental._baseline_data(store, capture_id, 2, pin, _context=verification):
+                with incremental._baseline_data(
+                    store, capture_id, catalogue_version, pin, _context=verification
+                ):
                     pass
             state = capture.read_capture(store, capture_id)
-            pruned = incremental.prune(store, state, release_id, 2, _context=verification)
+            pruned = incremental.prune(
+                store, state, release_id, catalogue_version, _context=verification
+            )
             # Recheck the current release and certification after cleanup, before the
             # external production path can change.
-            rechecked = publish.current(store, catalogue_version=2)
+            rechecked = publish.current(store, catalogue_version=catalogue_version)
             rechecked_manifest_sha256 = digest(
                 regular_bytes(Path(rechecked["output"]) / "manifest.json", 1024**2)
             )
             if rechecked != current or rechecked_manifest_sha256 != manifest_sha256:
-                raise RuntimeError("current v2 publication changed during retention cleanup")
+                raise RuntimeError("current publication changed during retention cleanup")
             receipt = warehouse.certified(
-                store, capture_id, catalogue_version=2, _context=verification
+                store, capture_id, catalogue_version=catalogue_version, _context=verification
             )
             if receipt.get("warehouse_sha256") != checksum:
                 raise RuntimeError("certified warehouse changed during retention cleanup")
-            source = store.path(f"builds-v2/{capture_id}/warehouse.duckdb")
+            source = store.path(
+                f"{warehouse.build_directory(capture_id, catalogue_version)}/warehouse.duckdb"
+            )
             source_info = source.lstat()
             if not stat.S_ISREG(source_info.st_mode) or source.is_symlink():
                 raise RuntimeError("certified warehouse is not a regular file")
@@ -149,7 +158,14 @@ def activate_current(
                 "import duckdb,json,sys; "
                 "c=duckdb.connect(sys.argv[1],read_only=True); "
                 "n=c.execute('select count(*) from current_markets').fetchone()[0]; "
-                "c.close(); print(json.dumps({'current_markets':n}))"
+                "v={'current_markets':n}; "
+                + (
+                    "r=c.execute('select historical_contract,scope,omitted_scopes,source_capture_id,source_capture_complete from main.catalogue_coverage').fetchone(); "
+                    "v['catalogue_coverage']=dict(zip(['historical_contract','scope','omitted_scopes','source_capture_id','source_capture_complete'],r)); "
+                    if catalogue_version == 3
+                    else ""
+                )
+                + "c.close(); print(json.dumps(v))"
             )
             readback = subprocess.run(
                 [sys.executable, "-c", query, str(alias)],
@@ -166,6 +182,19 @@ def activate_current(
                 or market_count < 0
             ):
                 raise RuntimeError("production DuckDB readback returned an invalid market count")
+            coverage = readback_data.get("catalogue_coverage") if catalogue_version == 3 else None
+            if catalogue_version == 3:
+                expected_omitted = json.loads(current["omitted_scopes_json"])
+                if coverage != {
+                    "historical_contract": current.get("historical_contract"),
+                    "scope": "historical",
+                    "omitted_scopes": expected_omitted,
+                    "source_capture_id": capture_id,
+                    "source_capture_complete": current.get("source_capture_complete"),
+                }:
+                    raise RuntimeError(
+                        "production catalogue coverage readback differs from release"
+                    )
             counts = {}
             for filename in current["files"]:
                 if filename.endswith(".parquet") and filename != "coverage.parquet":
@@ -186,6 +215,10 @@ def activate_current(
                 "pruned_artifacts": pruned,
                 "production_readback": {"current_markets": market_count, "read_only": True},
                 "relation_rows": counts,
+                "coverage_scope": current.get("coverage_scope"),
+                "source_capture_complete": state.get("complete") is True,
+                "scope_complete": True,
+                **({"catalogue_coverage": coverage} if coverage is not None else {}),
                 "observation_interval": {
                     "started_at": state.get("started_at"),
                     "completed_at": state.get("completed_at"),

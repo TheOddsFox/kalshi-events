@@ -309,6 +309,7 @@ def test_live_cache_corruption_replays_committed_page_in_same_capture(tmp_path, 
         store,
         client_factory=RecordingClient,
         _on_capture_id=capture_ids.append,
+        catalogue_profile="exchange",
     )
 
     assert result["complete"] is True
@@ -338,7 +339,7 @@ def test_shared_group_recovery_cache_parent_uses_ephemeral_index(tmp_path):
             requested.append(endpoint)
             return super().get(endpoint, params, context)
 
-    result = capture.capture(store, client_factory=RecordingClient)
+    result = capture.capture(store, client_factory=RecordingClient, catalogue_profile="exchange")
 
     assert result["complete"] is True
     assert requested

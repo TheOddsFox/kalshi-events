@@ -58,6 +58,7 @@ def test_pipeline_fuses_evidence_passes_without_losing_cutoffs_or_fresh_verifica
             client_factory=lambda s, b, **_options: FakeClient(
                 s, b, {"/historical/cutoff": cutoff, "/historical/markets": historical}
             ),
+            catalogue_profile="exchange",
         )
     assert state["complete"]
     paths = body_paths(store, state)
@@ -193,7 +194,7 @@ def test_parent_hydration_uses_observation_winner_instead_of_receipt_iteration_o
             self.store.write(relative, receipt)
             return relative
 
-    state = acquisition.capture(store, client_factory=TimedClient)
+    state = acquisition.capture(store, client_factory=TimedClient, catalogue_profile="exchange")
     assert state["complete"]
     accounted_usage = store.usage()
     assert store.reconcile() == accounted_usage
@@ -243,7 +244,9 @@ def test_parent_hydration_does_not_let_newer_nested_market_override_direct_defin
             self.store.write(relative, receipt)
             return relative
 
-    state = acquisition.capture(store, client_factory=ReferencedClient)
+    state = acquisition.capture(
+        store, client_factory=ReferencedClient, catalogue_profile="exchange"
+    )
     assert requested.count("/events/DIRECT") == 1
     output = tmp_path / "metadata"
     metadata.export(store, ["MARKET"], output, capture_id=state["capture_id"])
@@ -254,7 +257,7 @@ def test_parent_hydration_does_not_let_newer_nested_market_override_direct_defin
 
 
 def test_transient_parent_information_does_not_extend_capture_state_contract(store):
-    state = acquisition.capture(store, client_factory=FakeClient)
+    state = acquisition.capture(store, client_factory=FakeClient, catalogue_profile="exchange")
     snapshot = json.loads(store.path(f"captures/{state['capture_id']}/state.json").read_text())
     persisted = snapshot["state"]
     assert set(persisted) == {
@@ -317,6 +320,7 @@ def test_compact_parent_collection_preserves_native_validation(store, failure):
         acquisition.capture(
             store,
             client_factory=lambda s, b, **_options: FakeClient(s, b, {endpoint: (200, payload)}),
+            catalogue_profile="exchange",
         )
     capture_id = next(store.path("captures").iterdir()).name
     assert acquisition.read_capture(store, capture_id)["complete"] is False
@@ -335,6 +339,7 @@ def test_empty_event_series_parent_remains_empty_in_projection(store):
                 )
             },
         ),
+        catalogue_profile="exchange",
     )
     assert state["complete"]
     projected = project_pages(acquisition.capture_pages(store, state))

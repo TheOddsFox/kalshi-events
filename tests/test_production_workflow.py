@@ -18,12 +18,32 @@ from kalshi_events.common import BudgetExceeded, Store
 from kalshi_events.transport import accounting
 
 production = activation_tests.production
-certified_production_root = activation_tests.certified_production_root
+
+
+@pytest.fixture(scope="module")
+def historical_production_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp("historical-production-source") / "operator"
+    store = Store(root)
+    state = capture.capture(store, client_factory=FakeClient, catalogue_profile="historical")
+    assert state["complete"] is True
+    manifest = publish.publish(store, state["capture_id"], catalogue_version=3)
+    assert not store.path("current-v2.json").exists()
+    return root, manifest
+
+
+@pytest.fixture(scope="module")
+def legacy_production_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp("legacy-production-source") / "operator"
+    store = Store(root)
+    state = capture.capture(store, client_factory=FakeClient, catalogue_profile="exchange")
+    assert state["complete"] is True
+    manifest = publish.publish(store, state["capture_id"], catalogue_version=2)
+    return root, manifest
 
 
 @pytest.fixture
-def workflow(production, certified_production_root, tmp_path, monkeypatch):
-    source, manifest = certified_production_root
+def workflow(production, historical_production_root, tmp_path, monkeypatch):
+    source, manifest = historical_production_root
     raw_accounting = accounting(Store(source))
     state = SimpleNamespace(events=[], outcomes=[], commands=[], source=source, manifest=manifest)
     state.actual = False
@@ -89,6 +109,9 @@ def workflow(production, certified_production_root, tmp_path, monkeypatch):
                     "complete": True,
                     "capture_id": manifest["capture_id"],
                     "capture_complete": True,
+                    "source_capture_complete": True,
+                    "coverage_scope": "historical",
+                    "scope_complete": True,
                     "resumable": True,
                     "publication_state": "verified",
                     "accounting_complete": True,
@@ -101,9 +124,13 @@ def workflow(production, certified_production_root, tmp_path, monkeypatch):
                 }
                 code = value.pop("returncode", 0)
         elif label == "activation":
-            current = publish.current(Store(operator), catalogue_version=2)
+            version = 3 if (operator / "current-historical.json").exists() else 2
+            current = publish.current(Store(operator), catalogue_version=version)
             value = production.activate_current(
-                operator, directory, expected_release_id=current["source_release_id"]
+                operator,
+                directory,
+                expected_release_id=current["source_release_id"],
+                catalogue_version=version,
             )
             code = 0
         else:
@@ -146,10 +173,7 @@ def workflow(production, certified_production_root, tmp_path, monkeypatch):
     monkeypatch.setattr(
         production,
         "_root_summary",
-        lambda operator, *_a, **_kw: {
-            "root_id": snapshot["root_id"],
-            "current_v2": publish.current(Store(operator), catalogue_version=2),
-        },
+        lambda operator, *_a, **_kw: production._read_root_summary(operator),
     )
     monkeypatch.setattr(production, "_release_verify", independently_verify)
     monkeypatch.setattr(
@@ -157,11 +181,12 @@ def workflow(production, certified_production_root, tmp_path, monkeypatch):
     )
     state.directory = tmp_path / "production"
     actual_capture = capture.capture
-    monkeypatch.setattr(
-        capture,
-        "capture",
-        lambda *a, **kw: actual_capture(*a, client_factory=FakeClient, **kw),
-    )
+
+    def historical_capture(*args, **kwargs):
+        kwargs.setdefault("catalogue_profile", "historical")
+        return actual_capture(*args, client_factory=FakeClient, **kwargs)
+
+    monkeypatch.setattr(capture, "capture", historical_capture)
     monkeypatch.setattr(transport, "source_url", lambda: transport.BASE_URL)
     return state
 
@@ -184,17 +209,17 @@ def test_full_workflow_verifies_before_activating_a_single_production_database(
     ]
     assert (workflow.directory / "production.duckdb").is_file()
     assert not (workflow.directory / "operator" / "current.json").exists()
+    assert (workflow.directory / "operator" / "current-historical.json").is_file()
     command = workflow.commands[0]
     assert command[-3] == "full"
     limits = json.loads(command[-1])
     assert limits["max-rate"] == 5
     assert limits["compression"] == "gzip"
     assert limits["max-requests"] == 850000
+    assert workflow.commands[-1][-1] == f"historical:{workflow.manifest['source_release_id']}"
 
 
-def test_complete_capture_budget_stop_preserves_id_and_exact_resume_subtracts_prior_consumption(
-    production, workflow
-):
+def test_complete_historical_capture_resumes_and_activates_v3(production, workflow):
     workflow.outcomes = [
         {
             "returncode": 3,
@@ -226,6 +251,50 @@ def test_complete_capture_budget_stop_preserves_id_and_exact_resume_subtracts_pr
     )
     assert complete["requests"] == partial["requests"]
     assert complete["downloaded_bytes"] == partial["downloaded_bytes"]
+    assert complete["coverage_scope"] == "historical"
+    assert workflow.commands[-1][-1] == f"historical:{workflow.manifest['source_release_id']}"
+
+
+def test_legacy_capture_resume_keeps_v2_activation(
+    production, workflow, legacy_production_root, monkeypatch
+):
+    workflow.actual = True
+    source, manifest = legacy_production_root
+    operator = workflow.directory / "operator"
+    shutil.copytree(source, operator)
+    store = Store(operator)
+    with store.lock():
+        from kalshi_events.incremental import root_id
+
+        logical_root_id = root_id(store)
+    production._bind_owner(workflow.directory, logical_root_id, "full")
+    report_path, report, _paths = production._session_report(
+        workflow.directory, "full", manifest["capture_id"]
+    )
+    prior = accounting(Store(operator))
+    report.update(
+        root_id=logical_root_id,
+        capture_complete=True,
+        publication_state="unknown",
+        accounting_complete=True,
+        requests=prior["attempts"],
+        downloaded_bytes=prior["downloaded_or_reserved_bytes"],
+        resumable=True,
+        phase="stopped",
+    )
+    production._atomic_report(report_path, report)
+    monkeypatch.setattr(
+        FakeClient,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("completed legacy capture used networking"),
+    )
+
+    result, code = production.run_production(workflow.directory, capture_id=manifest["capture_id"])
+
+    assert code == 0, result
+    assert result["coverage_scope"] == "catalogue"
+    assert result["production_state"] == "verified"
+    assert workflow.commands[-1][-1] == manifest["source_release_id"]
 
 
 def test_unknown_child_accounting_blocks_verification_activation_and_follow_on_networking(
@@ -242,12 +311,14 @@ def test_unknown_child_accounting_blocks_verification_activation_and_follow_on_n
     assert not (workflow.directory / "production.duckdb").exists()
 
 
-def test_activation_only_never_starts_acquisition(production, workflow):
-    shutil.copytree(workflow.source, workflow.directory / "operator")
+def test_activation_only_never_starts_acquisition(production, workflow, legacy_production_root):
+    workflow.actual = True
+    legacy_source, _legacy_manifest = legacy_production_root
+    shutil.copytree(legacy_source, workflow.directory / "operator")
     (workflow.directory / "runs").mkdir()
     production._bind_owner(
         workflow.directory,
-        json.loads((workflow.source / "root-id.json").read_text())["root_id"],
+        json.loads((legacy_source / "root-id.json").read_text())["root_id"],
         "full",
     )
     result, code = production.run_production(workflow.directory, activate_only=True)

@@ -122,6 +122,8 @@ def _legacy_landing_text(value: Any) -> str | None:
 
 
 def build_directory(capture_id: str, catalogue_version: int = 1) -> str:
+    if catalogue_version == 3:
+        return f"builds-historical/{capture_id}"
     return f"builds-v2/{capture_id}" if catalogue_version == 2 else f"builds/{capture_id}"
 
 
@@ -224,6 +226,39 @@ def _operation_evidence_binding(
     )
 
 
+def _historical_profile(state: dict[str, Any]) -> tuple[dict[str, Any], set[int]]:
+    from kalshi_events.historical import (
+        historical_selection,
+        historical_task_indices,
+    )
+
+    selection = historical_selection(state, allow_legacy_incomplete=True)
+    indices = historical_task_indices(state, allow_legacy_incomplete=True)
+    return selection, indices
+
+
+def _profile_capture(
+    store: Store,
+    capture_id: str,
+    catalogue_version: int,
+    state_hint: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if catalogue_version != 3:
+        state = _complete_capture(store, capture_id, _state=state_hint)
+        return state, page_receipts(store, state)
+    from kalshi_events.capture import read_capture
+
+    state = read_capture(store, capture_id)
+    if state.get("capture_id") != capture_id or (
+        state_hint is not None
+        and digest(json_bytes(dict(state_hint))) != digest(json_bytes(dict(state)))
+    ):
+        raise CatalogueError("historical capture state changed during the operation")
+    _, indices = _historical_profile(state)
+    rows = [row for row in page_receipts(store, state) if row["index"] in indices]
+    return state, rows
+
+
 def _operation_evidence(
     store: Store,
     state: dict[str, Any],
@@ -233,12 +268,12 @@ def _operation_evidence(
     capture_id = state.get("capture_id")
     if (
         not isinstance(capture_id, str)
-        or catalogue_version not in {1, 2}
+        or catalogue_version not in {1, 2, 3}
         or not store.writer_locked_by_current_thread
     ):
         raise CatalogueError("operation evidence lacks a capture identity")
-    _complete_capture(store, capture_id, _state=state)
-    rows = tuple(page_receipts(store, state))
+    state, rows = _profile_capture(store, capture_id, catalogue_version, state)
+    rows = tuple(rows)
     expected: set[str] = set()
     for row in rows:
         relative = row.get("relative")
@@ -308,7 +343,9 @@ def _validate_operation_evidence(
         != proof.binding_sha256
     ):
         raise CatalogueError("operation evidence binding mismatch")
-    state = _complete_capture(store, capture_id, _state=proof.state)
+    state, rows = _profile_capture(store, capture_id, catalogue_version, proof.state)
+    if tuple(rows) != proof.page_rows:
+        raise CatalogueError("operation evidence receipts do not match the capture profile")
     checkpoints = _checkpoint_inventory(store, state)
     if checkpoints != proof.checkpoints:
         raise CatalogueError("capture checkpoint changed during the operation")
@@ -352,6 +389,7 @@ def evidence_inventory(
     store: Store,
     capture_id: str,
     *,
+    catalogue_version: int = 1,
     verified_pages: dict[str, str] | None = None,
     _state: dict[str, Any] | None = None,
     _page_rows: list[dict[str, Any]] | None = None,
@@ -361,12 +399,20 @@ def evidence_inventory(
         state, proof_rows = _validate_operation_evidence(
             store, _proof, capture_id, _proof.catalogue_version
         )
+        catalogue_version = _proof.catalogue_version
         if verified_pages != _proof.verified_pages:
             raise CatalogueError("operation evidence does not match verified landing pages")
         _state = state
         _page_rows = list(proof_rows)
-    state = _complete_capture(store, capture_id, _state=_state)
-    rows = page_receipts(store, state) if _page_rows is None else _page_rows
+    if catalogue_version not in {1, 2, 3}:
+        raise CatalogueError("catalogue version must be 1, 2, or 3")
+    if _page_rows is None:
+        state, rows = _profile_capture(store, capture_id, catalogue_version, _state)
+    else:
+        state, expected_rows = _profile_capture(store, capture_id, catalogue_version, _state)
+        rows = _page_rows
+        if rows != expected_rows:
+            raise CatalogueError("operation-local receipts do not match the capture profile")
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise CatalogueError("invalid operation-local capture receipt inventory")
     result = _checkpoint_inventory(store, state)
@@ -405,6 +451,7 @@ def _land(
     *,
     verified_pages: dict[str, str] | None = None,
     parent_index: ParentIndex | DiskParentIndex | None = None,
+    task_indices: set[int] | None = None,
 ) -> int:
     """Land one capture into a fresh warehouse under `directory`. Returns observation count."""
     with metrics.phase("landing"):
@@ -414,6 +461,7 @@ def _land(
             directory,
             verified_pages=verified_pages,
             parent_index=parent_index,
+            task_indices=task_indices,
         )
 
 
@@ -424,6 +472,7 @@ def _land_rows(
     *,
     verified_pages: dict[str, str] | None = None,
     parent_index: ParentIndex | DiskParentIndex | None = None,
+    task_indices: set[int] | None = None,
 ) -> int:
     capture_id = state["capture_id"]
     observation_count = 0
@@ -431,7 +480,9 @@ def _land_rows(
 
     def rows():
         nonlocal observation_count
-        for manifest, payload in capture_pages(store, state, evidence=verified_pages):
+        for manifest, payload in capture_pages(
+            store, state, evidence=verified_pages, task_indices=task_indices
+        ):
             manifest = _scope_manifest(state, manifest)
             if parent_index is not None:
                 parent_index.add_page(manifest, payload)
@@ -1586,8 +1637,8 @@ def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
 
 
 def _recover_build(store: Store, capture_id: str, catalogue_version: int) -> None:
-    if catalogue_version not in {1, 2}:
-        raise CatalogueError("catalogue version must be 1 or 2")
+    if catalogue_version not in {1, 2, 3}:
+        raise CatalogueError("catalogue version must be 1, 2, or 3")
     if not store.writer_locked_by_current_thread:
         raise CatalogueError("build recovery requires the canonical writer lock")
     destination = store.path(build_directory(capture_id, catalogue_version))
@@ -1637,8 +1688,8 @@ def _install_build(
     staging: Path,
     proof: _OperationEvidence | None = None,
 ) -> dict[str, Any]:
-    if catalogue_version not in {1, 2}:
-        raise CatalogueError("catalogue version must be 1 or 2")
+    if catalogue_version not in {1, 2, 3}:
+        raise CatalogueError("catalogue version must be 1, 2, or 3")
     destination_relative = build_directory(capture_id, catalogue_version)
     destination = store.path(destination_relative)
     durable_mkdir(destination.parent)
@@ -1830,17 +1881,98 @@ def _build_scope_fields(state: dict[str, Any]) -> dict[str, Any]:
     return {"scope": "series", "series_scope": validated, "root_id": root_identity}
 
 
-def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dict[str, Any]:
+def _historical_receipt_fields(state: dict[str, Any]) -> dict[str, Any]:
+    from kalshi_events.historical import HISTORICAL_CONTRACT, HISTORICAL_VERSION
+
+    selection, _ = _historical_profile(state)
+    return {
+        "version": HISTORICAL_VERSION,
+        "catalogue_version": HISTORICAL_VERSION,
+        "scope": "historical",
+        "historical_contract": HISTORICAL_CONTRACT,
+        "historical_selection": selection,
+        "source_capture_complete": state.get("complete") is True,
+    }
+
+
+def _write_historical_coverage(
+    connection: duckdb.DuckDBPyConnection, state: dict[str, Any]
+) -> None:
+    from kalshi_events.historical import HISTORICAL_CONTRACT
+
+    connection.execute(
+        """create table main.catalogue_coverage (
+             historical_contract varchar,
+             scope varchar,
+             omitted_scopes varchar[],
+             source_capture_id varchar,
+             source_capture_complete boolean
+        )"""
+    )
+    connection.execute(
+        "insert into main.catalogue_coverage values (?, 'historical', ?, ?, ?)",
+        [
+            HISTORICAL_CONTRACT,
+            ["events_combo", "markets_live", "markets_combo"],
+            state["capture_id"],
+            state.get("complete") is True,
+        ],
+    )
+
+
+def _check_historical_coverage(
+    database: Path, capture_id: str, source_capture_complete: bool
+) -> None:
+    from kalshi_events.historical import HISTORICAL_CONTRACT
+
+    try:
+        with duckdb.connect(str(database), read_only=True) as connection:
+            result = connection.execute("select * from main.catalogue_coverage")
+            columns = tuple(column[0] for column in result.description or ())
+            rows = result.fetchall()
+    except duckdb.Error as exc:
+        raise CatalogueError("historical catalogue coverage is missing or invalid") from exc
+    if columns != (
+        "historical_contract",
+        "scope",
+        "omitted_scopes",
+        "source_capture_id",
+        "source_capture_complete",
+    ) or rows != [
+        (
+            HISTORICAL_CONTRACT,
+            "historical",
+            ["events_combo", "markets_live", "markets_combo"],
+            capture_id,
+            source_capture_complete,
+        )
+    ]:
+        raise CatalogueError("historical catalogue coverage does not match its build receipt")
+
+
+def _full_v2_build(
+    store: Store, state: dict[str, Any], *, rebuild: bool, historical: bool = False
+) -> dict[str, Any]:
     capture_id = state["capture_id"]
-    if not state.get("task_scopes") and any(
-        int(work.get("restarts", 0)) > 0 for work in state.get("tasks", [])
+    if (
+        not historical
+        and not state.get("task_scopes")
+        and any(int(work.get("restarts", 0)) > 0 for work in state.get("tasks", []))
     ):
         raise CatalogueError(
             "legacy full capture lacks final-generation membership after cursor reset; capture a new full baseline"
         )
     store.check_deadline()
-    _recover_build(store, capture_id, 2)
-    staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
+    catalogue_version = 3 if historical else 2
+    historical_indices: set[int] | None = None
+    if historical:
+        _, historical_indices = _historical_profile(state)
+    _recover_build(store, capture_id, catalogue_version)
+    staging_relative = (
+        f"tmp/build-historical-{uuid.uuid4().hex}"
+        if historical
+        else f"tmp/build-v2-{uuid.uuid4().hex}"
+    )
     staging = store.path(staging_relative)
     durable_mkdir(staging.parent)
     staging.mkdir()
@@ -1851,31 +1983,44 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
         else ParentIndex()
     )
     try:
-        source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
-        source_exists = store.scope is None and store.path(source_relative).exists()
-        if source_exists and not rebuild:
-            source_receipt = certified(store, capture_id, catalogue_version=1)
-            _copy_closed_database(
-                store,
-                source_relative,
-                staging,
-                expected_sha256=source_receipt["warehouse_sha256"],
-            )
-            _projection_index(store, state, verified_pages=verified_pages, index=index)
-        else:
+        if historical:
             _land(
                 store,
                 state,
                 staging,
                 verified_pages=verified_pages,
                 parent_index=index,
+                task_indices=historical_indices,
             )
+        else:
+            source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
+            source_exists = store.scope is None and store.path(source_relative).exists()
+            if source_exists and not rebuild:
+                source_receipt = certified(store, capture_id, catalogue_version=1)
+                _copy_closed_database(
+                    store,
+                    source_relative,
+                    staging,
+                    expected_sha256=source_receipt["warehouse_sha256"],
+                )
+                _projection_index(store, state, verified_pages=verified_pages, index=index)
+            else:
+                _land(
+                    store,
+                    state,
+                    staging,
+                    verified_pages=verified_pages,
+                    parent_index=index,
+                )
         with (
             duckdb.connect(str(staging / "warehouse.duckdb")) as connection,
             metrics.phase("current_projection"),
         ):
             _projection_membership(store, state, index, connection)
-            _parent_closure_is_fresh(connection, state, index)
+            if historical:
+                _write_historical_coverage(connection, state)
+            else:
+                _parent_closure_is_fresh(connection, state, index)
         dbt(
             store,
             ["build"],
@@ -1889,23 +2034,26 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
             },
         )
         store.sync(staging_relative)
-        operation_evidence = _operation_evidence(store, state, 2, verified_pages)
+        operation_evidence = _operation_evidence(store, state, catalogue_version, verified_pages)
         database = staging / "warehouse.duckdb"
         fsync_file(database)
         fsync_directory(staging)
         receipt = {
-            "version": 2,
-            "catalogue_version": 2,
+            **(
+                _historical_receipt_fields(state)
+                if historical
+                else {"version": 2, "catalogue_version": 2}
+            ),
             "capture_id": capture_id,
             "built_at": now(),
-            **_build_scope_fields(state),
+            **({} if historical else _build_scope_fields(state)),
             "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
         }
         store.write(f"{staging_relative}/build.json", receipt)
         fsync_directory(staging)
-        promoted = _install_build(store, capture_id, 2, staging, operation_evidence)
+        promoted = _install_build(store, capture_id, catalogue_version, staging, operation_evidence)
         store.check_storage()
         return promoted
     finally:
@@ -1920,6 +2068,20 @@ def _full_v2_build(store: Store, state: dict[str, Any], *, rebuild: bool) -> dic
 def build_v2_full(store: Store, capture_id: str, *, rebuild: bool = False) -> dict[str, Any]:
     with store.writer_guard():
         return _build_v2_full_locked(store, capture_id, rebuild=rebuild)
+
+
+def build_historical(store: Store, capture_id: str, *, rebuild: bool = False) -> dict[str, Any]:
+    with store.writer_guard():
+        store.require_writable()
+        if store.scope is not None:
+            raise CatalogueError("historical catalogue builds require a catalogue root")
+        from kalshi_events.incremental import finish_pending_retirement
+
+        finish_pending_retirement(store)
+        state, _ = _profile_capture(store, capture_id, 3)
+        if state.get("incremental"):
+            raise CatalogueError("incremental captures cannot be built as historical catalogues")
+        return _full_v2_build(store, state, rebuild=rebuild, historical=True)
 
 
 def _build_v2_full_locked(
@@ -2040,8 +2202,8 @@ def certified(
     _proof: _OperationEvidence | None = None,
     _context: _OperationContext | None = None,
 ) -> dict[str, Any]:
-    if catalogue_version not in {1, 2}:
-        raise CatalogueError("catalogue version must be 1 or 2")
+    if catalogue_version not in {1, 2, 3}:
+        raise CatalogueError("catalogue version must be 1, 2, or 3")
     if store.scope is not None and catalogue_version != 2:
         raise CatalogueError("series roots support only internal v2 warehouse builds")
     if _context is not None:
@@ -2080,8 +2242,7 @@ def certified(
         rows = list(proof_rows)
         proof_pages = _proof.verified_pages
     else:
-        state = _complete_capture(store, capture_id, _state=_state)
-        expected_rows = page_receipts(store, state)
+        state, expected_rows = _profile_capture(store, capture_id, catalogue_version, _state)
         rows = expected_rows if _page_rows is None else _page_rows
         if (
             not isinstance(rows, list)
@@ -2095,6 +2256,12 @@ def certified(
             raise CatalogueError("build receipt scope does not match the operator root")
     elif receipt.get("scope") == "series":
         raise CatalogueError("series build receipt cannot be verified from a catalogue root")
+    if catalogue_version == 3:
+        expected_profile = _historical_receipt_fields(state)
+        if any(receipt.get(key) != value for key, value in expected_profile.items()):
+            raise CatalogueError("historical build receipt does not match its source capture")
+    elif receipt.get("scope") == "historical":
+        raise CatalogueError("historical build receipt requires catalogue version 3")
     base = f"captures/{capture_id}"
     required = {f"{base}/state.json", f"{base}/pages.jsonl"}
     for row in rows:
@@ -2142,6 +2309,8 @@ def certified(
     warehouse = directory_path / "warehouse.duckdb"
     if file_digest(warehouse, store.limits.max_database_bytes)[0] != receipt["warehouse_sha256"]:
         raise CatalogueError("warehouse changed after certified build")
+    if catalogue_version == 3:
+        _check_historical_coverage(warehouse, capture_id, state.get("complete") is True)
     artifacts = directory_path / "build-artifacts.json"
     if digest(regular_bytes(artifacts)) != receipt["dbt_artifacts_sha256"]:
         raise CatalogueError("dbt certification artifacts changed")

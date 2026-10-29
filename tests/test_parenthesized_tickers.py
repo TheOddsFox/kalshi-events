@@ -358,6 +358,7 @@ def test_printable_punctuation_identities_survive_verified_v2_publication(store,
     state = capture.capture(
         store,
         client_factory=lambda s, b, **options: FakeClient(s, b, responses, **options),
+        catalogue_profile="exchange",
     )
     assert state["complete"]
     release = publish(store, state["capture_id"], catalogue_version=2)
@@ -764,6 +765,7 @@ def test_parenthesized_identity_survives_verified_full_v2_publication(store):
     state = capture.capture(
         store,
         client_factory=lambda s, b, **options: FakeClient(s, b, responses, **options),
+        catalogue_profile="exchange",
     )
     assert state["complete"]
     release = publish(store, state["capture_id"], catalogue_version=2)
@@ -787,6 +789,7 @@ def test_spaced_identity_survives_verified_full_v2_publication(store):
         client_factory=lambda s, b, **options: FakeClient(
             s, b, _gdp_responses(full=True), **options
         ),
+        catalogue_profile="exchange",
     )
     assert state["complete"]
     release = publish(store, state["capture_id"], catalogue_version=2)

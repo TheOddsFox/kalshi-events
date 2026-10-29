@@ -34,7 +34,7 @@ def production():
 def certified_production_root(tmp_path_factory):
     root = tmp_path_factory.mktemp("production-source") / "operator"
     store = Store(root)
-    state = capture.capture(store, client_factory=FakeClient)
+    state = capture.capture(store, client_factory=FakeClient, catalogue_profile="exchange")
     assert state["complete"] is True
     manifest = publish.publish(store, state["capture_id"], catalogue_version=2)
     assert not store.path("current.json").exists()
@@ -61,7 +61,7 @@ def rebased_production_root(certified_production_root, tmp_path_factory):
     old_alias = directory / "previous.duckdb"
     os.link(old_database, old_alias)
     store = Store(root)
-    state = capture.capture(store, client_factory=FakeClient)
+    state = capture.capture(store, client_factory=FakeClient, catalogue_profile="exchange")
     assert state["complete"]
     manifest = publish.publish(store, state["capture_id"], catalogue_version=2)
     assert manifest["warehouse_sha256"] != old_manifest["warehouse_sha256"]
@@ -459,7 +459,9 @@ def test_interrupted_post_promotion_retirement_blocks_activation_until_cleanup_f
     activate(production, candidate)
     alias = directory / "production.duckdb"
     previous_bytes = alias.read_bytes()
-    next_state = capture.capture(Store(root), client_factory=FakeClient)
+    next_state = capture.capture(
+        Store(root), client_factory=FakeClient, catalogue_profile="exchange"
+    )
     assert next_state["complete"]
     original_finish = incremental._finish_retirement_plan
 

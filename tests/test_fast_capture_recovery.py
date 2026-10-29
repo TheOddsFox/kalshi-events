@@ -366,7 +366,7 @@ def test_prune_plan_derives_cache_owner_before_unlinking_plan(tmp_path, monkeypa
     store = Store(root)
     with store.writer_guard():
         store.write("root-id.json", {"version": 1, "root_id": "a" * 32})
-    result = capture.capture(store, client_factory=FakeClient)
+    result = capture.capture(store, client_factory=FakeClient, catalogue_profile="exchange")
     capture_id = result["capture_id"]
     cache_path = store.path(f"tmp/recovery-index/{capture_id}/index.sqlite")
     assert cache_path.is_file()

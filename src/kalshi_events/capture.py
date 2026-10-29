@@ -65,7 +65,7 @@ _PROTOCOL5_POLICIES = {
     "cutoff_policy": "checkpoint-v1",
 }
 _LEGACY_PROTOCOL5_POLICIES = {
-    "parent_policy": {"singular-v1", "batched-v1"},
+    "parent_policy": {"singular-v1", "batched-v1", "historical-only-v1"},
     "cutoff_policy": {"per-page-v1", "checkpoint-v1"},
 }
 _CHECKPOINT_TASK_FIELDS = {
@@ -224,6 +224,13 @@ def _batched_parent_policy(state: dict[str, Any]) -> bool:
     return (
         _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
         and state.get("parent_policy") == "batched-v1"
+    )
+
+
+def _historical_only_policy(state: dict[str, Any]) -> bool:
+    return (
+        _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
+        and state.get("parent_policy") == "historical-only-v1"
     )
 
 
@@ -833,6 +840,44 @@ def _validate_logical_state(state: Any, capture_id: str) -> dict[str, Any]:
             raise CatalogueError("reconciliation scope does not match its traversal")
         if _batch_tickers(work) is not None or work.get("parent_batch") is not None:
             raise CatalogueError("selected market batches cannot define a reconciliation scope")
+    if state.get("parent_policy") == "historical-only-v1":
+        expected_plan = (
+            ("/historical/cutoff", None, True, {}),
+            ("/series", "series", False, {}),
+            (
+                "/events",
+                "events",
+                False,
+                {"with_nested_markets": "false", "limit": EVENT_PAGE_LIMIT},
+            ),
+            (
+                "/historical/markets",
+                "markets",
+                False,
+                {"limit": MARKET_PAGE_LIMIT},
+            ),
+        )
+        if (
+            state.get("selected") is not None
+            or state.get("incremental") is not False
+            or "scope" in state
+            or len(state["tasks"]) != len(expected_plan)
+            or scopes != {"1": "series", "2": "events_live", "3": "markets_history"}
+            or any(
+                (
+                    work.get("endpoint"),
+                    work.get("kind"),
+                    work.get("singular"),
+                    work.get("params"),
+                    work.get("requested"),
+                )
+                != (endpoint, kind, singular, params, None)
+                for work, (endpoint, kind, singular, params) in zip(
+                    state["tasks"], expected_plan, strict=True
+                )
+            )
+        ):
+            raise CatalogueError("historical capture differs from its sealed task plan")
     return state
 
 
@@ -2114,8 +2159,18 @@ def capture_pages(
     state: dict[str, Any],
     *,
     evidence: dict[str, str] | None = None,
+    task_indices: set[int] | None = None,
 ) -> Iterator[tuple[dict[str, Any], Any]]:
+    if task_indices is not None and any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(state.get("tasks", []))
+        for index in task_indices
+    ):
+        raise CatalogueError("capture page filter contains an invalid task index")
     for row in page_receipts(store, state):
+        if task_indices is not None and row["index"] not in task_indices:
+            continue
         store.check_deadline()
         manifest, payload = read_page(
             store,
@@ -2421,11 +2476,17 @@ def new_capture(
     compression: str = "gzip",
     *,
     incremental: bool = False,
+    catalogue_profile: str = "historical",
     rate_policy: str = "decrease-on-429",
     _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if compression not in {"identity", "gzip"}:
         raise CatalogueError("compression must be identity or gzip")
+    if not isinstance(catalogue_profile, str) or catalogue_profile not in {
+        "historical",
+        "exchange",
+    }:
+        raise CatalogueError("catalogue profile must be historical or exchange")
     if not isinstance(rate_policy, str) or rate_policy not in {"fixed", "decrease-on-429"}:
         raise CatalogueError("rate policy must be fixed or decrease-on-429")
     if incremental and selected:
@@ -2480,14 +2541,17 @@ def new_capture(
                 "events",
                 params={"with_nested_markets": "false", "limit": EVENT_PAGE_LIMIT},
             ),
-            task(
-                "/events/multivariate",
-                "events",
-                params={"with_nested_markets": "false", "limit": EVENT_PAGE_LIMIT},
-            ),
-            task("/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
-            task("/historical/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
         ]
+        if catalogue_profile == "exchange":
+            work += [
+                task(
+                    "/events/multivariate",
+                    "events",
+                    params={"with_nested_markets": "false", "limit": EVENT_PAGE_LIMIT},
+                ),
+                task("/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}),
+            ]
+        work.append(task("/historical/markets", "markets", params={"limit": MARKET_PAGE_LIMIT}))
     elif scope is None:
         for batch in _selected_market_batches(selections(selected)):
             if len(batch) == 1 and "," in batch[0]:
@@ -2553,6 +2617,13 @@ def new_capture(
     }
     if protocol == CURRENT_ACQUISITION_PROTOCOL:
         policies = {**_PROTOCOL5_POLICIES, "rate_policy": rate_policy}
+        if (
+            scope is None
+            and selected is None
+            and not incremental
+            and catalogue_profile == "historical"
+        ):
+            policies["parent_policy"] = "historical-only-v1"
         state.update(policies)
         state["acquisition_policy_sha256"] = digest(json_bytes(policies))
         state["tasks"] = [
@@ -2935,6 +3006,8 @@ def _hydrate_from_recovery_hint(
 
 
 def _hydrate_pages(store: Store, state: dict[str, Any], identities: ParentIndex) -> bool:
+    if _historical_only_policy(state):
+        return any(not work["done"] for work in state["tasks"])
     if isinstance(identities, DiskParentIndex):
         existing = _task_identity_set(state)
         added: list[dict[str, Any]] = []
@@ -3455,6 +3528,12 @@ def _run(
                 failure = failure or exc
 
 
+def _reject_retired_capture_resume(store: Store, capture_id: str) -> None:
+    marker = store.path(f"captures/{capture_id}/retired-scopes.json")
+    if marker.exists() or marker.is_symlink():
+        raise CatalogueError("capture scopes were retired; ordinary resume is blocked")
+
+
 def _capture_locked(
     store: Store,
     *,
@@ -3464,8 +3543,11 @@ def _capture_locked(
     compression: str | None = None,
     rate_policy: str | None = None,
     incremental: bool = False,
+    catalogue_profile: str = "historical",
     _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    if resume is not None:
+        _reject_retired_capture_resume(store, resume)
     capture_state = None
     if resume is not None:
         snapshot = store.path(f"captures/{resume}/state.json")
@@ -3502,6 +3584,7 @@ def _capture_locked(
             compression=compression,
             rate_policy=rate_policy,
             incremental=incremental,
+            catalogue_profile=catalogue_profile,
             _on_capture_id=_on_capture_id,
             identities=identities,
             identity_holder=identity_holder,
@@ -3540,6 +3623,7 @@ def _capture_locked_impl(
     compression: str | None = None,
     rate_policy: str | None = None,
     incremental: bool = False,
+    catalogue_profile: str = "historical",
     _on_capture_id: Callable[[str], None] | None = None,
     identities: ParentIndex | DiskParentIndex,
     identity_holder: list[ParentIndex | DiskParentIndex] | None = None,
@@ -3548,8 +3632,20 @@ def _capture_locked_impl(
     if resume and _on_capture_id is not None:
         _on_capture_id(resume)
     snapshot_present = bool(resume and store.path(f"captures/{resume}/state.json").is_file())
+    snapshot_state = None
+    if snapshot_present:
+        envelope = decode(
+            regular_bytes(store.path(f"captures/{resume}/state.json"), store.limits.max_root_bytes)
+        )
+        snapshot_state = envelope.get("state", envelope) if isinstance(envelope, dict) else None
     defer_prefix_replay = bool(
-        resume and snapshot_present and isinstance(identities, DiskParentIndex)
+        resume
+        and snapshot_present
+        and isinstance(identities, DiskParentIndex)
+        and not (
+            isinstance(snapshot_state, dict)
+            and snapshot_state.get("parent_policy") == "historical-only-v1"
+        )
     )
     state = (
         read_capture(
@@ -3564,6 +3660,7 @@ def _capture_locked_impl(
             selected,
             compression if compression is not None else "gzip",
             incremental=incremental,
+            catalogue_profile=catalogue_profile,
             rate_policy=rate_policy if rate_policy is not None else "decrease-on-429",
             _on_capture_id=_on_capture_id,
         )
@@ -3802,9 +3899,12 @@ def capture(
     compression: str | None = None,
     rate_policy: str | None = None,
     incremental: bool = False,
+    catalogue_profile: str = "historical",
     _on_capture_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     with store.writer_guard():
+        if resume is not None:
+            _reject_retired_capture_resume(store, resume)
         from kalshi_events.incremental import finish_pending_retirement
 
         finish_pending_retirement(store)
@@ -3816,6 +3916,7 @@ def capture(
             compression=compression,
             rate_policy=rate_policy,
             incremental=incremental,
+            catalogue_profile=catalogue_profile,
             _on_capture_id=_on_capture_id,
         )
 

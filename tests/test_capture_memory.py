@@ -12,7 +12,7 @@ from kalshi_events.common import CatalogueError, Limits, Store
 
 def _incomplete_v2_state(store):
     bounded = Store(store.root, Limits(max_requests=7))
-    result = acquisition.capture(bounded, client_factory=FakeClient)
+    result = acquisition.capture(bounded, client_factory=FakeClient, catalogue_profile="exchange")
     assert result["complete"] is False
 
     state = acquisition.read_capture(store, result["capture_id"])
@@ -94,7 +94,7 @@ def test_recover_receipts_uses_validated_v2_membership_and_skips_logged_decode(s
 
 
 def test_recover_receipts_handles_empty_v2_state_without_public_projection(store, monkeypatch):
-    state = acquisition.new_capture(store, None)
+    state = acquisition.new_capture(store, None, catalogue_profile="exchange")
     assert not state.processed
 
     monkeypatch.setattr(
@@ -136,7 +136,7 @@ def test_recover_receipts_keeps_legacy_journal_fallback(store):
 
 
 def test_recover_receipts_still_fails_on_unlogged_invalid_manifest(store):
-    state = acquisition.new_capture(store, None)
+    state = acquisition.new_capture(store, None, catalogue_profile="exchange")
     store.write_bytes("raw/unlogged/manifest.json", b"not-json")
 
     with pytest.raises(CatalogueError, match="invalid JSON"):
@@ -145,7 +145,7 @@ def test_recover_receipts_still_fails_on_unlogged_invalid_manifest(store):
 
 @pytest.mark.parametrize("mismatch", ["request_id", "protocol"])
 def test_recover_receipts_preserves_unlogged_mismatch_behavior(store, mismatch):
-    state = acquisition.new_capture(store, None)
+    state = acquisition.new_capture(store, None, catalogue_profile="exchange")
     context = acquisition._request_context(state, 0)
     manifest = {
         **context,

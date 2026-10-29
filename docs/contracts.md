@@ -52,7 +52,7 @@ New ordinary and scoped captures seal `acquisition_protocol: 5` in their journal
 
 The current protocol-5 defaults request gzip and use `decrease-on-429`; `--compression identity` and `--rate-policy fixed` are explicit alternatives. The shared adaptive limiter starts at the operator's `--max-rate` ceiling (5 requests/second by default), halves once on the first 429 from each limiter generation, and never falls below `min(initial ceiling, 0.25 requests/second)` or increases within an invocation. It honors `Retry-After`; waiting workers recheck the new spacing and cooldown. A manual resume starts from its supplied ceiling, so the previous invocation's effective lowered rate is not persisted.
 
-#### Private protocol-5 full-capture recovery index
+#### Private legacy exchange-profile full-capture recovery index
 
 Only unscoped, non-incremental protocol-5 full captures may use the private persistent SQLite parent index. It is enabled only when the operator root already has a validated logical root ID. Without that ID, resume still prioritizes acquisition before reconstructing older receipts with the disposable index; the cache never creates an ID or changes capture, receipt or request identities to enable itself. If directory permissions prevent creating a private cache, acquisition uses the disposable index without changing those permissions or leaving a capture cache behind. Existing unsafe cache files and links still fail closed. The index is an auxiliary hint, not raw evidence, an authorization to publish, or a certification result.
 
@@ -82,9 +82,54 @@ Coverage accumulates across a batch's pages and resets when its pagination gener
 
 New protocol-3 event-parent lookups request `exclude_markets=true`, preserving native event definitions and series relationships while omitting incidental child markets. Existing receipts, including embedded child observations, remain readable and unchanged. Direct market traversals still establish full catalogue coverage. Batching changes source endpoints, receipt and observation identities for newly acquired selections; provenance always names the actual request rather than a synthetic individual lookup. Metadata output preserves the operator's selection order.
 
-Protocol-5 parent hydration batches missing event tickers in deterministic groups of 20–100, bounded to 6,144 encoded initial-URL bytes. Small groups and URL-constrained tails remain singular. Ordinary events are queried first, then multivariate events for omissions, then singular lookups preserve authoritative 404/200 behavior; scoped ordinary-series captures skip the multivariate stage. Nested markets remain disabled. Every returned identity and applicable scope is validated, and parent batches never become reconciliation membership. Only successful results in the final pagination generation authorize a positive lookup, while native winner selection still compares all observations by `received_at DESC, observation_id DESC`. Actual batch receipt provenance is retained. A list omission never proves absence.
+Selected, dedicated-series and legacy exchange-profile protocol-5 parent hydration batches missing event tickers in deterministic groups of 20–100, bounded to 6,144 encoded initial-URL bytes. Small groups and URL-constrained tails remain singular. Ordinary events are queried first, then multivariate events for omissions, then singular lookups preserve authoritative 404/200 behavior; scoped ordinary-series captures skip the multivariate stage. Nested markets remain disabled. Every returned identity and applicable scope is validated, and parent batches never become reconciliation membership. Only successful results in the final pagination generation authorize a positive lookup, while native winner selection still compares all observations by `received_at DESC, observation_id DESC`. Actual batch receipt provenance is retained. A list omission never proves absence.
 
 Protocol-5 historical list traversals retain every cutoff receipt and read a fresh boundary at start, after resume or cursor reset, after 100 data pages or a 300-second monotonic scheduler interval, and before terminal completion. The interval is checked before scheduling a logical page; limiter waits, retries and network latency may extend the time until a cutoff response arrives. It is not an atomic snapshot or a hard freshness SLA. Singular historical lookups retain a fresh cutoff per lookup. Failure to obtain a terminal cutoff leaves the traversal incomplete; resume reuses committed data receipts and obtains the required boundary before new data requests.
+
+### Historical full-capture scope
+
+New unselected, unscoped full captures acquire series, ordinary events and all historical
+markets, including historical combos. They omit the live `/markets` and
+`/events/multivariate` traversals. The protocol-5 `parent_policy: "historical-only-v1"`
+seals this plan into the existing acquisition-policy checksum, request context, genesis and
+snapshot checks. Older readers reject the unsupported sealed policy. This does not change
+raw formats, journal framing, root storage version or the meaning of old captures.
+Explicit legacy exchange captures, selected metadata and dedicated-series captures retain
+their own plans. Historical captures verify their acquired evidence before completion but
+do not acquire missing parent definitions; unresolved relationships remain visible.
+
+An explicit historical build profile can also select completed series, ordinary-event and
+historical-market tasks from an incomplete legacy capture. All selected primary tasks and
+the terminal historical cutoff must be complete. The full source journal and snapshot are
+validated; selected receipts retain their original capture/receipt provenance and are freshly
+verified. This operation never changes the source capture's completion state or performs
+network requests. Event-reference markets and excluded traversal observations cannot enter
+the historical warehouse. History retains all selected generations; current membership uses
+only final generations and winners still compare `received_at DESC, observation_id DESC`.
+
+Historical builds share the Arrow/dbt projection, integrity-test, export and certification
+machinery, with a distinct `builds-historical/<capture_id>` identity. Parent and combo-leg
+availability do not remove historical markets. The database includes a
+`main.catalogue_coverage` record identifying its historical scope and real source-capture
+completion state. Internal build selector 3 is not a public catalogue-v3 contract.
+
+Publication uses `oddsfox.kalshi.historical.v1`, `coverage_scope: "historical"` and
+`current-historical.json`. Manifest and coverage bind the included/omitted scopes, selected
+task indices and final generations, source completion status and root identity. Complete
+exports, immutable file checksums and independent verification remain required. Historical
+publications cannot become catalogue-v2 incremental baselines; historical delta composition
+is not implemented. Legacy catalogue v1/v2 and series v1 contracts remain unchanged.
+Replay, rebuild, retention and discard respect the historical publication's evidence closure.
+
+`refresh --historical --capture-id ID` explicitly finishes a saved historical scope without
+acquisition. Its verified workflow and scope may complete while `capture_complete` and
+`source_capture_complete` remain false. Ordinary resume never implicitly changes a legacy
+capture's sealed plan. User-authorized retirement of excluded raw bodies records a separate
+`retired-scopes.json` guard; updated binaries reject ordinary network resume for that source.
+Keep all selected evidence, manifests, journal/snapshot and any suffix bodies required for
+replay. Retirement does not erase consumed requests/downloads or establish byte integrity of
+the removed data. It intentionally ends full-exchange recovery and requires an auditable,
+exclusive deletion list; it is not automatic retention cleanup.
 
 ### DuckDB 2 physical storage compatibility
 
@@ -204,11 +249,20 @@ Report version 2 identifies the throughput profile; existing screening reports r
 
 The manual production runner manages a dedicated external directory containing an ordinary `operator/` root, session reports under `runs/`, and `production.duckdb`. Its bookkeeping is external operational state: existing root versions, acquisition protocols, receipts, catalogue v1/v2, metadata v1 and series v1 remain unchanged. Existing catalogue commands do not implicitly activate this entry point.
 
-Production activation requires successful refresh cleanup, standalone verification of the exact release, and fresh warehouse certification under the canonical writer lock. The current v2 publication must still identify that expected release. If the freshly computed database hash matches the manifest's optional `warehouse_sha256`, the report's `verification_mode` is `warehouse_hash`; if the hint is absent or differs, the mode is `semantic` and activation proves schema, row-multiset and membership equivalence against the pinned release. It records the actual database hash and manifest hint separately; this fallback does not rewrite an existing immutable manifest. Both source and destination WAL files are forbidden. A same-filesystem temporary hard link is atomically renamed to `production.duckdb`, followed by directory synchronization and file readback. No evidence-directory symlink exception or permission change is introduced.
+Production activation requires successful refresh cleanup, standalone verification of the exact release, and fresh warehouse certification under the canonical writer lock. The selected historical or legacy v2 publication must still identify that expected release. If the freshly computed database hash matches the manifest's optional `warehouse_sha256`, the report's `verification_mode` is `warehouse_hash`; if the hint is absent or differs, the mode is `semantic` and activation proves schema, row-multiset and membership equivalence against the pinned release. It records the actual database hash and manifest hint separately; this fallback does not rewrite an existing immutable manifest. Both source and destination WAL files are forbidden. A same-filesystem temporary hard link is atomically renamed to `production.duckdb`, followed by directory synchronization and file readback. No evidence-directory symlink exception or permission change is introduced.
 
 The entry point and its warehouse share an inode and immutable contents. Consumers must use DuckDB 2.0 or newer and open the database read-only; DuckDB 1.x cannot open native v2.0 storage files. Public Parquet releases remain a separate engine-independent handoff. Existing readers retain their opened generation across replacement. DuckDB may reuse the old database instance for additional connections to that path in the same process; close all connections to the path before reopening, or use a fresh process to obtain the new generation. The link survives removal of its original warehouse pathname, but does not extend raw-evidence retention or independently certify deleted evidence. Session storage accounting counts unique device/inode pairs and includes the production file after its original pathname disappears. Files held open after unlink can consume additional disk space; the minimum free-space check remains necessary.
 
 Acquisition completion, operator publication and production activation are separate states. A failure before replacement preserves the prior production link. A failure after replacement can leave activation uncertain even when the new file is present; reports must not claim rollback. Recovery verifies actual database hashes and the expected publication instead of trusting a prior status string. `--activate-current` performs offline verification, completes the current verified publication's existing retention cleanup under the writer lock, and then activates it; it does not acquire, build or silently resume a capture.
+
+`--historical --capture-id ID` is the saved-evidence-only production path and
+`--activate-current --historical` selects historical activation. A separately authorized
+`--offline-duration-seconds` of at most 14,400 creates an immutable, capture/root/revision-bound
+`offline_historical_window` after preflight. Historical processing uses this window through
+build, export, standalone verification and activation, even if the original networking
+workflow/session period has expired. Existing network deadlines, counters and consumed
+extension history remain unchanged. A repeat invocation reuses the recorded window and
+cannot reset it. Network/full modes reject this option; no acquisition can use its allowance.
 
 The full-run supervisor retains the effective approved session deadline and cumulative invocation consumption across ordinary explicit exact-capture resumes. Each child receives an immutable UTC stage deadline before dispatch; active monitoring checks both that deadline and its monotonic deadline, including the termination reserve and resource-check timeouts. Neither a forward wall-clock change/forced sleep nor a backward wall-clock change grants additional runtime. Pruning retained receipts must not reduce the session's request/download totals. Unverified or unbounded consumption, expired networking allowances, contradictory capture identities or an unreaped worker prevent subsequent acquisition. Progress reporting never restarts a child or extends the deadline. Ordinary explicit resume retains the effective approved clock and cumulative limits. The one-time `--capture-id ID --reconcile-accounting --extend-session` flow can consume a new 48-hour window; it records old/new deadlines before preflight and preserves cumulative request, download and storage ceilings. Production-path activation never represents an atomic exchange snapshot: the verified release retains its real observation interval and `atomic_snapshot: false`.
 

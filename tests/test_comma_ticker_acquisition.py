@@ -277,7 +277,9 @@ def test_comma_event_parent_is_never_in_parent_csv_batch(tmp_path, planner):
         with scoped_store.lock():
             state = capture.new_capture(scoped_store, selected=None)
     else:
-        state = capture.new_capture(Store(tmp_path / "root"), selected=None)
+        state = capture.new_capture(
+            Store(tmp_path / "root"), selected=None, catalogue_profile="exchange"
+        )
     parents = [f"EVENT-A-{index:02d}" for index in range(19)] + [
         COMMA_PARENT,
         *[f"EVENT-Z-{index:02d}" for index in range(19)],

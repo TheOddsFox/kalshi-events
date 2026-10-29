@@ -39,6 +39,7 @@ def _capture_at(root, timestamp, *, incremental=False, max_requests=25_000):
             Store(root, Limits(max_requests=max_requests)),
             client_factory=ReconciliationClient,
             incremental=incremental,
+            catalogue_profile="exchange",
         )
 
 

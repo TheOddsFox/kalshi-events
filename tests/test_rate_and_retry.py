@@ -332,7 +332,7 @@ def test_page_sizes_are_per_traversal(store):
                 limits[endpoint] = params["limit"]
             return super().response(endpoint, params)
 
-    state = capture(store, client_factory=Recording)
+    state = capture(store, client_factory=Recording, catalogue_profile="exchange")
     assert state["complete"]
     assert limits == {
         "/events": 200,
@@ -358,6 +358,6 @@ def test_traversals_share_one_client_and_overlap(store):
                 with gate:
                     peak["active"] -= 1
 
-    state = capture(store, client_factory=Overlapping)
+    state = capture(store, client_factory=Overlapping, catalogue_profile="exchange")
     assert state["complete"]
     assert peak["peak"] >= 2

@@ -33,7 +33,9 @@ def last_good_capture_root(tmp_path_factory):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(fixtures, "now", lambda: "2026-01-01T12:00:00+00:00")
         patch.setattr(acquisition, "now", lambda: "2026-01-01T12:00:00+00:00")
-        state = acquisition.capture(Store(root), client_factory=FakeClient)
+        state = acquisition.capture(
+            Store(root), client_factory=FakeClient, catalogue_profile="exchange"
+        )
     warehouse.build(Store(root), state["capture_id"])
     release = publishing.publish(Store(root), state["capture_id"])
     return root, state["capture_id"], release["source_release_id"]
@@ -127,7 +129,8 @@ def replaced(source, destination, *args, **kwargs):
 
 EvidenceSpool.commit, Store.write, Store.append = committed, written, appended
 acquisition._apply_page_change, os.replace = installed, replaced
-state = acquisition.capture(store, resume=resume, client_factory=factory)
+state = acquisition.capture(store, resume=resume, client_factory=factory,
+                            catalogue_profile='exchange')
 assert state['complete']
 if boundary != 'resume':
     raise AssertionError('requested crash boundary was not reached: ' + boundary)

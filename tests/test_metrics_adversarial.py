@@ -155,7 +155,7 @@ def test_report_sibling_with_shared_root_prefix_is_allowed(tmp_path, capsys):
 def certified_metrics_artifacts(tmp_path_factory):
     directory = tmp_path_factory.mktemp("metrics-artifacts")
     store = Store(directory / "root")
-    state = capture(store, client_factory=FakeClient)
+    state = capture(store, client_factory=FakeClient, catalogue_profile="exchange")
     warehouse.build(store, state["capture_id"])
     release = publish.publish(store, state["capture_id"])
     bundle = directory / "metadata"

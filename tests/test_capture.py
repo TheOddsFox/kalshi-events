@@ -34,7 +34,7 @@ def _legacy_checkpoint(store, state):
 
 
 def test_native_full_catalogue_keeps_history_and_relationships(store, factory):
-    state = acquisition.capture(store, client_factory=factory)
+    state = acquisition.capture(store, client_factory=factory, catalogue_profile="exchange")
     assert state["complete"]
     assert state["requests"] == 8
     projected = project_pages(acquisition.capture_pages(store, state))
@@ -98,7 +98,7 @@ def test_new_capture_seals_gzip_and_downward_rate_policy_by_default(store):
     assert state["rate_policy"] == "decrease-on-429"
     assert acquisition._protocol5_policies(state) == {
         "rate_policy": "decrease-on-429",
-        "parent_policy": "batched-v1",
+        "parent_policy": "historical-only-v1",
         "cutoff_policy": "checkpoint-v1",
     }
 
@@ -182,7 +182,7 @@ def test_each_historical_read_records_its_own_cutoff(store):
 
 def test_budget_stop_resumes_without_publishing_incomplete(store, factory):
     bounded = Store(store.root, Limits(max_requests=2))
-    state = acquisition.capture(bounded, client_factory=factory)
+    state = acquisition.capture(bounded, client_factory=factory, catalogue_profile="exchange")
     assert not state["complete"]
     assert state["requests"] == 2
     with pytest.raises(CatalogueError, match="incomplete"):
@@ -236,7 +236,7 @@ def test_pre_1_0_capture_is_refused_with_new_root_message(store, factory):
 
 
 def test_raw_commit_crash_is_recoverable_without_reissuing_request(store, factory, monkeypatch):
-    initial = acquisition.new_capture(store, None)
+    initial = acquisition.new_capture(store, None, catalogue_profile="exchange")
     _legacy_checkpoint(store, initial)
     original = acquisition._consume
 
@@ -271,7 +271,9 @@ def test_invalidated_cursor_restarts_and_retains_all_observations(store):
         return 200, {"events": [EVENTS[0]], "cursor": "expired"}
 
     state = acquisition.capture(
-        store, client_factory=lambda s, b, **_options: FakeClient(s, b, {"/events": events})
+        store,
+        catalogue_profile="exchange",
+        client_factory=lambda s, b, **_options: FakeClient(s, b, {"/events": events}),
     )
     assert state["complete"]
     assert state["tasks"][2]["restarts"] == 1
@@ -297,6 +299,7 @@ def test_malformed_pages_never_complete(store, payload):
     with pytest.raises(CatalogueError):
         acquisition.capture(
             store,
+            catalogue_profile="exchange",
             client_factory=lambda s, b, **_options: FakeClient(s, b, {"/markets": (200, payload)}),
         )
     assert not acquisition.read_capture(store, next(store.path("captures").iterdir()).name)[

@@ -106,7 +106,7 @@ def test_completed_refresh_matches_manual_v2_publication_from_frozen_capture(
 ) -> None:
     """Compare actual public bytes while allowing internal dlt database IDs to differ."""
     seed = Store(tmp_path / "seed")
-    state = capture.capture(seed, client_factory=FakeClient)
+    state = capture.capture(seed, client_factory=FakeClient, catalogue_profile="exchange")
     assert state["complete"]
     with seed.lock():
         incremental.root_id(seed, create=True)
@@ -149,7 +149,7 @@ def test_completed_refresh_matches_manual_v2_publication_from_frozen_capture(
 
 
 @pytest.mark.timeout(90)
-def test_cli_full_delta_and_explicit_rebase_use_only_v2(
+def test_cli_exchange_resume_delta_and_explicit_rebase_use_only_v2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from conftest import COMBO, MARKET
@@ -181,13 +181,15 @@ def test_cli_full_delta_and_explicit_rebase_use_only_v2(
         assert release["capture_id"] == result["capture_id"]
         return result, release
 
-    baseline, baseline_release = invoke("--full")
+    baseline_capture = capture.capture(Store(root), catalogue_profile="exchange")
+    baseline, baseline_release = invoke("--capture-id", baseline_capture["capture_id"])
     assert baseline_release["delta_depth"] == 0
     delta, delta_release = invoke()
     assert delta_release["delta_depth"] == 1
     assert delta_release["baseline_capture_id"] == baseline["capture_id"]
     assert capture.latest_catalogue_capture(Store(root)) == baseline["capture_id"]
-    rebased, rebase_release = invoke("--full")
+    rebase_capture = capture.capture(Store(root), catalogue_profile="exchange")
+    rebased, rebase_release = invoke("--capture-id", rebase_capture["capture_id"])
     assert rebase_release["delta_depth"] == 0
     assert rebase_release["baseline_capture_id"] is None
     assert rebased["capture_id"] not in {baseline["capture_id"], delta["capture_id"]}

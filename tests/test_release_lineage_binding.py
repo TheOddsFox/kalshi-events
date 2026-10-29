@@ -49,7 +49,10 @@ def lineage_releases(tmp_path_factory):
             patch.setattr(fixtures, "now", lambda timestamp=timestamp: timestamp)
             patch.setattr(acquisition, "now", lambda timestamp=timestamp: timestamp)
             state = acquisition.capture(
-                store, client_factory=ReconciliationClient, incremental=day == 2
+                store,
+                client_factory=ReconciliationClient,
+                incremental=day == 2,
+                catalogue_profile="exchange",
             )
         assert state["complete"]
         warehouse.build(store, state["capture_id"])

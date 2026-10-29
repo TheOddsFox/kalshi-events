@@ -42,6 +42,7 @@ def test_combo_leg_with_wrong_native_event_remains_unresolved(store):
     }
     state = acquisition.capture(
         store,
+        catalogue_profile="exchange",
         client_factory=lambda s, b, **_options: FakeClient(
             s, b, {"/markets": (200, {"markets": [MARKET, combo], "cursor": ""})}
         ),

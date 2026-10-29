@@ -26,6 +26,7 @@ from kalshi_events.common import (
     json_bytes,
     safe_path,
 )
+from kalshi_events.historical import HISTORICAL_VERSION, is_historical_capture
 from kalshi_events.transport import accounting
 
 EXIT_INCOMPLETE = 3
@@ -66,6 +67,12 @@ def parser() -> argparse.ArgumentParser:
                 "--rate-policy", choices=("fixed", "decrease-on-429"), default=None
             )
             command.add_argument("--incremental", action="store_true")
+            command.add_argument(
+                "--catalogue-profile",
+                choices=("historical", "exchange"),
+                default=None,
+                help="historical full capture by default; exchange preserves the legacy broad plan",
+            )
         if name == "refresh":
             command.add_argument("--full", action="store_true")
             command.add_argument("--capture-id")
@@ -74,7 +81,13 @@ def parser() -> argparse.ArgumentParser:
                 "--rate-policy", choices=("fixed", "decrease-on-429"), default=None
             )
         if name in {"current", "replay", "rebuild", "publish"}:
-            command.add_argument("--catalogue-version", type=int, choices=(1, 2), default=1)
+            command.add_argument("--catalogue-version", type=int, choices=(1, 2), default=None)
+        if name in {"refresh", "build", "publish", "current", "replay", "rebuild"}:
+            command.add_argument(
+                "--historical",
+                action="store_true",
+                help="use the historical catalogue; an explicit capture can use saved evidence only",
+            )
         if name == "discard":
             command.add_argument("--capture-id", required=True)
         if name == "verify":
@@ -174,6 +187,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             result = warehouse.dbt(store, arguments or ["parse"])
             return {"returncode": result.returncode}
     root = args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data"))
+    if getattr(args, "historical", False) and not _has_operator_marker(safe_path(root)):
+        raise CatalogueError("saved historical operations require an existing operator root")
     store = Store(root, limits)
     operation_error = None
     result = None
@@ -197,11 +212,35 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _catalogue_version(store: Store, args: argparse.Namespace) -> int:
+    version = getattr(args, "catalogue_version", None)
+    if getattr(args, "historical", False):
+        if version is not None:
+            raise CatalogueError("--historical cannot be combined with --catalogue-version")
+        return HISTORICAL_VERSION
+    if version is not None:
+        return version
+    capture_id = getattr(args, "capture_id", None)
+    if capture_id is not None:
+        if is_historical_capture(acquisition.read_capture(store, capture_id)):
+            return HISTORICAL_VERSION
+    elif (
+        args.command in {"current", "replay", "rebuild", "publish"}
+        and store.path("current-historical.json").exists()
+    ):
+        return HISTORICAL_VERSION
+    if args.command in {"build", "publish"} and capture_id is None:
+        latest = acquisition.latest_catalogue_capture(store)
+        if is_historical_capture(acquisition.read_capture(store, latest)):
+            return HISTORICAL_VERSION
+    return 1
+
+
 def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
     if store.scope is not None and args.command not in {"status", "discard", "upgrade-root"}:
         raise CatalogueError("catalogue commands cannot operate on a scoped series root")
     if args.command == "current":
-        return publish.current(store, catalogue_version=args.catalogue_version)
+        return publish.current(store, catalogue_version=_catalogue_version(store, args))
     if args.command == "status":
         return _status(store)
     if args.command == "upgrade-root":
@@ -221,8 +260,13 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
                     compression=args.compression,
                     rate_policy=args.rate_policy,
                     incremental=args.incremental,
+                    **(
+                        {"catalogue_profile": args.catalogue_profile}
+                        if args.catalogue_profile is not None
+                        else {}
+                    ),
                 )
-            return {
+            result = {
                 key: state[key]
                 for key in (
                     "capture_id",
@@ -233,18 +277,28 @@ def _run(store: Store, args: argparse.Namespace) -> dict[str, Any]:
                     "accounting_complete",
                 )
             }
+            if is_historical_capture(state):
+                result["coverage_scope"] = "historical"
+                result["omitted_scopes"] = ["events_combo", "markets_live", "markets_combo"]
+            return result
         if args.command == "load":
             capture_id = args.capture_id or acquisition.latest_catalogue_capture(store)
             return warehouse.load(store, capture_id)
         if args.command == "build":
             capture_id = args.capture_id or acquisition.latest_catalogue_capture(store)
+            if _catalogue_version(store, args) == HISTORICAL_VERSION:
+                return warehouse.build_historical(store, capture_id)
             return warehouse.build(store, capture_id)
         if args.command == "replay":
-            return recovery.replay(store, args.capture_id, catalogue_version=args.catalogue_version)
+            return recovery.replay(
+                store, args.capture_id, catalogue_version=_catalogue_version(store, args)
+            )
         if args.command == "publish":
-            return publish.publish(store, args.capture_id, catalogue_version=args.catalogue_version)
+            return publish.publish(
+                store, args.capture_id, catalogue_version=_catalogue_version(store, args)
+            )
         if args.command == "rebuild":
-            return recovery.rebuild(store, catalogue_version=args.catalogue_version)
+            return recovery.rebuild(store, catalogue_version=_catalogue_version(store, args))
         if args.command == "discard":
             from kalshi_events.incremental import discard
 
@@ -324,6 +378,11 @@ def _status(store: Store) -> dict[str, Any]:
             if store.scope is None and store.path("current-v2.json").exists()
             else None
         ),
+        "current_historical": (
+            publish.current(store, catalogue_version=HISTORICAL_VERSION)
+            if store.scope is None and store.path("current-historical.json").exists()
+            else None
+        ),
     }
     if store.scope is not None:
         result["series_scope"] = store.scope
@@ -394,6 +453,8 @@ def _refresh_main(args: argparse.Namespace) -> int:
             raise CatalogueError("--full and --capture-id cannot be used together")
         limits = Limits(**{field: getattr(args, field) for field in Limits.__dataclass_fields__})
         root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
+        if getattr(args, "historical", False) and not args.full and not _has_operator_marker(root):
+            raise CatalogueError("saved historical refresh requires an existing operator root")
         if series_command and not _has_operator_marker(root) and args.series_ticker is None:
             raise CatalogueError("a new series root requires --series-ticker")
         if args.metrics_file is not None:
@@ -428,6 +489,7 @@ def _refresh_main(args: argparse.Namespace) -> int:
                     capture_id=args.capture_id,
                     compression=args.compression,
                     rate_policy=args.rate_policy,
+                    **({"historical": True} if getattr(args, "historical", False) else {}),
                 )
                 if series_command:
                     result["series_scope"] = store.scope

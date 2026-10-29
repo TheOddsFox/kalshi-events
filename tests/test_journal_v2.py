@@ -23,6 +23,24 @@ class PowerLoss(BaseException):
     pass
 
 
+@pytest.fixture(autouse=True)
+def legacy_exchange_profile(monkeypatch):
+    """Keep journal-recovery cases on the traversal plan they were authored against."""
+    original_capture = acquisition.capture
+    original_new_capture = acquisition.new_capture
+
+    def capture_exchange(*args, **kwargs):
+        kwargs.setdefault("catalogue_profile", "exchange")
+        return original_capture(*args, **kwargs)
+
+    def new_capture_exchange(*args, **kwargs):
+        kwargs.setdefault("catalogue_profile", "exchange")
+        return original_new_capture(*args, **kwargs)
+
+    monkeypatch.setattr(acquisition, "capture", capture_exchange)
+    monkeypatch.setattr(acquisition, "new_capture", new_capture_exchange)
+
+
 def checksum(value):
     return hashlib.sha256(json_bytes(value)).hexdigest()
 

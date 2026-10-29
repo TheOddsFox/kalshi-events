@@ -83,6 +83,7 @@ RUN_LIMITS: dict[str, int | float | str] = {
     "compression": "gzip",
     "rate_policy": "decrease-on-429",
 }
+MAX_OFFLINE_HISTORICAL_SECONDS = 4 * 3600
 CAPTURE_ID = re.compile(r"[0-9a-f]{32}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
 REPORT_NAME = "session.json"
@@ -117,6 +118,7 @@ _STOP_IN_PROGRESS = False
 _SPAWNING_CHILD = False
 _PENDING_STOP_SIGNAL: int | None = None
 _TERMINATION_ATTEMPTED: set[int] = set()
+_ACTIVE_OFFLINE_HISTORICAL_WINDOW: dict[str, Any] | None = None
 
 
 class RunnerError(RuntimeError):
@@ -131,14 +133,45 @@ class RunnerInterrupted(RunnerError):
     """The operator requested a clean stop while a supervised stage was running."""
 
 
-def validate_mode(full: bool, capture_id: str | None, activate_current: bool) -> str:
+def validate_mode(
+    full: bool,
+    capture_id: str | None,
+    activate_current: bool,
+    historical: bool = False,
+    offline_duration_seconds: float | None = None,
+) -> str:
+    duration = _validate_offline_duration_seconds(offline_duration_seconds)
     if sum((full, capture_id is not None, activate_current)) != 1:
         raise RunnerError("choose exactly one of --full, --capture-id or --activate-current")
+    if historical and (full or (capture_id is None and not activate_current)):
+        raise RunnerError("--historical requires --capture-id or --activate-current")
     if capture_id is not None and (
         not isinstance(capture_id, str) or not CAPTURE_ID.fullmatch(capture_id)
     ):
         raise RunnerError("--capture-id must be a 32-character lowercase hex ID")
-    return "full" if full else "resume" if capture_id else "activate-current"
+    if historical:
+        mode = "historical" if capture_id is not None else "activate-historical"
+    else:
+        mode = "full" if full else "resume" if capture_id else "activate-current"
+    if duration is not None and mode != "historical":
+        raise RunnerError("--offline-duration-seconds requires --historical --capture-id")
+    return mode
+
+
+def _validate_offline_duration_seconds(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RunnerError("--offline-duration-seconds must be a finite positive number")
+    try:
+        duration = float(value)
+    except OverflowError as exc:
+        raise RunnerError("--offline-duration-seconds must be a finite positive number") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise RunnerError("--offline-duration-seconds must be a finite positive number")
+    if duration > MAX_OFFLINE_HISTORICAL_SECONDS:
+        raise RunnerError("--offline-duration-seconds cannot exceed four hours")
+    return duration
 
 
 def remaining_allowances(
@@ -1154,9 +1187,21 @@ def _read_root_summary(root: Path) -> dict[str, Any]:
     from kalshi_events.common import Limits, Store
 
     store = Store(root, Limits(max_root_bytes=int(RUN_LIMITS["root_bytes"])))
-    result: dict[str, Any] = {"root_id": _root_id(store), "current_v2": None}
+    result: dict[str, Any] = {
+        "root_id": _root_id(store),
+        "current_v2": None,
+        "current_historical": None,
+    }
     if store.path("current-v2.json").exists():
-        result["current_v2"] = publish.current(store, catalogue_version=2)
+        try:
+            result["current_v2"] = publish.current(store, catalogue_version=2)
+        except Exception:
+            result["current_v2"] = None
+    if store.path("current-historical.json").exists():
+        try:
+            result["current_historical"] = publish.current(store, catalogue_version=3)
+        except Exception:
+            result["current_historical"] = None
     return result
 
 
@@ -1176,6 +1221,7 @@ def activate_current(
     *,
     expected_release_id: str | None = None,
     standalone_verified: dict[str, Any] | None = None,
+    catalogue_version: int = 2,
     link_fn: Any = None,
     replace_fn: Any = None,
     sync_fn: Any = None,
@@ -1188,6 +1234,7 @@ def activate_current(
         production_directory,
         expected_release_id=expected_release_id,
         standalone_verified=standalone_verified,
+        catalogue_version=catalogue_version,
         link_fn=link_fn,
         replace_fn=replace_fn,
         sync_fn=sync_fn,
@@ -1198,15 +1245,17 @@ def _external_bytes(directory: Path) -> int:
     total = 0
     operator = directory / "operator"
     seen: set[tuple[int, int]] = set()
-    builds = operator / "builds-v2"
-    if builds.is_symlink():
-        raise RunnerError("operator build directory is a symlink")
-    if builds.is_dir():
-        for candidate in builds.glob("*/warehouse.duckdb"):
-            if candidate.is_symlink() or not candidate.is_file():
-                raise RunnerError("retained warehouse path is unsafe during external accounting")
-            info = candidate.stat()
-            seen.add((info.st_dev, info.st_ino))
+    for builds in (operator / "builds-v2", operator / "builds-historical"):
+        if builds.is_symlink():
+            raise RunnerError("operator build directory is a symlink")
+        if builds.is_dir():
+            for candidate in builds.glob("*/warehouse.duckdb"):
+                if candidate.is_symlink() or not candidate.is_file():
+                    raise RunnerError(
+                        "retained warehouse path is unsafe during external accounting"
+                    )
+                info = candidate.stat()
+                seen.add((info.st_dev, info.st_ino))
     for path in (directory / "production.duckdb", directory / "runs"):
         if path.is_symlink():
             raise RunnerError(f"external production accounting path is a symlink: {path.name}")
@@ -1358,6 +1407,14 @@ def _monitor_deadline(report: dict[str, Any], *, workflow: bool) -> float:
     ceiling = float(
         RUN_LIMITS["workflow_seconds"] if workflow else RUN_LIMITS["active_cutoff_seconds"]
     )
+    if _ACTIVE_OFFLINE_HISTORICAL_WINDOW is not None:
+        window = _ACTIVE_OFFLINE_HISTORICAL_WINDOW
+        wall_remaining = float(window["deadline_epoch"]) - time.time()
+        return min(
+            float(window["deadline_monotonic"]),
+            float(window["started_monotonic"]) + ceiling,
+            time.monotonic() + max(0.0, wall_remaining),
+        )
     monotonic_deadline = min(
         _time_budget_started(report, "monotonic") + ceiling,
         _time_budget_deadline(report, "monotonic"),
@@ -1374,6 +1431,19 @@ def _child_wall_deadline_epoch(
     report: dict[str, Any], monotonic_deadline: float, *, workflow_deadline: bool = False
 ) -> float | None:
     """Seal a child wall deadline from the effective session and active-stage caps."""
+    if _ACTIVE_OFFLINE_HISTORICAL_WINDOW is not None:
+        window = _ACTIVE_OFFLINE_HISTORICAL_WINDOW
+        stage_seconds = float(
+            RUN_LIMITS["workflow_seconds"]
+            if workflow_deadline
+            else RUN_LIMITS["active_cutoff_seconds"]
+        )
+        wall_now = time.time()
+        return min(
+            float(window["deadline_epoch"]),
+            float(window["started_epoch"]) + stage_seconds,
+            wall_now + max(0.0, monotonic_deadline - time.monotonic()),
+        )
     if "time_budget_started_epoch" in report:
         started = _time_budget_started(report, "epoch")
     else:
@@ -1396,6 +1466,96 @@ def _child_wall_deadline_epoch(
     return min(deadlines)
 
 
+def _validate_offline_historical_window(report: dict[str, Any], capture_id: str) -> dict[str, Any]:
+    window = report.get("offline_historical_window")
+    if not isinstance(window, dict):
+        raise RunnerError("offline historical window is invalid")
+    expected = {
+        "version",
+        "capture_id",
+        "root_id",
+        "revision",
+        "started_at",
+        "started_epoch",
+        "started_monotonic",
+        "deadline_epoch",
+        "deadline_monotonic",
+    }
+    if set(window) != expected or window.get("version") != 1:
+        raise RunnerError("offline historical window is invalid")
+    root_id = report.get("root_id")
+    if (
+        window.get("capture_id") != capture_id
+        or window.get("root_id") != root_id
+        or not isinstance(root_id, str)
+        or not CAPTURE_ID.fullmatch(root_id)
+        or window.get("revision") != _revision()
+        or not isinstance(window.get("started_at"), str)
+    ):
+        raise RunnerError("offline historical window identity does not match this session")
+    for field in (
+        "started_epoch",
+        "started_monotonic",
+        "deadline_epoch",
+        "deadline_monotonic",
+    ):
+        value = window.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise RunnerError("offline historical window deadline is invalid")
+    epoch_duration = float(window["deadline_epoch"]) - float(window["started_epoch"])
+    monotonic_duration = float(window["deadline_monotonic"]) - float(window["started_monotonic"])
+    if (
+        epoch_duration <= 0
+        or epoch_duration > MAX_OFFLINE_HISTORICAL_SECONDS
+        or monotonic_duration <= 0
+        or monotonic_duration > MAX_OFFLINE_HISTORICAL_SECONDS
+        or abs(epoch_duration - monotonic_duration) > 1.0
+    ):
+        raise RunnerError("offline historical window duration is invalid")
+    remaining = min(
+        float(window["deadline_epoch"]) - time.time(),
+        float(window["deadline_monotonic"]) - time.monotonic(),
+    )
+    if remaining <= 0:
+        raise RunnerError("offline historical window expired")
+    return window
+
+
+def _configure_offline_historical_window(
+    report: dict[str, Any], capture_id: str, duration_seconds: float | None
+) -> dict[str, Any] | None:
+    duration = _validate_offline_duration_seconds(duration_seconds)
+    existing = report.get("offline_historical_window")
+    if existing is not None:
+        return _validate_offline_historical_window(report, capture_id)
+    if duration is None:
+        return None
+    root_id = report.get("root_id")
+    if not isinstance(root_id, str) or not CAPTURE_ID.fullmatch(root_id):
+        raise RunnerError("offline historical window requires a verified session root")
+    revision = _revision()
+    if not REVISION.fullmatch(revision):
+        raise RunnerError("offline historical window requires a verified source revision")
+    started_epoch = time.time()
+    started_monotonic = time.monotonic()
+    report["offline_historical_window"] = {
+        "version": 1,
+        "capture_id": capture_id,
+        "root_id": root_id,
+        "revision": revision,
+        "started_at": _utc(),
+        "started_epoch": started_epoch,
+        "started_monotonic": started_monotonic,
+        "deadline_epoch": started_epoch + duration,
+        "deadline_monotonic": started_monotonic + duration,
+    }
+    return report["offline_historical_window"]
+
+
 def _child_time_remaining(
     monotonic_deadline: float,
     wall_deadline_epoch: float | None,
@@ -1408,6 +1568,19 @@ def _child_time_remaining(
             wall_deadline_epoch - (time.time() if wall_now is None else wall_now),
         )
     return remaining
+
+
+def _effective_deadline_expired(report: dict[str, Any]) -> bool:
+    if _ACTIVE_OFFLINE_HISTORICAL_WINDOW is not None:
+        window = _ACTIVE_OFFLINE_HISTORICAL_WINDOW
+        return (
+            min(
+                float(window["deadline_epoch"]) - time.time(),
+                float(window["deadline_monotonic"]) - time.monotonic(),
+            )
+            <= 0
+        )
+    return time.time() >= _time_budget_deadline(report, "epoch")
 
 
 def _run_external_child(
@@ -1472,14 +1645,22 @@ def run_production(
     full: bool = False,
     capture_id: str | None = None,
     activate_only: bool = False,
+    historical: bool = False,
+    offline_duration_seconds: float | None = None,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
     recover_reboot: bool = False,
     recovery_volume_uuid: str | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Run one bounded full refresh/resume or verify-and-activate current v2."""
+    """Run one bounded catalogue refresh/resume or verify-and-activate a publication."""
     preflight_started = time.monotonic()
-    mode = validate_mode(full, capture_id, activate_only)
+    mode = validate_mode(
+        full,
+        capture_id,
+        activate_only,
+        historical,
+        offline_duration_seconds=offline_duration_seconds,
+    )
     _validate_runtime_versions(_package_versions())
     if reconcile_accounting and mode != "resume":
         raise RunnerError("accounting reconciliation requires --capture-id resume")
@@ -1505,10 +1686,14 @@ def run_production(
             run_root.mkdir()
     lock_context = _run_lock(directory)
     with lock_context:
-        if mode == "resume":
+        if mode in {"resume", "historical"}:
             report_path, report, paths = _load_resume(
                 directory,
                 str(capture_id),
+                historical=mode == "historical",
+                offline_duration_seconds=(
+                    offline_duration_seconds if mode == "historical" else None
+                ),
                 reconcile_accounting=reconcile_accounting,
                 extend_session=extend_session,
                 recover_reboot=recover_reboot,
@@ -1544,7 +1729,7 @@ def run_production(
         phases = report.setdefault("phase_seconds", {})
         phases["preflight"] = phases.get("preflight", 0) + time.monotonic() - preflight_started
         result: dict[str, Any] = report
-        if mode == "activate-current":
+        if mode in {"activate-current", "activate-historical"}:
             report["requests"] = None
             report["downloaded_bytes"] = None
             report["accounting_complete"] = False
@@ -1570,11 +1755,18 @@ def run_production(
                     "transport_sha256": _transport_source_sha256(),
                 }
             )
-        from kalshi_events.transport import BASE_URL, source_url
+        if mode in {"historical", "activate-historical"}:
+            report["network_activity_this_invocation"] = {
+                "requests": 0,
+                "downloaded_bytes": 0,
+                "accounting_complete": True,
+            }
+        else:
+            from kalshi_events.transport import BASE_URL, source_url
 
-        report["api_origin"] = source_url()
-        if mode != "activate-current" and report["api_origin"] != BASE_URL:
-            raise RunnerError("production acquisition must use the public Kalshi API origin")
+            report["api_origin"] = source_url()
+            if mode != "activate-current" and report["api_origin"] != BASE_URL:
+                raise RunnerError("production acquisition must use the public Kalshi API origin")
         report["last_observed_epoch"] = time.time()
         report["last_observed_at"] = _utc()
         _atomic_report(report_path, report)
@@ -1583,6 +1775,13 @@ def run_production(
             report["phase"] = "stopped"
             _atomic_report(report_path, report)
             return result, 3
+        offline_window = (
+            _configure_offline_historical_window(report, str(capture_id), offline_duration_seconds)
+            if mode == "historical"
+            else None
+        )
+        if offline_window is not None:
+            _atomic_report(report_path, report)
         awake = subprocess.Popen(
             ["caffeinate", "-is", "-w", str(os.getpid())],
             stdin=subprocess.DEVNULL,
@@ -1590,12 +1789,50 @@ def run_production(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        global _ACTIVE_OFFLINE_HISTORICAL_WINDOW
+        _ACTIVE_OFFLINE_HISTORICAL_WINDOW = offline_window
         try:
+            if mode not in {"activate-current", "activate-historical"} and _monitor_deadline(
+                report, workflow=True
+            ) <= time.monotonic() + float(RUN_LIMITS["terminate_seconds"]):
+                raise BudgetStop("workflow deadline reached before supervised work could start")
             session_deadline = _monitor_deadline(report, workflow=False)
             standalone_result: dict[str, Any] | None = None
-            if mode != "activate-current":
+            if mode not in {"activate-current", "activate-historical"}:
                 snapshot = None
-                if mode == "resume":
+                if mode == "historical":
+                    snapshot = _resource_guard(
+                        directory,
+                        operator,
+                        report=report,
+                        deadline=session_deadline,
+                        paths=paths,
+                        require_complete_accounting=False,
+                        workflow_deadline=True,
+                        capture_id=capture_id,
+                    )
+                    if snapshot.get("root_id") != report.get("root_id"):
+                        raise RunnerError("operator root identity changed since this session began")
+                    if report.get("accounting_complete") is True or (
+                        report.get("accounting_complete") is False
+                        and report.get("accounting_basis") == "reserved-upper-bound"
+                        and isinstance(report.get("requests"), int)
+                        and isinstance(report.get("downloaded_bytes_upper_bound"), int)
+                    ):
+                        _check_accounting_match(snapshot, report)
+                    prior = _reconciliation_accounting(snapshot, str(capture_id))
+                    _check_accounting_match(snapshot, prior)
+                    report.update(
+                        requests=prior["attempts"],
+                        downloaded_bytes=prior.get("downloaded_bytes"),
+                        downloaded_bytes_upper_bound=prior.get("downloaded_bytes_upper_bound"),
+                        accounting_complete=prior["accounting_complete"],
+                        accounting_basis=prior["accounting_basis"],
+                        accounting_bound_verified=prior["accounting_bound_verified"],
+                        unfinished_reservation_ids=prior.get("unfinished_reservation_ids", []),
+                        consumption_state=prior["accounting_basis"],
+                    )
+                elif mode == "resume":
                     if reconcile_accounting:
                         snapshot = _resource_guard(
                             directory,
@@ -1656,7 +1893,7 @@ def run_production(
                         _check_accounting_match(snapshot, report)
                     if snapshot.get("root_id") != report.get("root_id"):
                         raise RunnerError("operator root identity changed since this session began")
-                if not reconcile_accounting:
+                if not reconcile_accounting and mode != "historical":
                     prior = (
                         _accounting_shape(snapshot)
                         if snapshot is not None
@@ -1666,18 +1903,40 @@ def run_production(
                             "accounting_complete": True,
                         }
                     )
-                allowances = remaining_allowances(
-                    prior,
-                    started_at=_time_budget_started(report, "monotonic"),
-                    external_reserved_bytes=_external_bytes(directory),
-                    started_epoch=_time_budget_started(report, "epoch"),
-                    wall_now=time.time(),
-                )
-                duration = min(
-                    float(allowances["max-duration-seconds"]),
-                    max(0.0, session_deadline - time.monotonic()),
-                )
-                allowances["max-duration-seconds"] = duration
+                if mode == "historical":
+                    workflow_deadline = _monitor_deadline(report, workflow=True)
+                    refresh_deadline = min(workflow_deadline, session_deadline)
+                    duration = max(
+                        0.0,
+                        refresh_deadline - time.monotonic(),
+                    )
+                    allowances = {
+                        "max-requests": int(RUN_LIMITS["attempts"]),
+                        "max-download-bytes": int(RUN_LIMITS["downloaded_bytes"]),
+                        "max-root-bytes": int(RUN_LIMITS["root_bytes"]),
+                        "max-temp-bytes": int(RUN_LIMITS["temporary_bytes"]),
+                        "max-database-bytes": int(RUN_LIMITS["database_bytes"]),
+                        "max-response-bytes": int(RUN_LIMITS["response_bytes"]),
+                        "max-decoded-response-bytes": int(RUN_LIMITS["decoded_response_bytes"]),
+                        "max-duration-seconds": duration,
+                        "max-rate": float(RUN_LIMITS["rate"]),
+                        "compression": str(RUN_LIMITS["compression"]),
+                        "rate-policy": str(RUN_LIMITS["rate_policy"]),
+                    }
+                else:
+                    refresh_deadline = None
+                    allowances = remaining_allowances(
+                        prior,
+                        started_at=_time_budget_started(report, "monotonic"),
+                        external_reserved_bytes=_external_bytes(directory),
+                        started_epoch=_time_budget_started(report, "epoch"),
+                        wall_now=time.time(),
+                    )
+                    duration = min(
+                        float(allowances["max-duration-seconds"]),
+                        max(0.0, session_deadline - time.monotonic()),
+                    )
+                    allowances["max-duration-seconds"] = duration
                 command = _refresh_command(operator, paths, mode, capture_id, allowances)
                 if reconcile_accounting:
                     report["error"] = None
@@ -1689,17 +1948,28 @@ def run_production(
                     "accounting_complete": prior.get("accounting_complete", True),
                     "accounting_basis": prior.get("accounting_basis", "exact"),
                 }
-                report["accounting_complete"] = False
-                report["requests"] = None
-                report["downloaded_bytes"] = None
-                report["consumption_state"] = "in_progress"
+                if mode != "historical":
+                    report["accounting_complete"] = False
+                    report["requests"] = None
+                    report["downloaded_bytes"] = None
+                    report["consumption_state"] = "in_progress"
+                else:
+                    report["network_activity_this_invocation"] = {
+                        "requests": None,
+                        "downloaded_bytes": None,
+                        "accounting_complete": False,
+                    }
                 code, stop_reason, reaped, stdout_path, stderr_path = _run_external_child(
                     command,
                     directory=directory,
                     operator=operator,
                     paths=paths,
                     report=report,
-                    deadline=time.monotonic() + duration,
+                    deadline=(
+                        refresh_deadline
+                        if refresh_deadline is not None
+                        else time.monotonic() + duration
+                    ),
                     label="refresh",
                     capture_id=capture_id,
                 )
@@ -1733,22 +2003,68 @@ def run_production(
                 if not reaped:
                     stop_reason = "refresh subprocess could not be reaped within five seconds"
                 if stop_reason or cli_result is None or code not in {0, 1, 3}:
-                    report["accounting_complete"] = False
-                    report["requests"] = None
-                    report["downloaded_bytes"] = None
-                    report["capture_complete"] = None
+                    if mode != "historical":
+                        report["accounting_complete"] = False
+                        report["requests"] = None
+                        report["downloaded_bytes"] = None
+                        report["capture_complete"] = None
                     report["publication_state"] = "unknown"
-                    report["error"] = stop_reason or "refresh failed with unknown child accounting"
-                    report["resumable"] = None
+                    report["scope_complete"] = False
+                    report["error"] = stop_reason or (
+                        "offline historical build did not return a complete report"
+                        if mode == "historical"
+                        else "refresh failed with unknown child accounting"
+                    )
+                    if mode != "historical":
+                        report["resumable"] = None
                     report["phase"] = "stopped"
                     report["recovery"] = (
-                        f"Preserve {operator}; do not resume until accounting is independently reconciled."
+                        (
+                            f"After investigating the stop, retry only this saved capture offline: "
+                            f"--historical --capture-id {capture_id}, within its existing session deadline."
+                        )
+                        if mode == "historical"
+                        else f"Preserve {operator}; do not resume until accounting is independently reconciled."
                     )
                     _atomic_report(report_path, report)
                     return result, 3 if stop_reason else 1
-                report["capture_complete"] = cli_result.get("capture_complete") is True
+                source_capture_complete = cli_result.get(
+                    "source_capture_complete", cli_result.get("capture_complete")
+                )
+                if not isinstance(source_capture_complete, bool):
+                    raise RunnerError("refresh did not report source capture completeness")
+                report["capture_complete"] = source_capture_complete
+                report["source_capture_complete"] = source_capture_complete
+                report["coverage_scope"] = cli_result.get("coverage_scope", "catalogue")
+                report["scope_complete"] = (
+                    cli_result.get(
+                        "scope_complete",
+                        cli_result.get("complete") is True and source_capture_complete,
+                    )
+                    is True
+                )
                 report["publication_state"] = cli_result.get("publication_state", "unknown")
-                if cli_result.get("accounting_complete") is not True and not reconcile_accounting:
+                historical_profile = report["coverage_scope"] == "historical"
+                historical_required = mode in {"full", "historical"}
+                if code == 0 and historical_required and not historical_profile:
+                    report["error"] = "historical scope is incomplete or has the wrong contract"
+                    report["phase"] = "stopped"
+                    _atomic_report(report_path, report)
+                    return result, 1
+                if (
+                    code == 0
+                    and historical_profile
+                    and cli_result.get("scope_complete") is not True
+                ):
+                    report["error"] = "historical scope is incomplete or has the wrong contract"
+                    report["phase"] = "stopped"
+                    _atomic_report(report_path, report)
+                    return result, 1
+                if (
+                    mode != "historical"
+                    and cli_result.get("accounting_complete") is not True
+                    and not reconcile_accounting
+                ):
                     report["accounting_complete"] = False
                     report["error"] = "refresh reported incomplete acquisition accounting"
                     report["resumable"] = None
@@ -1756,7 +2072,7 @@ def run_production(
                     _atomic_report(report_path, report)
                     return result, 1
                 report["resumable"] = cli_result.get("resumable") is True
-                if report["resumable"] is not True:
+                if mode != "historical" and report["resumable"] is not True:
                     report["accounting_complete"] = False
                     report["error"] = "capture initialization or recovery state is uncertain"
                     report["phase"] = "stopped"
@@ -1770,10 +2086,34 @@ def run_production(
                     deadline=session_deadline,
                     paths=paths,
                     require_complete_accounting=(
-                        not reconcile_accounting or prior.get("accounting_complete") is True
+                        mode != "historical"
+                        and (not reconcile_accounting or prior.get("accounting_complete") is True)
                     ),
-                    capture_id=capture_id if reconcile_accounting else None,
+                    capture_id=capture_id if reconcile_accounting or mode == "historical" else None,
                 )
+                if mode == "historical":
+                    after = _reconciliation_accounting(snapshot, str(capture_id))
+                    if after != prior:
+                        report.update(
+                            accounting_complete=False,
+                            accounting_basis="offline-historical-accounting-changed",
+                            accounting_bound_verified=False,
+                            consumption_state="unknown",
+                            network_activity_this_invocation={
+                                "requests": None,
+                                "downloaded_bytes": None,
+                                "accounting_complete": False,
+                            },
+                        )
+                        raise RunnerError("offline historical work changed acquisition accounting")
+                    _check_accounting_match(snapshot, after)
+                    if snapshot.get("root_id") != report.get("root_id"):
+                        raise RunnerError("operator root identity changed during historical work")
+                    report["network_activity_this_invocation"] = {
+                        "requests": 0,
+                        "downloaded_bytes": 0,
+                        "accounting_complete": True,
+                    }
                 prior_charged_bytes = prior.get("downloaded_bytes_upper_bound")
                 if prior_charged_bytes is None:
                     prior_charged_bytes = prior.get("downloaded_bytes", 0)
@@ -1846,6 +2186,8 @@ def run_production(
                         report["unfinished_reservation_ids"] = bound["unfinished_reservation_ids"]
                         report["accounting_complete"] = False
                         report["consumption_state"] = "reserved-upper-bound"
+                elif mode == "historical":
+                    cumulative = prior
                 elif (
                     cli_result.get("requests") is None or cli_result.get("downloaded_bytes") is None
                 ):
@@ -1861,7 +2203,7 @@ def run_production(
                         + int(cli_result["downloaded_bytes"]),
                         "accounting_complete": True,
                     }
-                if not reconcile_accounting:
+                if not reconcile_accounting and mode != "historical":
                     _check_accounting_match(snapshot, cumulative)
                     report["requests"] = snapshot["attempts"]
                     report["downloaded_bytes"] = snapshot["downloaded_or_reserved_bytes"]
@@ -1872,7 +2214,8 @@ def run_production(
                 if (
                     code != 0
                     or cli_result.get("complete") is not True
-                    or report["capture_complete"] is not True
+                    or not report["scope_complete"]
+                    or (mode != "historical" and not report["capture_complete"])
                     or report["publication_state"] != "verified"
                 ):
                     report["error"] = (
@@ -1880,9 +2223,9 @@ def run_production(
                     )
                     report["phase"] = "stopped"
                     report["recovery"] = (
-                        (
-                            f"After investigating the stop, resume only this capture: --capture-id {report['capture_id']}."
-                        )
+                        f"After investigating the stop, retry only this saved capture offline: --historical --capture-id {report['capture_id']}, within its existing session deadline."
+                        if mode == "historical"
+                        else f"After investigating the stop, resume only this capture: --capture-id {report['capture_id']}."
                         if report.get("capture_id") and report["accounting_complete"]
                         else None
                     )
@@ -1891,7 +2234,7 @@ def run_production(
                 release_path = Path(str(cli_result.get("output", "")))
                 release_id = cli_result.get("source_release_id")
                 if not release_path.is_absolute() or not isinstance(release_id, str):
-                    raise RunnerError("refresh did not report a verified v2 release")
+                    raise RunnerError("refresh did not report a verified release")
                 report["phase"] = "standalone-verification"
                 _atomic_report(report_path, report)
                 standalone_result = _release_verify(
@@ -1904,6 +2247,8 @@ def run_production(
                 )
                 if standalone_result.get("source_release_id") != release_id:
                     raise RunnerError("standalone verification returned a different release")
+                if historical_profile and standalone_result.get("coverage_scope") != "historical":
+                    raise RunnerError("standalone verification did not confirm historical coverage")
             else:
                 activation_accounting = _resource_guard(
                     directory,
@@ -1919,9 +2264,15 @@ def run_production(
                     raise RunnerError(
                         "operator root does not match the managed production directory"
                     )
-                current = summary.get("current_v2")
+                current = summary.get(
+                    "current_historical" if mode == "activate-historical" else "current_v2"
+                )
                 if not isinstance(current, dict):
-                    raise RunnerError("no verified current v2 release is available")
+                    raise RunnerError(
+                        "no verified current historical release is available"
+                        if mode == "activate-historical"
+                        else "no verified current v2 release is available"
+                    )
                 release = Path(str(current["output"]))
                 standalone_result = _release_verify(
                     release,
@@ -1931,11 +2282,24 @@ def run_production(
                     report,
                     _monitor_deadline(report, workflow=False),
                 )
+                if mode == "activate-historical":
+                    source_capture_complete = standalone_result.get("source_capture_complete")
+                    if not isinstance(source_capture_complete, bool):
+                        raise RunnerError(
+                            "historical release verification omitted source capture completeness"
+                        )
+                    report["coverage_scope"] = "historical"
+                    report["source_capture_complete"] = source_capture_complete
+                    report["capture_complete"] = source_capture_complete
+                    report["scope_complete"] = True
             expected_release = (
                 standalone_result.get("source_release_id") if standalone_result else None
             )
             if not expected_release:
                 raise RunnerError("no verified current catalogue release is available")
+            catalogue_version = 3 if standalone_result.get("coverage_scope") == "historical" else 2
+            if mode == "activate-historical" and catalogue_version != 3:
+                raise RunnerError("current release does not use the historical contract")
             report["phase"] = "activation"
             _atomic_report(report_path, report)
             command = [
@@ -1944,7 +2308,9 @@ def run_production(
                 "--_activate-current",
                 str(operator),
                 str(directory),
-                str(expected_release),
+                f"historical:{expected_release}"
+                if catalogue_version == 3
+                else str(expected_release),
             ]
             code, stop_reason, reaped, activation_stdout, activation_stderr = _run_external_child(
                 command,
@@ -1968,7 +2334,9 @@ def run_production(
                     stop_reason or "production activation did not finish with verified readback"
                 )
                 report["recovery"] = (
-                    "Run --activate-current to reverify the actual publication and hard-link state."
+                    "Run --activate-current --historical to reverify the historical publication and hard-link state."
+                    if catalogue_version == 3
+                    else "Run --activate-current to reverify the actual publication and hard-link state."
                 )
                 report["phase"] = "stopped"
                 _atomic_report(report_path, report)
@@ -1981,10 +2349,16 @@ def run_production(
                 paths=paths,
                 require_complete_accounting=False,
             )
-            if mode == "activate-current":
+            if mode in {"activate-current", "activate-historical"}:
                 _record_operator_accounting(report, final_accounting)
             report["production_state"] = "verified"
             report["activation"] = activated
+            if activated.get("coverage_scope") is not None:
+                report["coverage_scope"] = activated["coverage_scope"]
+                report["capture_id"] = activated.get("capture_id")
+                report["source_capture_complete"] = activated.get("source_capture_complete")
+                report["capture_complete"] = activated.get("source_capture_complete") is True
+                report["scope_complete"] = activated.get("scope_complete") is True
             report["phase"] = "complete"
             report["completed_at"] = _utc()
             report["last_observed_epoch"] = time.time()
@@ -2007,16 +2381,26 @@ def run_production(
             return result, (
                 3
                 if isinstance(exc, (BudgetStop, RunnerInterrupted))
-                or time.time() >= _time_budget_deadline(report, "epoch")
+                or _effective_deadline_expired(report)
                 else 1
             )
         finally:
+            _ACTIVE_OFFLINE_HISTORICAL_WINDOW = None
             _kill_awake_guard(awake)
 
 
 def _activation_worker(operator: Path, directory: Path, expected: str) -> int:
     try:
-        result = activate_current(operator, directory, expected_release_id=expected)
+        catalogue_version = 3 if expected.startswith("historical:") else 2
+        release_id = expected.removeprefix("historical:")
+        if not re.fullmatch(r"[0-9a-f]{64}", release_id):
+            raise RunnerError("activation release ID is invalid")
+        result = activate_current(
+            operator,
+            directory,
+            expected_release_id=release_id,
+            catalogue_version=catalogue_version,
+        )
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return 0
     except Exception as exc:
@@ -2038,6 +2422,16 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--capture-id")
     modes.add_argument("--activate-current", action="store_true")
     parser.add_argument(
+        "--historical",
+        action="store_true",
+        help="finish saved evidence offline or activate the historical publication",
+    )
+    parser.add_argument(
+        "--offline-duration-seconds",
+        type=float,
+        help="start or reuse a bounded offline historical window (maximum four hours)",
+    )
+    parser.add_argument(
         "--reconcile-accounting",
         action="store_true",
         help="resume only after charging unfinished requests at their full durable reservation",
@@ -2057,8 +2451,18 @@ def main(argv: list[str] | None = None) -> int:
         help="explicit APFS volume UUID to verify when recovering after reboot",
     )
     args = parser.parse_args(argv)
-    if args.reconcile_accounting and not args.capture_id:
-        parser.error("--reconcile-accounting requires --capture-id")
+    try:
+        validate_mode(
+            args.full,
+            args.capture_id,
+            args.activate_current,
+            args.historical,
+            offline_duration_seconds=args.offline_duration_seconds,
+        )
+    except RunnerError as exc:
+        parser.error(str(exc))
+    if args.reconcile_accounting and (not args.capture_id or args.historical):
+        parser.error("--reconcile-accounting requires a network --capture-id resume")
     if args.extend_session and (not args.capture_id or not args.reconcile_accounting):
         parser.error("--extend-session requires --capture-id and --reconcile-accounting")
     if args.recover_reboot and (
@@ -2081,6 +2485,8 @@ def main(argv: list[str] | None = None) -> int:
                 full=args.full,
                 capture_id=args.capture_id,
                 activate_only=args.activate_current,
+                historical=args.historical,
+                offline_duration_seconds=args.offline_duration_seconds,
                 reconcile_accounting=args.reconcile_accounting,
                 extend_session=args.extend_session,
                 recover_reboot=args.recover_reboot,
@@ -2152,11 +2558,18 @@ def _load_resume(
     directory: Path,
     capture_id: str,
     *,
+    historical: bool = False,
+    offline_duration_seconds: float | None = None,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
     recover_reboot: bool = False,
     recovery_volume_uuid: str | None = None,
 ) -> tuple[Path, dict[str, Any], dict[str, Path]]:
+    duration = _validate_offline_duration_seconds(offline_duration_seconds)
+    if duration is not None and not historical:
+        raise RunnerError("--offline-duration-seconds requires offline historical completion")
+    if historical and (reconcile_accounting or extend_session or recover_reboot):
+        raise RunnerError("offline historical completion cannot reconcile or extend acquisition")
     if extend_session and not reconcile_accounting:
         raise RunnerError("session extension requires --reconcile-accounting")
     if recover_reboot and (
@@ -2181,11 +2594,13 @@ def _load_resume(
     recoverable_accounting_stop = _is_recoverable_accounting_stop(
         report, capture_id, reconcile_accounting
     )
-    if (report.get("accounting_complete") is not True and not recoverable_accounting_stop) or (
-        report.get("production_state") == "verified"
-    ):
+    if (
+        not historical
+        and report.get("accounting_complete") is not True
+        and not recoverable_accounting_stop
+    ) or report.get("production_state") == "verified":
         raise RunnerError("resume accounting is unknown or production activation already succeeded")
-    if reconcile_accounting:
+    if reconcile_accounting and not historical:
         saved_system = report.get("system")
         saved_versions = (
             saved_system.get("package_versions") if isinstance(saved_system, dict) else None
@@ -2250,14 +2665,6 @@ def _load_resume(
     rebooted = report.get("boot_stamp") != current_boot
     if rebooted and not recover_reboot:
         raise RunnerError("Mac restarted; explicit reconciled reboot recovery is required")
-    if (
-        not rebooted
-        and time.monotonic() >= _time_budget_deadline(report, "monotonic")
-        and not extend_session
-    ):
-        raise RunnerError("48-hour session expired; networking resume is prohibited")
-    if now >= _time_budget_deadline(report, "epoch") and not extend_session:
-        raise RunnerError("48-hour wall-clock session expired; networking resume is prohibited")
     if rebooted and report.get("phase") != "stopped":
         raise RunnerError("reboot recovery requires a durably stopped session")
     if not isinstance(report.get("root_id"), str) or _owner_root_id(directory) != report["root_id"]:
@@ -2285,6 +2692,23 @@ def _load_resume(
             raise RunnerError("production operator directory is on another filesystem")
     if not rebooted and saved_device != current_device:
         raise RunnerError("production filesystem changed since the original session")
+    existing_offline_window = "offline_historical_window" in report
+    if historical and existing_offline_window:
+        _validate_offline_historical_window(report, capture_id)
+    offline_historical_allowed = historical and (duration is not None or existing_offline_window)
+    if (
+        not offline_historical_allowed
+        and not rebooted
+        and time.monotonic() >= _time_budget_deadline(report, "monotonic")
+        and not extend_session
+    ):
+        raise RunnerError("48-hour session expired; networking resume is prohibited")
+    if (
+        not offline_historical_allowed
+        and now >= _time_budget_deadline(report, "epoch")
+        and not extend_session
+    ):
+        raise RunnerError("48-hour wall-clock session expired; networking resume is prohibited")
     if rebooted:
         old_deadlines = {
             "started_monotonic": report.get("started_monotonic"),
@@ -2547,7 +2971,6 @@ def _refresh_worker_main(
 ) -> int:
     from kalshi_events import metrics, refresh
     from kalshi_events.common import Limits, Store
-    from kalshi_events.transport import BASE_URL, source_url
 
     report = _strict_json(report_path)
     result = refresh.result_template()
@@ -2555,9 +2978,12 @@ def _refresh_worker_main(
         print(json.dumps({**result, "error": "session report is missing"}))
         return 1
     try:
-        actual_source = source_url()
-        if actual_source != BASE_URL:
-            raise RunnerError("production acquisition must use the public Kalshi API origin")
+        if mode != "historical":
+            from kalshi_events.transport import BASE_URL, source_url
+
+            actual_source = source_url()
+            if actual_source != BASE_URL:
+                raise RunnerError("production acquisition must use the public Kalshi API origin")
         values = json.loads(raw_limits)
         limits = Limits(
             **{
@@ -2581,15 +3007,21 @@ def _refresh_worker_main(
 
                     logical_root_id = root_id(store, create=True)
                     _bind_owner(operator.parent, logical_root_id, mode)
-                    _write_capture_notification(notification_path, None, logical_root_id)
+                    if mode != "historical":
+                        _write_capture_notification(notification_path, None, logical_root_id)
                     result, exit_code = refresh.run(
                         store,
                         full=mode == "full",
                         capture_id=capture_id,
+                        historical=mode == "historical",
                         compression=compression,
                         rate_policy=rate_policy,
-                        on_capture_id=lambda value: _write_capture_notification(
-                            notification_path, value, logical_root_id
+                        on_capture_id=(
+                            None
+                            if mode == "historical"
+                            else lambda value: _write_capture_notification(
+                                notification_path, value, logical_root_id
+                            )
                         ),
                     )
             except Exception as exc:

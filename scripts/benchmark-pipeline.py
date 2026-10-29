@@ -10,6 +10,7 @@ import functools
 import hashlib
 import importlib.metadata
 import importlib.util
+import inspect
 import json
 import os
 import platform
@@ -1274,13 +1275,18 @@ def _worker(
         else 2 * 1024**3
     )
     limits = Limits(max_rate=1000, max_requests=10000, max_download_bytes=download_limit)
+    capture_profile = (
+        {"catalogue_profile": "exchange"}
+        if "catalogue_profile" in inspect.signature(capture.new_capture).parameters
+        else {}
+    )
     profile_metrics = metrics.collect() if metrics else contextlib.nullcontext(None)
     with profile_metrics as measured:
         if profile == "baseline-setup":
             store = Store(root, limits)
             if refresh_mode == "incremental":
                 _seed_incremental_root(store)
-            state = capture.capture(store, client_factory=client_factory)
+            state = capture.capture(store, client_factory=client_factory, **capture_profile)
             _require_complete(state, profile)
             warehouse.build(store, state["capture_id"])
             release = publish.publish(Store(root, limits), state["capture_id"])
@@ -1292,7 +1298,7 @@ def _worker(
         elif profile == "baseline-v2-setup":
             store = Store(root, limits)
             _seed_incremental_root(store)
-            state = capture.capture(store, client_factory=client_factory)
+            state = capture.capture(store, client_factory=client_factory, **capture_profile)
             _require_complete(state, profile)
             _direct_v2_setup_build(warehouse, store, state["capture_id"])
             release = publish.publish(Store(root, limits), state["capture_id"], catalogue_version=2)
@@ -1300,9 +1306,11 @@ def _worker(
         elif profile in {"no-change", "sparse-change", "all-change", "history-sparse"}:
             store = Store(root, limits)
             if refresh_mode == "incremental":
-                state = capture.capture(store, client_factory=client_factory, incremental=True)
+                state = capture.capture(
+                    store, client_factory=client_factory, incremental=True, **capture_profile
+                )
             else:
-                state = capture.capture(store, client_factory=client_factory)
+                state = capture.capture(store, client_factory=client_factory, **capture_profile)
             _require_complete(state, profile)
             warehouse.build(store, state["capture_id"])
             if refresh_mode == "incremental":
@@ -1316,9 +1324,14 @@ def _worker(
             output = Path(release["output"])
         elif profile == "resume":
             initial_limits = Limits(max_rate=1000, max_requests=4, max_download_bytes=2 * 1024**3)
-            partial = capture.capture(Store(root, initial_limits), client_factory=client_factory)
+            partial = capture.capture(
+                Store(root, initial_limits), client_factory=client_factory, **capture_profile
+            )
             state = capture.capture(
-                Store(root, limits), resume=partial["capture_id"], client_factory=client_factory
+                Store(root, limits),
+                resume=partial["capture_id"],
+                client_factory=client_factory,
+                **capture_profile,
             )
             _require_complete(state, profile)
             warehouse.build(Store(root, limits), state["capture_id"])
@@ -1333,7 +1346,9 @@ def _worker(
             store = Store(root, limits)
             if capture_only:
                 _seed_incremental_root(store)
-            state = capture.capture(store, client_factory=client_factory, selected=selected)
+            state = capture.capture(
+                store, client_factory=client_factory, selected=selected, **capture_profile
+            )
             if profile in TARGETED_PROFILES:
                 from kalshi_events import metadata
 

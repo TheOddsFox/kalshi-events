@@ -34,6 +34,7 @@ MAX_DELTAS = 8
 OVERLAP = timedelta(minutes=5)
 SERIES_CONTRACT = "oddsfox.kalshi.series.v1"
 CATALOGUE_V2_CONTRACT = "oddsfox.kalshi.catalogue.v2"
+HISTORICAL_CONTRACT = "oddsfox.kalshi.historical.v1"
 
 
 def pointer_profile(store: Store) -> tuple[str, int, str]:
@@ -46,7 +47,7 @@ def pointer_profile(store: Store) -> tuple[str, int, str]:
 def publication_pointers(store: Store) -> tuple[tuple[int, str], ...]:
     if store.scope is not None:
         return ((2, "current-series.json"),)
-    return ((1, "current.json"), (2, "current-v2.json"))
+    return ((1, "current.json"), (2, "current-v2.json"), (3, "current-historical.json"))
 
 
 def _utc(value: Any, label: str) -> datetime:
@@ -186,6 +187,8 @@ def verify_pin(store: Store, state: dict[str, Any]) -> dict[str, Any]:
         if pin_scope != store.scope:
             raise CatalogueError("pinned series baseline belongs to a different contract or scope")
     version = pin.get("catalogue_version")
+    if isinstance(version, bool) or version not in {1, 2}:
+        raise CatalogueError("incremental baseline must use catalogue version 1 or 2")
     release_id = pin.get("source_release_id")
     if not isinstance(release_id, str) or len(release_id) != 64:
         raise CatalogueError("invalid incremental baseline release identity")
@@ -212,6 +215,8 @@ def verify_pin(store: Store, state: dict[str, Any]) -> dict[str, Any]:
         pin.get("release_contract") == SERIES_CONTRACT or current.get("contract") == SERIES_CONTRACT
     ):
         raise CatalogueError("series publication cannot be used as a catalogue baseline")
+    elif current.get("contract") == HISTORICAL_CONTRACT:
+        raise CatalogueError("historical publications cannot be incremental baselines")
     expected_depth = 0 if version == 1 else current.get("delta_depth")
     if pin.get("delta_depth") != expected_depth:
         raise CatalogueError("incremental baseline depth differs from its pinned publication")
@@ -231,6 +236,8 @@ def verify_pin(store: Store, state: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_directory(capture_id: str, version: int) -> str:
+    if version == 3:
+        return f"builds-historical/{capture_id}"
     return f"builds-v2/{capture_id}" if version == 2 else f"builds/{capture_id}"
 
 
@@ -896,6 +903,16 @@ def _lineage_impl(
             baseline_started = _utc(baseline_state.get("started_at"), "v1 baseline start")
             evidence[capture_id] = (1, manifest)
             break
+        if contract == HISTORICAL_CONTRACT:
+            if scope is not None or child_depth is not None:
+                raise CatalogueError("historical releases cannot be used as incremental lineage")
+            if expected_root is not None and manifest.get("root_id") != expected_root:
+                raise CatalogueError("historical release belongs to a different logical root")
+            from kalshi_events.capture import read_capture
+
+            capture_states[capture_id] = read_capture(store, capture_id)
+            evidence[capture_id] = (3, manifest)
+            break
         if contract not in {CATALOGUE_V2_CONTRACT, SERIES_CONTRACT}:
             raise CatalogueError("unsupported release in ancestry")
         if scope is not None:
@@ -961,11 +978,16 @@ def _lineage_impl(
             if capture_state is None:
                 capture_state = read_capture(store, capture_id)
             page_rows = page_receipts(store, capture_state)
+            if version == 3:
+                from kalshi_events.historical import historical_task_indices
+
+                selected = historical_task_indices(capture_state, allow_legacy_incomplete=True)
+                page_rows = [row for row in page_rows if row["index"] in selected]
         else:
             capture_state = cached.proof.state
             page_rows = list(cached.proof.page_rows)
         capture_states[capture_id] = capture_state
-        certified(
+        receipt = certified(
             store,
             capture_id,
             catalogue_version=version,
@@ -973,6 +995,14 @@ def _lineage_impl(
             _page_rows=page_rows,
             _context=_context,
         )
+        if version == 3:
+            expected = publish._historical_coverage_fields(capture_state)
+            expected.update(
+                root_id=root_id(store),
+                warehouse_sha256=receipt.get("warehouse_sha256"),
+            )
+            if any(manifest.get(name) != value for name, value in expected.items()):
+                raise CatalogueError("historical release coverage differs from its source capture")
         if version == 2:
             expected_membership = manifest.get("membership_sha256")
             if (
@@ -1018,6 +1048,7 @@ def _validate_retirement_artifact(store: Store, path: Path, root: str, identity:
         "raw": "manifest.json",
         "builds": "build.json",
         "builds-v2": "build.json",
+        "builds-historical": "build.json",
         "releases": "manifest.json",
     }[root]
     value = decode(regular_bytes(path / filename, store.limits.max_root_bytes))
@@ -1078,7 +1109,14 @@ def _finish_retirement_plan(store: Store) -> None:
     }
     if plan.get("kind") == "discard":
         retired_capture_ids.add(plan["capture_id"])
-    allowed_roots = {"captures", "raw", "builds", "builds-v2", "releases"}
+    allowed_roots = {
+        "captures",
+        "raw",
+        "builds",
+        "builds-v2",
+        "builds-historical",
+        "releases",
+    }
     targets: set[str] = set()
     sources: set[str] = set()
     plan_sha256 = hashlib.sha256(plan_body).hexdigest()
@@ -1237,7 +1275,16 @@ def _finish_retirement_plan(store: Store) -> None:
             protected_captures.update(captures)
     for index, entry in enumerate(entries):
         parts = Path(entry["source"]).parts
-        if parts[0] in {"captures", "builds", "builds-v2"} and parts[1] in protected_captures:
+        if (
+            parts[0]
+            in {
+                "captures",
+                "builds",
+                "builds-v2",
+                "builds-historical",
+            }
+            and parts[1] in protected_captures
+        ):
             raise CatalogueError("pending prune plan now intersects a publication or recovery pin")
         if (
             parts[0] == "captures"
@@ -1350,7 +1397,15 @@ def _finish_retirement_plan(store: Store) -> None:
     fsync_directory(store.root)
     progress_path.unlink(missing_ok=True)
     fsync_directory(store.root)
-    for relative in ("captures", "raw", "builds", "builds-v2", "releases", "prune-trash"):
+    for relative in (
+        "captures",
+        "raw",
+        "builds",
+        "builds-v2",
+        "builds-historical",
+        "releases",
+        "prune-trash",
+    ):
         if store.path(relative).exists():
             store.sync(relative)
 
@@ -1394,8 +1449,8 @@ def _prune_locked(
     store.require_writable()
     if not store.writer_locked_by_current_thread:
         raise CatalogueError("pruning requires the canonical writer lock")
-    if catalogue_version not in {1, 2}:
-        raise CatalogueError("catalogue version must be 1 or 2")
+    if catalogue_version not in {1, 2, 3}:
+        raise CatalogueError("catalogue version must be 1, 2, or 3")
     published = publish.current(store, catalogue_version=catalogue_version)
     if published.get("source_release_id") != release_id or published.get("capture_id") != state.get(
         "capture_id"
@@ -1414,7 +1469,14 @@ def _prune_locked(
     keep_captures: set[str] = {state["capture_id"]}
     full_cutoffs: list[datetime] = []
     for manifest in pointer_manifests:
-        version = 2 if manifest.get("contract") in {CATALOGUE_V2_CONTRACT, SERIES_CONTRACT} else 1
+        contract = manifest.get("contract")
+        version = (
+            3
+            if contract == HISTORICAL_CONTRACT
+            else 2
+            if contract in {CATALOGUE_V2_CONTRACT, SERIES_CONTRACT}
+            else 1
+        )
         ids, captures, baseline_started = _lineage(
             store,
             manifest["source_release_id"],
@@ -1443,7 +1505,7 @@ def _prune_locked(
         cached = next(
             (
                 context.captures.get((path.name, version))
-                for version in (1, 2)
+                for version in (1, 2, 3)
                 if context.captures.get((path.name, version)) is not None
             ),
             None,
@@ -1548,7 +1610,7 @@ def _prune_locked(
             path = store.path(f"captures/{identity}")
             if path.exists():
                 remove.append(path)
-    for dirname in ("builds", "builds-v2"):
+    for dirname in ("builds", "builds-v2", "builds-historical"):
         base = store.path(dirname)
         for path in sorted(base.iterdir()) if base.exists() else []:
             if (

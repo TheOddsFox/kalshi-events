@@ -52,7 +52,9 @@ def catalogue(tmp_path_factory):
         "/markets": (200, {"markets": [market, combo], "cursor": ""}),
     }
     state = capture.capture(
-        store, client_factory=lambda s, b, **_options: FakeClient(s, b, responses)
+        store,
+        client_factory=lambda s, b, **_options: FakeClient(s, b, responses),
+        catalogue_profile="exchange",
     )
     warehouse.build(store, state["capture_id"])
     release = publish.publish(store, state["capture_id"])

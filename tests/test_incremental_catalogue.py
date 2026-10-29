@@ -119,6 +119,10 @@ class Snapshot:
 
 
 def capture_at(store, snapshot, timestamp=DELTA_TIME, *, client_factory=None, **kwargs):
+    # This helper builds the pre-historical exchange catalogue used by the
+    # incremental compatibility tests. New historical-profile behavior is
+    # exercised directly in test_historical_capture.py.
+    kwargs.setdefault("catalogue_profile", "exchange")
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(fixtures, "now", lambda: timestamp)
         patch.setattr(acquisition, "now", lambda: timestamp)
@@ -943,7 +947,7 @@ def test_legacy_full_without_fresh_final_scope_parent_proof_requires_a_new_captu
     snapshot.overrides["/events"] = events
     with monkeypatch.context() as patch:
         patch.setattr(acquisition, "now", lambda: BASE_TIME)
-        initial = acquisition.new_capture(store, None)
+        initial = acquisition.new_capture(store, None, catalogue_profile="exchange")
         old_fields = {
             "version",
             "capture_id",
@@ -1085,12 +1089,17 @@ def test_stale_pinned_parent_cannot_replace_a_newer_published_branch(baseline):
     )
 
 
-def test_cli_versions_default_to_one_and_require_explicit_composed_publication():
-    from kalshi_events.cli import parser
+def test_cli_versions_default_to_one_and_require_explicit_composed_publication(tmp_path):
+    from kalshi_events.cli import _catalogue_version, parser
 
     cli = parser()
+    store = Store(tmp_path / "legacy-root")
+    capture_at(store, Snapshot())
     for command in ("current", "replay", "rebuild", "publish"):
-        assert cli.parse_args([command]).catalogue_version == 1
+        parsed = cli.parse_args([command])
+        assert parsed.catalogue_version is None
+        assert _catalogue_version(store, parsed) == 1
+        assert cli.parse_args([command, "--catalogue-version", "1"]).catalogue_version == 1
         assert cli.parse_args([command, "--catalogue-version", "2"]).catalogue_version == 2
     assert cli.parse_args(["capture", "--incremental"]).incremental
 

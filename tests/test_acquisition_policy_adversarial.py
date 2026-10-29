@@ -760,7 +760,7 @@ def anchored_policy_root(tmp_path_factory):
             assert endpoint == "/historical/markets"
             return 200, {"markets": [], "cursor": "" if params.get("cursor") else "LAST"}
 
-    state = capture.capture(Store(root), client_factory=Client)
+    state = capture.capture(Store(root), client_factory=Client, catalogue_profile="exchange")
     assert state["complete"]
     snapshots = json.loads((root / "captures" / state["capture_id"] / "state.json").read_bytes())
     assert snapshots["state"]["complete"]

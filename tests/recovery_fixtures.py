@@ -206,7 +206,13 @@ def build_recovery_root(
         patch.object(capture.uuid, "uuid4", return_value=uuid.UUID(hex=CAPTURE_ID)),
     ):
         store.write("root-id.json", {"version": 1, "root_id": ROOT_ID})
-        state = capture.new_capture(store, None, compression="identity", rate_policy="fixed")
+        state = capture.new_capture(
+            store,
+            None,
+            compression="identity",
+            rate_policy="fixed",
+            catalogue_profile="exchange",
+        )
         if scenario == "primary":
             index = 2  # The canonical primary /events traversal.
             if repeats == 0 and num_pages > 1000:

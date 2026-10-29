@@ -1,6 +1,6 @@
 # kalshi-events
 
-Independent, operator-invoked catalogue of public Kalshi event contracts. This repository owns native series, ordinary and multivariate events, live and historical markets, rules, price grids, lifecycle and settlement definitions, relationships and observation history. `kalshi-market-data` owns prices, candles, trades and books. The two applications exchange copied immutable files; they do not share a warehouse or import each other's packages.
+Independent, operator-invoked historical catalogue of public Kalshi event contracts. New full captures acquire series, ordinary events and all historical markets, including historical combos. They exclude live-market and multivariate-event traversals. Rules, price grids, lifecycle and settlement definitions, relationships and observation history retain their native values. Legacy exchange-wide artifacts remain readable; targeted metadata and dedicated-series workflows retain their own acquisition plans. `kalshi-market-data` owns prices, candles, trades and books. The two applications exchange copied immutable files; they do not share a warehouse or import each other's packages.
 
 See [native contracts and storage/publication formats](docs/contracts.md) for compatibility, recovery and incremental freshness boundaries.
 
@@ -33,7 +33,7 @@ An isolated, locked DuckDB 2.0 runtime has been installed and verified. Installa
 
 ## Capture
 
-The public transport uses only `https://external-api.kalshi.com/trade-api/v2`. Requests use a shared limiter at a 5 requests/second ceiling by default. This is a configured client ceiling, not a verified anonymous-provider allowance. Set `--max-rate` to choose another positive initial ceiling. A fair scheduler keeps at most eight futures submitted and one request outstanding per traversal. Events and multivariate events use pages of 200; live and historical markets use pages of 1000.
+The public transport uses only `https://external-api.kalshi.com/trade-api/v2`. Requests use a shared limiter at a 5 requests/second ceiling by default. This is a configured client ceiling, not a verified anonymous-provider allowance. Set `--max-rate` to choose another positive initial ceiling. A fair scheduler keeps at most eight futures submitted and one request outstanding per traversal. The default historical plan uses 200 ordinary events/page and 1000 historical markets/page. `capture --catalogue-profile exchange` explicitly selects the legacy broad plan; metadata selections and dedicated series captures retain their documented behavior.
 
 Each attempt writes its raw HTTP response bytes and per-attempt accounting before its page is applied. A request that fails with 429, 500, 502, 503 or 504 is retried up to four attempts in total, with equal-jitter exponential backoff capped at 30 seconds. A `Retry-After` header, as delta-seconds or an HTTP date, is always honored and recorded on the attempt receipt. Workers recheck shared cooldowns after waiting, so a later deferral also delays workers already waiting for a request slot. Resume recovers verified completed receipts without reissuing their requests.
 
@@ -94,9 +94,46 @@ Reports preserve partial evidence and stop remaining scenarios after any HTTP 42
 
 ## Build and publish
 
-A full `build --capture-id` lands a fresh warehouse in staging from that one complete catalogue capture, runs packaged dbt models and tests in DuckDB, and certifies the raw inventory, database and dbt artifacts before renaming the staged build into place. Without `--capture-id`, the newest complete full catalogue capture is used. Incremental and targeted captures are excluded from this default. Targeted metadata captures never enter the catalogue warehouse. A failed build leaves prior builds and releases untouched.
+The default full-capture scope is historical: series, ordinary events and all historical
+markets, including combos. `build` and `publish` automatically select the historical profile
+for a new sealed historical capture. The shared Arrow/dbt path preserves native payloads,
+exact decimals, provenance, observation history and deterministic exports. Missing parents
+and combo references remain visibly unresolved; no historical market is removed for that
+reason.
 
-`publish` promotes only a certified, complete catalogue build. It writes the immutable `oddsfox.kalshi.catalogue.v1` release and atomically promotes `current.json`. After publication and verification both succeed, obsolete catalogue captures, raw evidence, builds and releases may be pruned. Both publication pointers and every incomplete capture retain their complete dependency closure. A failed publish or verification prunes nothing.
+Historical builds use `builds-historical/`, publish `oddsfox.kalshi.historical.v1`, and promote
+`current-historical.json`. Their coverage binds included and omitted scopes, selected task
+indices/generations, the source capture's actual completion status, root identity and
+warehouse checksum. The database's `main.catalogue_coverage` identifies this scope.
+Historical output cannot serve as a legacy exchange-wide incremental baseline. `current`,
+`replay` and `rebuild` prefer the historical pointer when present; explicit
+`--catalogue-version 1|2` continues to select legacy publication tracks.
+
+To finish completed historical scopes from a stopped legacy capture without networking:
+
+```sh
+uv run kalshi-events --root /absolute/operator/kalshi-events refresh \
+  --historical --capture-id SAVED_CAPTURE_ID
+# Individual stages are also available; these never resume acquisition.
+uv run kalshi-events --root /absolute/operator/kalshi-events build \
+  --historical --capture-id SAVED_CAPTURE_ID
+uv run kalshi-events --root /absolute/operator/kalshi-events publish \
+  --historical --capture-id SAVED_CAPTURE_ID
+uv run kalshi-events --root /absolute/operator/kalshi-events current --historical
+```
+
+This explicit offline path requires completed series, ordinary-event and historical-market
+traversals, including terminal cutoff evidence. It validates the full journal and selected
+raw receipts, without changing the old capture's globally incomplete state. Excluded bodies
+are not certified by a historical build. The output is complete for its declared scope,
+not the full exchange or an atomic snapshot. Targeted captures cannot enter this path.
+A failed build or verification preserves prior publications.
+
+Legacy exchange-profile captures still use certified catalogue v1/v2 builds and their
+`current.json`/`current-v2.json` pointers. Existing releases and schemas are not rewritten.
+Historical publication and incomplete captures protect their required evidence; discard
+refuses referenced sources. Intentional retirement of excluded data ends ordinary resume
+for that source and leaves an explicit `retired-scopes.json` guard; it is not normal pruning.
 
 Native tickers preserve their exact identifiers, including punctuation. Singular lookup URLs encode each ticker as one path segment. Trailing U+0020 spaces remain part of the native identity and become `%20` at the end of a lookup URL. Comma-containing tickers such as `JOBLESS-22SEP10-C220,000` use singular selected-market and parent lookups; other selected markets retain automatic bounded batching. Pass a leading-hyphen ticker with an equals sign, for example `--market-ticker=-23MAR-T3`.
 
@@ -104,9 +141,9 @@ Native payloads remain in `payload_json`. Commonly queried prices and fractional
 
 The release contains `series.parquet`, `events.parquet`, `markets.parquet`, `relationships.parquet`, `combo_legs.parquet`, `observation_history.parquet`, `coverage.parquet` and a checksummed manifest. Coverage records the observed traversal interval and cutoff evidence. These endpoints do not provide an atomic exchange snapshot. Markets moving between live and historical tiers can change during the observation interval; live and historical traversals overlap, and repeated direct observations are retained.
 
-## Opt-in incremental refresh
+## Legacy exchange-wide incremental refresh
 
-A full capture remains the default. To create a version 2 baseline from a complete full capture, publish it with the version selector; this builds the version 2 warehouse when needed. A preceding version 1 build/publication is necessary only when both publication tracks are wanted. Version 2 uses a separate `builds-v2` warehouse and `current-v2.json`; version 1 uses `builds` and `current.json`.
+This section applies only to the explicit legacy exchange profile and existing catalogue v1/v2 publications. Historical publications are not incremental baselines; use an explicit historical `refresh --full` for a new reconciliation. To create a legacy version 2 baseline from a complete exchange-profile capture, publish it with the version selector; this builds the version 2 warehouse when needed. A preceding version 1 build/publication is necessary only when both publication tracks are wanted. Version 2 uses a separate `builds-v2` warehouse and `current-v2.json`; version 1 uses `builds` and `current.json`.
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events publish \
@@ -128,7 +165,7 @@ This mode permits dated price, volume and open-interest values. Carried rows ret
 
 Membership is separate from historical observations. A complete reconciliation replaces its scope's membership, while omission from a delta removes nothing. Live and historical membership are combined before resolving current markets. Removed entities retain their history and can reappear. Parent lookups resolve declared relationships without turning lookup-only entities into permanent list members.
 
-Each baseline supports at most eight deltas. Retained baseline and delta warehouses, including WAL and staging copies, count toward the storage limits; size those limits for the retained chain before refreshing. To rebase, acquire and build a new full capture, then publish that capture with `--catalogue-version 2`. A refresh whose pinned predecessor has been superseded cannot publish; acquire a new refresh against the current publication. Incomplete captures remain recovery pins indefinitely. Explicitly abandon an unreferenced incomplete capture with:
+Each baseline supports at most eight deltas. Retained baseline and delta warehouses, including WAL and staging copies, count toward the storage limits; size those limits for the retained chain before refreshing. To rebase the legacy track, explicitly acquire an exchange-profile capture with `capture --catalogue-profile exchange`, then publish that capture with `--catalogue-version 2`. A refresh whose pinned predecessor has been superseded cannot publish; acquire a new refresh against the current publication. Incomplete captures remain recovery pins indefinitely. Explicitly abandon an unreferenced incomplete capture with:
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events discard --capture-id CAPTURE_ID
@@ -138,23 +175,38 @@ Discard refuses complete captures and captures referenced by a publication or de
 
 ## One-command catalogue refresh
 
-The operator-invoked `refresh` command coordinates capture and verified publication through catalogue v2. Establish a baseline explicitly, then request incremental updates:
+The operator-invoked `refresh --full` coordinates the historical acquisition plan, shared
+build, complete export, fresh verification, historical pointer promotion and cleanup under
+one writer lock and invocation deadline:
 
 ```sh
 uv run kalshi-events --root /absolute/operator/kalshi-events refresh --full
-uv run kalshi-events --root /absolute/operator/kalshi-events refresh
+# Resume a new historical capture's sealed acquisition plan:
 uv run kalshi-events --root /absolute/operator/kalshi-events refresh --capture-id CAPTURE_ID
+# Complete saved historical scopes of an old broad capture without acquisition:
+uv run kalshi-events --root /absolute/operator/kalshi-events refresh \
+  --historical --capture-id SAVED_CAPTURE_ID
 ```
 
-A new incremental refresh requires an existing verified publication, preferring v2 and otherwise using v1. `--full` explicitly creates a baseline or rebase; after eight deltas the command stops and asks for a full rebase. It never silently starts a full crawl. `--full` and `--capture-id` cannot be combined. Resume retains the exact capture's acquisition settings and predecessor; targeted metadata captures cannot enter this workflow.
+`--full` and `--capture-id` conflict. New full captures request gzip and use the
+5 requests/second initial ceiling with downward-only adjustment after HTTP 429. Resource,
+compression and rate-policy options remain available; resumed captures retain sealed
+settings. Historical publications currently require explicit full reconciliations; bare
+`refresh` will not silently turn a historical baseline into an exchange-wide delta or rebase.
+Existing legacy v1/v2 incremental workflows keep their separate baseline rules.
 
-One canonical writer lock and one invocation deadline span acquisition, the required v2 build, complete export, independent verification, pointer promotion and pruning. The workflow publishes only `current-v2.json`; the v1 pointer and existing command defaults remain unchanged. New captures request gzip and use the 5 requests/second initial ceiling with downward-only adjustment after HTTP 429. Existing resource flags, `--compression identity|gzip`, and `--rate-policy fixed|decrease-on-429` are supported; size explicit full-run allowances for the entire catalogue rather than assuming the default download allowance will suffice.
+The JSON result distinguishes workflow `complete`, real `capture_complete`, stage,
+publication state and available accounting. Historical results additionally identify
+`coverage_scope`, `scope_complete` and `source_capture_complete`. A saved historical build
+can finish with `complete: true`, `scope_complete: true` and `capture_complete: false`:
+that does not mark the old broad capture complete. Its zero requests/download bytes describe
+only this offline invocation, never a reset of cumulative production consumption.
+Unknown accounting remains null. Publication state `unknown` may mean a pointer was promoted
+before cleanup failed; inspect and retry the same explicit offline command rather than
+assuming rollback or resuming network acquisition. Budgets return exit 3, invalid input or
+invariant failures exit 1, and only verified completion exits 0.
 
-The command prints one JSON result. `complete` describes the whole workflow, while `capture_complete` describes acquisition. `capture_id` identifies the exact allocated or resumed capture, and nullable `resumable` distinguishes confirmed durable state from an unknown initialization outcome. `stage` is `preflight`, `capture`, `publication` or `complete`; publication includes build, export and cleanup. `publication_state` is `not_attempted`, `verified` or `unknown`. Unknown acquisition counters are null with `accounting_complete: false`. Successful results include `source_release_id` and `output`.
-
-Exit 0 means verified publication and cleanup completed; exit 3 means a budget stopped the workflow; exit 1 means invalid input or a failed invariant. Resume by the returned capture ID after relieving the exhausted allowance. An allocated ID with unknown resumability is not proof that initialization committed; inspect `status` and preserve the root if initialization failed. Publication can promote its pointer before cleanup fails, so `unknown` must not be interpreted as rollback. Retrying the same ID uses the existing recovery machinery. No separate workflow state file is created.
-
-Incremental refresh retains the freshness and reconciliation limitations above. For 1–100 selected markets, use `metadata refresh` below to avoid a full catalogue traversal.
+For 1–100 selected markets, use `metadata refresh`; it retains its explicit selection scope.
 
 ## Supervised production catalogue
 
@@ -167,6 +219,10 @@ python scripts/run-production.py \
 python scripts/run-production.py \
   --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
   --capture-id CAPTURE_ID
+# Finish only the completed historical scopes of a saved legacy capture, without HTTP:
+python scripts/run-production.py \
+  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --historical --capture-id CAPTURE_ID
 # Only after a supervisor reports unknown child accounting from abrupt termination:
 python scripts/run-production.py \
   --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
@@ -180,9 +236,9 @@ python scripts/run-production.py \
 python scripts/run-production.py \
   --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
   --capture-id CAPTURE_ID --reconcile-accounting --extend-session
-# Recover activation of the current verified publication without acquisition.
+# Recover activation of the current historical publication without acquisition.
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" --activate-current
+  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" --activate-current --historical
 ```
 
 `--reconcile-accounting` is an explicit recovery path for a stopped session whose child died before returning its counters. Under the canonical writer lock, it validates every receipt and binds each unfinished request to the exact capture task. If all durable attempts are finalized, it restores their validated exact totals. Otherwise it charges the full sealed response ceiling plus one 64 KiB HTTP read chunk per unfinished request against the original aggregate limit. The pinned HTTP core reads at most 64 KiB per chunk. Before recovery proceeds, the supervisor enforces the approved legacy-to-current or current-to-current lock/package transition, HTTP transport-source fingerprint and 64 KiB read bound described in the [recovery contract](docs/contracts.md#production-database-entry-point). Only the documented historical legacy reports may omit selected saved package fields. The prior system snapshot is retained as `original_system`, while `system` records the recovery environment. In the latter case exact downloaded bytes remain unknown and the report records the conservative bound; unfinished receipts are never edited. Recovery accepts only the stopped session's exact capture, pinned HTTP runtime, boot identity (unless explicitly recovered below), effective deadlines and resource ceilings, and only after supported child-counter stops (including a resumed child missing invocation counters), compressed-memory, process RSS, low-disk-space, or persistent process-group RSS sampling timeouts. The exact legacy system-wide `ps` timeout report is accepted for existing sessions. Current free-space and all other resource checks still run before networking; ledger mismatches, receipt or integrity failures, mount changes, malformed resource output, and unreaped process groups remain ineligible. It records the recovery revision while preserving the original revision and source. The supervisor also stops acquisition if macOS reports 20 GiB of pages stored in the compressor, which catches compressed-memory growth that process RSS misses. A retry after any new abrupt stop needs another explicit reconciliation.
@@ -191,17 +247,27 @@ python scripts/run-production.py \
 
 `--extend-session` may be used once per report and only with `--capture-id` and `--reconcile-accounting`. It records the old and new deadlines and current source revision, then consumes a fixed new 48-hour window before offline accounting preflight; that preflight uses the new window, and a failed preflight does not return the grant. The original `started_*` values remain as provenance. Ordinary resume keeps the current effective clock. The 850,000-attempt, 256 GiB download, storage and response limits remain cumulative across the extension.
 
-Protocol-5 unscoped full captures may keep a private SQLite parent index across invocations, in the operator's accounted temporary storage, with an 8 MiB page cache and memory mapping disabled. The persistent cache is enabled only when the root already has a validated logical root ID; without one, acquisition-first recovery still applies using the disposable index, and no root ID is created for this optimization. Cache checkpoints bind the root ID, capture ID and settings, acquisition protocol, normalization version and exact journal anchor, and represent an ordered prefix of verified journal pages. On resume, the runner validates the snapshot and journal, prioritizes available acquisition requests, then indexes older committed receipts in journal order when the scheduler has room. This ordering depends on a validated snapshot; if it is absent, recovery may need to replay the full authoritative journal before networking begins. The index has a separate soft checkpoint trigger at 100 indexed pages or five seconds, checked between pages; one large receipt can exceed five seconds.
+Legacy exchange-profile protocol-5 full captures may keep a private SQLite parent index across invocations, in the operator's accounted temporary storage, with an 8 MiB page cache and memory mapping disabled. The persistent cache is enabled only when the root already has a validated logical root ID; without one, acquisition-first recovery still applies using the disposable index, and no root ID is created for this optimization. Cache checkpoints bind the root ID, capture ID and settings, acquisition protocol, normalization version and exact journal anchor, and represent an ordered prefix of verified journal pages. On resume, the runner validates the snapshot and journal, prioritizes available acquisition requests, then indexes older committed receipts in journal order when the scheduler has room. This ordering depends on a validated snapshot; if it is absent, recovery may need to replay the full authoritative journal before networking begins. The index has a separate soft checkpoint trigger at 100 indexed pages or five seconds, checked between pages; one large receipt can exceed five seconds.
 
 The index is an auxiliary hint, never evidence or certification. A missing, stale, ahead, incompatible or corrupt cache can be discarded and rebuilt from validated receipts; malformed settings, journal state, raw evidence or receipts still fail closed. If parent-directory permissions prevent creating a private cache, acquisition uses the disposable index without changing those permissions. Existing unsafe cache contents still fail closed. Completion requires a clean index built from evidence verified in the current invocation and a freshly verified parent closure. A warm cache is reset before that pass rather than upserted; a cold clean accumulator may be reused. Legacy, targeted, scoped-series and incremental captures keep their existing indexing behavior. Published builds remain independently verified.
 
 A paired 100-page SSD benchmark measured earlier first-request and first-commit medians on warm recovery, while cold recovery improved the first-request median and had a slightly slower first-commit median. These small-fixture results do not establish the five-minute target or full-scale performance; see [recovery measurements and open gates](docs/performance.md#supervised-production-acceptance).
 
-The directory contains the producer-owned `operator/` root, external session evidence in `runs/`, and the consumer entry point `production.duckdb`. The runner uses catalogue v2 only, retaining all ordinary and multivariate events and live/historical markets. It requests gzip at a five-request/second ceiling with downward adjustment after HTTP 429. It never resumes automatically or publishes incomplete acquisition.
+The directory contains the producer-owned `operator/` root, external session evidence in `runs/`, and the consumer entry point `production.duckdb`. New full runs use the historical contract, retaining series, ordinary events and every historical market including combos, while excluding live-market and multivariate-event traversals. Legacy run reports and v2 publications retain their original scope. Use `--historical --capture-id ID` to finish saved historical scopes offline and `--activate-current --historical` to recover historical activation. It requests gzip at a five-request/second ceiling with downward adjustment after HTTP 429. It never resumes automatically or publishes incomplete acquisition.
 
 Each approved window lasts at most 48 hours, including preflight and reporting. Refresh has a 46-hour cutoff; independent verification and activation must finish before hour 47:50. Active stages continuously check their effective UTC and monotonic deadlines: forced sleep or a forward wall-clock change cannot extend the wall allowance, and a backward change cannot extend the monotonic allowance. The ceilings are 850,000 attempts, 256 GiB encoded downloads, 400 GiB aggregate storage, 350 GiB operator-root storage, and 64 GiB each for temporary and database storage. At least 150 GiB must remain free. Per-response ceilings are 384 MiB encoded and 768 MiB decoded. Resource checks run every 15 seconds; summed descendant RSS over 24 GiB for one minute stops the run. This conservative RSS sum can count shared pages more than once. Process RSS is queried only for the supervised process group. One `ps` timeout is retried once within the same five-second probe budget; if RSS remains unavailable, the supervisor stops and reaps the child without recording an RSS sample. The report records `resource accounting failed: process-group RSS sampling timed out`; resuming that exact capture requires explicit accounting reconciliation. A transient timeout that succeeds on retry does not stop the run. Malformed output or an empty result for a live group remains ineligible. Existing dlt post-load quota limitations still apply.
 
 Progress snapshots do not restart a stopped worker or extend any deadline. Ordinary resume remains an explicit operator command for the exact reported capture and retains the current 48-hour session clock and cumulative accounting.
+
+An explicitly authorized offline completion can supply
+`--historical --capture-id ID --offline-duration-seconds SECONDS` (at most 14,400 seconds).
+This records one separate historical-only window bound to the capture, root and frozen
+revision. It may outlive the old networking period, but never changes that period, consumed
+request/download totals or extension history. Repeating the command reuses the saved offline
+deadline rather than granting more time. The window covers saved-evidence processing,
+verification and activation only; it cannot enable HTTP requests or ordinary resume.
+Storage, memory, free-space and termination safeguards still apply. Without this explicit
+option, the existing approved deadline remains in force.
 
 `production.duckdb` is an atomically activated hard link to the certified warehouse, sharing its physical storage. It appears only after the workflow completes, standalone release verification passes, and fresh certification binds the database checksum to the expected publication. Open it read-only:
 

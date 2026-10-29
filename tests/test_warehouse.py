@@ -26,12 +26,18 @@ from kalshi_events.recovery import rebuild
 from kalshi_events.warehouse import build, certified, load
 
 
+def legacy_capture(*args, **kwargs):
+    """Seed exchange-profile captures for the legacy warehouse contract tests."""
+    kwargs.setdefault("catalogue_profile", "exchange")
+    return capture(*args, **kwargs)
+
+
 def warehouse_path(store, capture_id):
     return store.path(f"builds/{capture_id}/warehouse.duckdb")
 
 
 def test_dlt_dbt_publish_replay_exact_decimals_and_rebuild(store, factory):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     release = publish(store)
     assert current(store)["source_release_id"] == release["source_release_id"]
@@ -69,7 +75,7 @@ def test_backup_and_restore_are_removed(tmp_path, capsys):
 
 
 def test_changed_build_evidence_cannot_promote_pointer(store, factory):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     release = publish(store)
     manifest = store.path(page_receipts(store, state)[0]["relative"])
@@ -80,7 +86,7 @@ def test_changed_build_evidence_cannot_promote_pointer(store, factory):
 
 
 def test_failed_build_preserves_prior_publication(store, factory, monkeypatch):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     release = publish(store)
 
@@ -95,8 +101,8 @@ def test_failed_build_preserves_prior_publication(store, factory, monkeypatch):
 
 
 def test_latest_only_build_ignores_targeted_capture(store, factory, monkeypatch, capsys):
-    catalogue = capture(store, client_factory=factory)
-    targeted = capture(store, selected=["MARKET"], client_factory=factory)
+    catalogue = legacy_capture(store, client_factory=factory)
+    targeted = legacy_capture(store, selected=["MARKET"], client_factory=factory)
     assert latest_catalogue_capture(store) == catalogue["capture_id"]
     with pytest.raises(CatalogueError, match="targeted"):
         build(store, targeted["capture_id"])
@@ -114,8 +120,8 @@ def test_latest_only_build_ignores_targeted_capture(store, factory, monkeypatch,
 
 
 def test_catalogue_build_lands_only_its_own_observations(store, factory):
-    catalogue = capture(store, client_factory=factory)
-    targeted = capture(store, selected=["MARKET"], client_factory=factory)
+    catalogue = legacy_capture(store, client_factory=factory)
+    targeted = legacy_capture(store, selected=["MARKET"], client_factory=factory)
     assert targeted["complete"]
     build(store, catalogue["capture_id"])
     with duckdb.connect(
@@ -128,10 +134,10 @@ def test_catalogue_build_lands_only_its_own_observations(store, factory):
 
 
 def test_prune_after_verify_keeps_current_capture(store, factory):
-    first = capture(store, client_factory=factory)
+    first = legacy_capture(store, client_factory=factory)
     build(store, first["capture_id"])
     publish(store)
-    second = capture(store, client_factory=factory)
+    second = legacy_capture(store, client_factory=factory)
     build(store, second["capture_id"])
     release = publish(store)
     assert release["pruned_captures"] == [first["capture_id"]]
@@ -149,11 +155,11 @@ def test_prune_after_verify_keeps_current_capture(store, factory):
 
 
 def test_prune_deletes_superseded_raw_bodies_not_just_receipts(store, factory):
-    first = capture(store, client_factory=factory)
+    first = legacy_capture(store, client_factory=factory)
     build(store, first["capture_id"])
     publish(store)
     superseded = {path.name for path in store.path("raw").iterdir()}
-    second = capture(store, client_factory=factory)
+    second = legacy_capture(store, client_factory=factory)
     build(store, second["capture_id"])
     publish(store)
     remaining = {path.name for path in store.path("raw").iterdir()}
@@ -163,10 +169,10 @@ def test_prune_deletes_superseded_raw_bodies_not_just_receipts(store, factory):
 
 
 def test_verification_failure_blocks_pruning(store, factory, monkeypatch):
-    first = capture(store, client_factory=factory)
+    first = legacy_capture(store, client_factory=factory)
     build(store, first["capture_id"])
     publish(store)
-    second = capture(store, client_factory=factory)
+    second = legacy_capture(store, client_factory=factory)
     build(store, second["capture_id"])
 
     def unverified(_store):
@@ -180,12 +186,12 @@ def test_verification_failure_blocks_pruning(store, factory, monkeypatch):
 
 
 def test_missing_bodies_of_superseded_captures_do_not_fail_publication(store, factory):
-    first = capture(store, client_factory=factory)
+    first = legacy_capture(store, client_factory=factory)
     build(store, first["capture_id"])
     publish(store)
     for receipt in page_receipts(store, first):
         store.path(receipt["relative"]).parent.joinpath("body.bin").unlink()
-    second = capture(store, client_factory=factory)
+    second = legacy_capture(store, client_factory=factory)
     build(store, second["capture_id"])
     release = publish(store)
     assert release["pruned_captures"] == [first["capture_id"]]
@@ -193,7 +199,7 @@ def test_missing_bodies_of_superseded_captures_do_not_fail_publication(store, fa
 
 
 def test_missing_body_of_current_capture_fails_build_and_publish(store, factory):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     release = publish(store)
     body = store.path(page_receipts(store, state)[0]["relative"]).parent / "body.bin"
@@ -206,7 +212,7 @@ def test_missing_body_of_current_capture_fails_build_and_publish(store, factory)
 
 
 def test_certification_rejects_missing_body_of_current_capture(store, factory):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     assert certified(store, state["capture_id"])["capture_id"] == state["capture_id"]
     body = store.path(page_receipts(store, state)[0]["relative"]).parent / "body.bin"
@@ -217,17 +223,17 @@ def test_certification_rejects_missing_body_of_current_capture(store, factory):
 
 
 def test_rebuild_rebuilds_only_the_current_capture(store, factory):
-    published = capture(store, client_factory=factory)
+    published = legacy_capture(store, client_factory=factory)
     build(store, published["capture_id"])
     release = publish(store)
-    capture(store, client_factory=factory)
+    legacy_capture(store, client_factory=factory)
     assert rebuild(store)["capture_id"] == published["capture_id"]
     assert sorted(path.name for path in store.path("builds").iterdir()) == [published["capture_id"]]
     assert current(store)["source_release_id"] == release["source_release_id"]
 
 
 def test_load_stages_and_discards_landing(store, factory):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     receipt = load(store, state["capture_id"])
     assert receipt["observation_count"] == 7
     assert not store.path("loaded").exists()
@@ -235,7 +241,7 @@ def test_load_stages_and_discards_landing(store, factory):
 
 
 def test_deadline_is_enforced_while_dlt_loads(store, factory):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     calls = 0
     original = store.check_deadline
 
@@ -253,7 +259,7 @@ def test_deadline_is_enforced_while_dlt_loads(store, factory):
 
 
 def test_expired_deadline_blocks_publication_without_pointer_change(store, factory):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     release = publish(store)
     expired = Store(store.root, Limits(max_duration_seconds=1))
@@ -286,7 +292,7 @@ def test_combo_leg_with_missing_authoritative_event_remains_unresolved_in_wareho
             {"event_ticker": "UNKNOWN", "market_ticker": "MARKET", "side": "yes"}
         ],
     }
-    state = capture(
+    state = legacy_capture(
         store,
         client_factory=lambda s, b, **_options: FakeClient(
             s,
@@ -327,7 +333,7 @@ def test_dbt_operation_deadline_is_a_budget_stop(store, monkeypatch, capsys):
 
 
 def test_failed_publication_rename_restores_previous_build(store, factory, monkeypatch):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     release = publish(store)
     before = certified(store, state["capture_id"])
@@ -349,7 +355,7 @@ def test_failed_publication_rename_restores_previous_build(store, factory, monke
 
 
 def test_evidence_walk_checks_deadline_on_every_page(store, factory, monkeypatch):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     expired = Store(store.root, Limits(max_duration_seconds=60))
     file_digest = warehouse.file_digest
     body_reads = []
@@ -368,7 +374,7 @@ def test_evidence_walk_checks_deadline_on_every_page(store, factory, monkeypatch
 
 
 def test_status_and_current_report_the_published_release(store, factory, capsys):
-    state = capture(store, client_factory=factory)
+    state = legacy_capture(store, client_factory=factory)
     build(store, state["capture_id"])
     release = publish(store)
     assert main(["--root", str(store.root), "status"]) == 0
