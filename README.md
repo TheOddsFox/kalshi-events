@@ -270,7 +270,7 @@ Each approved window lasts at most 48 hours, including preflight and reporting. 
 Progress snapshots do not restart a stopped worker or extend any deadline. Ordinary resume remains an explicit operator command for the exact reported capture and retains the current 48-hour session clock and cumulative accounting.
 
 An explicitly authorized offline completion can supply
-`--historical --capture-id ID --offline-duration-seconds SECONDS` (at most 14,400 seconds).
+`--historical --capture-id ID --offline-duration-seconds SECONDS` (at most 86,400 seconds).
 This records one separate historical-only window bound to the capture, root and frozen
 revision. It may outlive the old networking period, but never changes that period, consumed
 request/download totals or extension history. Repeating the command reuses the saved offline
@@ -278,6 +278,26 @@ deadline rather than granting more time. The window covers saved-evidence proces
 verification and activation only; it cannot enable HTTP requests or ordinary resume.
 Storage, memory, free-space and termination safeguards still apply. Without this explicit
 option, the existing approved deadline remains in force.
+
+After a window expires, a separately authorized continuation must explicitly renew it:
+
+```sh
+python scripts/run-production.py --directory ./data/kalshi-production \
+  --historical --capture-id CAPTURE_ID \
+  --offline-duration-seconds 86400 --renew-offline-window
+```
+
+Renewal requires a stopped session with no unreconciled child, the same boot and volume,
+and matching production-owner and operator-root identities. Both clocks must show that
+the prior window expired. The old window remains unchanged in
+`offline_historical_window_history`; the new window binds the current verified source
+revision. New grants use operational-window version 2 with a 24-hour maximum. Existing
+version 1 grants retain their four-hour maximum, including when checked in history;
+requesting a longer duration on an ordinary retry never extends them. This window version
+is separate from root storage, acquisition and release versions.
+Renewal cannot reset acquisition
+accounting, resource ceilings or consumed extensions, and cannot enable API requests.
+It grants processing time, not a promise that a large build will finish within 24 hours.
 
 `production.duckdb` is an atomically activated hard link to the certified warehouse, sharing its physical storage. It appears only after the workflow completes, standalone release verification passes, and fresh certification binds the database checksum to the expected publication. Open it read-only:
 

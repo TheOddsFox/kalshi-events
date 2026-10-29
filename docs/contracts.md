@@ -259,12 +259,34 @@ Acquisition completion, operator publication and production activation are separ
 
 `--historical --capture-id ID` is the saved-evidence-only production path and
 `--activate-current --historical` selects historical activation. A separately authorized
-`--offline-duration-seconds` of at most 14,400 creates an immutable, capture/root/revision-bound
+`--offline-duration-seconds` of at most 86,400 creates an immutable, capture/root/revision-bound
 `offline_historical_window` after preflight. Historical processing uses this window through
 build, export, standalone verification and activation, even if the original networking
 workflow/session period has expired. Existing network deadlines, counters and consumed
 extension history remain unchanged. A repeat invocation reuses the recorded window and
 cannot reset it. Network/full modes reject this option; no acquisition can use its allowance.
+
+An expired window can be replaced only by a separately authorized invocation with
+`--historical --capture-id ID --offline-duration-seconds SECONDS --renew-offline-window`.
+New grants use operational-window version 2, with a duration of at most 86,400 seconds
+(24 hours). Existing version 1 grants remain valid only through their original maximum of
+14,400 seconds (four hours). Both versions use the same closed field set; each current or
+historical window is checked against its own version's limit. Unknown versions and boolean
+version values are rejected. New initial grants and explicit renewals write version 2;
+ordinary reuse preserves the existing record and deadline, even with a larger requested
+duration. These are operational report versions, not new root, acquisition or release formats.
+Renewal rejects unexpired windows, active or
+unreconciled children, already activated sessions, incompatible boots/volumes and mismatched
+production-owner/operator-root identities. The prior grant must be structurally valid and
+expired on both wall and monotonic clocks. Its revision remains provenance and may differ
+from the new verified source revision. The existing grant is appended unchanged to
+`offline_historical_window_history`, and the new grant is persisted atomically before child
+work. History must retain matching capture/root bindings, bounded durations and ordered,
+nonoverlapping windows. This operational history is not catalogue certification evidence.
+Acquisition counters, original session clocks, resource limits and consumed acquisition
+extensions are not reset. The option cannot accompany acquisition, activation-only,
+accounting reconciliation, session extension or reboot recovery. Ordinary invocation
+without renewal retains the existing expiry and revision checks.
 
 The full-run supervisor retains the effective approved session deadline and cumulative invocation consumption across ordinary explicit exact-capture resumes. Each child receives an immutable UTC stage deadline before dispatch; active monitoring checks both that deadline and its monotonic deadline, including the termination reserve and resource-check timeouts. Neither a forward wall-clock change/forced sleep nor a backward wall-clock change grants additional runtime. Pruning retained receipts must not reduce the session's request/download totals. Unverified or unbounded consumption, expired networking allowances, contradictory capture identities or an unreaped worker prevent subsequent acquisition. Progress reporting never restarts a child or extends the deadline. Ordinary explicit resume retains the effective approved clock and cumulative limits. The one-time `--capture-id ID --reconcile-accounting --extend-session` flow can consume a new 48-hour window; it records old/new deadlines before preflight and preserves cumulative request, download and storage ceilings. Production-path activation never represents an atomic exchange snapshot: the verified release retains its real observation interval and `atomic_snapshot: false`.
 

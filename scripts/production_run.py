@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -83,7 +83,8 @@ RUN_LIMITS: dict[str, int | float | str] = {
     "compression": "gzip",
     "rate_policy": "decrease-on-429",
 }
-MAX_OFFLINE_HISTORICAL_SECONDS = 4 * 3600
+MAX_LEGACY_OFFLINE_HISTORICAL_SECONDS = 4 * 3600
+MAX_OFFLINE_HISTORICAL_SECONDS = 24 * 3600
 CAPTURE_ID = re.compile(r"[0-9a-f]{32}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
 REPORT_NAME = "session.json"
@@ -139,6 +140,7 @@ def validate_mode(
     activate_current: bool,
     historical: bool = False,
     offline_duration_seconds: float | None = None,
+    renew_offline_window: bool = False,
 ) -> str:
     duration = _validate_offline_duration_seconds(offline_duration_seconds)
     if sum((full, capture_id is not None, activate_current)) != 1:
@@ -155,6 +157,11 @@ def validate_mode(
         mode = "full" if full else "resume" if capture_id else "activate-current"
     if duration is not None and mode != "historical":
         raise RunnerError("--offline-duration-seconds requires --historical --capture-id")
+    if renew_offline_window and (mode != "historical" or duration is None):
+        raise RunnerError(
+            "--renew-offline-window requires --historical --capture-id and "
+            "--offline-duration-seconds"
+        )
     return mode
 
 
@@ -170,7 +177,7 @@ def _validate_offline_duration_seconds(value: float | None) -> float | None:
     if not math.isfinite(duration) or duration <= 0:
         raise RunnerError("--offline-duration-seconds must be a finite positive number")
     if duration > MAX_OFFLINE_HISTORICAL_SECONDS:
-        raise RunnerError("--offline-duration-seconds cannot exceed four hours")
+        raise RunnerError("--offline-duration-seconds cannot exceed 24 hours")
     return duration
 
 
@@ -329,14 +336,14 @@ def _graceful_stop_handlers():
         _PENDING_STOP_SIGNAL = None
 
 
-def _strict_json(path: Path) -> dict[str, Any] | None:
+def _strict_json(path: Path, limit: int = 16 * MIB) -> dict[str, Any] | None:
     from kalshi_events.common import CatalogueError, regular_bytes
 
     def reject(value: str) -> None:
         raise ValueError(value)
 
     try:
-        raw = regular_bytes(path, 16 * MIB)
+        raw = regular_bytes(path, limit)
         value = json.loads(raw.decode("utf-8"), parse_constant=reject)
     except (CatalogueError, OSError, UnicodeError, ValueError):
         return None
@@ -1314,6 +1321,157 @@ def _run_lock(directory: Path):
         lock.close()
 
 
+@contextlib.contextmanager
+def _operator_writer_lock(operator: Path):
+    """Read operator identity under its canonical lock without creating or truncating it."""
+    path = operator / "writer.lock"
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RunnerError("operator root writer lock is missing or unsafe") from exc
+    locked = False
+    try:
+        import stat
+
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise RunnerError("operator root writer lock is not a private regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RunnerError("another writer holds the canonical operator root lock") from exc
+        locked = True
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise RunnerError("canonical operator writer lock changed during acquisition") from exc
+        if (current.st_dev, current.st_ino) != (details.st_dev, details.st_ino):
+            raise RunnerError("canonical operator writer lock changed during acquisition")
+        yield details.st_dev, details.st_ino
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _validate_offline_renewal_root(
+    directory: Path,
+    operator: Path,
+    expected_root_id: str,
+    capture_id: str,
+    *,
+    writer_lock_identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+
+    def validate(lock_identity: tuple[int, int]) -> tuple[int, int]:
+        import stat
+
+        from kalshi_events.common import json_bytes, safe_path
+
+        operator_details = os.stat(operator, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(operator_details.st_mode)
+            or operator.resolve() != operator.absolute()
+            or operator_details.st_dev != directory.stat().st_dev
+        ):
+            raise RunnerError("offline historical renewal requires the original operator root")
+        marker = _strict_json(operator / "root.json")
+        if marker != {"owner": "oddsfox.kalshi.events.v1", "storage_version": 5}:
+            raise RunnerError(
+                "offline historical renewal requires a current unscoped operator root"
+            )
+        identity = _strict_json(operator / "root-id.json", MIB)
+        root_id = identity.get("root_id") if isinstance(identity, dict) else None
+        if (
+            not isinstance(identity, dict)
+            or set(identity) != {"version", "root_id"}
+            or type(identity.get("version")) is not int
+            or identity.get("version") != 1
+            or not isinstance(root_id, str)
+            or not CAPTURE_ID.fullmatch(root_id)
+            or root_id != expected_root_id
+            or _owner_root_id(directory) != expected_root_id
+        ):
+            raise RunnerError("offline historical renewal root identity does not match the session")
+        capture_root = safe_path(operator / "captures" / capture_id)
+        if not capture_root.is_dir() or not capture_root.is_relative_to(operator):
+            raise RunnerError(
+                "offline historical capture path does not exist under the operator root"
+            )
+        journal_path = safe_path(capture_root / "pages.jsonl")
+        try:
+            with journal_path.open("rb") as stream:
+                genesis_bytes = stream.readline(16 * MIB + 1)
+            if len(genesis_bytes) > 16 * MIB or not genesis_bytes.endswith(b"\n"):
+                raise ValueError("missing or oversized journal genesis")
+
+            def reject_constant(value: str) -> None:
+                raise ValueError(value)
+
+            genesis = json.loads(genesis_bytes, parse_constant=reject_constant)
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RunnerError("offline historical capture genesis is missing or invalid") from exc
+        payload = genesis.get("payload") if isinstance(genesis, dict) else None
+        state = payload.get("state") if isinstance(payload, dict) else None
+        if (
+            not isinstance(genesis, dict)
+            or set(genesis) != {"version", "capture_id", "seq", "prev", "op", "payload", "sha256"}
+            or type(genesis.get("version")) is not int
+            or genesis.get("version") != 2
+            or genesis.get("capture_id") != capture_id
+            or type(genesis.get("seq")) is not int
+            or genesis.get("seq") != 1
+            or genesis.get("prev") != "0" * 64
+            or genesis.get("op") != "start"
+            or not isinstance(payload, dict)
+            or set(payload) != {"state", "seen_cursors", "state_sha256"}
+            or not isinstance(payload.get("seen_cursors"), dict)
+            or not isinstance(payload.get("state_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload["state_sha256"])
+            or not isinstance(state, dict)
+            or type(state.get("version")) is not int
+            or state.get("version") != 1
+            or state.get("capture_id") != capture_id
+            or ("root_id" in state and state.get("root_id") != expected_root_id)
+        ):
+            raise RunnerError(
+                "offline historical capture genesis identity does not match the session"
+            )
+        checksum = genesis["sha256"]
+        if (
+            not isinstance(checksum, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+            or hashlib.sha256(
+                json_bytes({key: value for key, value in genesis.items() if key != "sha256"})
+            ).hexdigest()
+            != checksum
+        ):
+            raise RunnerError("offline historical capture genesis checksum is invalid")
+        try:
+            operator_after = os.stat(operator, follow_symlinks=False)
+            lock_after = os.stat(operator / "writer.lock", follow_symlinks=False)
+        except OSError as exc:
+            raise RunnerError(
+                "operator root or writer lock changed during renewal validation"
+            ) from exc
+        if (
+            (operator_after.st_dev, operator_after.st_ino)
+            != (operator_details.st_dev, operator_details.st_ino)
+            or (lock_after.st_dev, lock_after.st_ino) != lock_identity
+            or not stat.S_ISREG(lock_after.st_mode)
+            or lock_after.st_nlink != 1
+        ):
+            raise RunnerError("operator root or writer lock changed during renewal validation")
+        return operator_details.st_dev, operator_details.st_ino
+
+    if writer_lock_identity is not None:
+        return validate(writer_lock_identity)
+    else:
+        with _operator_writer_lock(operator) as lock_identity:
+            return validate(lock_identity)
+
+
 def _resource_guard(
     directory: Path,
     operator: Path,
@@ -1468,8 +1626,13 @@ def _child_wall_deadline_epoch(
     return min(deadlines)
 
 
-def _validate_offline_historical_window(report: dict[str, Any], capture_id: str) -> dict[str, Any]:
-    window = report.get("offline_historical_window")
+def _offline_historical_window_bounds(
+    report: dict[str, Any],
+    capture_id: str,
+    window: Any,
+    *,
+    require_current_revision: bool,
+) -> tuple[float, float, float, float]:
     if not isinstance(window, dict):
         raise RunnerError("offline historical window is invalid")
     expected = {
@@ -1483,18 +1646,31 @@ def _validate_offline_historical_window(report: dict[str, Any], capture_id: str)
         "deadline_epoch",
         "deadline_monotonic",
     }
-    if set(window) != expected or window.get("version") != 1:
+    if (
+        set(window) != expected
+        or type(window.get("version")) is not int
+        or window["version"] not in {1, 2}
+    ):
         raise RunnerError("offline historical window is invalid")
     root_id = report.get("root_id")
+    revision = window.get("revision")
+    if not isinstance(revision, str) or not REVISION.fullmatch(revision):
+        raise RunnerError("offline historical window revision is invalid")
     if (
         window.get("capture_id") != capture_id
         or window.get("root_id") != root_id
         or not isinstance(root_id, str)
         or not CAPTURE_ID.fullmatch(root_id)
-        or window.get("revision") != _revision()
+        or (require_current_revision and revision != _revision())
         or not isinstance(window.get("started_at"), str)
     ):
         raise RunnerError("offline historical window identity does not match this session")
+    try:
+        started_at = datetime.fromisoformat(window["started_at"].replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RunnerError("offline historical window start time is invalid") from exc
+    if started_at.tzinfo is None or started_at.utcoffset() != timedelta(0):
+        raise RunnerError("offline historical window start time is invalid")
     for field in (
         "started_epoch",
         "started_monotonic",
@@ -1508,30 +1684,104 @@ def _validate_offline_historical_window(report: dict[str, Any], capture_id: str)
             or not math.isfinite(value)
         ):
             raise RunnerError("offline historical window deadline is invalid")
-    epoch_duration = float(window["deadline_epoch"]) - float(window["started_epoch"])
-    monotonic_duration = float(window["deadline_monotonic"]) - float(window["started_monotonic"])
+    started_epoch = float(window["started_epoch"])
+    started_monotonic = float(window["started_monotonic"])
+    deadline_epoch = float(window["deadline_epoch"])
+    deadline_monotonic = float(window["deadline_monotonic"])
+    epoch_duration = deadline_epoch - started_epoch
+    monotonic_duration = deadline_monotonic - started_monotonic
+    max_duration = (
+        MAX_LEGACY_OFFLINE_HISTORICAL_SECONDS
+        if window["version"] == 1
+        else MAX_OFFLINE_HISTORICAL_SECONDS
+    )
     if (
         epoch_duration <= 0
-        or epoch_duration > MAX_OFFLINE_HISTORICAL_SECONDS
+        or deadline_epoch > started_epoch + max_duration
         or monotonic_duration <= 0
-        or monotonic_duration > MAX_OFFLINE_HISTORICAL_SECONDS
+        or deadline_monotonic > started_monotonic + max_duration
         or abs(epoch_duration - monotonic_duration) > 1.0
     ):
         raise RunnerError("offline historical window duration is invalid")
-    remaining = min(
-        float(window["deadline_epoch"]) - time.time(),
-        float(window["deadline_monotonic"]) - time.monotonic(),
+    return started_epoch, deadline_epoch, started_monotonic, deadline_monotonic
+
+
+def _validate_offline_historical_window_history(
+    report: dict[str, Any], capture_id: str, *, allow_old_current_revision: bool = False
+) -> list[dict[str, Any]]:
+    history = report.get("offline_historical_window_history", [])
+    current = report.get("offline_historical_window")
+    if not isinstance(history, list) or not isinstance(current, dict):
+        raise RunnerError("offline historical window history is invalid")
+    previous: tuple[float, float, float, float] | None = None
+    for item in [*history, current]:
+        bounds = _offline_historical_window_bounds(
+            report,
+            capture_id,
+            item,
+            require_current_revision=(item is current and not allow_old_current_revision),
+        )
+        if previous is not None and (bounds[0] < previous[1] or bounds[2] < previous[3]):
+            raise RunnerError("offline historical window history overlaps or is out of order")
+        previous = bounds
+    return history
+
+
+def _validate_offline_historical_window(
+    report: dict[str, Any],
+    capture_id: str,
+    *,
+    allow_expired: bool = False,
+    allow_revision_change: bool = False,
+) -> dict[str, Any]:
+    window = report.get("offline_historical_window")
+    if not isinstance(window, dict):
+        raise RunnerError("offline historical window is invalid")
+    bounds = _offline_historical_window_bounds(
+        report,
+        capture_id,
+        window,
+        require_current_revision=not allow_revision_change,
     )
-    if remaining <= 0:
+    _validate_offline_historical_window_history(
+        report, capture_id, allow_old_current_revision=allow_revision_change
+    )
+    remaining = min(
+        bounds[1] - time.time(),
+        bounds[3] - time.monotonic(),
+    )
+    if remaining <= 0 and not allow_expired:
         raise RunnerError("offline historical window expired")
     return window
 
 
 def _configure_offline_historical_window(
-    report: dict[str, Any], capture_id: str, duration_seconds: float | None
+    report: dict[str, Any],
+    capture_id: str,
+    duration_seconds: float | None,
+    *,
+    renew: bool = False,
 ) -> dict[str, Any] | None:
     duration = _validate_offline_duration_seconds(duration_seconds)
     existing = report.get("offline_historical_window")
+    if renew:
+        if duration is None or not isinstance(existing, dict):
+            raise RunnerError("offline historical window renewal requires an existing window")
+        _validate_offline_historical_window(
+            report,
+            capture_id,
+            allow_expired=True,
+            allow_revision_change=True,
+        )
+        if time.time() < float(existing["deadline_epoch"]) or time.monotonic() < float(
+            existing["deadline_monotonic"]
+        ):
+            raise RunnerError("offline historical window renewal requires both clocks to expire")
+        history = list(report.get("offline_historical_window_history", []))
+        history.append(dict(existing))
+        report["offline_historical_window_history"] = history
+        report["offline_historical_window"] = None
+        existing = None
     if existing is not None:
         return _validate_offline_historical_window(report, capture_id)
     if duration is None:
@@ -1545,7 +1795,7 @@ def _configure_offline_historical_window(
     started_epoch = time.time()
     started_monotonic = time.monotonic()
     report["offline_historical_window"] = {
-        "version": 1,
+        "version": 2,
         "capture_id": capture_id,
         "root_id": root_id,
         "revision": revision,
@@ -1555,7 +1805,7 @@ def _configure_offline_historical_window(
         "deadline_epoch": started_epoch + duration,
         "deadline_monotonic": started_monotonic + duration,
     }
-    return report["offline_historical_window"]
+    return _validate_offline_historical_window(report, capture_id)
 
 
 def _child_time_remaining(
@@ -1649,6 +1899,7 @@ def run_production(
     activate_only: bool = False,
     historical: bool = False,
     offline_duration_seconds: float | None = None,
+    renew_offline_window: bool = False,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
     recover_reboot: bool = False,
@@ -1662,6 +1913,7 @@ def run_production(
         activate_only,
         historical,
         offline_duration_seconds=offline_duration_seconds,
+        renew_offline_window=renew_offline_window,
     )
     _validate_runtime_versions(_package_versions())
     if reconcile_accounting and mode != "resume":
@@ -1696,6 +1948,7 @@ def run_production(
                 offline_duration_seconds=(
                     offline_duration_seconds if mode == "historical" else None
                 ),
+                renew_offline_window=renew_offline_window,
                 reconcile_accounting=reconcile_accounting,
                 extend_session=extend_session,
                 recover_reboot=recover_reboot,
@@ -1777,13 +2030,45 @@ def run_production(
             report["phase"] = "stopped"
             _atomic_report(report_path, report)
             return result, 3
-        offline_window = (
-            _configure_offline_historical_window(report, str(capture_id), offline_duration_seconds)
-            if mode == "historical"
-            else None
-        )
-        if offline_window is not None:
-            _atomic_report(report_path, report)
+        offline_window = None
+        if mode == "historical":
+            if renew_offline_window:
+                with _operator_writer_lock(operator) as writer_lock_identity:
+                    operator_identity = _validate_offline_renewal_root(
+                        directory,
+                        operator,
+                        str(report["root_id"]),
+                        str(capture_id),
+                        writer_lock_identity=writer_lock_identity,
+                    )
+                    offline_window = _configure_offline_historical_window(
+                        report,
+                        str(capture_id),
+                        offline_duration_seconds,
+                        renew=True,
+                    )
+                    try:
+                        operator_after = os.stat(operator, follow_symlinks=False)
+                        lock_after = os.stat(operator / "writer.lock", follow_symlinks=False)
+                    except OSError as exc:
+                        raise RunnerError(
+                            "operator root or writer lock changed before the renewal grant"
+                        ) from exc
+                    if (
+                        (operator_after.st_dev, operator_after.st_ino) != operator_identity
+                        or (lock_after.st_dev, lock_after.st_ino) != writer_lock_identity
+                        or lock_after.st_nlink != 1
+                    ):
+                        raise RunnerError(
+                            "operator root or writer lock changed before the renewal grant"
+                        )
+                    _atomic_report(report_path, report)
+            else:
+                offline_window = _configure_offline_historical_window(
+                    report, str(capture_id), offline_duration_seconds
+                )
+                if offline_window is not None:
+                    _atomic_report(report_path, report)
         awake = subprocess.Popen(
             ["caffeinate", "-is", "-w", str(os.getpid())],
             stdin=subprocess.DEVNULL,
@@ -2437,7 +2722,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--offline-duration-seconds",
         type=float,
-        help="start or reuse a bounded offline historical window (maximum four hours)",
+        help="start or reuse a bounded offline historical window (maximum 24 hours)",
+    )
+    parser.add_argument(
+        "--renew-offline-window",
+        action="store_true",
+        help="explicitly grant a new offline window after the saved one expired",
     )
     parser.add_argument(
         "--reconcile-accounting",
@@ -2466,6 +2756,7 @@ def main(argv: list[str] | None = None) -> int:
             args.activate_current,
             args.historical,
             offline_duration_seconds=args.offline_duration_seconds,
+            renew_offline_window=args.renew_offline_window,
         )
     except RunnerError as exc:
         parser.error(str(exc))
@@ -2495,6 +2786,7 @@ def main(argv: list[str] | None = None) -> int:
                 activate_only=args.activate_current,
                 historical=args.historical,
                 offline_duration_seconds=args.offline_duration_seconds,
+                renew_offline_window=args.renew_offline_window,
                 reconcile_accounting=args.reconcile_accounting,
                 extend_session=args.extend_session,
                 recover_reboot=args.recover_reboot,
@@ -2568,6 +2860,7 @@ def _load_resume(
     *,
     historical: bool = False,
     offline_duration_seconds: float | None = None,
+    renew_offline_window: bool = False,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
     recover_reboot: bool = False,
@@ -2576,6 +2869,10 @@ def _load_resume(
     duration = _validate_offline_duration_seconds(offline_duration_seconds)
     if duration is not None and not historical:
         raise RunnerError("--offline-duration-seconds requires offline historical completion")
+    if renew_offline_window and (not historical or duration is None):
+        raise RunnerError(
+            "--renew-offline-window requires offline historical completion and an explicit duration"
+        )
     if historical and (reconcile_accounting or extend_session or recover_reboot):
         raise RunnerError("offline historical completion cannot reconcile or extend acquisition")
     if extend_session and not reconcile_accounting:
@@ -2702,7 +2999,52 @@ def _load_resume(
         raise RunnerError("production filesystem changed since the original session")
     existing_offline_window = "offline_historical_window" in report
     if historical and existing_offline_window:
-        _validate_offline_historical_window(report, capture_id)
+        _validate_offline_historical_window(
+            report,
+            capture_id,
+            allow_expired=renew_offline_window,
+            allow_revision_change=renew_offline_window,
+        )
+    elif historical and "offline_historical_window_history" in report:
+        history = report.get("offline_historical_window_history")
+        if not isinstance(history, list) or history:
+            raise RunnerError("offline historical window history has no current window")
+    if renew_offline_window:
+        window = report.get("offline_historical_window")
+        if not isinstance(window, dict):
+            raise RunnerError("offline historical window renewal requires an existing window")
+        if report.get("phase") != "stopped":
+            raise RunnerError("offline historical window renewal requires a stopped session")
+        if report.get("production_state") == "verified":
+            raise RunnerError("offline historical window renewal is prohibited after activation")
+        session_id = report.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not CAPTURE_ID.fullmatch(session_id)
+            or session_id != report_path.parent.name
+            or report_path.name != REPORT_NAME
+            or report_path.parent.parent != run_root
+        ):
+            raise RunnerError("offline historical renewal report is outside its capture path")
+        if time.time() < float(window["deadline_epoch"]) or time.monotonic() < float(
+            window["deadline_monotonic"]
+        ):
+            raise RunnerError("offline historical window renewal requires both clocks to expire")
+        if (
+            not isinstance(saved_volume_uuid, str)
+            or not re.fullmatch(
+                r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}",
+                saved_volume_uuid,
+            )
+            or _volume_uuid(directory) != saved_volume_uuid.upper()
+        ):
+            raise RunnerError("production volume UUID differs from the saved session")
+        _validate_offline_renewal_root(
+            directory,
+            directory / "operator",
+            str(report["root_id"]),
+            capture_id,
+        )
     offline_historical_allowed = historical and (duration is not None or existing_offline_window)
     if (
         not offline_historical_allowed
