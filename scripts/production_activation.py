@@ -27,20 +27,27 @@ def activate_current(
     """Certify the selected warehouse, then atomically expose its hard link."""
     from kalshi_events import capture, incremental, publish, warehouse
     from kalshi_events.common import (
+        CatalogueError,
         Limits,
         Store,
         digest,
         file_digest,
         fsync_directory,
         regular_bytes,
-        safe_path,
     )
+    from kalshi_events.paths import PathPolicyError, persistent_path, project_root
 
     link_fn = os.link if link_fn is None else link_fn
     replace_fn = os.replace if replace_fn is None else replace_fn
     sync_fn = fsync_directory if sync_fn is None else sync_fn
-    directory = safe_path(Path(production_directory))
-    root = safe_path(Path(operator_root))
+    try:
+        checkout = project_root(code_root=Path(__file__).resolve().parents[1])
+        directory = persistent_path(
+            production_directory, checkout=checkout, label="production directory"
+        )
+        root = persistent_path(operator_root, checkout=checkout, label="production operator root")
+    except PathPolicyError as exc:
+        raise CatalogueError(str(exc)) from exc
     if not directory.is_dir() or root != directory / "operator":
         raise RuntimeError("activation paths do not match the production layout")
     if isinstance(catalogue_version, bool) or catalogue_version not in {2, 3}:

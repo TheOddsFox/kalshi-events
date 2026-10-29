@@ -45,12 +45,17 @@ def _load_benchmark_supervisor():
     return module
 
 
-def _test_environment(source: Path, repo: Path, fixture_root: Path) -> dict[str, str]:
+def _test_environment(
+    source: Path, repo: Path, fixture_root: Path, checkout: Path
+) -> dict[str, str]:
+    sys.path.insert(0, str(checkout / "src"))
+    from kalshi_events.paths import child_environment
+
     environment = os.environ.copy()
     environment["KALSHI_DUCKDB_UPGRADE_ROOT"] = str(fixture_root / "reference-root")
     environment["KALSHI_DUCKDB_UPGRADE_APPLICATION_SOURCE"] = str(source)
     environment["PYTHONPATH"] = os.pathsep.join((str(source / "src"), str(repo / "tests")))
-    return environment
+    return child_environment(environment, checkout)
 
 
 def _run(
@@ -62,11 +67,22 @@ def _run(
     run_supervised,
     timeout: float = CHILD_TIMEOUT_SECONDS,
 ) -> int:
+    project = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(project / "src"))
+    from kalshi_events.common import atomic_bytes
+    from kalshi_events.paths import persistent_path, project_root
+
+    checkout = project_root(code_root=project)
+    if checkout is None:
+        raise ValueError("checker source must be run from a validated checkout")
+    log_dir = persistent_path(log_dir, checkout=checkout, label="DuckDB compatibility logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     stem = label.replace(" ", "-")
     stdout_path = log_dir / f"{stem}.stdout.log"
     stderr_path = log_dir / f"{stem}.stderr.log"
-    command = [str(interpreter), "-m", "pytest", "-q", "-x", *tests]
+    stdout_path = persistent_path(stdout_path, checkout=checkout, label="DuckDB stdout log")
+    stderr_path = persistent_path(stderr_path, checkout=checkout, label="DuckDB stderr log")
+    command = [str(interpreter), "-P", "-m", "pytest", "-q", "-x", *tests]
     try:
         result = run_supervised(
             command,
@@ -79,13 +95,13 @@ def _run(
     except subprocess.TimeoutExpired as exc:
         stdout = _text(exc.stdout)
         stderr = _text(exc.stderr) + f"\nChild timed out after {timeout:g} seconds.\n"
-        stdout_path.write_text(stdout)
-        stderr_path.write_text(stderr)
+        atomic_bytes(stdout_path, stdout.encode("utf-8"))
+        atomic_bytes(stderr_path, stderr.encode("utf-8"))
         print(f"{label} timed out after {timeout:g}s; logs: {log_dir}", flush=True)
         return 124
 
-    stdout_path.write_text(result.stdout)
-    stderr_path.write_text(result.stderr)
+    atomic_bytes(stdout_path, result.stdout.encode("utf-8"))
+    atomic_bytes(stderr_path, result.stderr.encode("utf-8"))
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:
@@ -100,6 +116,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run focused DuckDB compatibility tests serially in two Python environments."
     )
+    sys.path.insert(0, str(project / "src"))
+    from kalshi_events.paths import data_directory, persistent_path, project_root
+
+    checkout = project_root(code_root=project)
+    if checkout is None:
+        parser.error("checker source must be run from a validated checkout")
     parser.add_argument("--reference-python", required=True, type=Path)
     parser.add_argument("--candidate-python", required=True, type=Path)
     parser.add_argument("--reference-source", required=True, type=Path)
@@ -124,17 +146,23 @@ def main() -> int:
 
     log_dir = arguments.log_dir
     if log_dir is None:
-        log_dir = Path(tempfile.mkdtemp(prefix="duckdb-upgrade-compat-logs-"))
+        log_parent = data_directory(checkout, "verification")
+        log_dir = Path(tempfile.mkdtemp(prefix="duckdb-upgrade-compat-logs-", dir=log_parent))
     else:
-        log_dir = _absolute_path(log_dir, invocation_dir)
+        log_dir = persistent_path(
+            _absolute_path(log_dir, invocation_dir),
+            checkout=checkout,
+            label="DuckDB compatibility logs",
+        )
     os.chdir(repo)
     print(f"Logs: {log_dir}", flush=True)
 
     benchmark = _load_benchmark_supervisor()
-    fixture_root = Path(tempfile.mkdtemp(prefix="duckdb-upgrade-compat-"))
+    fixture_parent = data_directory(checkout, "verification")
+    fixture_root = Path(tempfile.mkdtemp(prefix="duckdb-upgrade-compat-", dir=fixture_parent))
     print(f"Fixture root: {fixture_root}", flush=True)
-    reference_environment = _test_environment(reference_source, repo, fixture_root)
-    candidate_environment = _test_environment(repo, repo, fixture_root)
+    reference_environment = _test_environment(reference_source, repo, fixture_root, checkout)
+    candidate_environment = _test_environment(repo, repo, fixture_root, checkout)
     try:
         phases = (
             (

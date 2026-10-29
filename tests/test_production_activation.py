@@ -86,6 +86,17 @@ def activate(production, candidate, **kwargs):
     )
 
 
+def test_activation_rejects_repository_code_paths_before_opening_store(production):
+    source = SCRIPT.parents[1] / "src" / "kalshi_events"
+    with pytest.raises((CatalogueError, ValueError, RuntimeError), match="strict descendant"):
+        production.activate_current(
+            source / "operator",
+            source,
+            expected_release_id="a" * 64,
+        )
+    assert not (source / "production.duckdb").exists()
+
+
 def update_manifest(candidate, change):
     _directory, root, _warehouse, manifest = candidate
     store = Store(root)

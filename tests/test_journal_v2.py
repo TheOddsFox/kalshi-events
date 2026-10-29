@@ -468,12 +468,16 @@ def test_crash_after_each_durable_boundary_recovers_without_duplicate_requests(
     assert_chain_and_anchor(store, identity)
 
 
-def test_raw_body_without_usable_receipt_is_retried_after_process_death(store, monkeypatch):
+@pytest.mark.parametrize("fault_endpoint", ["/events", "/historical/cutoff"])
+def test_raw_body_without_usable_receipt_is_retried_after_process_death(
+    store, monkeypatch, fault_endpoint
+):
     from kalshi_events.common import EvidenceSpool
 
     issued = []
     guard = threading.Lock()
     crashed = False
+    failed_request_id = None
 
     class RecordingClient(PublicClient):
         def get(self, endpoint, params=None, context=None):
@@ -501,11 +505,18 @@ def test_raw_body_without_usable_receipt_is_retried_after_process_death(store, m
     original = EvidenceSpool.commit
 
     def raw_committed(spool):
-        nonlocal crashed
+        nonlocal crashed, failed_request_id
         original(spool)
+        manifest = json.loads((spool.destination.parent / "manifest.json").read_text())
+        if manifest.get("endpoint") != fault_endpoint or (
+            fault_endpoint == "/historical/cutoff" and manifest.get("cutoff_reason") != "start"
+        ):
+            return
         with guard:
             crash = not crashed
-            crashed = True
+            if crash:
+                crashed = True
+                failed_request_id = manifest["request_id"]
         if crash:
             raise PowerLoss("raw body committed before usable receipt")
 
@@ -515,10 +526,17 @@ def test_raw_body_without_usable_receipt_is_retried_after_process_death(store, m
             acquisition.capture(store, client_factory=factory)
     identity = capture_id(store)
     resumed = acquisition.capture(store, resume=identity, client_factory=factory)
+    assert crashed and failed_request_id
     assert resumed["complete"]
-    assert len(issued) == 10
-    assert sorted(Counter(issued).values()) == [1, 1, 1, 1, 1, 1, 1, 1, 2]
-    assert len(acquisition.page_receipts(store, resumed)) == 9
+    issued_counts = Counter(issued)
+    receipts = acquisition.page_receipts(store, resumed)
+    receipt_request_ids = [row["request_id"] for row in receipts]
+    assert issued_counts[failed_request_id] == 2
+    assert all(
+        count == 1 for request_id, count in issued_counts.items() if request_id != failed_request_id
+    )
+    assert set(issued_counts) == set(receipt_request_ids)
+    assert Counter(receipt_request_ids) == Counter({request_id: 1 for request_id in issued_counts})
     assert_chain_and_anchor(store, identity)
 
 

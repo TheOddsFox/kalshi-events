@@ -13,7 +13,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from kalshi_events.common import CatalogueError, safe_path, ticker
+from kalshi_events.common import CatalogueError, atomic_bytes, safe_path, ticker
+from kalshi_events.paths import child_environment, operator_root, persistent_path, project_root
 
 MIB = 1024**2
 GIB = 1024**3
@@ -96,11 +97,18 @@ def validate_throughput_selection(
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
+    body = (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+    atomic_bytes(path, body)
+
+
+def _require_fresh_or_empty_root(root: Path) -> Path:
+    if root.exists():
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("probe operator root must be a directory")
+        with os.scandir(root) as entries:
+            if next(entries, None) is not None:
+                raise ValueError("probe operator root must be new or empty")
+    return root
 
 
 def _load_report(path: Path) -> dict[str, Any] | None:
@@ -789,6 +797,9 @@ def _run_pilot_child(
     _save_initial(destination, report)
     command = _pilot_command(config_path, result_path)
     environment = os.environ.copy()
+    environment = child_environment(
+        environment, project_root(code_root=Path(__file__).resolve().parents[1])
+    )
     source = str(Path(__file__).resolve().parents[1] / "src")
     environment["PYTHONPATH"] = source + (
         os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
@@ -1070,11 +1081,12 @@ def run_throughput(
     source_root = Path(__file__).resolve().parents[1]
     destination = output.expanduser().absolute()
     try:
-        destination = safe_path(destination)
+        checkout = project_root(code_root=source_root)
+        destination = persistent_path(
+            destination, checkout=checkout, label="throughput output directory"
+        )
     except Exception as exc:
-        raise ValueError("output path cannot contain symlinks") from exc
-    if destination == source_root or source_root in destination.parents:
-        raise ValueError("output directory must be outside the repository")
+        raise ValueError(str(exc)) from exc
     if destination.exists() or not destination.parent.is_dir():
         raise ValueError("output must be a new directory under an existing parent")
     destination.mkdir()
@@ -1260,6 +1272,7 @@ def run_throughput(
             remaining_temporary,
         )
         environment = os.environ.copy()
+        environment = child_environment(environment, project_root(code_root=source_root))
         source = str(source_root / "src")
         environment["PYTHONPATH"] = source + (
             os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
@@ -1511,13 +1524,25 @@ def worker_main(arguments: list[str]) -> int:
     prefix, cli_arguments = arguments[:separator], arguments[separator + 1 :]
     if len(prefix) != 2 or prefix[0] != "--result":
         return 2
-    result_path = Path(prefix[1])
+    try:
+        from kalshi_events import cli
+
+        checkout = project_root(code_root=Path(__file__).resolve().parents[1])
+        result_path = persistent_path(
+            Path(prefix[1]), checkout=checkout, label="probe worker result"
+        )
+        parsed_args = cli.parser().parse_args(cli_arguments)
+        root = operator_root(parsed_args.root, checkout=checkout)
+        _require_fresh_or_empty_root(root)
+        if parsed_args.metrics_file is None:
+            raise ValueError("probe worker requires a metrics output path")
+        persistent_path(parsed_args.metrics_file, checkout=checkout, label="probe metrics report")
+    except Exception:
+        return 2
     started = time.monotonic()
     output = io.StringIO()
     error: str | None = None
     try:
-        from kalshi_events import cli
-
         with contextlib.redirect_stdout(output):
             returncode = cli.main(cli_arguments)
         try:
@@ -1529,8 +1554,7 @@ def worker_main(arguments: list[str]) -> int:
                 capture_result = None
         except ValueError:
             capture_result = None
-        args = cli.parser().parse_args(cli_arguments)
-        root = safe_path(args.root)
+        args = parsed_args
         from kalshi_events import capture
         from kalshi_events.common import Limits, Store
         from kalshi_events.transport import accounting
@@ -1542,7 +1566,9 @@ def worker_main(arguments: list[str]) -> int:
         usage = store.usage()
         receipts = _inspect_capture_receipts(store, capture, capture_result)
         accounting_seconds = time.monotonic() - accounting_started
-        metrics_path = safe_path(args.metrics_file)
+        metrics_path = persistent_path(
+            args.metrics_file, checkout=checkout, label="probe metrics report"
+        )
         metrics_value = json.loads(metrics_path.read_text(encoding="utf-8"))
         metrics_summary = {
             key: metrics_value.get(key)
@@ -1628,7 +1654,13 @@ def partition_worker_main(arguments: list[str]) -> int:
     """Run one raw-only diagnostic traversal, never a production capture command."""
     if len(arguments) != 4 or arguments[0] != "--result" or arguments[2] != "--config":
         return 2
-    result_path = Path(arguments[1])
+    try:
+        checkout = project_root(code_root=Path(__file__).resolve().parents[1])
+        result_path = persistent_path(
+            Path(arguments[1]), checkout=checkout, label="partition worker result"
+        )
+    except Exception:
+        return 2
     config_path = Path(arguments[3])
     started = time.monotonic()
     result: dict[str, Any] = {
@@ -1676,6 +1708,8 @@ def partition_worker_main(arguments: list[str]) -> int:
             "workers",
         }:
             raise ValueError("invalid pilot configuration")
+        root = operator_root(Path(config["root"]), checkout=checkout)
+        _require_fresh_or_empty_root(root)
         from kalshi_events import capture
         from kalshi_events.common import Budget, Limits, Store
         from kalshi_events.metrics import collect
@@ -1685,7 +1719,7 @@ def partition_worker_main(arguments: list[str]) -> int:
         if not isinstance(config["limits"], dict):
             raise ValueError("invalid pilot limits")
         limits = Limits(**config["limits"])
-        store = Store(Path(config["root"]), limits)
+        store = Store(root, limits)
         operation = config["operation"]
         worker_count = config["workers"]
         if operation not in {"preflight", "partitions"}:

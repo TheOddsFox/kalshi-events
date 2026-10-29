@@ -358,14 +358,14 @@ def _atomic_report(path: Path, report: dict[str, Any]) -> None:
 
 
 def _external_path(path: Path) -> Path:
-    from kalshi_events.common import CatalogueError, safe_path
+    from kalshi_events.common import CatalogueError
+    from kalshi_events.paths import PathPolicyError, persistent_path, project_root
 
     try:
-        result = safe_path(path.expanduser().absolute())
-    except CatalogueError as exc:
+        checkout = project_root(code_root=SOURCE_ROOT)
+        result = persistent_path(path, checkout=checkout, label="production directory")
+    except (CatalogueError, PathPolicyError) as exc:
         raise RunnerError(str(exc)) from exc
-    if result == SOURCE_ROOT or SOURCE_ROOT in result.parents:
-        raise RunnerError("production directory must be outside the repository")
     return result
 
 
@@ -840,9 +840,11 @@ def _invoke(
     workflow_deadline: bool = False,
 ) -> tuple[int | None, str | None, bool]:
     from kalshi_events.common import safe_path
+    from kalshi_events.paths import child_environment, project_root
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SOURCE_ROOT / "src")
+    env = child_environment(env, project_root(code_root=SOURCE_ROOT))
     directory = _external_path(directory)
     original_device = directory.stat().st_dev
     recorded_device = report.get("system", {}).get("filesystem_device")
@@ -2393,6 +2395,10 @@ def run_production(
 
 def _activation_worker(operator: Path, directory: Path, expected: str) -> int:
     try:
+        directory = _external_path(directory)
+        operator = _external_path(operator)
+        if operator != directory / "operator":
+            raise RunnerError("activation operator root must belong to its production directory")
         catalogue_version = 3 if expected.startswith("historical:") else 2
         release_id = expected.removeprefix("historical:")
         if not re.fullmatch(r"[0-9a-f]{64}", release_id):
@@ -2945,6 +2951,7 @@ def _read_cli_result(path: Path) -> dict[str, Any] | None:
 
 def _accounting_worker_main(root: Path, capture_id: str | None = None) -> int:
     try:
+        root = _existing_operator_root(root)
         value = _read_accounting_worker(root, capture_id)
         print(json.dumps(value, sort_keys=True, allow_nan=False))
         return 0
@@ -2955,11 +2962,28 @@ def _accounting_worker_main(root: Path, capture_id: str | None = None) -> int:
 
 def _root_summary_worker_main(root: Path) -> int:
     try:
+        root = _existing_operator_root(root)
         print(json.dumps(_read_root_summary(root), sort_keys=True, allow_nan=False))
         return 0
     except Exception as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
+
+
+def _existing_operator_root(root: Path) -> Path:
+    from kalshi_events.common import CatalogueError
+    from kalshi_events.paths import PathPolicyError
+
+    try:
+        root = _external_path(root)
+        details = (root / "root.json").lstat()
+    except (CatalogueError, PathPolicyError, OSError) as exc:
+        raise RunnerError("read worker requires an existing operator root") from exc
+    import stat
+
+    if root.is_symlink() or not root.is_dir() or not stat.S_ISREG(details.st_mode):
+        raise RunnerError("read worker requires an existing operator root")
+    return root
 
 
 def _refresh_worker_main(
@@ -2974,6 +2998,21 @@ def _refresh_worker_main(
     from kalshi_events import metrics, refresh
     from kalshi_events.common import Limits, Store
 
+    try:
+        operator = _external_path(operator)
+        if operator != operator.parent / "operator":
+            raise RunnerError(
+                "refresh worker operator root must belong to its production directory"
+            )
+        report_path = _external_path(report_path)
+        metrics_path = _external_path(metrics_path)
+        notification_path = _external_path(notification_path)
+    except Exception as exc:
+        result = refresh.result_template()
+        result["complete"] = False
+        result["error"] = str(exc)
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 1
     report = _strict_json(report_path)
     result = refresh.result_template()
     if report is None:

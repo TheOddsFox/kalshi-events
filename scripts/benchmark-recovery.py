@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in offline recovery comparison; all generated roots and reports stay external."""
+"""Opt-in offline recovery comparison; generated roots and reports stay in checkout data."""
 
 from __future__ import annotations
 
@@ -73,11 +73,35 @@ def _external(path: Path, protected: list[Path]) -> Path:
         if cursor.is_symlink():
             raise ValueError(f"benchmark path cannot pass through a symlink: {cursor}")
     resolved = candidate.resolve()
-    if any(resolved == base or resolved.is_relative_to(base) for base in protected):
-        raise ValueError(f"benchmark data must be outside source checkouts: {resolved}")
-    if any((ancestor / ".git").exists() for ancestor in (resolved, *resolved.parents)):
+    checkout = _pipeline_tools()._checkout_root()
+    data = checkout / "data" if checkout is not None else None
+    if any(
+        resolved == base
+        or (
+            resolved.is_relative_to(base)
+            and not (base == checkout and data is not None and resolved.is_relative_to(data))
+        )
+        for base in protected
+    ):
+        raise ValueError(f"benchmark input overlaps source checkouts: {resolved}")
+    if any(
+        (ancestor / ".git").exists() and ancestor != checkout
+        for ancestor in (resolved, *resolved.parents)
+    ):
         raise ValueError(f"benchmark data cannot be inside a Git checkout: {resolved}")
     return resolved
+
+
+def _output(path: Path, protected: list[Path], *, label: str) -> Path:
+    output = _pipeline_tools()._persistent_output(path, label)
+    checkout = _pipeline_tools()._checkout_root()
+    for source in protected:
+        source = source.resolve()
+        if source != checkout and (
+            output == source or output.is_relative_to(source) or source.is_relative_to(output)
+        ):
+            raise ValueError(f"{label} overlaps a source input: {source}")
+    return output
 
 
 def _write_new(path: Path, value: dict[str, Any]) -> None:
@@ -295,9 +319,16 @@ def _reject_fixture_symlinks(root: Path) -> tuple[int, int]:
 
 
 def _worker_imports(source_root: Path, fixture_root: Path) -> None:
-    paths = [str(source_root / "src"), str(fixture_root / "tests")]
+    source = source_root.resolve()
+    paths = [str(source / "src"), str(fixture_root.resolve() / "tests")]
     sys.path[:] = [value for value in sys.path if value not in paths]
     sys.path[:0] = paths
+    for name in tuple(sys.modules):
+        if name == "kalshi_events" or name.startswith("kalshi_events."):
+            del sys.modules[name]
+    package = __import__("kalshi_events")
+    if not Path(package.__file__).resolve().is_relative_to((source / "src").resolve()):
+        raise RuntimeError(f"selected source import escaped {source / 'src'}")
 
 
 def _child_env(source_root: Path, fixture_root: Path) -> dict[str, str]:
@@ -306,7 +337,8 @@ def _child_env(source_root: Path, fixture_root: Path) -> dict[str, str]:
         (str(source_root / "src"), str(fixture_root / "tests"))
     )
     environment["PYTHONNOUSERSITE"] = "1"
-    return environment
+    pipeline = _pipeline_tools()
+    return pipeline._path_policy().child_environment(environment, pipeline._checkout_root())
 
 
 def _seed_worker(args: argparse.Namespace) -> int:
@@ -622,8 +654,9 @@ def _worker(args: argparse.Namespace) -> int | None:
     protected = [args.source_root.resolve(), Path(__file__).resolve().parents[1]]
     if not args.worker_copy:
         protected.append(args.fixture_root.resolve())
-    _external(args.root, protected)
-    _external(args.result, protected)
+    outputs_protected = protected[:]
+    args.root = _output(args.root, outputs_protected, label="recovery worker root")
+    args.result = _output(args.result, outputs_protected, label="recovery worker result")
     if sum(modes) != 1:
         raise ValueError("select exactly one worker mode")
     if args.worker_seed:
@@ -778,22 +811,38 @@ def _benchmark(args: argparse.Namespace) -> int:
     fixture_template = None
     if args.fixture_template:
         fixture_template = _external(args.fixture_template, protected)
-        if any(
-            fixture_template == source
-            or fixture_template.is_relative_to(source)
-            or source.is_relative_to(fixture_template)
-            for source in protected
-        ):
-            raise ValueError("fixture template must be disjoint from source checkouts")
+        checkout = _pipeline_tools()._checkout_root()
+        local_data = checkout / "data" if checkout is not None else None
+        for source in protected:
+            if (
+                source == checkout
+                and local_data is not None
+                and fixture_template.is_relative_to(local_data)
+            ):
+                continue
+            if (
+                fixture_template == source
+                or fixture_template.is_relative_to(source)
+                or source.is_relative_to(fixture_template)
+            ):
+                raise ValueError("fixture template must be disjoint from source checkouts")
         protected.append(fixture_template)
     if args.report_dir is None:
         suffix = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        report_dir = Path(tempfile.gettempdir()).resolve() / (
-            f"kalshi-recovery-benchmark-{suffix}-{os.getpid()}"
-        )
+        pipeline = _pipeline_tools()
+        checkout = pipeline._checkout_root()
+        if checkout is not None:
+            parent = pipeline._path_policy().data_directory(checkout, "benchmarks")
+        else:
+            parent = Path(tempfile.gettempdir()).resolve()
+        report_dir = parent / f"kalshi-recovery-benchmark-{suffix}-{os.getpid()}"
     else:
         report_dir = args.report_dir
-    report_dir = _external(report_dir, protected)
+    report_dir = _output(
+        report_dir,
+        [candidate_root, reference_root, *([fixture_template] if fixture_template else [])],
+        label="recovery benchmark report directory",
+    )
     if fixture_template and fixture_template.is_relative_to(report_dir):
         raise ValueError("report directory and fixture template must be disjoint")
     if report_dir.exists():

@@ -18,6 +18,13 @@ import pytest
 SCRIPT = Path(__file__).parents[1] / "scripts" / "production_run.py"
 
 
+def _checkout(path: Path) -> Path:
+    path.mkdir(parents=True)
+    (path / ".git").mkdir()
+    (path / "pyproject.toml").write_text('[project]\nname = "oddsfox-kalshi-events"\n')
+    return path
+
+
 @pytest.fixture(scope="module")
 def production():
     spec = importlib.util.spec_from_file_location("production_run", SCRIPT)
@@ -1003,6 +1010,121 @@ def test_symlinked_production_directory_is_rejected(production, tmp_path, mode):
 def test_production_directory_cannot_be_inside_checkout(production):
     with pytest.raises((ValueError, RuntimeError)):
         production.prepare_directory(SCRIPT.parent.parent / "production-not-allowed", "full")
+
+
+def test_production_directory_inside_checkout_data_is_allowed(production, tmp_path, monkeypatch):
+    checkout = _checkout(tmp_path / "checkout")
+    data = checkout / "data"
+    data.mkdir()
+    monkeypatch.setattr(production, "SOURCE_ROOT", checkout)
+    monkeypatch.setenv("KALSHI_EVENTS_PROJECT_ROOT", str(checkout))
+
+    directory = data / "nested" / "production"
+    assert production.prepare_directory(directory, "full") == directory
+    assert (directory / "runs").is_dir()
+    nested_data = data / "safe-local"
+    assert production._external_path(nested_data) == nested_data
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [Path(), Path("data"), Path("src/production"), Path("tests/production")],
+)
+def test_production_directory_rejects_checkout_root_and_non_data_paths(
+    production, tmp_path, monkeypatch, relative_path
+):
+    checkout = tmp_path / "checkout"
+    _checkout(checkout)
+    (checkout / "data").mkdir()
+    monkeypatch.setattr(production, "SOURCE_ROOT", checkout)
+    monkeypatch.setenv("KALSHI_EVENTS_PROJECT_ROOT", str(checkout))
+
+    with pytest.raises((ValueError, RuntimeError)):
+        production._external_path(checkout / relative_path)
+
+
+def test_production_directory_rejects_paths_that_escape_checkout_data(
+    production, tmp_path, monkeypatch
+):
+    checkout = tmp_path / "checkout"
+    _checkout(checkout)
+    (checkout / "data").mkdir()
+    monkeypatch.setattr(production, "SOURCE_ROOT", checkout)
+    monkeypatch.setenv("KALSHI_EVENTS_PROJECT_ROOT", str(checkout))
+
+    with pytest.raises((ValueError, RuntimeError)):
+        production._external_path(checkout / "data" / ".." / "src" / "production")
+
+
+def test_production_directory_rejects_symlinked_checkout_data(production, tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    _checkout(checkout)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (checkout / "data").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(production, "SOURCE_ROOT", checkout)
+    monkeypatch.setenv("KALSHI_EVENTS_PROJECT_ROOT", str(checkout))
+
+    with pytest.raises((ValueError, RuntimeError)):
+        production._external_path(checkout / "data" / "nested" / "production")
+
+
+def test_hidden_workers_reject_source_tree_write_paths(production, capsys):
+    source = SCRIPT.parents[1] / "src" / "kalshi_events"
+    operator = source / "operator"
+    assert (
+        production._refresh_worker_main(
+            operator,
+            source / "session.json",
+            source / "metrics.json",
+            source / "notification.json",
+            "historical",
+            "a" * 32,
+            "{}",
+        )
+        == 1
+    )
+    assert not (source / "session.json").exists()
+    assert not (source / "metrics.json").exists()
+    capsys.readouterr()
+
+    assert production._activation_worker(operator, source, "a" * 64) == 1
+    assert not (source / "production.duckdb").exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        lambda root: ["--_account-root", str(root)],
+        lambda root: ["--_account-recovery", str(root), "a" * 32],
+        lambda root: ["--_root-summary", str(root)],
+    ],
+)
+def test_hidden_read_workers_do_not_create_missing_operator_roots(
+    production, tmp_path, monkeypatch, capsys, arguments
+):
+    checkout = _checkout(tmp_path / "checkout")
+    (checkout / "data").mkdir()
+    monkeypatch.setenv("KALSHI_EVENTS_PROJECT_ROOT", str(checkout))
+    missing = checkout / "data" / "missing-operator"
+
+    assert production._main_hidden(arguments(missing)) == 1
+    assert not missing.exists()
+    assert "existing operator root" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        lambda root: ["--_account-root", str(root)],
+        lambda root: ["--_account-recovery", str(root), "a" * 32],
+        lambda root: ["--_root-summary", str(root)],
+    ],
+)
+def test_hidden_read_workers_reject_checkout_source_paths(production, capsys, arguments):
+    source = SCRIPT.parents[1] / "src" / "kalshi_events"
+    assert production._main_hidden(arguments(source)) == 1
+    assert "strict descendant" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

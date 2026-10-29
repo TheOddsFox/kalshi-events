@@ -316,7 +316,7 @@ def test_supervised_worker_accounts_and_writes_bounded_result_before_exit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = tmp_path / "root"
-    Store(root)
+    root.mkdir()
     metrics_path = tmp_path / "metrics.json"
     result_path = tmp_path / "worker.json"
 

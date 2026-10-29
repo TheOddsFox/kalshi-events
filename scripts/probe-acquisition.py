@@ -17,6 +17,8 @@ from typing import Any
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(SOURCE_ROOT / "src"))
+from kalshi_events.common import atomic_bytes  # noqa: E402
+from kalshi_events.paths import child_environment, persistent_path, project_root  # noqa: E402
 
 MIB = 1024**2
 GIB = 1024**3
@@ -56,17 +58,12 @@ def parse_rates(values: list[str] | None) -> list[float]:
 
 
 def validate_output(path: Path, repository: Path) -> Path:
-    """Return the canonical destination, requiring a new external directory path."""
-    from kalshi_events.common import safe_path
-
-    expanded = path.expanduser().absolute()
+    """Return a new destination beneath checkout data, or caller-owned standalone output."""
     try:
-        destination = safe_path(expanded)
+        checkout = project_root(code_root=repository)
+        destination = persistent_path(path, checkout=checkout, label="probe output directory")
     except Exception as exc:
-        raise ValueError("output path cannot contain symlinks") from exc
-    repo = repository.resolve()
-    if destination == repo or repo in destination.parents:
-        raise ValueError("output directory must be outside the repository")
+        raise ValueError(str(exc)) from exc
     if destination.exists():
         raise ValueError("output directory must not already exist")
     if not destination.parent.is_dir():
@@ -301,6 +298,7 @@ def _sample(
         remaining_temporary,
     )
     env = os.environ.copy()
+    env = child_environment(env, project_root(code_root=SOURCE_ROOT))
     source = str(SOURCE_ROOT / "src")
     env["PYTHONPATH"] = source + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     child_started = time.monotonic()
@@ -534,9 +532,8 @@ def run(
     def save() -> None:
         report["accounting"] = dict(used)
         summary = paths["reports"] / "summary.json"
-        temporary = summary.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        temporary.replace(summary)
+        body = (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        atomic_bytes(summary, body)
 
     index = 0
     for rate in rates:
@@ -562,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
         "--output",
         type=Path,
         required=True,
-        help="new external directory for disposable roots and reports",
+        help="new directory beneath checkout data for disposable roots and reports",
     )
     parser.add_argument("--profile", choices=("screening", "throughput"), default="screening")
     parser.add_argument("--rates", nargs="+", help="one to three distinct rates, each <= 20")

@@ -1,5 +1,7 @@
 # Offline performance measurements
 
+New source-checkout benchmark, probe and operator data must stay beneath the checkout's ignored `data/` directory. Dated absolute paths below identify the locations used for the original experiments; consult the relocation inventory for their current locations. Historical reports are preserved without rewriting provenance. Runtime code and virtual environments may remain external.
+
 The benchmark generates deterministic public-API-shaped responses without networking. It runs capture, build and publication with the same fixture, interpreter, dependencies, limits and filesystem for each revision. It checks output equivalence before accepting a timing result.
 
 The frozen full fixture contains 197 markets and three parent observations. The scale fixture contains 249,997 markets and three parents, including 249 combo markets. Both use 200-market response pages, exact decimal strings, native combo legs, repeated parents, rules and nested price ranges. This synthetic pagination is a benchmark input, not an estimate of exchange page counts or live runtime. A separate 1,203-market test exercises seven pages and a combo leg without changing the frozen fixtures.
@@ -8,13 +10,14 @@ The original unfiltered mock market traversal rebuilt the complete market-index 
 
 ## Reproduce a comparison
 
-Use one locked environment and two immutable source archives. Keep both archives and all generated roots/reports on the same filesystem, outside Git. Do not run another benchmark or test suite concurrently.
+Use one locked environment and two immutable source archives. Keep source archives separate from mutable outputs and all generated roots/reports beneath this checkout’s ignored `data/` directory, outside Git contents. Runtime source archives and environments may remain external. Do not run another benchmark or test suite concurrently.
 
 Run both source archives on the MacBook using the same interpreter, locked dependencies and external SSD. Preserve file and directory synchronization inside the measured work.
 
 ```sh
 uv sync --locked
-bench_dir=$(mktemp -d /tmp/kalshi-events-benchmark-XXXXXX)
+mkdir -p ./data/benchmarks
+bench_dir=$(mktemp -d "$PWD/data/benchmarks/comparison-XXXXXX")
 mkdir "$bench_dir/baseline" "$bench_dir/candidate"
 git archive 21edf14a486addfa743c524a645857ed711b640f | tar -x -C "$bench_dir/baseline"
 git archive HEAD | tar -x -C "$bench_dir/candidate"
@@ -33,7 +36,7 @@ Benchmark workers use a 180-second deadline budget, reserving up to five seconds
 
 Existing full, targeted and resume profiles retain their original request protocol and frozen receipt identities. They compare the same evidence through the dictionary and Arrow loaders. Existing composed-refresh profiles retain their workload definitions and request protocol; the mock receipt-ID correction described below applies to that family. `--profile selected-stress` instead compares changed acquisition requests: 100 ordered selections share parents, with live, historical, absent and unresolved cases, a maximum-length ticker, and a parent containing 2,000 unrelated child markets. Native values and coverage must agree; each side's actual receipt provenance is independently validated. Only incidental child arrays in parent-event payloads are excluded from that native comparison. Receipt and release identities are expected to differ.
 
-The `--fixture combo-heavy` variant is a separate combo-heavy payload workload for `full`, `no-change`, `sparse-change` and `all-change`. To prepare same-receipt v2 build input, create a fresh storage-version-5 capture-only root outside the checkout with `--fixture combo-heavy --profile full --prepare-frozen-capture PATH`; record its capture ID and preserve the root. Then run `--profile frozen-v2-build --frozen-root PATH --capture-id ID` against two implementations that both support storage version 5. The seed is built and published directly as v2; it does not require a v1 publication first. The frozen-v2 profile deliberately rejects pre-v5 runtimes, so use the `ddc19b2` storage-v5-compatible reference for the same-receipt comparison. Use `ed133d9` for changed-acquisition/full-pipeline comparisons, not to consume this frozen-v2 seed. Compare verified public artifacts and release identities; the physical DuckDB file hash is not a public identity and is not an equality requirement.
+The `--fixture combo-heavy` variant is a separate combo-heavy payload workload for `full`, `no-change`, `sparse-change` and `all-change`. To prepare same-receipt v2 build input, create a fresh storage-version-5 capture-only root beneath the checkout’s ignored `data/` directory with `--fixture combo-heavy --profile full --prepare-frozen-capture PATH`; record its capture ID and preserve the root. Then run `--profile frozen-v2-build --frozen-root PATH --capture-id ID` against two implementations that both support storage version 5. The seed is built and published directly as v2; it does not require a v1 publication first. The frozen-v2 profile deliberately rejects pre-v5 runtimes, so use the `ddc19b2` storage-v5-compatible reference for the same-receipt comparison. Use `ed133d9` for changed-acquisition/full-pipeline comparisons, not to consume this frozen-v2 seed. Compare verified public artifacts and release identities; the physical DuckDB file hash is not a public identity and is not an equality requirement.
 
 Example preparation and comparison commands (replace paths and the capture ID with the generated values):
 
@@ -81,7 +84,7 @@ The DuckDB 2 export uses a private in-memory database instance, a read-only ware
 
 The producer pins DuckDB 2.0.0, dlt 1.31.0, dbt-duckdb 1.11.1 and dbt-core 1.12.5; the lock resolves PyArrow 26.0.0 from the declared `>=17` range. The app's dlt compatibility claim is limited to its tested Arrow landing path. The [DuckDB release calendar](https://duckdb.org/release_calendar) identifies 2.0.0 as LTS, and its [migration guide](https://duckdb.org/docs/2.0/operations_manual/migration) and [Python migration guide](https://duckdb.org/docs/2.0/clients/python/migration) describe the storage and API boundary. [dlt PR 4601](https://github.com/dlt-hub/dlt/pull/4601) tracks upstream DuckDB 2 compatibility work; this repository's narrow application path does not establish general upstream support.
 
-The serial `scripts/check-duckdb-upgrade.py` workflow seeds dictionary-landed and scoped legacy warehouses with the DuckDB 1.5.6 reference environment, verifies reference reads and recovery, replays the legacy dictionary warehouse with the DuckDB 2 candidate, exercises native conversion and series lineage, and confirms that the legacy reader rejects a native DuckDB 2 file. Keep reference and candidate sources immutable and put fixture roots and logs outside the repository. Before rollout, require the canonical verification, distribution and installed-wheel checks plus the reference-to-candidate workflow and an actual installed producer/consumer handoff. Metadata Parquet exchange is a separate compatibility check; consumers that open the native production database require DuckDB 2.0 or newer.
+The serial `scripts/check-duckdb-upgrade.py` workflow seeds dictionary-landed and scoped legacy warehouses with the DuckDB 1.5.6 reference environment, verifies reference reads and recovery, replays the legacy dictionary warehouse with the DuckDB 2 candidate, exercises native conversion and series lineage, and confirms that the legacy reader rejects a native DuckDB 2 file. Keep reference and candidate sources immutable and put fixture roots and logs beneath the canonical checkout’s ignored `data/verification/` directory. Runtime environments stay separate. Before rollout, require the canonical verification, distribution and installed-wheel checks plus the reference-to-candidate workflow and an actual installed producer/consumer handoff. Metadata Parquet exchange is a separate compatibility check; consumers that open the native production database require DuckDB 2.0 or newer.
 
 On 2026-10-27, the focused migration-interruption checks passed (20 tests, 22.52 seconds), and the DuckDB profiling tests passed (99 tests, 6.32 seconds). Final compatibility, canonical verification, distribution and installed producer/consumer checks subsequently passed. Production SQL is unchanged; the 20% affected-phase improvement threshold for a SQL rewrite remains unproven. Preserve the matching old runtime, publication and evidence for rollback.
 

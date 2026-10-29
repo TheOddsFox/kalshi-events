@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import tempfile
 from contextlib import nullcontext
@@ -27,9 +26,52 @@ from kalshi_events.common import (
     safe_path,
 )
 from kalshi_events.historical import HISTORICAL_VERSION, is_historical_capture
+from kalshi_events.paths import (
+    PathPolicyError,
+    data_directory,
+)
+from kalshi_events.paths import (
+    operator_root as _policy_operator_root,
+)
+from kalshi_events.paths import (
+    persistent_path as _policy_persistent_path,
+)
+from kalshi_events.paths import (
+    project_root as _policy_project_root,
+)
 from kalshi_events.transport import accounting
 
 EXIT_INCOMPLETE = 3
+
+
+def _checkout_root() -> Path | None:
+    try:
+        return _policy_project_root(code_root=Path(__file__).resolve().parents[2])
+    except PathPolicyError as exc:
+        raise CatalogueError(str(exc)) from exc
+
+
+def _operator_root(explicit: Path | None, *, checkout: Path | None) -> Path:
+    try:
+        return _policy_operator_root(explicit, checkout=checkout)
+    except PathPolicyError as exc:
+        raise CatalogueError(str(exc)) from exc
+
+
+def _persistent_path(path: Path, *, checkout: Path | None, label: str) -> Path:
+    try:
+        return _policy_persistent_path(path, checkout=checkout, label=label)
+    except PathPolicyError as exc:
+        raise CatalogueError(str(exc)) from exc
+
+
+def _data_directory(checkout: Path, relative: str) -> Path:
+    try:
+        return data_directory(checkout, relative)
+    except PathPolicyError as exc:
+        raise CatalogueError(str(exc)) from exc
+
+
 FLOAT_LIMITS = {"max_rate", "max_duration_seconds"}
 
 
@@ -140,8 +182,15 @@ def _limits(command: argparse.ArgumentParser) -> None:
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     limits = Limits(**{field: getattr(args, field) for field in Limits.__dataclass_fields__})
+    if args.command == "metadata" and args.metadata_action == "verify":
+        return metadata.verify(args.output)
+    if args.command == "verify":
+        return publish.verify_release(args.release, limits.max_root_bytes)
+    checkout = _checkout_root()
+    if args.command == "metadata":
+        args.output = _persistent_path(args.output, checkout=checkout, label="metadata output")
     if args.command == "series":
-        root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
+        root = _operator_root(args.root, checkout=checkout)
         if args.series_action != "refresh" and not _has_operator_marker(root):
             raise CatalogueError("series commands require an existing scoped operator root")
         if (
@@ -176,17 +225,16 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         raise
         assert result is not None
         return result
-    if args.command == "metadata" and args.metadata_action == "verify":
-        return metadata.verify(args.output)
-    if args.command == "verify":
-        return publish.verify_release(args.release, limits.max_root_bytes)
     if args.command == "dbt" and args.root is None:
-        with tempfile.TemporaryDirectory(prefix="kalshi-events-dbt-") as directory:
+        temporary_parent = _data_directory(checkout, "tmp") if checkout else None
+        with tempfile.TemporaryDirectory(
+            prefix="kalshi-events-dbt-", dir=temporary_parent
+        ) as directory:
             store = Store(Path(directory).resolve() / "root", limits)
             arguments = args.dbt_args[1:] if args.dbt_args[:1] == ["--"] else args.dbt_args
             result = warehouse.dbt(store, arguments or ["parse"])
             return {"returncode": result.returncode}
-    root = args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data"))
+    root = _operator_root(args.root, checkout=checkout)
     if getattr(args, "historical", False) and not _has_operator_marker(safe_path(root)):
         raise CatalogueError("saved historical operations require an existing operator root")
     store = Store(root, limits)
@@ -402,8 +450,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.metrics_file is None:
             result = execute(args)
         else:
-            root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
-            metrics_path = safe_path(args.metrics_file)
+            checkout = _checkout_root()
+            root = _operator_root(args.root, checkout=checkout)
+            metrics_path = _persistent_path(
+                args.metrics_file, checkout=checkout, label="metrics report"
+            )
             progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
             _validate_metrics_root_overlap(root, metrics_path, progress_path)
             _validate_metrics_output_overlap(args, metrics_path, progress_path)
@@ -452,13 +503,16 @@ def _refresh_main(args: argparse.Namespace) -> int:
         if args.full and args.capture_id is not None:
             raise CatalogueError("--full and --capture-id cannot be used together")
         limits = Limits(**{field: getattr(args, field) for field in Limits.__dataclass_fields__})
-        root = safe_path(args.root or Path(os.environ.get("KALSHI_EVENTS_ROOT", "data")))
+        checkout = _checkout_root()
+        root = _operator_root(args.root, checkout=checkout)
         if getattr(args, "historical", False) and not args.full and not _has_operator_marker(root):
             raise CatalogueError("saved historical refresh requires an existing operator root")
         if series_command and not _has_operator_marker(root) and args.series_ticker is None:
             raise CatalogueError("a new series root requires --series-ticker")
         if args.metrics_file is not None:
-            metrics_path = safe_path(args.metrics_file)
+            metrics_path = _persistent_path(
+                args.metrics_file, checkout=checkout, label="metrics report"
+            )
             progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
             _validate_metrics_root_overlap(root, metrics_path, progress_path)
             if metrics_path.exists():

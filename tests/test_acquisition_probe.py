@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from kalshi_events import capture as acquisition
-from kalshi_events.common import Store
+from kalshi_events.common import CatalogueError, Store
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-acquisition.py"
 SPEC = importlib.util.spec_from_file_location("acquisition_probe", SCRIPT)
@@ -18,6 +18,12 @@ assert SPEC and SPEC.loader
 probe = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(probe)
 REAL_RECEIPT_SUMMARY = probe._receipt_summary
+WORKER_SPEC = importlib.util.spec_from_file_location(
+    "acquisition_probe_worker", SCRIPT.with_name("acquisition_probe.py")
+)
+assert WORKER_SPEC and WORKER_SPEC.loader
+worker = importlib.util.module_from_spec(WORKER_SPEC)
+WORKER_SPEC.loader.exec_module(worker)
 
 
 def test_rates_default_and_validation() -> None:
@@ -28,25 +34,182 @@ def test_rates_default_and_validation() -> None:
             probe.parse_rates(values)
 
 
-def test_output_must_be_new_external_and_without_symlinks(tmp_path: Path) -> None:
+def test_output_must_be_new_checkout_data_and_without_symlinks(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    with pytest.raises(ValueError, match="outside"):
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text('[project]\nname = "oddsfox-kalshi-events"\n')
+    with pytest.raises(ValueError, match="strict descendant"):
         probe.validate_output(repo / "out", repo)
-    existing = tmp_path / "existing"
+    destination = repo / "data" / "probe"
+    destination.parent.mkdir()
+    assert probe.validate_output(destination, repo) == destination
+    existing = repo / "data" / "existing"
     existing.mkdir()
     with pytest.raises(ValueError, match="already exist"):
         probe.validate_output(existing, repo)
-    real_parent = tmp_path / "real"
+    real_parent = repo / "data" / "real"
     real_parent.mkdir()
-    link = tmp_path / "link"
+    link = repo / "data" / "link"
     link.symlink_to(real_parent, target_is_directory=True)
-    with pytest.raises(ValueError, match="symlinks"):
+    with pytest.raises(ValueError, match="symlink"):
         probe.validate_output(link / "new", repo)
-    broken_link = tmp_path / "broken-link"
-    broken_link.symlink_to(tmp_path / "missing", target_is_directory=True)
-    with pytest.raises(ValueError, match="symlinks"):
+    broken_link = repo / "data" / "broken-link"
+    broken_link.symlink_to(repo / "data" / "missing", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
         probe.validate_output(broken_link, repo)
+
+
+def test_private_capture_worker_rejects_external_root_before_cli_or_network(tmp_path: Path):
+    result = tmp_path / "worker-result.json"
+    metrics = tmp_path / "metrics.json"
+    external_root = SCRIPT.parents[1] / "src" / "external-operator-root"
+    status = worker.worker_main(
+        [
+            "--result",
+            str(result),
+            "--",
+            "--root",
+            str(external_root),
+            "--metrics-file",
+            str(metrics),
+            "capture",
+        ]
+    )
+    assert status == 2
+    assert not result.exists()
+    assert not metrics.exists()
+
+
+def test_private_partition_worker_rejects_external_root_before_network(tmp_path: Path):
+    config = tmp_path / "config.json"
+    result = tmp_path / "partition-result.json"
+    config.write_text(
+        json.dumps(
+            {
+                "operation": "partitions",
+                "root": str(SCRIPT.parents[1] / "src" / "external-operator-root"),
+                "limits": {},
+                "compression": "gzip",
+                "partitions": [],
+                "collection_series": {},
+                "workers": 1,
+            }
+        )
+    )
+
+    assert worker.partition_worker_main(["--result", str(result), "--config", str(config)]) == 0
+    saved = json.loads(result.read_text())
+    assert "strict descendant" in saved["error"]
+
+
+def _operator_checkout(tmp_path: Path) -> tuple[Path, Path]:
+    checkout = tmp_path / "checkout"
+    (checkout / "data").mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    (checkout / "pyproject.toml").write_text('[project]\nname = "oddsfox-kalshi-events"\n')
+    root = checkout / "data" / "operator"
+    root.mkdir()
+    (root / "root.json").write_text('{"root_id":"protected"}\n')
+    (root / "receipt.json").write_text('{"status":"protected"}\n')
+    return checkout, root
+
+
+def test_capture_worker_refuses_existing_operator_root_before_cli_main(tmp_path: Path, monkeypatch):
+    from kalshi_events import cli
+
+    checkout, root = _operator_checkout(tmp_path)
+    monkeypatch.setenv("KALSHI_EVENTS_PROJECT_ROOT", str(checkout))
+    called = False
+
+    def forbidden_cli(_arguments):
+        nonlocal called
+        called = True
+        raise AssertionError("capture must not start on an existing operator root")
+
+    monkeypatch.setattr(cli, "main", forbidden_cli)
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+    result = checkout / "data" / "worker.json"
+    metrics = checkout / "data" / "metrics.json"
+
+    status = worker.worker_main(
+        [
+            "--result",
+            str(result),
+            "--",
+            "--root",
+            str(root),
+            "--metrics-file",
+            str(metrics),
+            "capture",
+        ]
+    )
+
+    assert status == 2
+    assert not called
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+    assert not result.exists()
+    assert not metrics.exists()
+
+
+def test_partition_worker_refuses_existing_operator_root_before_store(tmp_path: Path, monkeypatch):
+    from kalshi_events import common
+
+    checkout, root = _operator_checkout(tmp_path)
+    monkeypatch.setenv("KALSHI_EVENTS_PROJECT_ROOT", str(checkout))
+    config = checkout / "data" / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "operation": "partitions",
+                "root": str(root),
+                "limits": {},
+                "compression": "gzip",
+                "partitions": [],
+                "collection_series": {},
+                "workers": 1,
+            }
+        )
+    )
+    result = checkout / "data" / "partition-worker.json"
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+
+    def forbidden_store(*_args, **_kwargs):
+        raise AssertionError("Store must not open an existing operator root")
+
+    monkeypatch.setattr(common, "Store", forbidden_store)
+    assert worker.partition_worker_main(["--result", str(result), "--config", str(config)]) == 0
+
+    saved = json.loads(result.read_text())
+    assert "must be new or empty" in saved["error"]
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+
+
+def test_worker_json_write_does_not_follow_existing_symlink(tmp_path: Path):
+    target = tmp_path / "protected.json"
+    target.write_text("protected")
+    output = tmp_path / "worker.json"
+    output.symlink_to(target)
+
+    with pytest.raises(CatalogueError, match="symlink"):
+        worker._atomic_json(output, {"value": 1})
+
+    assert target.read_text() == "protected"
+
+
+def test_screening_summary_write_does_not_follow_existing_symlink(tmp_path: Path, monkeypatch):
+    target = tmp_path / "protected-summary.json"
+    target.write_text("protected")
+
+    def create_summary_symlink(_rate, _compression, _index, paths, *_args):
+        (paths["reports"] / "summary.json").symlink_to(target)
+        return {"stop_reason": "fixture stop"}
+
+    monkeypatch.setattr(probe, "_sample", create_summary_symlink)
+    with pytest.raises(CatalogueError, match="symlink"):
+        probe.run(tmp_path / "screening", [5.0])
+
+    assert target.read_text() == "protected"
 
 
 class FakePopen:

@@ -8,18 +8,26 @@ Python 3.12 and uv are required:
 
 ```sh
 uv sync --locked
-uv run kalshi-events --root /absolute/operator/kalshi-events capture
+uv run kalshi-events --root ./data/operator capture
 # Exit 0 with "complete": true means the catalogue capture is ready. Exit 3 with
 # "complete": false means the invocation hit a budget; repeat with the reported capture ID.
-uv run kalshi-events --root /absolute/operator/kalshi-events capture --capture-id CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events build --capture-id CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events publish --capture-id CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events current
+uv run kalshi-events --root ./data/operator capture --capture-id CAPTURE_ID
+uv run kalshi-events --root ./data/operator build --capture-id CAPTURE_ID
+uv run kalshi-events --root ./data/operator publish --capture-id CAPTURE_ID
+uv run kalshi-events --root ./data/operator current
 ```
 
-The operator root is the persistent directory passed with `--root`, or `KALSHI_EVENTS_ROOT`, or `data`. It holds raw evidence, captures, builds, releases and the versioned publication pointers. Only one writer may hold the canonical root at a time. Symlinked roots, files and destinations are refused.
+In a source checkout, the operator root defaults to the canonical checkout’s `data/operator`, independent of the current working directory. `--root` and `KALSHI_EVENTS_ROOT` can select another strict descendant of that same `data/` directory; external write destinations are rejected. It holds raw evidence, captures, builds, releases and the versioned publication pointers. Only one writer may hold the canonical root at a time. Symlinked roots, files and destinations are refused.
 
-New ordinary and scoped roots use storage version 5. Existing storage versions 1–4 remain readable; stop writers and explicitly run `kalshi-events --root /absolute/operator/kalshi-events upgrade-root` before further writes. Upgrade changes only the closed-schema marker under the writer lock, preserving the logical root ID and exact series scope. Existing incomplete captures retain their sealed acquisition settings and recovery protocol. Older binaries refuse an upgraded root, including after waiting for its writer lock; binary rollback requires a separate legacy root and retained verified publication. Never downgrade the marker. Storage version 5 does not introduce a new catalogue or metadata contract.
+New ordinary and scoped roots use storage version 5. Existing storage versions 1–4 remain readable; stop writers and explicitly run `kalshi-events --root ./data/operator upgrade-root` before further writes. Upgrade changes only the closed-schema marker under the writer lock, preserving the logical root ID and exact series scope. Existing incomplete captures retain their sealed acquisition settings and recovery protocol. Older binaries refuse an upgraded root, including after waiting for its writer lock; binary rollback requires a separate legacy root and retained verified publication. Never downgrade the marker. Storage version 5 does not introduce a new catalogue or metadata contract.
+
+## Data location
+
+Keep persistent datasets, raw evidence, warehouses, releases, metadata bundles, diagnostic samples, metrics and benchmark reports beneath this checkout’s ignored `data/` directory. Source-checkout commands enforce that boundary, including explicitly supplied output paths. The `data/` container itself is not an operator root. Symlink ancestors, traversal outside the boundary and writes into source directories remain forbidden. Use separate child directories for operator roots, probes, metadata and reports; metrics must still stay outside the selected operator root and bundle.
+
+`data/` is persistent user data, not a disposable build cache. It is excluded from Git and package distributions. Repository cleanup must preserve it. Code runtimes and virtual environments remain separate. Standalone installed consumers retain their caller-owned path behavior when no checkout context is present; read-only verification can inspect externally supplied artifacts. Low-level `Store` callers remain responsible for selecting their own paths.
+
+Invoke frozen runtime tools from the canonical checkout, or set `KALSHI_EVENTS_PROJECT_ROOT` to its absolute path, so they use this project’s data boundary rather than the frozen code directory. The binding must identify a real checkout of this project; it does not permit an arbitrary data directory. Do not move a directory while a worker is using it. Existing active jobs retain their original paths until they stop; migrate complete trees under their canonical locks, preserving hard links, evidence bytes and original limits. Dated report paths remain historical provenance; consult `data/relocation-20261029/completed-migration-map.json` for completed moves.
 
 ## DuckDB 2 runtime and database files
 
@@ -54,8 +62,9 @@ With `--metrics-file FILE`, the CLI also writes a sibling `FILE.progress.json`. 
 Capability and rate checks are manual, bounded operations. Use a new disposable root and a known market ticker with a new metrics report path:
 
 ```sh
-uv run kalshi-events --root /absolute/new/probe-root \
-  --metrics-file /absolute/new/probe-metrics.json capture \
+mkdir -p ./data/probes/manual
+uv run kalshi-events --root ./data/probes/manual/root \
+  --metrics-file ./data/probes/manual/metrics.json capture \
   --market-ticker KNOWN_MARKET_TICKER --compression gzip --max-rate 5 \
   --max-requests 12 --max-download-bytes 8388608 \
   --max-response-bytes 4194304 --max-decoded-response-bytes 4194304 \
@@ -66,11 +75,12 @@ Inspect the probe's raw receipts: version 2 with `content_encoding: "gzip"` prov
 
 ### Serial acquisition comparisons
 
-Run the manual probe script from the locked environment with a new destination outside the checkout:
+Run the manual probe script from the checkout’s locked environment with a new destination beneath `data/`. Create its parent first:
 
 ```sh
-uv run --locked python scripts/probe-acquisition.py --output /absolute/new/acquisition-probe
-uv run --locked python scripts/probe-acquisition.py --output /absolute/new/rate-probe --rates 5 10 20
+mkdir -p ./data/probes
+uv run --locked python scripts/probe-acquisition.py --output ./data/probes/acquisition-probe
+uv run --locked python scripts/probe-acquisition.py --output ./data/probes/rate-probe --rates 5 10 20
 ```
 
 The default compares identity and requested gzip at 5 requests/second. Explicit rates replace that list; at most three distinct finite positive rates up to 20 are accepted. Samples run serially against fresh roots and never build or publish. Each sample allows 12 attempts, 30 seconds and 64 MiB encoded downloads, with independent 32 MiB encoded and 64 MiB decoded response ceilings. The screening run retains its 72-attempt, 256-MiB and 180-second total supervision/accounting allowance, plus at most five seconds for termination and reaping. Aggregate retained and temporary allowances are 2 GiB and 1 GiB under existing Store accounting semantics. Remaining allowances can shorten later samples.
@@ -81,7 +91,7 @@ For longer, explicitly bounded comparisons, select the throughput profile:
 
 ```sh
 uv run --locked python scripts/probe-acquisition.py --profile throughput \
-  --output /absolute/new/throughput-probe --rates 10 15 20 \
+  --output ./data/probes/throughput-probe --rates 10 15 20 \
   --series-ticker KXMIDTERMVOTETURN --series-ticker KXMIDTERMMOV \
   --collection-ticker KXMVECROSSCATEGORY-R
 ```
@@ -112,14 +122,14 @@ Historical output cannot serve as a legacy exchange-wide incremental baseline. `
 To finish completed historical scopes from a stopped legacy capture without networking:
 
 ```sh
-uv run kalshi-events --root /absolute/operator/kalshi-events refresh \
+uv run kalshi-events --root ./data/operator refresh \
   --historical --capture-id SAVED_CAPTURE_ID
 # Individual stages are also available; these never resume acquisition.
-uv run kalshi-events --root /absolute/operator/kalshi-events build \
+uv run kalshi-events --root ./data/operator build \
   --historical --capture-id SAVED_CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events publish \
+uv run kalshi-events --root ./data/operator publish \
   --historical --capture-id SAVED_CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events current --historical
+uv run kalshi-events --root ./data/operator current --historical
 ```
 
 This explicit offline path requires completed series, ordinary-event and historical-market
@@ -146,15 +156,15 @@ The release contains `series.parquet`, `events.parquet`, `markets.parquet`, `rel
 This section applies only to the explicit legacy exchange profile and existing catalogue v1/v2 publications. Historical publications are not incremental baselines; use an explicit historical `refresh --full` for a new reconciliation. To create a legacy version 2 baseline from a complete exchange-profile capture, publish it with the version selector; this builds the version 2 warehouse when needed. A preceding version 1 build/publication is necessary only when both publication tracks are wanted. Version 2 uses a separate `builds-v2` warehouse and `current-v2.json`; version 1 uses `builds` and `current.json`.
 
 ```sh
-uv run kalshi-events --root /absolute/operator/kalshi-events publish \
+uv run kalshi-events --root ./data/operator publish \
   --capture-id FULL_CAPTURE_ID --catalogue-version 2
-uv run kalshi-events --root /absolute/operator/kalshi-events capture --incremental
+uv run kalshi-events --root ./data/operator capture --incremental
 # Resume an incomplete refresh with its reported ID; its original baseline/window stay sealed.
-uv run kalshi-events --root /absolute/operator/kalshi-events capture --capture-id DELTA_CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events build --capture-id DELTA_CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kalshi-events publish \
+uv run kalshi-events --root ./data/operator capture --capture-id DELTA_CAPTURE_ID
+uv run kalshi-events --root ./data/operator build --capture-id DELTA_CAPTURE_ID
+uv run kalshi-events --root ./data/operator publish \
   --capture-id DELTA_CAPTURE_ID --catalogue-version 2
-uv run kalshi-events --root /absolute/operator/kalshi-events current --catalogue-version 2
+uv run kalshi-events --root ./data/operator current --catalogue-version 2
 ```
 
 An incremental capture pins the certified v2 publication when one exists, otherwise the certified v1 publication. A corrupt v2 publication fails closed. Composed builds and publications require explicit capture IDs. Legacy default selection continues to choose a full capture, and metadata v1 export rejects an explicit incremental capture.
@@ -168,7 +178,7 @@ Membership is separate from historical observations. A complete reconciliation r
 Each baseline supports at most eight deltas. Retained baseline and delta warehouses, including WAL and staging copies, count toward the storage limits; size those limits for the retained chain before refreshing. To rebase the legacy track, explicitly acquire an exchange-profile capture with `capture --catalogue-profile exchange`, then publish that capture with `--catalogue-version 2`. A refresh whose pinned predecessor has been superseded cannot publish; acquire a new refresh against the current publication. Incomplete captures remain recovery pins indefinitely. Explicitly abandon an unreferenced incomplete capture with:
 
 ```sh
-uv run kalshi-events --root /absolute/operator/kalshi-events discard --capture-id CAPTURE_ID
+uv run kalshi-events --root ./data/operator discard --capture-id CAPTURE_ID
 ```
 
 Discard refuses complete captures and captures referenced by a publication or descendant. Subsequent verified publication can prune obsolete dependencies. Missing, cyclic, corrupted or cross-root ancestry prevents composition and publication. Never manually delete pinned captures, raw evidence, builds or releases.
@@ -180,11 +190,11 @@ build, complete export, fresh verification, historical pointer promotion and cle
 one writer lock and invocation deadline:
 
 ```sh
-uv run kalshi-events --root /absolute/operator/kalshi-events refresh --full
+uv run kalshi-events --root ./data/operator refresh --full
 # Resume a new historical capture's sealed acquisition plan:
-uv run kalshi-events --root /absolute/operator/kalshi-events refresh --capture-id CAPTURE_ID
+uv run kalshi-events --root ./data/operator refresh --capture-id CAPTURE_ID
 # Complete saved historical scopes of an old broad capture without acquisition:
-uv run kalshi-events --root /absolute/operator/kalshi-events refresh \
+uv run kalshi-events --root ./data/operator refresh \
   --historical --capture-id SAVED_CAPTURE_ID
 ```
 
@@ -210,35 +220,35 @@ For 1–100 selected markets, use `metadata refresh`; it retains its explicit se
 
 ## Supervised production catalogue
 
-Use the manual production runner to establish one consumer database on this MacBook. Run it with Python 3.12 in the locked project environment (`uv run --locked python` or the activated virtual environment):
+Use the manual production runner to establish one consumer database on this MacBook. Run the following commands from the checkout root with Python 3.12 in the locked project environment (`uv run --locked python` or the activated virtual environment). Retained datasets and run logs must stay under the ignored `data/` directory; use an explicit `--root` for the particular operator root when several datasets share that container. Production directories inside the checkout must be strict descendants of `data/`; the source tree and the `data/` container itself are rejected. Source-checkout commands reject external write destinations, and symlink paths remain forbidden. The `data/` directory holds persistent operator evidence, not disposable build output; preserve it during repository cleanup. Relocation inventories are stored with the data; archived reports retain their original paths as provenance.
 
 ```sh
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" --full
+  --directory "./data/kalshi-production" --full
 # Resume only the exact reported capture after reviewing the stop reason.
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --directory "./data/kalshi-production" \
   --capture-id CAPTURE_ID
 # Finish only the completed historical scopes of a saved legacy capture, without HTTP:
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --directory "./data/kalshi-production" \
   --historical --capture-id CAPTURE_ID
 # Only after a supervisor reports unknown child accounting from abrupt termination:
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --directory "./data/kalshi-production" \
   --capture-id CAPTURE_ID --reconcile-accounting
 # Explicit recovery after a Mac reboot, preserving every existing wall deadline/cap.
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --directory "./data/kalshi-production" \
   --capture-id CAPTURE_ID --reconcile-accounting --recover-reboot \
   --recovery-volume-uuid EXPECTED_VOLUME_UUID
 # Consume the report's one-time 48-hour window for this exact stopped capture.
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" \
+  --directory "./data/kalshi-production" \
   --capture-id CAPTURE_ID --reconcile-accounting --extend-session
 # Recover activation of the current historical publication without acquisition.
 python scripts/run-production.py \
-  --directory "/Volumes/Mac SSD/oddsfox-data/kalshi-production" --activate-current --historical
+  --directory "./data/kalshi-production" --activate-current --historical
 ```
 
 `--reconcile-accounting` is an explicit recovery path for a stopped session whose child died before returning its counters. Under the canonical writer lock, it validates every receipt and binds each unfinished request to the exact capture task. If all durable attempts are finalized, it restores their validated exact totals. Otherwise it charges the full sealed response ceiling plus one 64 KiB HTTP read chunk per unfinished request against the original aggregate limit. The pinned HTTP core reads at most 64 KiB per chunk. Before recovery proceeds, the supervisor enforces the approved legacy-to-current or current-to-current lock/package transition, HTTP transport-source fingerprint and 64 KiB read bound described in the [recovery contract](docs/contracts.md#production-database-entry-point). Only the documented historical legacy reports may omit selected saved package fields. The prior system snapshot is retained as `original_system`, while `system` records the recovery environment. In the latter case exact downloaded bytes remain unknown and the report records the conservative bound; unfinished receipts are never edited. Recovery accepts only the stopped session's exact capture, pinned HTTP runtime, boot identity (unless explicitly recovered below), effective deadlines and resource ceilings, and only after supported child-counter stops (including a resumed child missing invocation counters), compressed-memory, process RSS, low-disk-space, or persistent process-group RSS sampling timeouts. The exact legacy system-wide `ps` timeout report is accepted for existing sessions. Current free-space and all other resource checks still run before networking; ledger mismatches, receipt or integrity failures, mount changes, malformed resource output, and unreaped process groups remain ineligible. It records the recovery revision while preserving the original revision and source. The supervisor also stops acquisition if macOS reports 20 GiB of pages stored in the compressor, which catches compressed-memory growth that process RSS misses. A retry after any new abrupt stop needs another explicit reconciliation.
@@ -275,7 +285,7 @@ option, the existing approved deadline remains in force.
 import duckdb
 
 connection = duckdb.connect(
-    "/Volumes/Mac SSD/oddsfox-data/kalshi-production/production.duckdb",
+    "./data/kalshi-production/production.duckdb",
     read_only=True,
 )
 ```
@@ -289,13 +299,13 @@ Publication and production activation are separate results. Failures before acti
 Use a new dedicated root for one ordinary series, such as `KXCPI`:
 
 ```sh
-uv run kalshi-events --root /absolute/operator/kxcpi series refresh --series-ticker KXCPI --full
-uv run kalshi-events --root /absolute/operator/kxcpi series refresh
-uv run kalshi-events --root /absolute/operator/kxcpi series refresh --capture-id CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kxcpi series current
-uv run kalshi-events --root /absolute/operator/kxcpi series replay --capture-id CAPTURE_ID
-uv run kalshi-events --root /absolute/operator/kxcpi series rebuild
-uv run kalshi-events verify --release /absolute/operator/kxcpi/releases/RELEASE_ID
+uv run kalshi-events --root ./data/series/KXCPI series refresh --series-ticker KXCPI --full
+uv run kalshi-events --root ./data/series/KXCPI series refresh
+uv run kalshi-events --root ./data/series/KXCPI series refresh --capture-id CAPTURE_ID
+uv run kalshi-events --root ./data/series/KXCPI series current
+uv run kalshi-events --root ./data/series/KXCPI series replay --capture-id CAPTURE_ID
+uv run kalshi-events --root ./data/series/KXCPI series rebuild
+uv run kalshi-events verify --release ./data/series/KXCPI/releases/RELEASE_ID
 ```
 
 The first command requires a series ticker and explicit `--full`. The root then fixes that scope permanently; later commands derive it and reject a conflicting ticker. New series roots use storage version 5 with the exact immutable scope descriptor and cannot convert populated catalogue roots. Catalogue and metadata acquisition/export commands reject series roots; `status` and `discard --capture-id ID` remain available.
@@ -317,12 +327,12 @@ Select 1–100 distinct explicit market tickers. New captures query bounded batc
 Batches contain at most 100 tickers and 6,144 encoded initial URL bytes, with pagination handled separately. New event-parent lookups use `exclude_markets=true` to avoid downloading unrelated children. Direct market coverage is unchanged; new captures no longer acquire those incidental child references through parent hydration. Older captures retain their original requests when resumed. Newly batched observations retain the actual list-request provenance and therefore have different receipt identities from individual requests.
 
 ```sh
-uv run kalshi-events --root /absolute/operator/kalshi-events metadata refresh \
-  --market-ticker KXEXAMPLE-26-YES --output /absolute/new/metadata-bundle
-uv run kalshi-events --root /absolute/operator/kalshi-events metadata export \
+uv run kalshi-events --root ./data/operator metadata refresh \
+  --market-ticker KXEXAMPLE-26-YES --output ./data/metadata/metadata-bundle
+uv run kalshi-events --root ./data/operator metadata export \
   --market-ticker KXEXAMPLE-26-YES --capture-id CAPTURE_ID \
-  --output /absolute/new/offline-bundle
-uv run kalshi-events metadata verify --output /absolute/new/offline-bundle
+  --output ./data/metadata/offline-bundle
+uv run kalshi-events metadata verify --output ./data/metadata/offline-bundle
 ```
 
 `oddsfox.kalshi.metadata.v1` contains the object arrays `series.json`, `events.json`, `markets.json`, `coverage.json` and `manifest.json`. The manifest carries `contract`, `source_release_id`, UTC `received_at`, `coverage_scope: "targeted"`, and `files` entries with exact `size` and `sha256`. Its release identity is SHA-256 of the sorted, compact UTF-8 JSON file inventory, without a trailing newline. Native fields are preserved alongside normalized tickers, receipt and observation identities. Market `usable` requires authoritative event and series parents; coverage is `found`, `absent`, `unresolved` or `unusable`. Bundles, including their manifests, are limited to 128 MiB and destinations must be new directories.
@@ -338,10 +348,10 @@ Atomic state and receipt replacements require room for the complete new temporar
 Known storage limitation: dlt landing measures its workspace and database after `pipeline.run()` returns. It can exceed the selected root, temporary or database allowance before reporting exhaustion. Those settings currently provide post-load detection for this phase, not a hard write quota. Hard enforcement requires a validated storage boundary; file rotation and periodic checks do not establish that guarantee.
 
 ```sh
-uv run kalshi-events --root /absolute/operator/kalshi-events status
-uv run kalshi-events --root /absolute/operator/kalshi-events replay
-uv run kalshi-events --root /absolute/operator/kalshi-events rebuild
-uv run kalshi-events verify --release /absolute/operator/kalshi-events/releases/RELEASE_ID
+uv run kalshi-events --root ./data/operator status
+uv run kalshi-events --root ./data/operator replay
+uv run kalshi-events --root ./data/operator rebuild
+uv run kalshi-events verify --release ./data/operator/releases/RELEASE_ID
 ```
 
 `replay` rebuilds the warehouse for the capture named by the current release, from committed raw evidence, without networking. `rebuild` does the same for that current capture and never changes published releases. Use `--catalogue-version 2` for the v2 pointer. Neither command publishes automatically. There is no backup or restore command. To move a publication, copy the operator root while no writer is running, or copy the immutable release directory that `verify` accepts.
@@ -354,7 +364,9 @@ Tests use synthetic source responses. Loopback HTTP is available only with both 
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion. Both installed wheels and source checkouts include dbt resources; runtime data, credentials, local Pad state and warehouse files are excluded from distributions.
 
-The supported execution environment is the MacBook with Python 3.12 and POSIX file/directory synchronization. Keep full-run operator roots, temporary files and benchmark reports on the external SSD, outside the checkout. Run the canonical verification commands above before a full catalogue pass. The bounded full-catalogue acceptance attempt described below stopped during acquisition; a successful eight-hour acceptance has not completed.
+Default pytest scratch stays under `data/testing` with pytest's normal temporary-directory retention. An unsafe checkout data path fails before tests run; extracted-source tests launched from the checkout use the same boundary.
+
+The supported execution environment is the MacBook with Python 3.12 and POSIX file/directory synchronization. Keep full-run operator roots and their temporary files beneath this checkout’s ignored `data/` directory on the external SSD. New benchmark/probe outputs must also start beneath `data/`; they no longer require an external destination. Existing active external roots move only after their workers stop. Run the canonical verification commands above before a full catalogue pass. The bounded full-catalogue acceptance attempt described below stopped during acquisition; a successful eight-hour acceptance has not completed.
 
 ## Offline benchmarking
 
@@ -385,7 +397,7 @@ python /absolute/kalshi-market-data/scripts/check-handoff.py \
   --events-executable /absolute/events-venv/bin/kalshi-events \
   --market-data-executable /absolute/data-venv/bin/kalshi-market-data \
   --python /absolute/data-venv/bin/python \
-  --report /absolute/new/acceptance.json
+  --report ./data/verification/acceptance.json
 ```
 
 This harness uses a synthetic loopback exchange, proves capture through publication and metadata transfer, exercises all market-data feeds and intervals, checks persistent refresh/replay/recovery, and performs no live acquisition.

@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -469,3 +471,56 @@ def test_harness_timeout_reaps_child_group_and_saves_logs(tmp_path):
     assert status == 124
     assert marker.read_text() == "done"
     assert "timed out after 6 seconds" in (tmp_path / "logs/tiny-timeout.stderr.log").read_text()
+
+
+def test_harness_rejects_symlinked_log_before_starting_child(tmp_path):
+    harness = _load_harness()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    target = tmp_path / "protected.log"
+    target.write_text("protected")
+    (log_dir / "unsafe.stdout.log").symlink_to(target)
+    launched = False
+
+    def run_child(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("child must not run when its log path is unsafe")
+
+    with pytest.raises(ValueError, match="symlink"):
+        harness._run(
+            "unsafe",
+            Path(sys.executable),
+            ("ignored-test",),
+            os.environ.copy(),
+            log_dir,
+            run_child,
+        )
+
+    assert not launched
+    assert target.read_text() == "protected"
+
+
+def test_harness_omits_current_directory_from_reference_python_imports(tmp_path):
+    harness = _load_harness()
+    command_seen = []
+
+    def run_child(command, **_kwargs):
+        command_seen.extend(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    assert (
+        harness._run(
+            "safe path",
+            Path(sys.executable),
+            (
+                "tests/test_duckdb_upgrade.py::test_harness_imports_application_from_expected_source",
+            ),
+            os.environ.copy(),
+            tmp_path / "logs",
+            run_child,
+        )
+        == 0
+    )
+
+    assert command_seen[:4] == [sys.executable, "-P", "-m", "pytest"]

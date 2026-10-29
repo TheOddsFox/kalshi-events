@@ -1,12 +1,97 @@
 from __future__ import annotations
 
+import os
+import stat
+import tempfile
 import threading
 import time
+import tomllib
 import uuid
+from pathlib import Path
 
 import pytest
 
 from kalshi_events.common import Store, digest, json_bytes, now
+
+
+def _test_checkout() -> Path | None:
+    configured = os.environ.get("KALSHI_EVENTS_PROJECT_ROOT")
+    source = Path(__file__).absolute().parents[1]
+    candidates = [Path(configured)] if configured else [source]
+    if not configured:
+        source_marker = source / ".git"
+        if not source_marker.exists() and not source_marker.is_symlink():
+            cwd = Path.cwd()
+            candidates.extend((cwd, *cwd.parents))
+    for candidate in candidates:
+        if not candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        marker = candidate / ".git"
+        project_file = candidate / "pyproject.toml"
+        data = candidate / "data"
+        try:
+            project_info = project_file.lstat()
+            if not stat.S_ISREG(project_info.st_mode):
+                continue
+            with project_file.open("rb") as stream:
+                name = tomllib.load(stream).get("project", {}).get("name")
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if name != "oddsfox-kalshi-events":
+            continue
+
+        # A project marker establishes checkout context. Once it does, unsafe
+        # paths must fail closed instead of falling back to the OS temp dir.
+        try:
+            marker_info = marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError(
+                "unsafe or invalid checkout data path for pytest temporary files"
+            ) from error
+        if (
+            stat.S_ISLNK(marker_info.st_mode)
+            or not (stat.S_ISREG(marker_info.st_mode) or stat.S_ISDIR(marker_info.st_mode))
+            or any(path.is_symlink() for path in (candidate, *candidate.parents))
+        ):
+            raise RuntimeError("unsafe or invalid checkout data path for pytest temporary files")
+        try:
+            data_info = data.lstat()
+        except FileNotFoundError:
+            data_info = None
+        except OSError as error:
+            raise RuntimeError(
+                "unsafe or invalid checkout data path for pytest temporary files"
+            ) from error
+        if data_info is not None and not stat.S_ISDIR(data_info.st_mode):
+            raise RuntimeError("unsafe or invalid checkout data path for pytest temporary files")
+        return candidate
+    return None
+
+
+def pytest_configure(config):
+    """Keep pytest's synthetic roots and tempfile outputs in ignored checkout data."""
+    checkout = _test_checkout()
+    if checkout is None:
+        source_checkout = Path(__file__).absolute().parents[1]
+        marker = source_checkout / ".git"
+        if os.environ.get("KALSHI_EVENTS_PROJECT_ROOT") or marker.exists() or marker.is_symlink():
+            raise RuntimeError("unsafe or invalid checkout data path for pytest temporary files")
+        return
+    data = checkout / "data"
+    parent = data / "testing"
+    if any(path.is_symlink() for path in (parent, *parent.parents)):
+        raise RuntimeError("unsafe symlink in pytest temporary-data path")
+    if data.exists() and not data.is_dir():
+        raise RuntimeError("pytest data path is not a directory")
+    if parent.exists() and not parent.is_dir():
+        raise RuntimeError("pytest testing-data path is not a directory")
+    parent.mkdir(parents=True, exist_ok=True)
+    # Leave basetemp unset so pytest retains its normal numbered, locked
+    # session directories and bounded cleanup under this checkout-owned root.
+    os.environ["TMPDIR"] = str(parent)
+    tempfile.tempdir = str(parent)
 
 
 @pytest.fixture

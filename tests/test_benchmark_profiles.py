@@ -74,6 +74,48 @@ def test_full_fixture_matches_original_request_hash(
     assert requests == expected_requests
 
 
+def test_worker_source_selection_imports_each_requested_tree_in_isolated_process(
+    tmp_path: Path,
+):
+    sources = [tmp_path / "source-a", tmp_path / "source-b"]
+    for source, value in zip(sources, ("a", "b"), strict=True):
+        package = source / "src/kalshi_events"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "origin.py").write_text(f"VALUE = {value!r}\n")
+
+    code = "\n".join(
+        [
+            "import importlib.util, json, sys",
+            f"spec = importlib.util.spec_from_file_location('pipeline', {str(SCRIPT)!r})",
+            "module = importlib.util.module_from_spec(spec)",
+            "spec.loader.exec_module(module)",
+            f"sources = {list(map(str, sources))!r}",
+            "observed = []",
+            "for source in sources:",
+            "    module._select_application_source(__import__('pathlib').Path(source))",
+            "    origin = __import__('kalshi_events.origin', fromlist=['VALUE'])",
+            "    observed.append((origin.VALUE, origin.__file__))",
+            "print(json.dumps(observed))",
+        ]
+    )
+    environment = os.environ.copy()
+    environment["KALSHI_EVENTS_API_URL"] = "http://127.0.0.1:9/trade-api/v2"
+    environment["KALSHI_EVENTS_ALLOW_LOOPBACK"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    observed = json.loads(result.stdout)
+    assert [value for value, _origin in observed] == ["a", "b"]
+    assert Path(observed[0][1]).is_relative_to(sources[0] / "src")
+    assert Path(observed[1][1]).is_relative_to(sources[1] / "src")
+
+
 def test_structural_fixture_covers_pagination_combo_legs_and_native_decimals():
     fixture = benchmark.FixtureClient(1203)
     cursor = "0"
@@ -504,7 +546,7 @@ def test_duckdb_profile_worker_rejects_non_report_inputs(tmp_path: Path):
 def test_duckdb_profile_worker_validates_output_before_creating_it():
     repository = SCRIPT.parents[1]
     output_dir = repository / "tests" / "must-not-create-dbt-profile"
-    with pytest.raises(ValueError, match="source checkout"):
+    with pytest.raises(ValueError, match="strict descendant"):
         benchmark._duckdb_profile_worker(SCRIPT, SCRIPT, repository, output_dir, repository)
     assert not output_dir.exists()
 
@@ -543,13 +585,36 @@ def test_duckdb_profile_worker_rejects_output_symlink_without_touching_target(tm
     target.write_text("leave this alone")
     (profile_dir / "summary.json").symlink_to(target)
 
-    with pytest.raises(ValueError, match="fresh directory"):
+    with pytest.raises(ValueError, match="symlink is forbidden"):
         benchmark._duckdb_profile_worker(
             database, artifacts, report_dir, profile_dir, SCRIPT.parents[1]
         )
 
     assert target.read_text() == "leave this alone"
     assert (profile_dir / "summary.json").is_symlink()
+
+
+def test_duckdb_profile_worker_rejects_output_symlink_ancestor_before_creation(tmp_path: Path):
+    report_dir = tmp_path / "report"
+    build = report_dir / "root" / "builds" / "capture-1"
+    build.mkdir(parents=True)
+    database = build / "warehouse.duckdb"
+    database.write_bytes(b"disposable")
+    artifacts = build / "build-artifacts.json"
+    artifacts.write_text(json.dumps(_dbt_profile_artifacts("SELECT 1")))
+    target = report_dir / "actual-profiles"
+    target.mkdir()
+    linked = report_dir / "linked-profiles"
+    linked.symlink_to(target, target_is_directory=True)
+    output_dir = linked / "reference-pair-0"
+
+    with pytest.raises(ValueError, match="symlink is forbidden"):
+        benchmark._duckdb_profile_worker(
+            database, artifacts, report_dir, output_dir, SCRIPT.parents[1]
+        )
+
+    assert not (target / output_dir.name).exists()
+    assert linked.is_symlink()
 
 
 def test_duckdb_profile_worker_preserves_preexisting_wal_marker(tmp_path: Path):
@@ -656,7 +721,7 @@ def test_benchmark_profile_uses_compiled_sql_from_its_build(
         1,
         profile,
         "candidate",
-        (baseline_root, {"capture_id": "capture-1"}, 0.0),
+        (baseline_root, {"capture_id": "b" * 32}, 0.0),
         duckdb_profile_json=True,
     )
 
@@ -931,7 +996,7 @@ def test_frozen_worker_rejects_output_paths_before_copying(tmp_path: Path, monke
         raise AssertionError("copy must not run before path validation")
 
     monkeypatch.setattr(shutil, "copytree", unexpected_copy)
-    with pytest.raises(ValueError, match="outside every source checkout"):
+    with pytest.raises(ValueError, match="strict descendant"):
         benchmark._frozen_v2_build_worker(
             source, frozen, output, "capture-id", tmp_path / "result.json"
         )
@@ -1669,18 +1734,124 @@ def test_warehouse_json_proxy_counts_two_direct_artifact_parses_locally():
     assert json.loads is original_loads
 
 
-def test_worker_destinations_are_outside_known_and_unlisted_checkouts(tmp_path: Path):
+def test_worker_destinations_are_confined_to_checkout_data_and_avoid_nested_checkouts(
+    tmp_path: Path,
+):
     source = tmp_path / "source"
     source.mkdir()
     benchmark._validate_worker_destinations(tmp_path / "data", tmp_path / "result.json", source)
-    with pytest.raises(ValueError, match="source checkout"):
+    with pytest.raises(ValueError, match="overlaps a source checkout"):
         benchmark._validate_worker_destinations(source / "data", tmp_path / "result.json", source)
     other_repo = tmp_path / "other-repo"
     (other_repo / ".git").mkdir(parents=True)
-    with pytest.raises(ValueError, match="Git checkout"):
+    with pytest.raises(ValueError, match="nested Git"):
         benchmark._validate_worker_destinations(
             other_repo / "data", tmp_path / "result.json", source
         )
+
+
+def test_worker_rejects_hardlinked_result_before_benchmark_work(tmp_path: Path, monkeypatch):
+    target = tmp_path / "protected-result.json"
+    target.write_text("protected")
+    result_path = tmp_path / "worker-result.json"
+    os.link(target, result_path)
+    root = tmp_path / "worker-root"
+
+    def benchmark_must_not_start(_source):
+        raise AssertionError("result validation must precede benchmark work")
+
+    monkeypatch.setattr(benchmark, "_select_application_source", benchmark_must_not_start)
+    with pytest.raises(ValueError, match="worker result path must be new"):
+        benchmark._worker(SCRIPT.parents[1], root, 1, result_path)
+
+    assert target.read_text() == "protected"
+    assert not root.exists()
+
+
+def test_frozen_worker_rejects_hardlinked_result_before_clone(tmp_path: Path, monkeypatch):
+    import shutil
+
+    frozen = tmp_path / "frozen"
+    frozen.mkdir()
+    target = tmp_path / "protected-result.json"
+    target.write_text("protected")
+    result_path = tmp_path / "worker-result.json"
+    os.link(target, result_path)
+    root = tmp_path / "clone"
+
+    def clone_must_not_start(*_args, **_kwargs):
+        raise AssertionError("result validation must precede clone work")
+
+    monkeypatch.setattr(shutil, "copytree", clone_must_not_start)
+    with pytest.raises(ValueError, match="worker result path must be new"):
+        benchmark._frozen_v2_build_worker(
+            SCRIPT.parents[1], frozen, root, "capture-id", result_path
+        )
+
+    assert target.read_text() == "protected"
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    ("profile", "refresh_mode", "baseline_capture_id"),
+    [("full", "full", None), ("sparse-change", "incremental", "a" * 32)],
+)
+def test_worker_refuses_existing_operator_like_root_without_parent_authorization(
+    tmp_path: Path, monkeypatch, profile, refresh_mode, baseline_capture_id
+):
+    root = tmp_path / "operator-like-root"
+    root.mkdir()
+    (root / "root.json").write_text('{"root_id":"operator"}\n')
+    receipt = root / "receipt.json"
+    receipt.write_text('{"status":"protected"}\n')
+    before = receipt.read_bytes()
+
+    def benchmark_must_not_start(_source):
+        raise AssertionError("existing-root validation must precede app import")
+
+    monkeypatch.setattr(benchmark, "_select_application_source", benchmark_must_not_start)
+    with pytest.raises(ValueError, match="worker root must be new|authorization is missing"):
+        benchmark._worker(
+            SCRIPT.parents[1],
+            root,
+            1,
+            tmp_path / "worker-result.json",
+            profile=profile,
+            scenario="sparse-change" if profile == "sparse-change" else "full",
+            refresh_mode=refresh_mode,
+            baseline_capture_id=baseline_capture_id,
+        )
+
+    assert receipt.read_bytes() == before
+
+
+def test_worker_accepts_and_consumes_parent_authorized_baseline_clone(tmp_path: Path, monkeypatch):
+    root = tmp_path / "prepared-clone"
+    root.mkdir()
+    (root / "root.json").write_text('{"root_id":"synthetic"}\n')
+    receipt = root / "receipt.json"
+    receipt.write_text('{"status":"baseline"}\n')
+    baseline_capture_id = "b" * 32
+    benchmark._write_clone_authorization(root, "sparse-change", "incremental", baseline_capture_id)
+
+    def stop_after_authorization(_source):
+        raise AssertionError("parent-authorized seed reached selected-source import")
+
+    monkeypatch.setattr(benchmark, "_select_application_source", stop_after_authorization)
+    with pytest.raises(AssertionError, match="reached selected-source import"):
+        benchmark._worker(
+            SCRIPT.parents[1],
+            root,
+            1,
+            tmp_path / "worker-result.json",
+            profile="sparse-change",
+            scenario="sparse-change",
+            refresh_mode="incremental",
+            baseline_capture_id=baseline_capture_id,
+        )
+
+    assert not benchmark._clone_authorization_path(root).exists()
+    assert receipt.read_text() == '{"status":"baseline"}\n'
 
 
 @pytest.mark.parametrize(

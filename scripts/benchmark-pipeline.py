@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repeatable offline capture/build/publish benchmark; reports stay outside the repository."""
+"""Repeatable offline capture/build/publish benchmark; reports stay in checkout data."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import json
 import os
 import platform
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,8 @@ DUCKDB_PROFILE_BENCHMARKS = {
 _request_id = contextvars.ContextVar("fixture_request_id")
 _page_request = contextvars.ContextVar("benchmark_page_request", default=None)
 _inside_page_read = contextvars.ContextVar("benchmark_inside_page_read", default=False)
+_PATH_POLICY: Any = None
+_SEEDED_WORKER_PROFILES = {"no-change", "sparse-change", "all-change", "history-sparse"}
 
 
 class _UnreapedWorkerGroup(RuntimeError):
@@ -175,6 +178,8 @@ def _run_supervised(
     check: bool = True,
 ) -> subprocess.CompletedProcess[Any]:
     """Run a worker and its descendants within a deadline and termination reserve."""
+    checkout = _checkout_root()
+    env = _path_policy().child_environment(dict(os.environ if env is None else env), checkout)
     stdout = subprocess.PIPE if capture_output else None
     stderr = subprocess.PIPE if capture_output else None
     process = None
@@ -1134,9 +1139,11 @@ def _worker(
     fixture_variant: str = "frozen",
     capture_only: bool = False,
 ) -> None:
+    _validate_worker_destinations(root, result_path, source_root)
+    root = _prepare_worker_root(root, profile, refresh_mode, baseline_capture_id)
     os.environ["DLT_TELEMETRY"] = "0"
     os.environ["DLT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
-    sys.path.insert(0, str(source_root / "src"))
+    _select_application_source(source_root)
     from kalshi_events import capture, common, metadata, normalize, publish, transport, warehouse
     from kalshi_events.common import Limits, Store
 
@@ -1557,7 +1564,10 @@ def _worker(
         )
     result["provenance"] = _environment(source_root, limits, root)
     result["capture_only"] = capture_only
-    result_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
+    common.atomic_bytes(
+        result_path,
+        (json.dumps(result, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8"),
+    )
 
 
 def _parquet_schemas(output: Path) -> dict[str, str]:
@@ -1575,6 +1585,9 @@ def _frozen_v2_build_worker(
     """Run one v2 full-baseline build against an already captured immutable root."""
     import shutil
 
+    _validate_worker_destinations(root, result_path, source_root)
+    if root.exists() or root.is_symlink():
+        raise ValueError("frozen-v2 worker clone root must be new")
     frozen_root = frozen_root.expanduser()
     if frozen_root.is_symlink():
         raise ValueError("frozen capture root must be an existing non-symlink directory")
@@ -1583,7 +1596,6 @@ def _frozen_v2_build_worker(
         raise ValueError("frozen capture root must be an existing non-symlink directory")
     if any(path.is_symlink() for path in frozen_root.rglob("*")):
         raise ValueError("frozen capture root must not contain symlinks")
-    _validate_worker_destinations(root, result_path, source_root)
     for destination in (root.resolve(), result_path.resolve()):
         if destination == frozen_root or destination.is_relative_to(frozen_root):
             raise ValueError("worker outputs must be outside the frozen capture root")
@@ -1595,7 +1607,7 @@ def _frozen_v2_build_worker(
     clone_seconds = round(time.perf_counter() - clone_started, 6)
     os.environ["DLT_TELEMETRY"] = "0"
     os.environ["DLT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
-    sys.path.insert(0, str(source_root / "src"))
+    _select_application_source(source_root)
     from kalshi_events import capture, common, metadata, normalize, publish, transport, warehouse
     from kalshi_events.common import Limits, Store
 
@@ -1685,7 +1697,10 @@ def _frozen_v2_build_worker(
         "output_bytes": sum(path.stat().st_size for path in output.glob("*.parquet")),
         "source_revision": _revision(source_root),
     }
-    result_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
+    common.atomic_bytes(
+        result_path,
+        (json.dumps(result, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8"),
+    )
 
 
 def _frozen_build_worker_command(
@@ -2107,7 +2122,7 @@ print(json.dumps({"storage_version_before": before, "storage_version_after": sto
     )
     started = time.perf_counter()
     completed = _run_supervised(
-        [sys.executable, "-c", code, str(root)],
+        [sys.executable, "-P", "-c", code, str(root)],
         check=True,
         capture_output=True,
         text=True,
@@ -2399,34 +2414,39 @@ def _run_one(
         else:
             baseline_root, setup_result, setup_seconds = prepared_baseline
             remove_baseline = False
+        baseline_capture_id = setup_result["capture_id"]
         clone_started = time.perf_counter()
         shutil.copytree(baseline_root, root)
         baseline_clone_seconds = round(time.perf_counter() - clone_started, 6)
         if profile == "history-sparse" and role == "candidate":
             baseline_upgrade_seconds, baseline_upgrade = _upgrade_baseline_clone(source_root, root)
-        baseline_capture_id = setup_result["capture_id"]
+        _write_clone_authorization(root, profile, refresh_mode, baseline_capture_id)
     else:
         baseline_root = None
         baseline_capture_id = None
         baseline_clone_seconds = None
 
     started = time.perf_counter()
-    _run_supervised(
-        _worker_command(
-            source_root,
-            root,
-            result_path,
-            markets,
-            profile,
-            scenario,
-            refresh_mode,
-            baseline_capture_id,
-            fixture_variant,
-        ),
-        check=True,
-        env=os.environ.copy(),
-        timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
-    )
+    try:
+        _run_supervised(
+            _worker_command(
+                source_root,
+                root,
+                result_path,
+                markets,
+                profile,
+                scenario,
+                refresh_mode,
+                baseline_capture_id,
+                fixture_variant,
+            ),
+            check=True,
+            env=os.environ.copy(),
+            timeout=BENCHMARK_CHILD_TIMEOUT_SECONDS,
+        )
+    finally:
+        if scenario != "full":
+            _revoke_clone_authorization(root)
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["worker_wall_seconds"] = round(time.perf_counter() - started, 6)
     result["role"] = role
@@ -2584,6 +2604,12 @@ def _duckdb_profile_worker_impl(
 
     if database_path.is_symlink() or artifacts_path.is_symlink() or output_dir.is_symlink():
         raise ValueError("DuckDB profile paths cannot be symlinks")
+    # Validate caller-supplied paths before resolve() can erase symlink ancestors.
+    # These are persistent report/output locations and must follow the same path
+    # policy as the later worker destination validation.
+    _persistent_output(report_root, "DuckDB profile report directory")
+    _persistent_output(output_dir, "DuckDB profile output directory")
+    _persistent_output(output_dir / "summary.json", "DuckDB profile summary")
     report_root = report_root.resolve()
     database_path = database_path.resolve()
     artifacts_path = artifacts_path.resolve()
@@ -2608,13 +2634,14 @@ def _duckdb_profile_worker_impl(
         raise RuntimeError("refusing to profile a benchmark warehouse with an uncheckpointed WAL")
     summary_path = output_dir / "summary.json"
     _validate_worker_destinations(output_dir, summary_path, source_root)
-    if any(
-        report_root == checkout
-        or report_root.is_relative_to(checkout)
-        or checkout.is_relative_to(report_root)
-        for checkout in (_script_checkout(), source_root.resolve())
+    checkout = _checkout_root()
+    source = source_root.resolve()
+    if source != checkout and (
+        report_root == source
+        or report_root.is_relative_to(source)
+        or source.is_relative_to(report_root)
     ):
-        raise ValueError("DuckDB profile report directory must be disjoint from source checkouts")
+        raise ValueError("DuckDB profile report directory must be disjoint from source checkout")
     if output_dir.exists():
         entries = list(output_dir.iterdir())
         if {entry.name for entry in entries} not in (set(), {"tmp", "dlt-data"}) or any(
@@ -3237,25 +3264,201 @@ def _script_checkout() -> Path:
     return script_path.parents[1] if script_path.parent.name == "scripts" else script_path.parent
 
 
+def _path_policy() -> Any:
+    """Load checkout policy without importing or caching the measured application package."""
+    global _PATH_POLICY
+    if _PATH_POLICY is None:
+        path = _script_checkout() / "src" / "kalshi_events" / "paths.py"
+        spec = importlib.util.spec_from_file_location("_kalshi_events_path_policy", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("could not load the checkout data path policy")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PATH_POLICY = module
+    return _PATH_POLICY
+
+
+def _checkout_root() -> Path | None:
+    return _path_policy().project_root(code_root=_script_checkout())
+
+
+def _persistent_output(path: Path, label: str) -> Path:
+    checkout = _checkout_root()
+    try:
+        return _path_policy().persistent_path(path, checkout=checkout, label=label)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _select_application_source(source_root: Path) -> Any:
+    """Import the requested source tree even if another version was previously loaded."""
+    source = source_root.resolve()
+    source_path = source / "src"
+    sys.path.insert(0, str(source_path))
+    for name in tuple(sys.modules):
+        if name == "kalshi_events" or name.startswith("kalshi_events."):
+            del sys.modules[name]
+    package = importlib.import_module("kalshi_events")
+    origin = Path(package.__file__).resolve()
+    if not origin.is_relative_to(source_path.resolve()):
+        for name in tuple(sys.modules):
+            if name == "kalshi_events" or name.startswith("kalshi_events."):
+                del sys.modules[name]
+        raise RuntimeError(f"selected source import escaped {source_path}: {origin}")
+    return package
+
+
 def _validate_worker_destinations(
     root: Path,
     result_path: Path,
     source_root: Path,
     compare_root: Path | None = None,
 ) -> None:
-    protected = [_script_checkout(), source_root.resolve()]
+    checkout = _checkout_root()
+    destinations = (
+        _persistent_output(root, "worker root"),
+        _persistent_output(result_path, "worker result"),
+    )
+    protected = [source_root.resolve()]
     if compare_root is not None:
         protected.append(compare_root.resolve())
-    for destination in (root.resolve(), result_path.resolve()):
-        if any(
-            destination == checkout or destination.is_relative_to(checkout)
-            for checkout in protected
+    for destination in destinations:
+        for source in protected:
+            if source != checkout and (
+                destination == source
+                or destination.is_relative_to(source)
+                or source.is_relative_to(destination)
+            ):
+                raise ValueError(f"worker destination overlaps a source checkout: {destination}")
+    result = destinations[1]
+    if result.exists() or result.is_symlink():
+        raise ValueError(f"worker result path must be new: {result}")
+
+
+def _clone_authorization_path(root: Path) -> Path:
+    return root.with_name(f".{root.name}.benchmark-clone.json")
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_clone_authorization(
+    root: Path, profile: str, refresh_mode: str, baseline_capture_id: str
+) -> None:
+    root = _persistent_output(root, "benchmark baseline clone")
+    marker = _persistent_output(_clone_authorization_path(root), "benchmark clone authorization")
+    if (
+        profile not in _SEEDED_WORKER_PROFILES
+        or len(baseline_capture_id) != 32
+        or any(character not in "0123456789abcdef" for character in baseline_capture_id)
+        or root.is_symlink()
+        or not root.is_dir()
+        or marker.exists()
+        or marker.is_symlink()
+    ):
+        raise ValueError("cannot authorize an invalid benchmark baseline clone")
+    identity = root.stat(follow_symlinks=False)
+    value = {
+        "version": 1,
+        "root": str(root),
+        "device": identity.st_dev,
+        "inode": identity.st_ino,
+        "profile": profile,
+        "refresh_mode": refresh_mode,
+        "baseline_capture_id": baseline_capture_id,
+    }
+    body = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    with marker.open("xb") as stream:
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    _sync_directory(marker.parent)
+
+
+def _revoke_clone_authorization(root: Path) -> None:
+    marker = _persistent_output(_clone_authorization_path(root), "benchmark clone authorization")
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return
+    _sync_directory(marker.parent)
+
+
+def _consume_clone_authorization(
+    root: Path, profile: str, refresh_mode: str, baseline_capture_id: str
+) -> None:
+    root = _persistent_output(root, "benchmark baseline clone")
+    marker = _persistent_output(_clone_authorization_path(root), "benchmark clone authorization")
+    try:
+        root_info = root.lstat()
+        marker_info = marker.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or not stat.S_ISREG(marker_info.st_mode)
+            or marker_info.st_nlink != 1
+            or marker_info.st_size > 4096
         ):
-            raise ValueError(
-                f"worker destination must be outside every source checkout: {destination}"
-            )
-        if any((ancestor / ".git").exists() for ancestor in (destination, *destination.parents)):
-            raise ValueError(f"worker destination cannot be inside a Git checkout: {destination}")
+            raise ValueError("benchmark baseline clone authorization is invalid")
+        descriptor = os.open(marker, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (marker_info.st_dev, marker_info.st_ino):
+                raise ValueError("benchmark baseline clone authorization changed")
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                body = stream.read(4097)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if len(body) > 4096:
+            raise ValueError("benchmark baseline clone authorization is too large")
+        value = json.loads(
+            body,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON constant")),
+        )
+        expected = {
+            "version": 1,
+            "root": str(root),
+            "device": root_info.st_dev,
+            "inode": root_info.st_ino,
+            "profile": profile,
+            "refresh_mode": refresh_mode,
+            "baseline_capture_id": baseline_capture_id,
+        }
+        if value != expected:
+            raise ValueError("benchmark baseline clone was not authorized by its parent")
+        marker.unlink()
+        _sync_directory(marker.parent)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("benchmark baseline clone authorization is missing or invalid") from exc
+
+
+def _prepare_worker_root(
+    root: Path,
+    profile: str,
+    refresh_mode: str,
+    baseline_capture_id: str | None,
+) -> Path:
+    root = _persistent_output(root, "worker root")
+    seeded_profile = profile in _SEEDED_WORKER_PROFILES
+    if seeded_profile:
+        if (
+            not isinstance(baseline_capture_id, str)
+            or len(baseline_capture_id) != 32
+            or any(character not in "0123456789abcdef" for character in baseline_capture_id)
+            or not root.is_dir()
+            or root.is_symlink()
+        ):
+            raise ValueError("incremental worker requires a parent-authorized baseline clone")
+        _consume_clone_authorization(root, profile, refresh_mode, baseline_capture_id)
+    elif root.exists() or root.is_symlink():
+        raise ValueError(f"worker root must be new for profile {profile}")
+    return root
 
 
 def _correctness_gate(
@@ -3407,9 +3610,7 @@ def main() -> int:
         default="full",
     )
     parser.add_argument("--sample-storage", action="store_true")
-    parser.add_argument(
-        "--report-dir", type=Path, default=Path(tempfile.gettempdir()) / "kalshi-events-benchmark"
-    )
+    parser.add_argument("--report-dir", type=Path)
     parser.add_argument(
         "--scale", action="store_true", help="benchmark approximately 250,000 observations"
     )
@@ -3517,6 +3718,14 @@ def main() -> int:
             args.capture_only,
         )
         return 0
+    if args.report_dir is None:
+        checkout = _checkout_root()
+        if checkout is not None:
+            parent = _path_policy().data_directory(checkout, "benchmarks")
+        else:
+            parent = Path(tempfile.gettempdir())
+        suffix = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        args.report_dir = parent / f"kalshi-events-benchmark-{suffix}-{os.getpid()}"
     if args.runs < 1 or args.warmups < 0:
         parser.error("--runs must be positive and --warmups nonnegative")
     if args.duckdb_profile_json and args.profile not in DUCKDB_PROFILE_BENCHMARKS:
@@ -3577,24 +3786,19 @@ def main() -> int:
             parser.error("--runs must be positive and --warmups nonnegative")
         source_root = args.source_root.resolve()
         compare_root = args.compare_root.resolve()
-        report_dir = args.report_dir.resolve()
+        report_dir = _persistent_output(args.report_dir, "benchmark report directory")
         if report_dir.exists():
-            parser.error("--report-dir must name a new directory outside the source roots")
-        protected_roots = (_script_checkout(), source_root, compare_root, frozen_root)
+            parser.error("--report-dir must name a new directory")
+        checkout = _checkout_root()
+        protected_roots = (source_root, compare_root, frozen_root)
         if any(
             report_dir == protected
             or report_dir.is_relative_to(protected)
             or protected.is_relative_to(report_dir)
             for protected in protected_roots
+            if protected != checkout
         ):
-            parser.error("--report-dir and frozen root must be disjoint from source checkouts")
-        if any(
-            frozen_root == source
-            or frozen_root.is_relative_to(source)
-            or source.is_relative_to(frozen_root)
-            for source in (source_root, compare_root, _script_checkout())
-        ):
-            parser.error("--frozen-root must be outside every source checkout")
+            parser.error("--report-dir must be disjoint from source inputs and frozen root")
         report_dir.mkdir(parents=True, exist_ok=False)
         summary = _run_frozen_v2_comparison(
             source_root,
@@ -3647,16 +3851,20 @@ def main() -> int:
         parser.error(
             "--fixture combo-heavy supports full, no-change, sparse-change, and all-change"
         )
-    report_dir = args.report_dir.resolve()
+    report_dir = _persistent_output(args.report_dir, "benchmark report directory")
     if report_dir.exists():
-        parser.error("--report-dir must name a new directory outside the repository")
+        parser.error("--report-dir must name a new directory")
+    checkout = _checkout_root()
     for _, source_root in [
-        ("script", _script_checkout()),
         ("source", args.source_root.resolve()),
         *([("compare", args.compare_root.resolve())] if args.compare_root else []),
     ]:
-        if report_dir.is_relative_to(source_root):
-            parser.error("--report-dir must be outside every source checkout")
+        if source_root != checkout and (
+            report_dir == source_root
+            or report_dir.is_relative_to(source_root)
+            or source_root.is_relative_to(report_dir)
+        ):
+            parser.error("--report-dir must be disjoint from external source checkouts")
     report_dir.mkdir(parents=True, exist_ok=True)
     roots = [("source", args.source_root.resolve())]
     if args.compare_root:

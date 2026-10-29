@@ -95,14 +95,14 @@ def test_output_rejects_symlink_ancestor_before_starting_child(tmp_path: Path) -
         link.symlink_to(target, target_is_directory=True)
     except OSError as exc:
         pytest.fail(f"POSIX symlink creation failed: {exc}")
-    with pytest.raises(ValueError, match="symlinks"):
+    with pytest.raises(ValueError, match="symlink is forbidden"):
         probe.run_throughput(link / "output", [10.0])
     assert not (target / "output").exists()
 
 
 def test_output_rejects_checkout_before_creating_directories() -> None:
     output = Path(probe.__file__).resolve().parents[1] / "should-never-be-probe-output"
-    with pytest.raises(ValueError, match="outside the repository"):
+    with pytest.raises(ValueError, match="strict descendant"):
         probe.run_throughput(output, [10.0])
     assert not output.exists()
 

@@ -160,7 +160,7 @@ def test_fixture_identity_rejects_fifo_without_opening_it(tmp_path):
         benchmark._validate_fixture_root(fixture)
 
 
-def test_report_directory_inside_fixture_is_rejected_without_modifying_it(tmp_path):
+def test_local_data_fixture_template_passes_main_input_validation(tmp_path, monkeypatch):
     benchmark = _benchmark_module()
     repo = SCRIPT.parents[1]
     reference = tmp_path / "reference"
@@ -177,6 +177,12 @@ def test_report_directory_inside_fixture_is_rejected_without_modifying_it(tmp_pa
         }
 
     before = inventory(fixture)
+    report_dir = tmp_path / "benchmark-report"
+
+    def stop_before_worker(*_args, **_kwargs):
+        raise RuntimeError("local fixture passed validation")
+
+    monkeypatch.setattr(benchmark, "_command", stop_before_worker)
     args = benchmark._parser().parse_args(
         [
             "--reference-source-root",
@@ -186,7 +192,7 @@ def test_report_directory_inside_fixture_is_rejected_without_modifying_it(tmp_pa
             "--fixture-template",
             str(fixture),
             "--report-dir",
-            str(fixture / "benchmark-report"),
+            str(report_dir),
             "--warmups",
             "0",
             "--runs",
@@ -194,9 +200,10 @@ def test_report_directory_inside_fixture_is_rejected_without_modifying_it(tmp_pa
         ]
     )
 
-    with pytest.raises(ValueError, match="outside source checkouts|disjoint"):
-        benchmark._benchmark(args)
-    assert not (fixture / "benchmark-report").exists()
+    assert benchmark._benchmark(args) == 2
+    assert (report_dir / "report.json").is_file()
+    report = json.loads((report_dir / "report.json").read_text())
+    assert report["error"] == "local fixture passed validation"
     assert inventory(fixture) == before
 
 
