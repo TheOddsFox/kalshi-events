@@ -115,18 +115,6 @@ def _command(
     ]
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(
-            path.read_text(encoding="utf-8"),
-            parse_constant=_reject_json_constant,
-            parse_float=_finite_json_float,
-        )
-    except (OSError, UnicodeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
@@ -167,22 +155,6 @@ def _account(root: Path) -> dict[str, Any] | None:
         return {**accounting(store), **store.usage()}
     except Exception:
         return None
-
-
-def _metrics_summary(metrics_path: Path) -> dict[str, Any] | None:
-    raw = _read_json(metrics_path)
-    if raw is None:
-        return None
-    counters = raw.get("counters", {})
-    phases = raw.get("phases_seconds", {})
-    high_water = raw.get("store_accounted_high_water_bytes", {})
-    return {
-        "counters": counters if isinstance(counters, dict) else {},
-        "phases_seconds": phases if isinstance(phases, dict) else {},
-        "store_accounted_high_water_bytes": (high_water if isinstance(high_water, dict) else {}),
-        "endpoint_families": raw.get("endpoint_families", {}),
-        "elapsed_seconds": raw.get("elapsed_seconds"),
-    }
 
 
 def _receipt_summary(root: Path, capture_id: str | None) -> dict[str, Any]:

@@ -669,10 +669,6 @@ def _worktree_dirty(root: Path) -> bool | None:
     return bool(result.stdout.strip()) if result.returncode == 0 else None
 
 
-def _find_capture_id(root: Path) -> str:
-    return _capture_id(root)
-
-
 def _copy_fixture(source: Path, destination: Path) -> str:
     capture_id = _validate_fixture_root(source)
     shutil.copytree(source, destination, symlinks=True)
