@@ -2351,6 +2351,8 @@ def run_production(
             )
             if mode in {"activate-current", "activate-historical"}:
                 _record_operator_accounting(report, final_accounting)
+            report["error"] = None
+            report["recovery"] = None
             report["production_state"] = "verified"
             report["activation"] = activated
             if activated.get("coverage_scope") is not None:

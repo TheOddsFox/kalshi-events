@@ -237,12 +237,20 @@ def test_complete_historical_capture_resumes_and_activates_v3(production, workfl
     assert partial["production_state"] != "verified"
     assert not (workflow.directory / "production.duckdb").exists()
     assert "independent-verification" not in workflow.events
+    partial["error"] = "received SIGTERM; stopping supervised work"
+    partial["recovery"] = "Obsolete instruction to retry after investigating the stop."
+    production._atomic_report(
+        workflow.directory / "runs" / partial["session_id"] / production.REPORT_NAME,
+        partial,
+    )
 
     complete, code = production.run_production(
         workflow.directory, capture_id=workflow.manifest["capture_id"]
     )
     assert code == 0
     assert complete["production_state"] == "verified"
+    assert complete["error"] is None
+    assert complete["recovery"] is None
     command = workflow.commands[1]
     assert command[-3] == "resume"
     assert command[-2] == workflow.manifest["capture_id"]
