@@ -76,6 +76,10 @@ RUN_LIMITS: dict[str, int | float | str] = {
     "response_bytes": 384 * MIB,
     "decoded_response_bytes": 768 * MIB,
     "minimum_free_bytes": 150 * GIB,
+    "storage_sample_seconds": 1,
+    "storage_category_stop_bytes": 56 * GIB,
+    "storage_inventory_entries": 65536,
+    "storage_release_directories": 4096,
     "peak_rss_bytes": 24 * GIB,
     "peak_rss_seconds": 60,
     "memory_pressure_warn_seconds": 60,
@@ -888,15 +892,36 @@ def _process_group_exists(group: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        raise
     return True
 
 
 def _terminate(process: subprocess.Popen[Any]) -> bool:
     global _STOP_IN_PROGRESS
+    previous = getattr(process, "_production_termination_outcome", None)
+    prior_errors = previous.get("termination_errors", []) if isinstance(previous, dict) else []
+    errors: list[str] = list(prior_errors)
+
+    def observe(*, attempted: bool) -> tuple[bool, bool | None]:
+        leader_reaped = process.poll() is not None
+        try:
+            group_absent: bool | None = not _process_group_exists(process.pid)
+        except OSError as exc:
+            errors.append(f"process-group probe: {exc}")
+            group_absent = None
+        with contextlib.suppress(AttributeError):
+            process._production_termination_outcome = {
+                "leader_reaped": leader_reaped,
+                "group_absent": group_absent,
+                "uncertain": not leader_reaped or group_absent is None,
+                "termination_attempted": attempted,
+                "termination_errors": list(errors),
+            }
+        return leader_reaped, group_absent
+
     if process.pid in _TERMINATION_ATTEMPTED:
-        process.poll()
-        reaped = not _process_group_exists(process.pid)
+        leader_reaped, group_absent = observe(attempted=False)
+        reaped = leader_reaped and group_absent is True
         if reaped:
             _TERMINATION_ATTEMPTED.discard(process.pid)
         return reaped
@@ -907,15 +932,40 @@ def _terminate(process: subprocess.Popen[Any]) -> bool:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            return process.poll() is not None
+            pass
+        except OSError as exc:
+            errors.append(f"SIGTERM: {exc}")
         term_deadline = min(grace_deadline, time.monotonic() + 2)
-        while _process_group_exists(process.pid) and time.monotonic() < term_deadline:
+        while time.monotonic() < term_deadline:
+            try:
+                group_exists = _process_group_exists(process.pid)
+            except OSError as exc:
+                errors.append(f"process-group probe: {exc}")
+                group_exists = True
+            if not group_exists:
+                break
             process.poll()
             time.sleep(min(0.05, max(0.0, term_deadline - time.monotonic())))
-        if _process_group_exists(process.pid):
-            with contextlib.suppress(ProcessLookupError):
+        try:
+            group_exists = _process_group_exists(process.pid)
+        except OSError as exc:
+            errors.append(f"process-group probe: {exc}")
+            group_exists = True
+        if group_exists:
+            try:
                 os.killpg(process.pid, signal.SIGKILL)
-        while _process_group_exists(process.pid) and time.monotonic() < grace_deadline:
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                errors.append(f"SIGKILL: {exc}")
+        while time.monotonic() < grace_deadline:
+            try:
+                group_exists = _process_group_exists(process.pid)
+            except OSError as exc:
+                errors.append(f"process-group probe: {exc}")
+                group_exists = True
+            if not group_exists:
+                break
             process.poll()
             time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
         if process.poll() is None:
@@ -923,10 +973,14 @@ def _terminate(process: subprocess.Popen[Any]) -> bool:
                 process.wait(timeout=max(0.0, grace_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 _TERMINATION_ATTEMPTED.add(process.pid)
+                observe(attempted=True)
                 return False
-        reaped = not _process_group_exists(process.pid)
+        leader_reaped, group_absent = observe(attempted=True)
+        reaped = leader_reaped and group_absent is True
         if not reaped:
             _TERMINATION_ATTEMPTED.add(process.pid)
+        else:
+            _TERMINATION_ATTEMPTED.discard(process.pid)
         return reaped
     finally:
         _STOP_IN_PROGRESS = was_stopping
@@ -944,23 +998,59 @@ def _monitor(
     original_device: int | None = None,
     capture_notification: Path | None = None,
     wall_deadline_epoch: float | None = None,
+    storage_state: dict[str, Any] | None = None,
+    storage_progress_path: Path | None = None,
+    storage_external_paths: dict[str, Path] | None = None,
 ) -> tuple[int | None, str | None, bool]:
     _resource_sample_state(report, report_path)
     samples: list[tuple[float, int]] = []
     warning_started: float | None = None
     previous_pressure_sample: float | None = None
     next_sample = time.monotonic()
+    next_storage_sample = time.monotonic()
     stop_reason = None
     reaped = True
     terminated = False
+    termination_status: dict[str, Any] = {}
+
+    def terminate() -> bool:
+        nonlocal reaped, terminated
+        reaped = _terminate(process)
+        saved_status = getattr(process, "_production_termination_outcome", None)
+        if isinstance(saved_status, dict):
+            termination_status.update(saved_status)
+        terminated = True
+        return reaped
+
     while process.poll() is None:
         now = time.monotonic()
         remaining = _child_time_remaining(deadline, wall_deadline_epoch)
         if remaining <= float(RUN_LIMITS["terminate_seconds"]):
             stop_reason = "session or workflow deadline reached termination reserve"
-            reaped = _terminate(process)
-            terminated = True
+            terminate()
             break
+        if (
+            storage_state is not None
+            and storage_progress_path is not None
+            and storage_external_paths is not None
+            and now >= next_storage_sample
+        ):
+            sample_started = time.monotonic()
+            try:
+                stop_reason = _sample_live_storage(
+                    directory,
+                    operator,
+                    report,
+                    storage_state,
+                    storage_progress_path,
+                    storage_external_paths,
+                )
+            except (OSError, RunnerError) as exc:
+                stop_reason = f"resource accounting failed: {exc}"
+            next_storage_sample = sample_started + float(RUN_LIMITS["storage_sample_seconds"])
+            if stop_reason:
+                terminate()
+                break
         if now >= next_sample:
             try:
                 _merge_capture_notification(report, capture_notification)
@@ -970,8 +1060,7 @@ def _monitor(
                 remaining = _child_time_remaining(deadline, wall_deadline_epoch)
                 if remaining <= float(RUN_LIMITS["terminate_seconds"]):
                     stop_reason = "session or workflow deadline reached termination reserve"
-                    reaped = _terminate(process)
-                    terminated = True
+                    terminate()
                     break
                 timeout = min(
                     5.0,
@@ -979,16 +1068,14 @@ def _monitor(
                 )
                 if timeout <= 0:
                     stop_reason = "session or workflow deadline reached termination reserve"
-                    reaped = _terminate(process)
-                    terminated = True
+                    terminate()
                     break
                 memory = _sample_memory(process.pid, timeout=timeout)
                 if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
                     RUN_LIMITS["terminate_seconds"]
                 ):
                     stop_reason = "session or workflow deadline reached termination reserve"
-                    reaped = _terminate(process)
-                    terminated = True
+                    terminate()
                     break
             except RunnerInterrupted:
                 raise
@@ -1001,8 +1088,7 @@ def _monitor(
                     stop_reason = "resource accounting failed: memory snapshot unavailable"
                 else:
                     stop_reason = f"resource accounting failed: {exc}"
-                reaped = _terminate(process)
-                terminated = True
+                terminate()
                 break
             observed_at = memory["system_memory_pressure_observed_monotonic"]
             rss = memory["child_process_group_rss_bytes"]
@@ -1054,29 +1140,71 @@ def _monitor(
             ):
                 stop_reason = "system memory pressure remained warning for 60 seconds"
             if stop_reason:
-                reaped = _terminate(process)
-                terminated = True
+                terminate()
                 break
             report["last_observed_at"] = _utc()
             _atomic_report(report_path, report)
             next_sample = now + float(RUN_LIMITS["sample_seconds"])
         remaining = _child_time_remaining(deadline, wall_deadline_epoch)
         time.sleep(min(1.0, max(0.0, remaining - float(RUN_LIMITS["terminate_seconds"]))))
+    if storage_state is not None and storage_progress_path is not None and storage_external_paths is not None:
+        try:
+            storage_reason = _sample_live_storage(
+                directory,
+                operator,
+                report,
+                storage_state,
+                storage_progress_path,
+                storage_external_paths,
+            )
+            if storage_reason:
+                stop_reason = stop_reason or storage_reason
+        except (OSError, RunnerError) as exc:
+            stop_reason = stop_reason or f"resource accounting failed: {exc}"
+    try:
+        group_absent_before_cleanup: bool | None = not _process_group_exists(process.pid)
+    except OSError as exc:
+        termination_status.setdefault("termination_errors", []).append(
+            f"process-group probe: {exc}"
+        )
+        group_absent_before_cleanup = None
     if process.poll() is None and not terminated:
-        reaped = _terminate(process)
-        terminated = True
-    elif _process_group_exists(process.pid) and not terminated:
+        terminate()
+    elif group_absent_before_cleanup is False and not terminated:
         stop_reason = stop_reason or "child left a descendant process running"
-        reaped = _terminate(process)
-        terminated = True
-    elif _process_group_exists(process.pid):
+        terminate()
+    elif group_absent_before_cleanup is False:
         stop_reason = stop_reason or "child process group remains after termination grace"
+        reaped = False
+    elif group_absent_before_cleanup is None:
+        stop_reason = stop_reason or "child process-group absence could not be verified"
         reaped = False
     try:
         returncode = process.wait(timeout=0.1 if process.poll() is not None else 0)
     except subprocess.TimeoutExpired:
         returncode = None
         reaped = False
+    try:
+        group_absent: bool | None = not _process_group_exists(process.pid)
+    except OSError as exc:
+        termination_status.setdefault("termination_errors", []).append(
+            f"process-group probe: {exc}"
+        )
+        group_absent = None
+    termination_status.update(
+        {
+            "leader_reaped": returncode is not None,
+            "group_absent": group_absent,
+            "uncertain": returncode is None or group_absent is None,
+            "primary_stop_reason": stop_reason,
+            "termination_errors": termination_status.get("termination_errors", []),
+        }
+    )
+    if isinstance(report.get("storage_supervision_invocation"), str):
+        termination_status["invocation_token"] = report["storage_supervision_invocation"]
+    reaped = returncode is not None and group_absent is True
+    report["process_supervision"] = termination_status
+    report["process_supervision"]["primary_stop_reason"] = stop_reason
     return returncode, stop_reason, reaped
 
 
@@ -1362,6 +1490,10 @@ def _invoke(
     capture_notification: Path | None = None,
     workflow_deadline: bool = False,
     phase_on_start: str | None = None,
+    storage_supervision: bool = False,
+    storage_invocation_token: str | None = None,
+    metrics_progress_path: Path | None = None,
+    storage_progress_path: Path | None = None,
 ) -> tuple[int | None, str | None, bool]:
     from kalshi_events.common import safe_path
     from kalshi_events.paths import child_environment, project_root
@@ -1422,6 +1554,8 @@ def _invoke(
         return None, reason, True
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         process: subprocess.Popen[Any] | None = None
+        storage_state = None
+        storage_external_paths = None
         try:
             global _PENDING_STOP_SIGNAL, _SPAWNING_CHILD
             wall_now = time.time()
@@ -1436,6 +1570,30 @@ def _invoke(
                     else "insufficient time remains to start and reap a child"
                 )
                 return None, reason, True
+            if storage_supervision:
+                if storage_progress_path is None:
+                    raise RunnerError("historical storage progress path is unavailable")
+                storage_external_paths = {
+                    "session_report": report_path,
+                    "stdout": stdout_path,
+                    "stderr": stderr_path,
+                    "storage_progress": storage_progress_path,
+                }
+                if capture_notification is not None:
+                    storage_external_paths["capture_notification"] = capture_notification
+                if metrics_progress_path is not None:
+                    storage_external_paths["metrics_progress"] = metrics_progress_path
+                    if metrics_progress_path.name.endswith(".progress.json"):
+                        storage_external_paths["metrics"] = metrics_progress_path.with_name(
+                            metrics_progress_path.name.removesuffix(".progress.json")
+                        )
+                storage_state = _begin_storage_supervision(
+                    directory,
+                    operator,
+                    report,
+                    storage_progress_path,
+                    storage_external_paths,
+                )
             _SPAWNING_CHILD = True
             try:
                 process = subprocess.Popen(
@@ -1449,6 +1607,10 @@ def _invoke(
                 )
                 if phase_on_start is not None:
                     report["phase"] = phase_on_start
+                if storage_supervision:
+                    report["storage_supervision_invocation"] = (
+                        storage_invocation_token or uuid.uuid4().hex
+                    )
                 report["active_process_group"] = process.pid
                 _atomic_report(report_path, report)
             finally:
@@ -1470,11 +1632,33 @@ def _invoke(
                 original_device=original_device,
                 capture_notification=capture_notification,
                 wall_deadline_epoch=wall_deadline_epoch,
+                storage_state=storage_state,
+                storage_progress_path=storage_progress_path if storage_state is not None else None,
+                storage_external_paths=storage_external_paths,
             )
         except BaseException as exc:
             _merge_capture_notification(report, capture_notification)
-            if process is not None and not _terminate(process):
-                raise RunnerError("child could not be reaped after supervision failure") from None
+            reaped = process is None or _terminate(process)
+            if process is not None:
+                outcome = getattr(process, "_production_termination_outcome", {})
+                if isinstance(report.get("storage_supervision_invocation"), str):
+                    outcome = {
+                        **(outcome if isinstance(outcome, dict) else {}),
+                        "invocation_token": report["storage_supervision_invocation"],
+                    }
+                report["process_supervision"] = {
+                    **(outcome if isinstance(outcome, dict) else {}),
+                    "primary_stop_reason": str(exc),
+                }
+            if process is not None and not reaped:
+                outcome = getattr(process, "_production_termination_outcome", {})
+                errors = "; ".join(
+                    outcome.get("termination_errors", []) if isinstance(outcome, dict) else []
+                )
+                detail = f"; termination errors: {errors}" if errors else ""
+                raise RunnerError(
+                    f"{exc}; child could not be confirmed reaped within five seconds{detail}"
+                ) from exc
             if process is not None:
                 report["active_process_group"] = None
             if _PENDING_STOP_SIGNAL is not None:
@@ -1587,6 +1771,8 @@ def _release_verify(
     paths: dict[str, Path],
     report: dict[str, Any],
     deadline: float,
+    *,
+    storage_supervision: bool = False,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -1600,6 +1786,8 @@ def _release_verify(
     ]
     stdout = paths["logs"] / "release-verify.stdout.json"
     stderr = paths["logs"] / "release-verify.stderr.log"
+    storage_progress = _stage_storage_progress_path(paths, "release-verify")
+    storage_token = uuid.uuid4().hex if storage_supervision else None
     started = time.monotonic()
     try:
         returncode, reason, reaped = _invoke(
@@ -1611,7 +1799,21 @@ def _release_verify(
             deadline=deadline,
             stdout_path=stdout,
             stderr_path=stderr,
+            storage_supervision=storage_supervision,
+            storage_invocation_token=storage_token,
+            metrics_progress_path=paths.get("metrics_progress"),
+            storage_progress_path=storage_progress if storage_supervision else None,
         )
+        if storage_supervision and report.get("storage_supervision_invocation") == storage_token:
+            if not storage_progress.exists() and not storage_progress.is_symlink():
+                raise RunnerError("live verification storage report disappeared after child start")
+            storage_result = _strict_json(storage_progress)
+            if storage_result is None or storage_result.get("version") != 1:
+                raise RunnerError("live verification storage report is missing or malformed")
+            report["storage_supervision_file"] = str(storage_progress)
+            report["storage_supervision"] = {
+                key: value for key, value in storage_result.items() if key != "baseline"
+            }
         value = _strict_json(stdout)
         if reason in DEADLINE_STOP_REASONS:
             raise BudgetStop(reason)
@@ -1976,6 +2178,553 @@ def _external_bytes(directory: Path) -> int:
     return total
 
 
+_LIVE_TMP_NAMES = (
+    re.compile(r"build-historical-[0-9a-f]{32}\Z"),
+    re.compile(r"parent-index-[1-9][0-9]*-[0-9a-f]{12}\Z"),
+    re.compile(r"membership-verify-[0-9a-f]{32}\Z"),
+    re.compile(r"publish-[0-9a-f]{32}\Z"),
+    re.compile(r"dbt-[0-9a-f]{32}\Z"),
+    re.compile(r"load-[0-9a-f]{32}\Z"),
+    re.compile(r"baseline-verify-[0-9a-f]{32}\Z"),
+    re.compile(r"database-copy-[0-9a-f]{32}\Z"),
+    re.compile(r"build-[0-9a-f]{32}\Z"),
+    re.compile(r"build-v2-[0-9a-f]{32}\Z"),
+    re.compile(r"replaced-[0-9a-f]{32}-v3\Z"),
+    re.compile(r"\.write-[A-Za-z0-9_]{8}\Z"),
+)
+_ATOMIC_TEMP_NAME = re.compile(r"\.write-[A-Za-z0-9_]{8}\Z")
+_ACTIVATION_TEMP_NAME = re.compile(r"\.production\.duckdb\.[0-9a-f]{32}\.tmp\Z")
+
+
+def _bounded_tree_bytes(
+    path: Path,
+    device: int,
+    count: list[int],
+    allocated_inodes: set[tuple[int, int]],
+) -> dict[str, int]:
+    """Measure one declared mutable tree without following links or walking the root."""
+    import stat
+
+    totals = {"logical_bytes": 0, "allocated_bytes": 0, "database_bytes": 0}
+    try:
+        root = path.lstat()
+    except FileNotFoundError:
+        return totals
+    if not stat.S_ISDIR(root.st_mode) or root.st_dev != device:
+        raise RunnerError(f"live storage workspace is unsafe: {path.name}")
+    def walk(directory: Path) -> None:
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    count[0] += 1
+                    if count[0] > int(RUN_LIMITS["storage_inventory_entries"]):
+                        raise RunnerError("live storage inventory exceeded its entry bound")
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise RunnerError("live storage entry could not be inspected") from exc
+                    if info.st_dev != device:
+                        raise RunnerError("live storage workspace crossed filesystems")
+                    if stat.S_ISDIR(info.st_mode):
+                        walk(Path(entry.path))
+                    elif stat.S_ISREG(info.st_mode):
+                        totals["logical_bytes"] += info.st_size
+                        inode = (info.st_dev, info.st_ino)
+                        if inode not in allocated_inodes:
+                            totals["allocated_bytes"] += info.st_blocks * 512
+                            allocated_inodes.add(inode)
+                        if entry.name.endswith((".duckdb", ".wal")):
+                            totals["database_bytes"] += info.st_size
+                    else:
+                        raise RunnerError("live storage workspace contains a non-regular entry")
+        except OSError as exc:
+            raise RunnerError("live storage workspace could not be scanned") from exc
+
+    walk(path)
+    return totals
+
+
+def _live_workspace_snapshot(
+    operator: Path, directory: Path, capture_id: str, expected_root_id: str
+) -> dict[str, Any]:
+    """Account only declared mutable workspaces and promotion destinations."""
+    import stat
+
+    root_info = operator.lstat()
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or operator.resolve() != operator.absolute()
+        or root_info.st_dev != directory.stat().st_dev
+    ):
+        raise RunnerError("operator root changed during live storage supervision")
+    root_identity = _strict_json(operator / "root-id.json", MIB)
+    if (
+        not isinstance(expected_root_id, str)
+        or _owner_root_id(directory) != expected_root_id
+        or not isinstance(root_identity, dict)
+        or root_identity.get("version") != 1
+        or root_identity.get("root_id") != expected_root_id
+    ):
+        raise RunnerError("operator root identity changed during live storage supervision")
+    count = [0]
+    allocated_inodes: set[tuple[int, int]] = set()
+    logical = allocated = database = temporary = 0
+    try:
+        with os.scandir(operator) as entries:
+            operator_entries = {}
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not (
+                    stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+                ):
+                    raise RunnerError("operator root contains an unsafe live entry")
+                operator_entries[entry.name] = [
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_blocks,
+                ]
+    except OSError as exc:
+        raise RunnerError("operator root could not be inventoried") from exc
+    if len(operator_entries) > int(RUN_LIMITS["storage_inventory_entries"]):
+        raise RunnerError("operator root exceeded its direct-entry bound")
+    pointer_entry = operator_entries.get("current-historical.json")
+    if pointer_entry is not None:
+        logical += pointer_entry[3]
+    for name, entry in operator_entries.items():
+        if not _ATOMIC_TEMP_NAME.fullmatch(name):
+            continue
+        if not stat.S_ISREG(entry[2]) or entry[0] != root_info.st_dev:
+            raise RunnerError("operator root atomic-write temporary is unsafe")
+        logical += entry[3]
+        temporary += entry[3]
+        inode = (entry[0], entry[1])
+        if inode not in allocated_inodes:
+            allocated += entry[5] * 512
+            allocated_inodes.add(inode)
+    tmp = operator / "tmp"
+    try:
+        tmp_info = tmp.lstat()
+    except FileNotFoundError:
+        tmp_info = None
+    if tmp_info is not None:
+        if not stat.S_ISDIR(tmp_info.st_mode) or tmp_info.st_dev != root_info.st_dev:
+            raise RunnerError("operator temporary namespace is unsafe")
+        try:
+            with os.scandir(tmp) as entries:
+                names = list(entries)
+        except OSError as exc:
+            raise RunnerError("operator temporary namespace could not be listed") from exc
+        if len(names) > int(RUN_LIMITS["storage_inventory_entries"]):
+            raise RunnerError("operator temporary namespace exceeded its entry bound")
+        for entry in names:
+            if entry.name == "recovery-index":
+                valid = entry.is_dir(follow_symlinks=False)
+            else:
+                valid = any(pattern.fullmatch(entry.name) for pattern in _LIVE_TMP_NAMES)
+            if not valid:
+                raise RunnerError(f"unknown live temporary workspace: {entry.name}")
+            info = entry.stat(follow_symlinks=False)
+            if info.st_dev != root_info.st_dev:
+                raise RunnerError("operator temporary workspace crossed filesystems")
+            if stat.S_ISDIR(info.st_mode):
+                totals = _bounded_tree_bytes(
+                    Path(entry.path), root_info.st_dev, count, allocated_inodes
+                )
+            elif stat.S_ISREG(info.st_mode) and entry.name.startswith(".write-"):
+                totals = {
+                    "logical_bytes": info.st_size,
+                    "allocated_bytes": info.st_blocks * 512,
+                    "database_bytes": 0,
+                }
+            else:
+                raise RunnerError("operator temporary workspace contains an unsafe entry")
+            logical += totals["logical_bytes"]
+            allocated += totals["allocated_bytes"]
+            database += totals["database_bytes"]
+            temporary += totals["logical_bytes"]
+
+    def directory_names(parent: Path, pattern: re.Pattern[str]) -> tuple[set[str], Path | None]:
+        try:
+            parent_info = parent.lstat()
+        except FileNotFoundError:
+            return set(), None
+        if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_dev != root_info.st_dev:
+            raise RunnerError(f"live storage directory is unsafe: {parent.name}")
+        try:
+            with os.scandir(parent) as entries:
+                rows = list(entries)
+        except OSError as exc:
+            raise RunnerError(f"live storage directory could not be listed: {parent.name}") from exc
+        if len(rows) > int(RUN_LIMITS["storage_release_directories"]):
+            raise RunnerError(f"live storage directory exceeded its entry bound: {parent.name}")
+        names = set()
+        for entry in rows:
+            if not pattern.fullmatch(entry.name) or not entry.is_dir(follow_symlinks=False):
+                raise RunnerError(f"unknown live storage destination: {entry.name}")
+            names.add(entry.name)
+        return names, parent
+
+    build_names, _ = directory_names(
+        operator / "builds-historical", re.compile(r"[0-9a-f]{32}\Z")
+    )
+    build_path = operator / "builds-historical" / capture_id
+    try:
+        build_info = build_path.lstat()
+    except FileNotFoundError:
+        build_info = None
+    if build_info is not None:
+        totals = _bounded_tree_bytes(build_path, root_info.st_dev, count, allocated_inodes)
+        logical += totals["logical_bytes"]
+        allocated += totals["allocated_bytes"]
+        database += totals["database_bytes"]
+
+    release_names, _ = directory_names(operator / "releases", re.compile(r"[0-9a-f]{64}\Z"))
+    pointer_path = operator / "current-historical.json"
+    try:
+        pointer_info = pointer_path.lstat()
+    except FileNotFoundError:
+        pointer_info = None
+    if pointer_info is not None and not stat.S_ISREG(pointer_info.st_mode):
+        raise RunnerError("historical release pointer is missing or unsafe")
+    pointer = _strict_json(pointer_path, MIB) if pointer_info is not None else None
+    if pointer_info is not None and pointer is None:
+        raise RunnerError("historical release pointer is missing or unsafe")
+    current_release = pointer.get("source_release_id") if pointer is not None else None
+    if current_release is not None and (
+        not isinstance(current_release, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", current_release)
+        or current_release not in release_names
+    ):
+        raise RunnerError("historical release pointer has no safe release directory")
+    return_value = {
+        "logical_bytes": logical,
+        "allocated_bytes": allocated,
+        "database_bytes": database,
+        "temporary_bytes": temporary,
+        "tmp_names": sorted(entry.name for entry in names) if tmp_info is not None else [],
+        "build_names": sorted(build_names),
+        "release_names": sorted(release_names),
+        "operator_entries": operator_entries,
+        "allocated_inodes": allocated_inodes,
+    }
+    return {
+        **return_value,
+    }
+
+
+def _live_external_paths(paths: dict[str, Path], directory: Path) -> dict[str, Path]:
+    import stat
+
+    report_path = paths.get("session_report")
+    if report_path is None:
+        raise RunnerError("live external inventory has no session report path")
+    result = dict(paths)
+    for parent, pattern, label in (
+        (report_path.parent, re.compile(r"\.session\.json\.[0-9a-f]{32}\.tmp\Z"), "report"),
+        (directory, _ACTIVATION_TEMP_NAME, "activation"),
+    ):
+        try:
+            with os.scandir(parent) as entries:
+                rows = list(entries)
+        except OSError as exc:
+            raise RunnerError("live external artifact directory could not be listed") from exc
+        if len(rows) > int(RUN_LIMITS["storage_inventory_entries"]):
+            raise RunnerError("live external artifact inventory exceeded its entry bound")
+        for entry in rows:
+            if pattern.fullmatch(entry.name):
+                result[f"{label}:{entry.name}"] = Path(entry.path)
+    try:
+        with os.scandir(directory) as entries:
+            root_rows = list(entries)
+    except OSError as exc:
+        raise RunnerError("production directory could not be inventoried") from exc
+    if len(root_rows) > int(RUN_LIMITS["storage_inventory_entries"]):
+        raise RunnerError("production directory exceeded its direct-entry bound")
+    fixed_root_entries = {
+        OWNER_MARKER: "file",
+        ".production-run.lock": "file",
+        "operator": "directory",
+        "runs": "directory",
+        "production.duckdb": "file",
+    }
+    for entry in root_rows:
+        if _ACTIVATION_TEMP_NAME.fullmatch(entry.name):
+            continue
+        expected_type = fixed_root_entries.get(entry.name)
+        if expected_type is None:
+            raise RunnerError(f"unknown production-root workspace: {entry.name}")
+        info = entry.stat(follow_symlinks=False)
+        if expected_type == "directory" and not stat.S_ISDIR(info.st_mode):
+            raise RunnerError(f"production-root directory is unsafe: {entry.name}")
+        if expected_type == "file" and not stat.S_ISREG(info.st_mode):
+            raise RunnerError(f"production-root file is unsafe: {entry.name}")
+    return result
+
+
+def _live_external_files(
+    paths: dict[str, Path],
+    *,
+    directory: Path,
+    seen: set[tuple[int, int]] | None = None,
+) -> dict[str, int]:
+    import stat
+
+    result: dict[str, int] = {}
+    seen = set() if seen is None else set(seen)
+    for name, path in _live_external_paths(paths, directory).items():
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            result[name] = 0
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink < 1:
+            raise RunnerError(f"live external artifact is unsafe: {path.name}")
+        identity = (info.st_dev, info.st_ino)
+        result[name] = info.st_size if identity not in seen else 0
+        seen.add(identity)
+    return result
+
+
+def _live_external_allocated_bytes(
+    paths: dict[str, Path],
+    *,
+    directory: Path,
+    seen: set[tuple[int, int]] | None = None,
+) -> int:
+    seen = set() if seen is None else set(seen)
+    total = 0
+    for path in _live_external_paths(paths, directory).values():
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        identity = (info.st_dev, info.st_ino)
+        if identity not in seen:
+            total += info.st_blocks * 512
+            seen.add(identity)
+    return total
+
+
+def _begin_storage_supervision(
+    directory: Path,
+    operator: Path,
+    report: dict[str, Any],
+    progress_path: Path,
+    external_paths: dict[str, Path],
+) -> dict[str, Any]:
+    saved = report.get("storage")
+    fields = (
+        "operator_retained_bytes",
+        "operator_temporary_bytes",
+        "operator_database_bytes",
+        "external_bytes",
+        "aggregate_estimate_bytes",
+    )
+    if not isinstance(saved, dict) or any(
+        type(saved.get(field)) is not int or saved[field] < 0 for field in fields
+    ):
+        raise RunnerError("live storage supervision has no verified baseline")
+    if not isinstance(report.get("capture_id"), str) or not CAPTURE_ID.fullmatch(
+        report["capture_id"]
+    ):
+        raise RunnerError("live storage supervision has no exact capture identity")
+    if progress_path.exists() or progress_path.is_symlink():
+        raise RunnerError("live storage progress path already exists or is unsafe")
+    workspace = _live_workspace_snapshot(
+        operator,
+        directory,
+        str(report["capture_id"]),
+        str(report.get("root_id", "")),
+    )
+    if any(_ATOMIC_TEMP_NAME.fullmatch(name) for name in workspace["operator_entries"]):
+        raise RunnerError("operator root contains a stale atomic-write temporary")
+    if (
+        saved["operator_database_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"])
+        or saved["operator_temporary_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"])
+        or saved["operator_retained_bytes"] > int(RUN_LIMITS["root_bytes"])
+        or saved["aggregate_estimate_bytes"] > int(RUN_LIMITS["aggregate_bytes"])
+    ):
+        raise RunnerError("verified storage baseline exceeds a live admission threshold")
+    external = _live_external_files(
+        external_paths,
+        directory=directory,
+        seen=workspace["allocated_inodes"],
+    )
+    if any(name.startswith("activation:") for name in external):
+        raise RunnerError("stale production activation temporary exists before supervision")
+    current = {
+        "operator_retained_bytes": saved["operator_retained_bytes"],
+        "operator_temporary_bytes": saved["operator_temporary_bytes"],
+        "operator_database_bytes": saved["operator_database_bytes"],
+        "external_bytes": saved["external_bytes"],
+        "aggregate_estimate_bytes": saved["aggregate_estimate_bytes"],
+        "operator_live_workspace_allocated_bytes": workspace["allocated_bytes"],
+    }
+    state = {
+        "version": 1,
+        "target_interval_seconds": int(RUN_LIMITS["storage_sample_seconds"]),
+        "sample_count": 0,
+        "last_sample_monotonic": None,
+        "max_interval_seconds": 0.0,
+        "baseline": {
+            "workspace": workspace,
+            "external_files": external,
+            "external_allocated_bytes": _live_external_allocated_bytes(
+                external_paths,
+                directory=directory,
+                seen=workspace["allocated_inodes"],
+            ),
+            "storage": saved,
+        },
+        "high_water": dict(current),
+        "current": current,
+    }
+    _write_storage_progress(progress_path, state, create=True)
+    return state
+
+
+def _write_storage_progress(path: Path, state: dict[str, Any], *, create: bool = False) -> None:
+    import stat
+
+    if create and (path.exists() or path.is_symlink()):
+        raise RunnerError("live storage progress path already exists")
+    if not create:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise RunnerError("live storage progress report is missing") from exc
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RunnerError("live storage progress path became unsafe")
+    if path.is_symlink():
+        raise RunnerError("live storage progress path became a symlink")
+    value = dict(state)
+    baseline = dict(state["baseline"])
+    workspace = baseline["workspace"]
+    baseline["workspace"] = {
+        key: workspace[key]
+        for key in (
+            "logical_bytes",
+            "allocated_bytes",
+            "database_bytes",
+            "temporary_bytes",
+        )
+    }
+    value["baseline"] = baseline
+    _atomic_report(path, value)
+
+
+def _sample_live_storage(
+    directory: Path,
+    operator: Path,
+    report: dict[str, Any],
+    state: dict[str, Any],
+    progress_path: Path,
+    external_paths: dict[str, Path],
+) -> str | None:
+    baseline = state["baseline"]
+    base_workspace = baseline["workspace"]
+    current_workspace = _live_workspace_snapshot(
+        operator,
+        directory,
+        str(report.get("capture_id", "")),
+        str(report.get("root_id", "")),
+    )
+    base_builds = set(base_workspace["build_names"])
+    if set(current_workspace["build_names"]) - base_builds - {str(report.get("capture_id"))}:
+        raise RunnerError("live historical build destination was not registered")
+    base_releases = set(base_workspace["release_names"])
+    added_releases = set(current_workspace["release_names"]) - base_releases
+    if len(added_releases) > 1:
+        raise RunnerError("multiple live historical release destinations are ambiguous")
+    if added_releases:
+        release_id = next(iter(added_releases))
+        release = _bounded_tree_bytes(
+            operator / "releases" / release_id,
+            operator.stat().st_dev,
+            [0],
+            current_workspace["allocated_inodes"],
+        )
+        current_workspace["logical_bytes"] += release["logical_bytes"]
+        current_workspace["allocated_bytes"] += release["allocated_bytes"]
+        current_workspace["database_bytes"] += release["database_bytes"]
+    baseline_entries = base_workspace["operator_entries"]
+    current_entries = current_workspace["operator_entries"]
+    mutable_top_level = {"tmp", "builds-historical", "releases", "current-historical.json"}
+    missing = set(baseline_entries) - set(current_entries)
+    if missing - {name for name in missing if _ATOMIC_TEMP_NAME.fullmatch(name)}:
+        raise RunnerError("operator root entry disappeared during live storage supervision")
+    new_entries = set(current_entries) - set(baseline_entries) - mutable_top_level
+    if new_entries - {name for name in new_entries if _ATOMIC_TEMP_NAME.fullmatch(name)}:
+        raise RunnerError("unknown operator-root workspace appeared during live supervision")
+    mutable_entries = mutable_top_level | {
+        name for name in set(baseline_entries) | set(current_entries) if _ATOMIC_TEMP_NAME.fullmatch(name)
+    }
+    for name in set(baseline_entries) & set(current_entries) - mutable_entries:
+        if baseline_entries[name] != current_entries[name]:
+            raise RunnerError(f"non-workspace operator entry changed during live work: {name}")
+    current_external = _live_external_files(
+        external_paths,
+        directory=directory,
+        seen=current_workspace["allocated_inodes"],
+    )
+    external_delta = sum(current_external.values()) - sum(baseline["external_files"].values())
+    external_allocated = _live_external_allocated_bytes(
+        external_paths,
+        directory=directory,
+        seen=current_workspace["allocated_inodes"],
+    )
+    free = shutil.disk_usage(directory).free
+    workspace_delta = current_workspace["logical_bytes"] - base_workspace["logical_bytes"]
+    database_delta = current_workspace["database_bytes"] - base_workspace["database_bytes"]
+    temporary_delta = current_workspace["temporary_bytes"] - base_workspace["temporary_bytes"]
+    saved = baseline["storage"]
+    current = {
+        "operator_retained_bytes": saved["operator_retained_bytes"] + workspace_delta,
+        "operator_temporary_bytes": saved["operator_temporary_bytes"] + temporary_delta,
+        "operator_database_bytes": saved["operator_database_bytes"] + database_delta,
+        "external_bytes": saved["external_bytes"] + external_delta,
+        "aggregate_estimate_bytes": saved["aggregate_estimate_bytes"]
+        + workspace_delta
+        + external_delta,
+        "operator_live_workspace_allocated_bytes": current_workspace["allocated_bytes"],
+        "external_live_artifact_allocated_bytes": external_allocated,
+        "external_live_artifact_logical_bytes": sum(current_external.values()),
+        "ssd_free_bytes": free,
+    }
+    state["sample_count"] += 1
+    now = time.monotonic()
+    previous = state.get("last_sample_monotonic")
+    interval = None if previous is None else max(0.0, now - previous)
+    if interval is not None:
+        state["max_interval_seconds"] = max(float(state["max_interval_seconds"]), interval)
+    state["last_sample_monotonic"] = now
+    state["last_interval_seconds"] = interval
+    state["last_observed_at"] = _utc()
+    state["current"] = current
+    for name, value in current.items():
+        if name.endswith("allocated_bytes") or name.endswith("logical_bytes"):
+            continue
+        state["high_water"][name] = max(state["high_water"].get(name, 0), value)
+    report["storage_supervision"] = {
+        key: value for key, value in state.items() if key != "baseline"
+    }
+    _write_storage_progress(progress_path, state)
+    if current["operator_database_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"]):
+        return "live database storage reached the 56 GiB stop threshold"
+    if current["operator_temporary_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"]):
+        return "live temporary storage reached the 56 GiB stop threshold"
+    if current["operator_retained_bytes"] > int(RUN_LIMITS["root_bytes"]):
+        return "live operator root storage allowance was exceeded"
+    if current["aggregate_estimate_bytes"] > int(RUN_LIMITS["aggregate_bytes"]):
+        return "live aggregate storage allowance was exceeded"
+    if free < int(RUN_LIMITS["minimum_free_bytes"]):
+        return "SSD free space fell below 150 GiB"
+    return None
+
+
 def _prepare_run_paths(directory: Path, report_path: Path) -> dict[str, Path]:
     run_root = report_path.parent
     logs = run_root / "logs" / f"invocation-{uuid.uuid4().hex}"
@@ -1987,8 +2736,16 @@ def _prepare_run_paths(directory: Path, report_path: Path) -> dict[str, Path]:
         "logs": logs,
         "metrics": metrics_path,
         "metrics_progress": metrics_path.with_name(f"{metrics_path.name}.progress.json"),
+        "storage_progress": run_root / f"storage-{uuid.uuid4().hex}.json",
         "capture_notification": run_root / "capture-notification.json",
     }
+
+
+def _stage_storage_progress_path(paths: dict[str, Path], label: str) -> Path:
+    candidate = paths.get("storage_progress")
+    if candidate is not None and not candidate.exists() and not candidate.is_symlink():
+        return candidate
+    return paths["logs"] / f"{label}.storage.json"
 
 
 @contextlib.contextmanager
@@ -2042,6 +2799,318 @@ def _operator_writer_lock(operator: Path):
         if locked:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def _stopped_worker_evidence(
+    directory: Path, report_path: Path, report: dict[str, Any], capture_id: str
+) -> tuple[dict[str, Any], Path, bytes]:
+    from kalshi_events.common import regular_bytes, safe_path
+
+    source_value = report.get("source_root")
+    if not isinstance(source_value, str):
+        raise RunnerError("stopped-worker reconciliation has no saved source root")
+    try:
+        source_root = safe_path(Path(source_value))
+    except Exception as exc:
+        raise RunnerError("saved source root is unsafe") from exc
+    runtime_root = (SOURCE_ROOT / "data" / "runtime").resolve()
+    if (
+        not source_root.is_dir()
+        or source_root.name != "source"
+        or source_root.parent.parent != runtime_root
+    ):
+        raise RunnerError("saved source root is outside the managed runtime layout")
+    launch_path = source_root.parent / "latest-launch.json"
+    try:
+        launch_stat = launch_path.lstat()
+    except OSError as exc:
+        raise RunnerError("saved source runtime has no latest-launch record") from exc
+    import stat
+
+    if not stat.S_ISREG(launch_stat.st_mode) or launch_stat.st_nlink != 1:
+        raise RunnerError("latest-launch record is unsafe")
+    launch_raw = regular_bytes(launch_path, MIB)
+    try:
+        launch = json.loads(launch_raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("latest-launch record is malformed") from exc
+    if not isinstance(launch, dict):
+        raise RunnerError("latest-launch record is malformed")
+    launch_capture = launch.get("capture_id")
+    launch_revision = launch.get("revision")
+    launch_pid = launch.get("pid")
+    launch_pgid = launch.get("pgid")
+    command = launch.get("command")
+    if (
+        launch.get("session") != str(report_path)
+        or launch_capture != capture_id
+        or launch_revision != report.get("revision")
+        or not isinstance(launch_revision, str)
+        or not REVISION.fullmatch(launch_revision)
+        or isinstance(launch_pid, bool)
+        or not isinstance(launch_pid, int)
+        or launch_pid <= 1
+        or isinstance(launch_pgid, bool)
+        or not isinstance(launch_pgid, int)
+        or launch_pgid != launch_pid
+        or launch.get("offline_only") is not True
+        or launch.get("automatic_retry") is not False
+        or not isinstance(command, list)
+        or any(not isinstance(item, str) for item in command)
+        or "--historical" not in command
+    ):
+        raise RunnerError("latest-launch identity does not match the stopped capture")
+    try:
+        capture_index = command.index("--capture-id")
+        directory_index = command.index("--directory")
+        command_capture = command[capture_index + 1]
+        command_directory = Path(command[directory_index + 1]).absolute()
+        command_script = safe_path(Path(command[1]))
+        latest_session = safe_path(Path(launch["session"]))
+    except (ValueError, IndexError, KeyError, OSError, TypeError) as exc:
+        raise RunnerError("latest-launch command is incomplete or unsafe") from exc
+    if (
+        command_capture != capture_id
+        or command_directory != directory.absolute()
+        or not command_script.is_file()
+        or not command_script.is_relative_to(source_root)
+        or latest_session != report_path
+    ):
+        raise RunnerError("latest-launch command does not match this session")
+    process_identity = launch.get("process_identity")
+    if not isinstance(process_identity, str) or process_identity.split(maxsplit=2)[:2] != [
+        str(launch_pid),
+        str(launch_pgid),
+    ]:
+        raise RunnerError("latest-launch process identity is ambiguous")
+    stdout_path = launch.get("stdout")
+    if not isinstance(stdout_path, str):
+        raise RunnerError("latest-launch stdout path is missing")
+    try:
+        stdout = safe_path(Path(stdout_path))
+        stdout_info = stdout.lstat()
+    except OSError as exc:
+        raise RunnerError("latest-launch stdout path is unsafe") from exc
+    if (
+        not stat.S_ISREG(stdout_info.st_mode)
+        or stdout.parent.parent != source_root.parent
+    ):
+        raise RunnerError("latest-launch stdout path is outside its managed run")
+    evidence_path = stdout.parent / "storage-safety-stop.json"
+    try:
+        evidence_info = evidence_path.lstat()
+    except OSError as exc:
+        raise RunnerError("stopped-worker evidence is missing") from exc
+    if not stat.S_ISREG(evidence_info.st_mode) or evidence_info.st_nlink != 1:
+        raise RunnerError("stopped-worker evidence is unsafe")
+    evidence_raw = regular_bytes(evidence_path, MIB)
+    try:
+        evidence = json.loads(evidence_raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("stopped-worker evidence is malformed") from exc
+    if not isinstance(evidence, dict):
+        raise RunnerError("stopped-worker evidence is malformed")
+    started_at = launch.get("started_at")
+    process_started_at = evidence.get("supervisor_process_started_utc")
+    try:
+        launch_started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        evidence_started = datetime.fromisoformat(str(process_started_at).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RunnerError("stopped-worker process start identity is invalid") from exc
+    original_group = report.get("active_process_group")
+    database_limit = int(RUN_LIMITS["database_bytes"])
+    activity = evidence.get("network_activity_this_invocation")
+    if (
+        launch_started.tzinfo is None
+        or evidence_started.tzinfo is None
+        or int(launch_started.timestamp()) != int(evidence_started.timestamp())
+        or evidence.get("capture_id") != capture_id
+        or evidence.get("revision") != report.get("revision")
+        or evidence.get("old_active_child_group") != original_group
+        or evidence.get("supervisor_pid") != launch_pid
+        or evidence.get("signal") != "SIGTERM to exact original supervisor only"
+        or evidence.get("original_pids_absent") is not True
+        or evidence.get("owned_group_members") != []
+        or evidence.get("production_exists") is not False
+        or evidence.get("automatic_retry") is not False
+        or evidence.get("session_phase") != "stopped"
+        or evidence.get("session_error") != report.get("error")
+        or evidence.get("database_limit_bytes") != database_limit
+        or type(evidence.get("observed_database_bytes")) is not int
+        or evidence["observed_database_bytes"] <= database_limit
+        or not isinstance(activity, dict)
+        or activity.get("requests") != 0
+        or activity.get("downloaded_bytes") != 0
+        or activity.get("accounting_complete") is not True
+        or not isinstance(evidence.get("session_before_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", evidence["session_before_sha256"])
+    ):
+        raise RunnerError("stopped-worker evidence identity or stop condition is invalid")
+    return evidence, evidence_path, evidence_raw
+
+
+def _append_stopped_worker_audit(
+    operator: Path, record: dict[str, Any]
+) -> dict[str, Any]:
+    from kalshi_events.common import fsync_directory
+
+    path = operator / "stopped-worker-reconciliation.jsonl"
+    flags = os.O_CREAT | os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        import stat
+
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != operator.stat().st_dev:
+            raise RunnerError("stopped-worker audit log is unsafe")
+        if info.st_size > MIB:
+            raise RunnerError("stopped-worker audit log exceeded its byte bound")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        previous = os.read(descriptor, MIB + 1)
+        if len(previous) > MIB:
+            raise RunnerError("stopped-worker audit log exceeded its byte bound")
+        for line in previous.splitlines():
+            try:
+                entry = json.loads(line.decode("utf-8"))
+            except (UnicodeError, ValueError) as exc:
+                raise RunnerError("stopped-worker audit log is malformed") from exc
+            if not isinstance(entry, dict) or entry.get("version") != 1:
+                raise RunnerError("stopped-worker audit log is malformed")
+            if entry.get("event_id") == record["event_id"]:
+                if {key: value for key, value in entry.items() if key != "reconciled_at"} != {
+                    key: value for key, value in record.items() if key != "reconciled_at"
+                }:
+                    raise RunnerError("stopped-worker audit event conflicts with its prior record")
+                return entry
+            if entry.get("session_id") == record["session_id"]:
+                raise RunnerError("this stopped session already has a different reconciliation audit")
+        body = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        remaining = memoryview(body)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise RunnerError("stopped-worker audit append was incomplete")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        if info.st_size == 0:
+            fsync_directory(operator)
+        return record
+    finally:
+        os.close(descriptor)
+
+
+def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any]:
+    from kalshi_events.common import regular_bytes, safe_path
+
+    directory = prepare_directory(directory, "historical")
+    operator = directory / "operator"
+    with _run_lock(directory):
+        run_root = directory / "runs"
+        matches = []
+        for candidate in run_root.glob(f"*/{REPORT_NAME}"):
+            try:
+                candidate = safe_path(candidate)
+            except Exception as exc:
+                raise RunnerError("session report path is unsafe") from exc
+            report = _strict_json(candidate)
+            if report is not None and report.get("capture_id") == capture_id:
+                matches.append((candidate, report))
+        if len(matches) != 1:
+            raise RunnerError("stopped-worker reconciliation requires one exact capture report")
+        report_path, report = matches[0]
+        group = report.get("active_process_group")
+        if (
+            not isinstance(report.get("session_id"), str)
+            or not CAPTURE_ID.fullmatch(report["session_id"])
+            or report["session_id"] != report_path.parent.name
+            or report_path.parent.parent != run_root
+            or type(group) is not int
+            or group <= 1
+            or report.get("phase") != "stopped"
+            or report.get("production_state") == "verified"
+            or not isinstance(report.get("error"), str)
+            or report.get("boot_stamp") != _boot_stamp()
+        ):
+            raise RunnerError("session is not an exact stopped worker on the saved boot")
+        root_id = report.get("root_id")
+        if not isinstance(root_id, str) or not CAPTURE_ID.fullmatch(root_id):
+            raise RunnerError("stopped session root identity is invalid")
+        window = _validate_offline_historical_window(
+            report,
+            capture_id,
+            allow_expired=True,
+            allow_revision_change=True,
+        )
+        if window.get("root_id") != root_id or _owner_root_id(directory) != root_id:
+            raise RunnerError("stopped session root identity does not match its owner marker")
+        evidence, evidence_path, evidence_raw = _stopped_worker_evidence(
+            directory, report_path, report, capture_id
+        )
+        supervisor_pid = evidence["supervisor_pid"]
+        if (
+            type(supervisor_pid) is not int
+            or supervisor_pid <= 1
+            or _pid_exists(group)
+            or _process_group_exists(group)
+            or _pid_exists(supervisor_pid)
+            or _process_group_exists(supervisor_pid)
+        ):
+            raise RunnerError("stopped worker or original supervisor is still alive or ambiguous")
+        raw_report = regular_bytes(report_path, 16 * MIB)
+        report_hash = hashlib.sha256(raw_report).hexdigest()
+        evidence_hash = hashlib.sha256(evidence_raw).hexdigest()
+        event_identity = {
+            "capture_id": capture_id,
+            "session_id": report.get("session_id"),
+            "root_id": root_id,
+            "stale_process_group": group,
+            "supervisor_pid": supervisor_pid,
+            "boot_stamp": report["boot_stamp"],
+            "revision": report.get("revision"),
+            "report_sha256": report_hash,
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": evidence_hash,
+            "evidence_report_preimage_sha256": evidence["session_before_sha256"],
+            "primary_stop_reason": report.get("error"),
+        }
+        event_id = hashlib.sha256(
+            json.dumps(event_identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        audit = {
+            "version": 1,
+            "event_id": event_id,
+            "reconciled_at": _utc(),
+            **event_identity,
+        }
+        with _operator_writer_lock(operator) as writer_identity:
+            _validate_offline_renewal_root(
+                directory,
+                operator,
+                root_id,
+                capture_id,
+                writer_lock_identity=writer_identity,
+            )
+            if (
+                _pid_exists(group)
+                or _process_group_exists(group)
+                or _pid_exists(supervisor_pid)
+                or _process_group_exists(supervisor_pid)
+            ):
+                raise RunnerError("stopped worker or original supervisor reappeared")
+            audit = _append_stopped_worker_audit(operator, audit)
+            report["active_process_group"] = None
+            report["stopped_worker_reconciliation"] = {
+                "event_id": event_id,
+                "audit_file": "stopped-worker-reconciliation.jsonl",
+                "reconciled_at": audit["reconciled_at"],
+                "stale_process_group": group,
+                "supervisor_pid": supervisor_pid,
+                "primary_stop_reason": report.get("error"),
+                "termination_evidence_sha256": evidence_hash,
+                "session_before_sha256": evidence["session_before_sha256"],
+            }
+            _atomic_report(report_path, report)
+        return report
 
 
 def _validate_offline_renewal_root(
@@ -2268,10 +3337,11 @@ def _monitor_deadline(report: dict[str, Any], *, workflow: bool) -> float:
     if _ACTIVE_OFFLINE_HISTORICAL_WINDOW is not None:
         window = _ACTIVE_OFFLINE_HISTORICAL_WINDOW
         wall_remaining = float(window["deadline_epoch"]) - time.time()
+        reserve = _offline_workflow_reserve(window) if workflow else 0.0
         return min(
-            float(window["deadline_monotonic"]),
+            float(window["deadline_monotonic"]) - reserve,
             float(window["started_monotonic"]) + ceiling,
-            time.monotonic() + max(0.0, wall_remaining),
+            time.monotonic() + max(0.0, wall_remaining - reserve),
         )
     monotonic_deadline = min(
         _time_budget_started(report, "monotonic") + ceiling,
@@ -2296,9 +3366,10 @@ def _child_wall_deadline_epoch(
             if workflow_deadline
             else RUN_LIMITS["active_cutoff_seconds"]
         )
+        reserve = _offline_workflow_reserve(window) if workflow_deadline else 0.0
         wall_now = time.time()
         return min(
-            float(window["deadline_epoch"]),
+            float(window["deadline_epoch"]) - reserve,
             float(window["started_epoch"]) + stage_seconds,
             wall_now + max(0.0, monotonic_deadline - time.monotonic()),
         )
@@ -2322,6 +3393,17 @@ def _child_wall_deadline_epoch(
     ]
     deadlines.append(_time_budget_deadline(report, "epoch"))
     return min(deadlines)
+
+
+def _offline_workflow_reserve(window: dict[str, Any]) -> float:
+    """Keep the final twelfth, up to two hours, for offline verification and activation."""
+    duration = min(
+        float(window["deadline_epoch"]) - float(window["started_epoch"]),
+        float(window["deadline_monotonic"]) - float(window["started_monotonic"]),
+    )
+    if not math.isfinite(duration) or duration <= 0:
+        raise RunnerError("offline historical window duration is invalid")
+    return min(2 * 3600.0, duration / 12.0)
 
 
 def _offline_historical_window_bounds(
@@ -2616,6 +3698,7 @@ def _run_external_child(
     label: str,
     capture_id: str | None = None,
     preserve_phase_until_start: bool = False,
+    storage_supervision: bool = False,
 ) -> tuple[int | None, str | None, bool, Path, Path]:
     stdout = paths["logs"] / f"{label}.stdout.json"
     stderr = paths["logs"] / f"{label}.stderr.log"
@@ -2627,6 +3710,8 @@ def _run_external_child(
         report["phase"] = label
         _atomic_report(paths["report"], report)
     started = time.monotonic()
+    storage_progress = _stage_storage_progress_path(paths, label)
+    storage_token = uuid.uuid4().hex if storage_supervision else None
     status = _invoke(
         command,
         directory=directory,
@@ -2640,7 +3725,21 @@ def _run_external_child(
         capture_notification=notification,
         workflow_deadline=label == "refresh",
         phase_on_start=label if preserve_phase_until_start else None,
+        storage_supervision=storage_supervision,
+        storage_invocation_token=storage_token,
+        metrics_progress_path=paths.get("metrics_progress"),
+        storage_progress_path=storage_progress if storage_supervision else None,
     )
+    if storage_supervision and report.get("storage_supervision_invocation") == storage_token:
+        if not storage_progress.exists() and not storage_progress.is_symlink():
+            raise RunnerError("live storage report disappeared after child start")
+        storage_result = _strict_json(storage_progress)
+        if storage_result is None or storage_result.get("version") != 1:
+            raise RunnerError("live storage supervision report is missing or malformed")
+        report["storage_supervision_file"] = str(storage_progress)
+        report["storage_supervision"] = {
+            key: value for key, value in storage_result.items() if key != "baseline"
+        }
     report["phase_seconds"][label] = report["phase_seconds"].get(label, 0) + (
         time.monotonic() - started
     )
@@ -2678,6 +3777,7 @@ def run_production(
     extend_session: bool = False,
     recover_reboot: bool = False,
     recovery_volume_uuid: str | None = None,
+    reconcile_stopped_worker: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded catalogue refresh/resume or verify-and-activate a publication."""
     preflight_started = time.monotonic()
@@ -2690,6 +3790,19 @@ def run_production(
         renew_offline_window=renew_offline_window,
         supersede_offline_window=supersede_offline_window,
     )
+    if reconcile_stopped_worker:
+        if (
+            mode != "historical"
+            or offline_duration_seconds is not None
+            or renew_offline_window
+            or supersede_offline_window
+            or reconcile_accounting
+            or extend_session
+            or recover_reboot
+            or recovery_volume_uuid is not None
+        ):
+            raise RunnerError("--reconcile-stopped-worker requires only --historical --capture-id")
+        return _reconcile_stopped_worker(directory, str(capture_id)), 0
     _validate_runtime_versions(_package_versions())
     if reconcile_accounting and mode != "resume":
         raise RunnerError("accounting reconciliation requires --capture-id resume")
@@ -2758,6 +3871,7 @@ def run_production(
             paths = _prepare_run_paths(directory, report_path)
             report["metrics_file"] = str(paths["metrics"])
             report["metrics_progress_file"] = str(paths["metrics_progress"])
+            report["storage_progress_file"] = str(paths["storage_progress"])
             if report.get("root_id") is None:
                 raise RunnerError("resume root identity was not durably recorded")
         else:
@@ -2765,6 +3879,7 @@ def run_production(
             paths = _prepare_run_paths(directory, report_path)
             report["metrics_file"] = str(paths["metrics"])
             report["metrics_progress_file"] = str(paths["metrics_progress"])
+            report["storage_progress_file"] = str(paths["storage_progress"])
         phases = report.setdefault("phase_seconds", {})
         phases["preflight"] = phases.get("preflight", 0) + time.monotonic() - preflight_started
         result: dict[str, Any] = report
@@ -2854,6 +3969,16 @@ def run_production(
                 )
                 if offline_window is not None:
                     _atomic_report(report_path, report)
+        if offline_window is not None:
+            reserve = _offline_workflow_reserve(offline_window)
+            report["offline_workflow_reserve_seconds"] = reserve
+            report["offline_workflow_deadline_epoch"] = (
+                float(offline_window["deadline_epoch"]) - reserve
+            )
+            report["offline_workflow_deadline_monotonic"] = (
+                float(offline_window["deadline_monotonic"]) - reserve
+            )
+            _atomic_report(report_path, report)
         awake = subprocess.Popen(
             ["caffeinate", "-is", "-w", str(os.getpid())],
             stdin=subprocess.DEVNULL,
@@ -3040,6 +4165,7 @@ def run_production(
                     label="refresh",
                     capture_id=capture_id,
                     preserve_phase_until_start=(mode == "historical"),
+                    storage_supervision=(mode == "historical"),
                 )
                 cli_result = _read_cli_result(stdout_path)
                 observed_capture = (cli_result or {}).get("capture_id") or report.get("capture_id")
@@ -3068,8 +4194,8 @@ def run_production(
                     )
                     _atomic_report(report_path, report)
                     return result, 3
-                if not reaped:
-                    stop_reason = "refresh subprocess could not be reaped within five seconds"
+                if not reaped and not stop_reason:
+                    stop_reason = "refresh process group could not be confirmed reaped"
                 if stop_reason or cli_result is None or code not in {0, 1, 3}:
                     if mode != "historical":
                         report["accounting_complete"] = False
@@ -3307,6 +4433,7 @@ def run_production(
                     paths,
                     report,
                     _monitor_deadline(report, workflow=False),
+                    storage_supervision=(mode == "historical"),
                 )
                 if standalone_result.get("source_release_id") != release_id:
                     raise RunnerError("standalone verification returned a different release")
@@ -3336,6 +4463,14 @@ def run_production(
                         if mode == "activate-historical"
                         else "no verified current v2 release is available"
                     )
+                if mode == "activate-historical":
+                    current_capture = current.get("capture_id")
+                    if not isinstance(current_capture, str) or not CAPTURE_ID.fullmatch(
+                        current_capture
+                    ):
+                        raise RunnerError("current historical release has no exact capture identity")
+                    report["capture_id"] = current_capture
+                    report["root_id"] = summary.get("root_id")
                 release = Path(str(current["output"]))
                 standalone_result = _release_verify(
                     release,
@@ -3344,6 +4479,7 @@ def run_production(
                     paths,
                     report,
                     _monitor_deadline(report, workflow=False),
+                    storage_supervision=(mode == "activate-historical"),
                 )
                 if mode == "activate-historical":
                     source_capture_complete = standalone_result.get("source_capture_complete")
@@ -3383,6 +4519,7 @@ def run_production(
                 report=report,
                 deadline=_monitor_deadline(report, workflow=False),
                 label="activation",
+                storage_supervision=(catalogue_version == 3),
             )
             activated = _strict_json(activation_stdout)
             if (
@@ -3516,6 +4653,11 @@ def main(argv: list[str] | None = None) -> int:
         help="resume only after charging unfinished requests at their full durable reservation",
     )
     parser.add_argument(
+        "--reconcile-stopped-worker",
+        action="store_true",
+        help="clear one evidenced stale historical child group without starting work",
+    )
+    parser.add_argument(
         "--extend-session",
         action="store_true",
         help="consume one new 48-hour window for an exact reconciled capture",
@@ -3544,6 +4686,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     if args.reconcile_accounting and (not args.capture_id or args.historical):
         parser.error("--reconcile-accounting requires a network --capture-id resume")
+    if args.reconcile_stopped_worker and (
+        not args.historical
+        or not args.capture_id
+        or args.offline_duration_seconds is not None
+        or args.renew_offline_window
+        or args.supersede_offline_window
+        or args.reconcile_accounting
+        or args.extend_session
+        or args.recover_reboot
+        or args.recovery_volume_uuid
+    ):
+        parser.error("--reconcile-stopped-worker requires only --historical --capture-id")
     if args.extend_session and (not args.capture_id or not args.reconcile_accounting):
         parser.error("--extend-session requires --capture-id and --reconcile-accounting")
     if args.recover_reboot and (
@@ -3574,6 +4728,7 @@ def main(argv: list[str] | None = None) -> int:
                 extend_session=args.extend_session,
                 recover_reboot=args.recover_reboot,
                 recovery_volume_uuid=args.recovery_volume_uuid,
+                reconcile_stopped_worker=args.reconcile_stopped_worker,
             )
     except (BudgetStop, RunnerInterrupted) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)

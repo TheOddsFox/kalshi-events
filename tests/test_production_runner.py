@@ -2893,7 +2893,11 @@ def test_unreaped_group_receives_only_one_grace_even_if_cleanup_is_reentered(
     assert clock[0] == pytest.approx(105), "reentry granted a second five-second grace"
     assert signals == prior_signals
     exists[0] = False
-    assert production._terminate(child) is True
+    assert production._terminate(child) is leader_reaped
+    status = child._production_termination_outcome
+    assert status["leader_reaped"] is leader_reaped
+    assert status["group_absent"] is True
+    assert status["uncertain"] is (not leader_reaped)
     assert clock[0] == pytest.approx(105)
 
 
