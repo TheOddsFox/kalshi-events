@@ -11,7 +11,9 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -38,6 +40,7 @@ from kalshi_events.capture import (
     read_capture,
 )
 from kalshi_events.common import (
+    MAX_BUNDLE_BYTES,
     BudgetExceeded,
     CatalogueError,
     Store,
@@ -94,25 +97,55 @@ _LANDING_BATCH_ROWS = 4096
 _LANDING_BATCH_BYTES = 8 * 1024 * 1024
 
 
+def _report_landing_progress(**counters: int) -> None:
+    try:
+        metrics.progress(**counters)
+    except Exception:
+        metrics.add("progress_write_failures")
+
+
 def _landing_arrow_batches(rows):
     batch: list[dict[str, Any]] = []
     batch_bytes = 0
+    observations_emitted = 0
+    batches_yielded = 0
     for row in rows:
         row_bytes = sum(len(value.encode("utf-8")) for value in row.values() if value is not None)
         if batch and (
             len(batch) >= _LANDING_BATCH_ROWS or batch_bytes + row_bytes > _LANDING_BATCH_BYTES
         ):
-            yield pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+            table = pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+            observations_emitted += len(batch)
+            batches_yielded += 1
+            _report_landing_progress(
+                observations_emitted=observations_emitted,
+                batches_yielded=batches_yielded,
+            )
+            yield table
             batch = []
             batch_bytes = 0
         batch.append(row)
         batch_bytes += row_bytes
         if len(batch) >= _LANDING_BATCH_ROWS or batch_bytes >= _LANDING_BATCH_BYTES:
-            yield pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+            table = pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+            observations_emitted += len(batch)
+            batches_yielded += 1
+            _report_landing_progress(
+                observations_emitted=observations_emitted,
+                batches_yielded=batches_yielded,
+            )
+            yield table
             batch = []
             batch_bytes = 0
     if batch:
-        yield pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+        table = pa.Table.from_pylist(batch, schema=_LANDING_SCHEMA)
+        observations_emitted += len(batch)
+        batches_yielded += 1
+        _report_landing_progress(
+            observations_emitted=observations_emitted,
+            batches_yielded=batches_yielded,
+        )
+        yield table
 
 
 def _legacy_landing_text(value: Any) -> str | None:
@@ -507,9 +540,10 @@ def _land_rows(
 
     def rows():
         nonlocal observation_count
-        for manifest, payload in capture_pages(
-            store, state, evidence=verified_pages, task_indices=task_indices
+        for receipts_verified, (manifest, payload) in enumerate(
+            capture_pages(store, state, evidence=verified_pages, task_indices=task_indices), start=1
         ):
+            _report_landing_progress(receipts_verified=receipts_verified)
             manifest = _scope_manifest(state, manifest)
             if parent_index is not None:
                 parent_index.add_page(manifest, payload)
@@ -1717,6 +1751,168 @@ def _recover_build(store: Store, capture_id: str, catalogue_version: int) -> Non
         fsync_directory(backup.parent)
     store.sync(build_directory(capture_id, catalogue_version))
     store.sync(backup_relative)
+
+
+def _validate_historical_stage(path: Path, root_device: int) -> tuple[int, int]:
+    root_stat = path.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_dev != root_device:
+        raise CatalogueError("abandoned historical stage has an unsafe root")
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        directory_stat = directory.lstat()
+        if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_dev != root_device:
+            raise CatalogueError("abandoned historical stage contains an unsafe directory")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                entry_stat = entry.stat(follow_symlinks=False)
+                if entry_stat.st_dev != root_device:
+                    raise CatalogueError("abandoned historical stage crosses a filesystem")
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    pending.append(Path(entry.path))
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    if entry_stat.st_nlink != 1:
+                        raise CatalogueError("abandoned historical stage has a hard-linked file")
+                else:
+                    raise CatalogueError("abandoned historical stage contains an unsafe file")
+    return root_stat.st_dev, root_stat.st_ino
+
+
+def _json_stage_reference(value: Any, targets: list[tuple[str, tuple[str, ...]]]) -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            reference = _json_stage_reference(key, targets) or _json_stage_reference(item, targets)
+            if reference is not None:
+                return reference
+        return None
+    if isinstance(value, list):
+        for item in value:
+            reference = _json_stage_reference(item, targets)
+            if reference is not None:
+                return reference
+        return None
+    if isinstance(value, str):
+        normalized = value.replace("\\", "/")
+        for relative, stage_targets in targets:
+            if any(target in normalized for target in stage_targets):
+                return relative
+    return None
+
+
+def _check_historical_stage_references(
+    store: Store, capture_id: str, stages: list[tuple[str, Path, tuple[int, int]]]
+) -> None:
+    targets = [
+        (relative, (relative, relative.rsplit("/", 1)[-1], str(path)))
+        for relative, path, _identity in stages
+    ]
+
+    def read_reference(path: Path, limit: int) -> Any | None:
+        try:
+            reference_stat = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(reference_stat.st_mode):
+            raise CatalogueError("historical stage reference is unsafe")
+        return decode(regular_bytes(path, limit))
+
+    pointers = []
+    for name in ("current.json", "current-v2.json", "current-historical.json"):
+        value = read_reference(store.path(name), 1024**2)
+        if value is not None:
+            pointers.append(value)
+    build_references = [
+        value
+        for name in (
+            f"{build_directory(capture_id, 3)}/build.json",
+            f"tmp/replaced-{capture_id}-v3/build.json",
+        )
+        if (value := read_reference(store.path(name), MAX_BUNDLE_BYTES)) is not None
+    ]
+
+    for value in (*pointers, *build_references):
+        if _json_stage_reference(value, targets) is not None:
+            raise CatalogueError("abandoned historical stage is referenced by a build or pointer")
+
+    release_manifests = []
+    for pointer in pointers:
+        release_id = pointer.get("source_release_id") if isinstance(pointer, dict) else None
+        if not isinstance(release_id, str) or re.fullmatch(r"[0-9a-f]{64}", release_id) is None:
+            raise CatalogueError("current publication pointer has an invalid release identity")
+        manifest = store.path(f"releases/{release_id}/manifest.json")
+        try:
+            manifest_stat = manifest.lstat()
+        except FileNotFoundError as exc:
+            raise CatalogueError("current publication pointer has no release manifest") from exc
+        if not stat.S_ISREG(manifest_stat.st_mode):
+            raise CatalogueError("current release manifest is unsafe")
+        release_manifests.append(decode(regular_bytes(manifest, store.limits.max_root_bytes)))
+
+    for manifest in release_manifests:
+        if _json_stage_reference(manifest, targets) is not None:
+            raise CatalogueError("abandoned historical stage is referenced by a published manifest")
+
+
+def recover_and_cleanup_abandoned_historical_stages(store: Store, capture_id: str) -> None:
+    """Recover a same-capture replacement, then prune only safe historical build stages."""
+    if not store.writer_locked_by_current_thread:
+        raise CatalogueError("historical stage cleanup requires the canonical writer lock")
+    if store.scope is not None:
+        raise CatalogueError("historical stage cleanup requires an unscoped root")
+    if (
+        not isinstance(capture_id, str)
+        or len(capture_id) != 32
+        or any(character not in "0123456789abcdef" for character in capture_id)
+    ):
+        raise CatalogueError("invalid capture identity for historical stage cleanup")
+
+    with metrics.phase("recovery_validation"):
+        state = read_capture(store, capture_id)
+        if state.get("capture_id") != capture_id:
+            raise CatalogueError("historical stage cleanup source capture does not match")
+        _historical_profile(state)
+        _recover_build(store, capture_id, 3)
+        temporary = store.path("tmp")
+        try:
+            temporary_stat = temporary.lstat()
+        except FileNotFoundError:
+            return
+        root_stat = store.root.lstat()
+        if not stat.S_ISDIR(temporary_stat.st_mode) or temporary_stat.st_dev != root_stat.st_dev:
+            raise CatalogueError("temporary build namespace is unsafe")
+
+        stages: list[tuple[str, Path, tuple[int, int]]] = []
+        with os.scandir(temporary) as entries:
+            for entry in entries:
+                if re.fullmatch(r"build-historical-[0-9a-f]{32}", entry.name) is None:
+                    continue
+                path = store.path(f"tmp/{entry.name}")
+                identity = _validate_historical_stage(path, root_stat.st_dev)
+                stages.append((f"tmp/{entry.name}", path, identity))
+
+        if not stages:
+            return
+        _check_historical_stage_references(store, capture_id, stages)
+
+        current_tmp_stat = temporary.lstat()
+        if (current_tmp_stat.st_dev, current_tmp_stat.st_ino) != (
+            temporary_stat.st_dev,
+            temporary_stat.st_ino,
+        ):
+            raise CatalogueError("temporary build namespace changed during cleanup validation")
+        for _relative, path, identity in stages:
+            current_stat = path.lstat()
+            if (current_stat.st_dev, current_stat.st_ino) != identity:
+                raise CatalogueError("historical build stage changed during cleanup validation")
+
+        for relative, _path, _identity in stages:
+            try:
+                store.remove(relative)
+            except BaseException:
+                # A partial prune remains eligible for the same safe validation on retry.
+                store.sync(relative)
+                raise
+            fsync_directory(temporary)
 
 
 def _install_build(

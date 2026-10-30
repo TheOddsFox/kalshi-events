@@ -104,6 +104,7 @@ class RecoveryParentIndex(DiskParentIndex):
         genesis_anchor: tuple[int, int, str],
     ) -> None:
         self.store = store
+        self.collect_winners = True
         self.processed: set[str] = set()
         self.defer_page_merges = False
         self.capture_id = capture_id

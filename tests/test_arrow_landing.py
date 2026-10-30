@@ -9,7 +9,7 @@ import duckdb
 import pytest
 from dlt.common.schema import Schema
 
-from kalshi_events import normalize, warehouse
+from kalshi_events import metrics, normalize, warehouse
 
 
 def _row(**updates):
@@ -64,6 +64,7 @@ def test_landing_arrow_batches_bound_rows_and_utf8_bytes():
 
 def test_arrow_merge_replays_dict_landed_database_with_text_coercion(store, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(metrics, "_PROGRESS_INTERVAL_SECONDS", 0)
     capture_id = "0" * 32
     directory = store.path("tmp/arrow-landing")
     directory.mkdir(parents=True)
@@ -223,12 +224,20 @@ def test_arrow_merge_replays_dict_landed_database_with_text_coercion(store, monk
     parent_index = normalize.DiskParentIndex(store, collect_winners=False)
     try:
         with dlt.config.values({"load.workers": 4}):
-            assert warehouse._land_rows(
-                store,
-                {"capture_id": capture_id},
-                directory,
-                parent_index=parent_index,
-            ) == len(values)
+            progress_path = tmp_path / "landing.progress.json"
+            with metrics.collect(progress_path=progress_path):
+                with metrics.phase("landing"):
+                    assert warehouse._land_rows(
+                        store,
+                        {"capture_id": capture_id},
+                        directory,
+                        parent_index=parent_index,
+                    ) == len(values)
+                progress = json.loads(progress_path.read_text())
+                assert progress["phase"] == "landing"
+                assert progress["counters"]["receipts_verified"] == 2
+                assert progress["counters"]["observations_emitted"] == len(values)
+                assert progress["counters"]["batches_yielded"] == len(values)
             assert warehouse._land_rows(
                 store,
                 {"capture_id": capture_id},
@@ -272,6 +281,9 @@ def test_arrow_merge_replays_dict_landed_database_with_text_coercion(store, monk
         actual = connection.execute(
             "select provider_updated_at, payload_json from landing.observations order by observation_id"
         ).fetchall()
+        observation_ids = connection.execute(
+            "select observation_id from landing.observations order by observation_id"
+        ).fetchall()
     with duckdb.connect(str(legacy_database), read_only=True) as connection:
         legacy_schema = {
             row[0]: (row[1], row[2])
@@ -284,6 +296,7 @@ def test_arrow_merge_replays_dict_landed_database_with_text_coercion(store, monk
     assert set(arrow_schema) == set(warehouse._LANDING_COLUMNS)
     assert arrow_schema == legacy_schema
     assert actual == legacy
+    assert observation_ids == sorted((row["observation_id"],) for row in source_rows)
     assert actual[5][0] is None
     assert actual[6][0] is None
     assert json.loads(actual[5][1]) == {"updated_time": {"at": "noon"}}

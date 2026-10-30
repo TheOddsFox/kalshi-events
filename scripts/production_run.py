@@ -92,6 +92,28 @@ CAPTURE_ID = re.compile(r"[0-9a-f]{32}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
 REPORT_NAME = "session.json"
 OWNER_MARKER = ".production-root.json"
+RESOURCE_SAMPLE_LIMIT = 256
+RESOURCE_SAMPLE_PEAK_FIELDS = (
+    ("peak_child_process_group_rss_bytes", "child_process_group_rss_bytes"),
+    (
+        "peak_child_process_group_physical_footprint_bytes",
+        "child_process_group_physical_footprint_bytes",
+    ),
+    ("peak_supervisor_physical_footprint_bytes", "supervisor_physical_footprint_bytes"),
+    ("peak_system_compressed_bytes", "system_compressed_bytes"),
+    ("peak_system_compressor_occupied_bytes", "system_compressor_occupied_bytes"),
+)
+RESOURCE_SAMPLE_INVOCATION_PEAK_FIELDS = (
+    ("invocation_peak_child_process_group_rss_bytes", "child_process_group_rss_bytes"),
+    (
+        "invocation_peak_child_process_group_physical_footprint_bytes",
+        "child_process_group_physical_footprint_bytes",
+    ),
+    (
+        "invocation_peak_supervisor_physical_footprint_bytes",
+        "supervisor_physical_footprint_bytes",
+    ),
+)
 DEADLINE_STOP_REASONS = frozenset(
     {
         "session or workflow deadline reached termination reserve",
@@ -372,6 +394,148 @@ def _atomic_report(path: Path, report: dict[str, Any]) -> None:
         os.fsync(stream.fileno())
     os.replace(temporary, path)
     fsync_directory(path.parent)
+
+
+def _effective_memory_policy() -> dict[str, Any]:
+    """Describe the current closed memory policy without rewriting legacy limits."""
+    return {
+        "version": 2,
+        "sample_interval_seconds": float(RUN_LIMITS["sample_seconds"]),
+        "sample_timeout_seconds": 5,
+        "process_group_rss_limit_bytes": int(RUN_LIMITS["peak_rss_bytes"]),
+        "process_group_rss_continuous_seconds": int(RUN_LIMITS["peak_rss_seconds"]),
+        "process_group_rss_limit_is_strict": True,
+        "warning_pressure_continuous_seconds": int(
+            RUN_LIMITS["memory_pressure_warn_seconds"]
+        ),
+        "pressure_sample_max_gap_seconds": float(
+            RUN_LIMITS["memory_pressure_max_gap_seconds"]
+        ),
+        "preflight_pressure": "normal",
+        "warn_pressure_resets_on_normal_or_sample_gap": True,
+        "critical_pressure_stops_on_first_sample": True,
+        "physical_footprint_is_telemetry_only": True,
+    }
+
+
+def _resource_sample_archive_path(report_path: Path) -> Path:
+    return report_path.with_name(
+        f"{report_path.stem}.before-resource-ring{report_path.suffix}"
+    )
+
+
+def _validate_resource_archive(
+    archive: dict[str, Any], report: dict[str, Any]
+) -> None:
+    samples = archive.get("resource_samples")
+    if not isinstance(samples, list) or len(samples) < RESOURCE_SAMPLE_LIMIT:
+        raise RunnerError("resource sample archive is invalid")
+    for key in ("session_id", "capture_id"):
+        expected = report.get(key)
+        if expected is not None and archive.get(key) != expected:
+            raise RunnerError("resource sample archive belongs to another session")
+
+
+def _archive_resource_samples_once(
+    report_path: Path, report: dict[str, Any]
+) -> None:
+    archive_path = _resource_sample_archive_path(report_path)
+    archive_name = archive_path.name
+    recorded = report.get("resource_samples_archive")
+    if recorded is not None:
+        if recorded != archive_name:
+            raise RunnerError("resource sample archive path is invalid")
+        if archive_path.is_symlink() or not archive_path.is_file():
+            raise RunnerError("recorded resource sample archive is missing or unsafe")
+        return
+    if archive_path.exists():
+        archive = _strict_json(archive_path, limit=64 * MIB)
+        if archive is None:
+            raise RunnerError("existing resource sample archive is unreadable")
+        _validate_resource_archive(archive, report)
+    else:
+        _atomic_report(archive_path, report)
+    report["resource_samples_archive"] = archive_name
+
+
+def _resource_sample_state(
+    report: dict[str, Any], report_path: Path
+) -> tuple[list[dict[str, Any]], int, int]:
+    samples = report.setdefault("resource_samples", [])
+    if not isinstance(samples, list) or any(not isinstance(row, dict) for row in samples):
+        raise RunnerError("resource sample history is invalid")
+    total = report.get("resource_samples_total")
+    dropped = report.get("resource_samples_dropped")
+    if total is None and dropped is None:
+        total, dropped = len(samples), 0
+    elif (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < 0
+        or isinstance(dropped, bool)
+        or not isinstance(dropped, int)
+        or dropped < 0
+        or total - dropped != len(samples)
+    ):
+        raise RunnerError("resource sample counters are invalid")
+    for peak_field, sample_field in RESOURCE_SAMPLE_PEAK_FIELDS:
+        peak = report.get(peak_field)
+        if peak is None:
+            peak = 0
+        if isinstance(peak, bool) or not isinstance(peak, int) or peak < 0:
+            raise RunnerError(f"{peak_field} is invalid")
+        for row in samples:
+            value = row.get(sample_field)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RunnerError(f"resource sample field {sample_field} is invalid")
+            peak = max(peak, value)
+        report[peak_field] = peak
+    if len(samples) > RESOURCE_SAMPLE_LIMIT:
+        report["resource_samples_total"] = total
+        report["resource_samples_dropped"] = dropped
+        _archive_resource_samples_once(report_path, report)
+        trim = len(samples) - RESOURCE_SAMPLE_LIMIT
+        del samples[:trim]
+        dropped += trim
+    for peak_field, _sample_field in RESOURCE_SAMPLE_INVOCATION_PEAK_FIELDS:
+        peak = report.get(peak_field, 0)
+        if isinstance(peak, bool) or not isinstance(peak, int) or peak < 0:
+            raise RunnerError(f"{peak_field} is invalid")
+        report[peak_field] = peak
+    report["resource_samples_total"] = total
+    report["resource_samples_dropped"] = dropped
+    return samples, total, dropped
+
+
+def _append_resource_sample(
+    report: dict[str, Any], report_path: Path, sample: dict[str, Any]
+) -> None:
+    samples, total, dropped = _resource_sample_state(report, report_path)
+    if len(samples) >= RESOURCE_SAMPLE_LIMIT:
+        _archive_resource_samples_once(report_path, report)
+    for peak_field, sample_field in RESOURCE_SAMPLE_PEAK_FIELDS:
+        value = sample.get(sample_field)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RunnerError(f"resource sample field {sample_field} is invalid")
+            report[peak_field] = max(report[peak_field], value)
+    for peak_field, sample_field in RESOURCE_SAMPLE_INVOCATION_PEAK_FIELDS:
+        value = sample.get(sample_field)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RunnerError(f"resource sample field {sample_field} is invalid")
+            report[peak_field] = max(report[peak_field], value)
+    sample["memory_policy_version"] = 2
+    samples.append(sample)
+    total += 1
+    if len(samples) > RESOURCE_SAMPLE_LIMIT:
+        trim = len(samples) - RESOURCE_SAMPLE_LIMIT
+        del samples[:trim]
+        dropped += trim
+    report["resource_samples_total"] = total
+    report["resource_samples_dropped"] = dropped
 
 
 def _external_path(path: Path) -> Path:
@@ -731,6 +895,7 @@ def _monitor(
     capture_notification: Path | None = None,
     wall_deadline_epoch: float | None = None,
 ) -> tuple[int | None, str | None, bool]:
+    _resource_sample_state(report, report_path)
     samples: list[tuple[float, int]] = []
     warning_started: float | None = None
     previous_pressure_sample: float | None = None
@@ -807,7 +972,9 @@ def _monitor(
                 warning_started = None
             elif pressure == "warn":
                 warning_started = observed_at if warning_started is None else warning_started
-            report["resource_samples"].append(
+            _append_resource_sample(
+                report,
+                report_path,
                 {
                     "at": _utc(),
                     "ssd_free_bytes": free,
@@ -824,12 +991,9 @@ def _monitor(
                     "supervisor_physical_footprint_bytes": memory[
                         "supervisor_physical_footprint_bytes"
                     ],
-                }
+                },
             )
             report["last_observed_epoch"] = time.time()
-            report["peak_child_process_group_rss_bytes"] = max(
-                report["peak_child_process_group_rss_bytes"], rss
-            )
             if free < int(RUN_LIMITS["minimum_free_bytes"]):
                 stop_reason = "SSD free space fell below 150 GiB"
             elif rss_limit_exceeded(samples):
@@ -1146,6 +1310,7 @@ def _invoke(
     capture_id: str | None = None,
     capture_notification: Path | None = None,
     workflow_deadline: bool = False,
+    phase_on_start: str | None = None,
 ) -> tuple[int | None, str | None, bool]:
     from kalshi_events.common import safe_path
     from kalshi_events.paths import child_environment, project_root
@@ -1233,6 +1398,8 @@ def _invoke(
                     shell=False,
                     start_new_session=True,
                 )
+                if phase_on_start is not None:
+                    report["phase"] = phase_on_start
                 report["active_process_group"] = process.pid
                 _atomic_report(report_path, report)
             finally:
@@ -1284,13 +1451,30 @@ def _child_accounting(
     require_complete: bool = True,
     workflow_deadline: bool = False,
     capture_id: str | None = None,
+    cleanup_historical_stages: bool = False,
+    expected_root_id: str | None = None,
 ) -> dict[str, Any]:
     command = [sys.executable, str(Path(__file__).resolve())]
-    command += (
-        ["--_account-recovery", str(operator), capture_id]
-        if capture_id is not None
-        else ["--_account-root", str(operator)]
-    )
+    if cleanup_historical_stages:
+        if (
+            capture_id is None
+            or expected_root_id is None
+            or report.get("active_process_group") is not None
+        ):
+            raise RunnerError("initial historical accounting cleanup is not session-bound")
+        command += [
+            "--_account-historical-initial",
+            str(operator),
+            str(paths["directory"]),
+            str(paths["report"]),
+            capture_id,
+            expected_root_id,
+            str(report.get("revision", "")),
+        ]
+    elif capture_id is not None:
+        command += ["--_account-recovery", str(operator), capture_id]
+    else:
+        command += ["--_account-root", str(operator)]
     run_id = uuid.uuid4().hex
     stdout = paths["logs"] / f"accounting-{run_id}.stdout.json"
     stderr = paths["logs"] / f"accounting-{run_id}.stderr.log"
@@ -1391,8 +1575,97 @@ def _release_verify(
         )
 
 
-def _read_accounting_worker(root: Path, expected_capture_id: str | None = None) -> dict[str, Any]:
+def _validate_initial_historical_accounting_session(
+    root: Path,
+    directory: Path,
+    report_path: Path,
+    capture_id: str,
+    expected_root_id: str,
+    expected_revision: str,
+) -> dict[str, Any]:
+    from kalshi_events.common import safe_path
+
+    root = safe_path(root)
+    directory = safe_path(directory)
+    report_path = safe_path(report_path)
+    expected_report_parent = directory / "runs"
+    session_id = report_path.parent.name
+    if (
+        root != directory / "operator"
+        or report_path.parent.parent != expected_report_parent
+        or report_path.name != REPORT_NAME
+        or not CAPTURE_ID.fullmatch(session_id)
+        or not isinstance(expected_root_id, str)
+        or not CAPTURE_ID.fullmatch(expected_root_id)
+        or not isinstance(expected_revision, str)
+        or not REVISION.fullmatch(expected_revision)
+    ):
+        raise RunnerError("initial historical accounting paths or identity are invalid")
+    report = _strict_json(report_path)
+    if (
+        report is None
+        or report.get("version") != 1
+        or report.get("mode") not in {"full", "historical"}
+        or report.get("session_id") != session_id
+        or report.get("capture_id") != capture_id
+        or report.get("root_id") != expected_root_id
+        or report.get("revision") != expected_revision
+        or report.get("active_process_group") != os.getpgrp()
+        or os.getpgrp() != os.getpid()
+    ):
+        raise RunnerError("initial historical accounting session binding changed")
+    if "offline_historical_window" in report:
+        _validate_offline_historical_window(
+            report,
+            capture_id,
+            allow_expired=True,
+            allow_revision_change=True,
+        )
+    elif "offline_historical_window_history" in report:
+        history = report.get("offline_historical_window_history")
+        if not isinstance(history, list) or history:
+            raise RunnerError("offline historical window history has no current window")
+    lock_path = root / "writer.lock"
+    try:
+        lock_details = os.stat(lock_path, follow_symlinks=False)
+    except OSError as exc:
+        raise RunnerError("canonical writer lock changed during historical cleanup") from exc
+    _validate_offline_renewal_root(
+        directory,
+        root,
+        expected_root_id,
+        capture_id,
+        writer_lock_identity=(lock_details.st_dev, lock_details.st_ino),
+    )
+    return report
+
+
+def _read_accounting_worker(
+    root: Path,
+    expected_capture_id: str | None = None,
+    *,
+    cleanup_historical_stages: bool = False,
+    expected_directory: Path | None = None,
+    report_path: Path | None = None,
+    expected_root_id: str | None = None,
+    expected_revision: str | None = None,
+) -> dict[str, Any]:
     from kalshi_events.common import Limits, Store, decode, regular_bytes
+
+    if cleanup_historical_stages:
+        if (
+            expected_capture_id is None
+            or expected_directory is None
+            or report_path is None
+            or expected_root_id is None
+            or expected_revision is None
+        ):
+            raise RunnerError("initial historical accounting cleanup identity is incomplete")
+    elif any(
+        value is not None
+        for value in (expected_directory, report_path, expected_root_id, expected_revision)
+    ):
+        raise RunnerError("historical cleanup identity was supplied without its closed flag")
 
     store = Store(
         root,
@@ -1424,6 +1697,26 @@ def _read_accounting_worker(root: Path, expected_capture_id: str | None = None) 
                 raise RunnerError(
                     "recovery capture does not match the session's sealed full-scope policy"
                 )
+        if cleanup_historical_stages:
+            assert expected_capture_id is not None
+            assert expected_directory is not None
+            assert report_path is not None
+            assert expected_root_id is not None
+            assert expected_revision is not None
+            _validate_initial_historical_accounting_session(
+                root,
+                expected_directory,
+                report_path,
+                expected_capture_id,
+                expected_root_id,
+                expected_revision,
+            )
+            from kalshi_events import warehouse
+
+            cleanup = getattr(warehouse, "recover_and_cleanup_abandoned_historical_stages", None)
+            if not callable(cleanup):
+                raise RunnerError("historical stage recovery helper is unavailable")
+            cleanup(store, expected_capture_id)
         attempts = downloaded_or_reserved = 0
         accounting_complete = True
         unfinished = []
@@ -1819,8 +2112,15 @@ def _resource_guard(
     require_complete_accounting: bool = True,
     workflow_deadline: bool = False,
     capture_id: str | None = None,
+    cleanup_historical_stages: bool = False,
 ) -> dict[str, Any]:
     """Run Store's only full accounting walk in a supervised boundary child."""
+    if cleanup_historical_stages and (
+        capture_id is None
+        or not isinstance(report.get("root_id"), str)
+        or report.get("active_process_group") is not None
+    ):
+        raise RunnerError("initial historical accounting cleanup is not eligible")
     started = time.monotonic()
     try:
         snapshot = _child_accounting(
@@ -1831,6 +2131,8 @@ def _resource_guard(
             require_complete=require_complete_accounting,
             workflow_deadline=workflow_deadline,
             capture_id=capture_id,
+            cleanup_historical_stages=cleanup_historical_stages,
+            expected_root_id=(report.get("root_id") if cleanup_historical_stages else None),
         )
     finally:
         phases = report.setdefault("phase_seconds", {})
@@ -2182,6 +2484,7 @@ def _run_external_child(
     deadline: float,
     label: str,
     capture_id: str | None = None,
+    preserve_phase_until_start: bool = False,
 ) -> tuple[int | None, str | None, bool, Path, Path]:
     stdout = paths["logs"] / f"{label}.stdout.json"
     stderr = paths["logs"] / f"{label}.stderr.log"
@@ -2189,8 +2492,9 @@ def _run_external_child(
     if notification is not None:
         with contextlib.suppress(FileNotFoundError):
             notification.unlink()
-    report["phase"] = label
-    _atomic_report(paths["report"], report)
+    if not preserve_phase_until_start:
+        report["phase"] = label
+        _atomic_report(paths["report"], report)
     started = time.monotonic()
     status = _invoke(
         command,
@@ -2204,6 +2508,7 @@ def _run_external_child(
         capture_id=capture_id,
         capture_notification=notification,
         workflow_deadline=label == "refresh",
+        phase_on_start=label if preserve_phase_until_start else None,
     )
     report["phase_seconds"][label] = report["phase_seconds"].get(label, 0) + (
         time.monotonic() - started
@@ -2302,8 +2607,16 @@ def run_production(
                     "explicit": True,
                     "started_at": _utc(),
                     "prior_exactness_preserved": False,
-                    "prior_error": report.get("error"),
-                    "prior_recovery_instructions": report.get("recovery"),
+                    "prior_error": (
+                        report.get("previous_stop", {}).get("error")
+                        if isinstance(report.get("previous_stop"), dict)
+                        else report.get("error")
+                    ),
+                    "prior_recovery_instructions": (
+                        report.get("previous_stop", {}).get("recovery")
+                        if isinstance(report.get("previous_stop"), dict)
+                        else report.get("recovery")
+                    ),
                     "runtime_transition": {
                         "from_uv_lock_sha256": saved_system["uv_lock_sha256"],
                     },
@@ -2434,6 +2747,7 @@ def run_production(
                         require_complete_accounting=False,
                         workflow_deadline=True,
                         capture_id=capture_id,
+                        cleanup_historical_stages=True,
                     )
                     if snapshot.get("root_id") != report.get("root_id"):
                         raise RunnerError("operator root identity changed since this session began")
@@ -2596,6 +2910,7 @@ def run_production(
                     ),
                     label="refresh",
                     capture_id=capture_id,
+                    preserve_phase_until_start=(mode == "historical"),
                 )
                 cli_result = _read_cli_result(stdout_path)
                 observed_capture = (cli_result or {}).get("capture_id") or report.get("capture_id")
@@ -3183,7 +3498,17 @@ def _session_report(
         "metrics_file": str(paths["metrics"]),
         "limits": dict(RUN_LIMITS),
         "resource_samples": [],
+        "resource_samples_total": 0,
+        "resource_samples_dropped": 0,
         "peak_child_process_group_rss_bytes": 0,
+        "peak_child_process_group_physical_footprint_bytes": 0,
+        "peak_supervisor_physical_footprint_bytes": 0,
+        "peak_system_compressed_bytes": 0,
+        "peak_system_compressor_occupied_bytes": 0,
+        "invocation_peak_child_process_group_rss_bytes": 0,
+        "invocation_peak_child_process_group_physical_footprint_bytes": 0,
+        "invocation_peak_supervisor_physical_footprint_bytes": 0,
+        "effective_memory_policy": _effective_memory_policy(),
         "error": None,
         "recovery": None,
     }
@@ -3475,6 +3800,39 @@ def _load_resume(
             }
         ]
         _atomic_report(report_path, report)
+    previous_error = report.get("error")
+    previous_recovery = report.get("recovery")
+    previous_phase = report.get("phase")
+    if previous_phase == "stopped" or previous_error is not None or previous_recovery is not None:
+        prior_resource_peaks = {
+            key: report.get(key)
+            for key, _sample_field in (
+                *RESOURCE_SAMPLE_PEAK_FIELDS,
+                *RESOURCE_SAMPLE_INVOCATION_PEAK_FIELDS,
+            )
+        }
+        previous_stop = {
+            "phase": previous_phase,
+            "error": previous_error,
+            "recovery": previous_recovery,
+            "last_observed_at": report.get("last_observed_at"),
+            "last_observed_epoch": report.get("last_observed_epoch"),
+            "resource_peaks": prior_resource_peaks,
+        }
+        history = report.get("stop_history", [])
+        if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+            raise RunnerError("session stop history is invalid")
+        history.append(previous_stop)
+        report["stop_history"] = history[-64:]
+        report["previous_stop"] = previous_stop
+    report["error"] = None
+    report["recovery"] = None
+    # Keep an offline grant in the durable stopped state until the first processing child
+    # actually starts. A crash between grant persistence and Popen must remain renewable.
+    report["phase"] = "stopped" if historical else "preflight"
+    for peak_field, _sample_field in RESOURCE_SAMPLE_INVOCATION_PEAK_FIELDS:
+        report[peak_field] = 0
+    report["effective_memory_policy"] = _effective_memory_policy()
     return report_path, report, paths
 
 
@@ -3628,10 +3986,27 @@ def _read_cli_result(path: Path) -> dict[str, Any] | None:
     return result if result and isinstance(result.get("complete"), bool) else None
 
 
-def _accounting_worker_main(root: Path, capture_id: str | None = None) -> int:
+def _accounting_worker_main(
+    root: Path,
+    capture_id: str | None = None,
+    *,
+    cleanup_historical_stages: bool = False,
+    expected_directory: Path | None = None,
+    report_path: Path | None = None,
+    expected_root_id: str | None = None,
+    expected_revision: str | None = None,
+) -> int:
     try:
         root = _existing_operator_root(root)
-        value = _read_accounting_worker(root, capture_id)
+        value = _read_accounting_worker(
+            root,
+            capture_id,
+            cleanup_historical_stages=cleanup_historical_stages,
+            expected_directory=expected_directory,
+            report_path=report_path,
+            expected_root_id=expected_root_id,
+            expected_revision=expected_revision,
+        )
         print(json.dumps(value, sort_keys=True, allow_nan=False))
         return 0
     except Exception as exc:
@@ -3810,15 +4185,39 @@ def _main_hidden(argv: list[str]) -> int | None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--_account-root", type=Path)
     parser.add_argument("--_account-recovery", nargs=2)
+    parser.add_argument("--_account-historical-initial", nargs=6)
     parser.add_argument("--_root-summary", type=Path)
     parser.add_argument("--_memory-sample", nargs=1)
     parser.add_argument("--_refresh-worker", nargs=7)
     parser.add_argument("--_activate-current", nargs=3)
     args, rest = parser.parse_known_args(argv)
+    selected_workers = (
+        args._account_root,
+        args._account_recovery,
+        args._account_historical_initial,
+        args._root_summary,
+        args._memory_sample,
+        args._refresh_worker,
+        args._activate_current,
+    )
+    if sum(value is not None for value in selected_workers) > 1:
+        print(json.dumps({"error": "conflicting hidden worker modes"}))
+        return 1
     if args._account_root is not None and not rest:
         return _accounting_worker_main(args._account_root)
     if args._account_recovery is not None and not rest:
         return _accounting_worker_main(Path(args._account_recovery[0]), args._account_recovery[1])
+    if args._account_historical_initial is not None and not rest:
+        operator, directory, report, capture_id, root_id, revision = args._account_historical_initial
+        return _accounting_worker_main(
+            Path(operator),
+            capture_id,
+            cleanup_historical_stages=True,
+            expected_directory=Path(directory),
+            report_path=Path(report),
+            expected_root_id=root_id,
+            expected_revision=revision,
+        )
     if args._root_summary is not None and not rest:
         return _root_summary_worker_main(args._root_summary)
     if args._memory_sample is not None and not rest:

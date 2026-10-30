@@ -121,6 +121,36 @@ def test_progress_is_noop_when_collection_has_no_companion(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_offline_build_progress_distinguishes_phases_and_aggregate_counts(tmp_path):
+    path = tmp_path / "metrics.json.progress.json"
+    with metrics.collect(progress_path=path):
+        metrics.progress(
+            "landing", receipts_verified=3, observations_emitted=4096, batches_yielded=1
+        )
+        report = json.loads(path.read_text())
+        assert report["phase"] == "landing"
+        assert report["counters"]["receipts_verified"] == 3
+        assert report["counters"]["observations_emitted"] == 4096
+        assert report["counters"]["batches_yielded"] == 1
+        for phase in ("current_projection", "dbt", "export", "verification", "activation"):
+            with metrics.phase(phase):
+                assert json.loads(path.read_text())["phase"] == phase
+                with metrics.phase("hashing"):
+                    assert json.loads(path.read_text())["phase"] == phase
+
+
+@pytest.mark.parametrize(
+    "counter",
+    [{"receipts_verified": -1}, {"observations_emitted": True}, {"batches_yielded": 2**63}],
+)
+def test_offline_build_progress_rejects_invalid_counts(tmp_path, counter):
+    with (
+        metrics.collect(progress_path=tmp_path / "metrics.json.progress.json"),
+        pytest.raises(ValueError, match="invalid recovery progress counter"),
+    ):
+        metrics.progress("landing", **counter)
+
+
 def test_first_data_request_progress_uses_non_cutoff_http_attempt_time(tmp_path, monkeypatch):
     clock = {"now": 0.0}
     monkeypatch.setattr("kalshi_events.transport.time.monotonic", lambda: clock["now"])

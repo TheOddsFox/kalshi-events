@@ -47,6 +47,12 @@ _PROGRESS_PHASES = frozenset(
         "first_new_request",
         "index_replay",
         "closure",
+        "landing",
+        "current_projection",
+        "dbt",
+        "export",
+        "verification",
+        "activation",
         "complete",
         "stopped",
     }
@@ -59,6 +65,9 @@ _PROGRESS_INTEGER_COUNTERS = frozenset(
         "backlog_pages",
         "reused_pages",
         "verified_pages",
+        "receipts_verified",
+        "observations_emitted",
+        "batches_yielded",
     }
 )
 _PROGRESS_ELAPSED_COUNTERS = frozenset(
@@ -406,6 +415,8 @@ def phase(name: str) -> Iterator[None]:
     if metrics is None:
         yield
         return
+    if name in _PROGRESS_PHASES:
+        metrics.progress(name)
     started = time.perf_counter()
     try:
         yield

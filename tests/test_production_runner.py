@@ -44,11 +44,145 @@ def _memory_sample(
     }
 
 
+def _resource_row(index, *, rss=None, group_footprint=None, supervisor_footprint=None):
+    return {
+        "sample_number": index,
+        "child_process_group_rss_bytes": index if rss is None else rss,
+        "system_compressed_bytes": index * 2,
+        "system_compressor_occupied_bytes": index * 3,
+        "child_process_group_physical_footprint_bytes": (
+            index if group_footprint is None else group_footprint
+        ),
+        "supervisor_physical_footprint_bytes": (
+            index if supervisor_footprint is None else supervisor_footprint
+        ),
+    }
+
+
 def _checkout(path: Path) -> Path:
     path.mkdir(parents=True)
     (path / ".git").mkdir()
     (path / "pyproject.toml").write_text('[project]\nname = "oddsfox-kalshi-events"\n')
     return path
+
+
+def _resume_report_fixture(production, tmp_path, monkeypatch, *, mode="full", phase="stopped"):
+    directory = tmp_path / "production"
+    directory.mkdir()
+    capture_id = "a" * 32
+    root_id = "b" * 32
+    session_id = "c" * 32
+    now_epoch = time.time()
+    now_monotonic = time.monotonic()
+    report_path = directory / "runs" / session_id / production.REPORT_NAME
+    report_path.parent.mkdir(parents=True)
+    report = {
+        "version": 1,
+        "session_id": session_id,
+        "mode": mode,
+        "capture_id": capture_id,
+        "root_id": root_id,
+        "phase": phase,
+        "phase_seconds": {},
+        "accounting_complete": True,
+        "requests": 17,
+        "downloaded_bytes": 1234,
+        "publication_state": "not_attempted",
+        "production_state": "not_attempted",
+        "started_epoch": now_epoch - 60,
+        "started_monotonic": now_monotonic - 60,
+        "time_budget_started_epoch": now_epoch - 60,
+        "time_budget_started_monotonic": now_monotonic - 60,
+        "deadline_epoch": now_epoch + 3600,
+        "deadline_monotonic": now_monotonic + 3600,
+        "last_observed_at": "before-resume",
+        "last_observed_epoch": now_epoch - 1,
+        "boot_stamp": "current-boot",
+        "system": {
+            "filesystem_device": directory.stat().st_dev,
+            "filesystem_volume_uuid": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+        },
+        "limits": {"legacy_system_compressed_bytes": 987},
+        "resource_samples": [],
+        "peak_child_process_group_rss_bytes": 20 * 1024**3,
+        "invocation_peak_child_process_group_rss_bytes": 19 * 1024**3,
+        "error": "previous stop",
+        "recovery": "preserve the prior capture",
+    }
+    report_path.write_text(json.dumps(report))
+    monkeypatch.setattr(production, "_owner_root_id", lambda _directory: root_id)
+    monkeypatch.setattr(production, "_boot_stamp", lambda: "current-boot")
+    return directory, report_path, report, capture_id, root_id
+
+
+def _initial_historical_accounting_fixture(production, tmp_path):
+    from conftest import FakeClient
+
+    from kalshi_events import capture
+    from kalshi_events.common import Store
+    from kalshi_events.incremental import root_id
+
+    directory = tmp_path / "historical-production"
+    (directory / "runs").mkdir(parents=True)
+    operator = directory / "operator"
+    store = Store(operator)
+    with store.lock():
+        logical_root_id = root_id(store, create=True)
+    state = capture.capture(store, client_factory=FakeClient)
+    baseline_temporary_bytes = store.usage()["temporary_bytes"]
+    with store.lock():
+        stage = store.path(f"tmp/build-historical-{'f' * 32}")
+        stage.mkdir(parents=True)
+        (stage / "partial.parquet").write_bytes(b"abandoned stage bytes")
+        store.sync("tmp")
+
+    session_id = "c" * 32
+    report_path = directory / "runs" / session_id / production.REPORT_NAME
+    report_path.parent.mkdir(parents=True)
+    report = {
+        "version": 1,
+        "session_id": session_id,
+        "mode": "full",
+        "capture_id": state["capture_id"],
+        "root_id": logical_root_id,
+        "revision": "d" * 40,
+        "phase": "preflight",
+        "phase_seconds": {},
+        "requests": 6,
+        "downloaded_bytes": 1077,
+        "network_activity_this_invocation": {
+            "requests": 0,
+            "downloaded_bytes": 0,
+            "accounting_complete": True,
+        },
+        "active_process_group": None,
+        "started_epoch": time.time(),
+        "started_monotonic": time.monotonic(),
+        "time_budget_started_epoch": time.time(),
+        "time_budget_started_monotonic": time.monotonic(),
+        "deadline_epoch": time.time() + 3600,
+        "deadline_monotonic": time.monotonic() + 3600,
+        "system": {"filesystem_device": directory.stat().st_dev},
+        "resource_samples": [],
+        "peak_child_process_group_rss_bytes": 0,
+    }
+    production._atomic_report(
+        directory / production.OWNER_MARKER,
+        {"version": 1, "root_id": logical_root_id},
+    )
+    production._atomic_report(report_path, report)
+    paths = production._prepare_run_paths(directory, report_path)
+    return (
+        directory,
+        operator,
+        store,
+        report_path,
+        report,
+        paths,
+        state["capture_id"],
+        stage,
+        baseline_temporary_bytes,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -115,6 +249,496 @@ def test_under_limit_rss_sample_resets_the_continuous_stop_window(production):
 def test_missed_rss_samples_do_not_establish_a_continuous_minute(production):
     limit = 24 * 1024**3
     assert not production.rss_limit_exceeded([(0, limit + 1), (60, limit + 1)])
+
+
+def test_resource_samples_keep_a_bounded_tail_archive_once_and_accumulate_peaks(
+    production, tmp_path
+):
+    report_path = tmp_path / "runs" / ("a" * 32) / "session.json"
+    report_path.parent.mkdir(parents=True)
+    report = {
+        "resource_samples": [],
+        "resource_samples_total": 0,
+        "resource_samples_dropped": 0,
+        "peak_child_process_group_rss_bytes": 0,
+    }
+
+    for number in range(270):
+        production._append_resource_sample(report, report_path, _resource_row(number))
+
+    assert len(report["resource_samples"]) == production.RESOURCE_SAMPLE_LIMIT
+    assert [row["sample_number"] for row in report["resource_samples"]] == list(
+        range(14, 270)
+    )
+    assert report["resource_samples_total"] == 270
+    assert report["resource_samples_dropped"] == 14
+    assert report["peak_child_process_group_rss_bytes"] == 269
+    assert report["peak_child_process_group_physical_footprint_bytes"] == 269
+    assert report["peak_supervisor_physical_footprint_bytes"] == 269
+    assert report["peak_system_compressed_bytes"] == 538
+    assert report["peak_system_compressor_occupied_bytes"] == 807
+    assert {row["memory_policy_version"] for row in report["resource_samples"]} == {2}
+
+    archive_path = production._resource_sample_archive_path(report_path)
+    archived = json.loads(archive_path.read_text())
+    assert [row["sample_number"] for row in archived["resource_samples"]] == list(
+        range(256)
+    )
+    before = archive_path.read_bytes()
+    production._append_resource_sample(report, report_path, _resource_row(270))
+    assert archive_path.read_bytes() == before
+    assert report["resource_samples_total"] == 271
+    assert report["resource_samples_dropped"] == 15
+
+
+def test_legacy_resource_samples_are_archived_before_trimming_without_retagging(
+    production, tmp_path
+):
+    report_path = tmp_path / "runs" / ("b" * 32) / "session.json"
+    report_path.parent.mkdir(parents=True)
+    legacy_rows = [_resource_row(index) for index in range(260)]
+    legacy_rows[0].update(
+        child_process_group_rss_bytes=999,
+        system_compressed_bytes=998,
+        system_compressor_occupied_bytes=997,
+        child_process_group_physical_footprint_bytes=996,
+        supervisor_physical_footprint_bytes=995,
+    )
+    archived_rows = [dict(row) for row in legacy_rows]
+    report = {"resource_samples": legacy_rows, "limits": {"system_compressed_bytes": 123}}
+
+    samples, total, dropped = production._resource_sample_state(report, report_path)
+
+    assert len(samples) == 256
+    assert total == 260 and dropped == 4
+    assert "memory_policy_version" not in samples[0]
+    assert report["limits"] == {"system_compressed_bytes": 123}
+    assert report["peak_child_process_group_rss_bytes"] == 999
+    assert report["peak_child_process_group_physical_footprint_bytes"] == 996
+    assert report["peak_supervisor_physical_footprint_bytes"] == 995
+    assert report["peak_system_compressed_bytes"] == 998
+    assert report["peak_system_compressor_occupied_bytes"] == 997
+    assert json.loads(
+        production._resource_sample_archive_path(report_path).read_text()
+    )["resource_samples"] == archived_rows
+
+
+def test_resource_sample_archive_failure_does_not_truncate_or_append(
+    production, tmp_path, monkeypatch
+):
+    report_path = tmp_path / "runs" / ("c" * 32) / "session.json"
+    report_path.parent.mkdir(parents=True)
+    rows = [_resource_row(index) for index in range(256)]
+    report = {
+        "resource_samples": rows.copy(),
+        "resource_samples_total": 256,
+        "resource_samples_dropped": 0,
+        "peak_child_process_group_rss_bytes": 255,
+    }
+    monkeypatch.setattr(
+        production,
+        "_atomic_report",
+        lambda path, _report: (_ for _ in ()).throw(OSError("archive write failed")),
+    )
+
+    with pytest.raises(OSError, match="archive write failed"):
+        production._append_resource_sample(report, report_path, _resource_row(256))
+
+    assert report["resource_samples"] == rows
+    assert report["resource_samples_total"] == 256
+    assert report["resource_samples_dropped"] == 0
+    assert "resource_samples_archive" not in report
+
+
+def test_current_memory_policy_is_versioned_and_has_no_compressor_stop_threshold(production):
+    policy = production._effective_memory_policy()
+    assert policy["version"] == 2
+    assert policy["process_group_rss_limit_bytes"] == 24 * 1024**3
+    assert policy["process_group_rss_continuous_seconds"] == 60
+    assert policy["sample_interval_seconds"] == 15
+    assert policy["sample_timeout_seconds"] == 5
+    assert policy["pressure_sample_max_gap_seconds"] == 22.5
+    assert policy["warning_pressure_continuous_seconds"] == 60
+    assert "system_compressed_bytes" not in policy
+
+
+def test_validated_resume_clears_current_stop_and_preserves_legacy_limits(
+    production, tmp_path, monkeypatch
+):
+    directory, _path, original, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch
+    )
+
+    _path, report, _paths = production._load_resume(directory, capture_id)
+
+    assert report["phase"] == "preflight"
+    assert report["error"] is None and report["recovery"] is None
+    assert report["previous_stop"]["error"] == original["error"]
+    assert report["previous_stop"]["recovery"] == original["recovery"]
+    assert report["stop_history"][-1] == report["previous_stop"]
+    assert report["effective_memory_policy"]["version"] == 2
+    assert report["limits"] == original["limits"]
+    assert report["requests"] == 17 and report["downloaded_bytes"] == 1234
+    assert report["peak_child_process_group_rss_bytes"] == 20 * 1024**3
+    assert report["previous_stop"]["resource_peaks"][
+        "invocation_peak_child_process_group_rss_bytes"
+    ] == 19 * 1024**3
+    assert report["invocation_peak_child_process_group_rss_bytes"] == 0
+
+
+def test_crash_before_historical_child_keeps_expired_grant_renewable(
+    production, tmp_path, monkeypatch
+):
+    directory, _path, report, capture_id, root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical", phase="stopped"
+    )
+    report["publication_state"] = "unknown"
+    now_epoch = time.time()
+    now_monotonic = time.monotonic()
+    report["offline_historical_window"] = {
+        "version": 2,
+        "capture_id": capture_id,
+        "root_id": root_id,
+        "revision": "d" * 40,
+        "started_at": "2026-10-30T00:00:00Z",
+        "started_epoch": now_epoch - 3601,
+        "started_monotonic": now_monotonic - 3601,
+        "deadline_epoch": now_epoch - 1,
+        "deadline_monotonic": now_monotonic - 1,
+    }
+    _path = directory / "runs" / report["session_id"] / production.REPORT_NAME
+    _path.write_text(json.dumps(report))
+    monkeypatch.setattr(
+        production,
+        "_volume_uuid",
+        lambda _directory: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+    )
+    monkeypatch.setattr(
+        production,
+        "_validate_offline_renewal_root",
+        lambda *_args, **_kwargs: (1, 2),
+    )
+    monkeypatch.setattr(production, "_revision", lambda: "e" * 40)
+
+    _path, resumed, _paths = production._load_resume(
+        directory,
+        capture_id,
+        historical=True,
+        offline_duration_seconds=3600,
+        renew_offline_window=True,
+    )
+
+    original_window = dict(resumed["offline_historical_window"])
+    assert resumed["phase"] == "stopped"
+    assert resumed["publication_state"] == "unknown"
+    assert resumed["effective_memory_policy"]["version"] == 2
+
+    production._configure_offline_historical_window(
+        resumed, capture_id, 3600, renew=True
+    )
+    production._atomic_report(_path, resumed)
+    renewed_window = resumed["offline_historical_window"]
+    assert resumed["phase"] == "stopped"
+    assert resumed["offline_historical_window_history"] == [original_window]
+    assert resumed["requests"] == 17 and resumed["downloaded_bytes"] == 1234
+
+    monkeypatch.setattr(
+        production.time, "time", lambda: renewed_window["deadline_epoch"] + 1
+    )
+    monkeypatch.setattr(
+        production.time,
+        "monotonic",
+        lambda: renewed_window["deadline_monotonic"] + 1,
+    )
+    _path, retried, _paths = production._load_resume(
+        directory,
+        capture_id,
+        historical=True,
+        offline_duration_seconds=3600,
+        renew_offline_window=True,
+    )
+
+    assert retried["phase"] == "stopped"
+    assert retried["publication_state"] == "unknown"
+    assert retried["offline_historical_window_history"] == [original_window]
+    assert retried["offline_historical_window"] == renewed_window
+    assert retried["requests"] == 17 and retried["downloaded_bytes"] == 1234
+
+
+def test_initial_historical_accounting_uses_closed_cleanup_command(
+    production, tmp_path, monkeypatch
+):
+    paths = {
+        "directory": tmp_path,
+        "report": tmp_path / "runs" / ("a" * 32) / production.REPORT_NAME,
+        "logs": tmp_path / "logs",
+    }
+    paths["report"].parent.mkdir(parents=True)
+    paths["logs"].mkdir()
+    report = {
+        "mode": "full",
+        "root_id": "b" * 32,
+        "revision": "c" * 40,
+        "active_process_group": None,
+    }
+    captured = {}
+
+    def invoke(command, *, stdout_path, **_kwargs):
+        captured["command"] = command
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "accounting_complete": True,
+                    "storage": {
+                        "retained_bytes": 1,
+                        "temporary_bytes": 2,
+                        "database_bytes": 3,
+                    },
+                }
+            )
+        )
+        return 0, None, True
+
+    monkeypatch.setattr(production, "_invoke", invoke)
+    value = production._child_accounting(
+        tmp_path / "operator",
+        time.monotonic() + 30,
+        paths,
+        report,
+        require_complete=False,
+        capture_id="d" * 32,
+        cleanup_historical_stages=True,
+        expected_root_id="b" * 32,
+    )
+
+    assert captured["command"][2] == "--_account-historical-initial"
+    assert captured["command"][3:] == [
+        str(tmp_path / "operator"),
+        str(tmp_path),
+        str(paths["report"]),
+        "d" * 32,
+        "b" * 32,
+        "c" * 40,
+    ]
+    assert value["storage"]["retained_bytes"] == 1
+
+
+def test_initial_historical_accounting_cleanup_refuses_prior_active_group(
+    production, tmp_path, monkeypatch
+):
+    paths = {"directory": tmp_path, "report": tmp_path / "session.json", "logs": tmp_path}
+    report = {
+        "mode": "historical",
+        "root_id": "b" * 32,
+        "revision": "c" * 40,
+        "active_process_group": 123,
+    }
+    monkeypatch.setattr(
+        production,
+        "_invoke",
+        lambda *_args, **_kwargs: pytest.fail("cleanup worker must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="not session-bound"):
+        production._child_accounting(
+            tmp_path / "operator",
+            time.monotonic() + 30,
+            paths,
+            report,
+            capture_id="d" * 32,
+            cleanup_historical_stages=True,
+            expected_root_id="b" * 32,
+        )
+
+
+def test_offline_refresh_phase_is_durable_only_when_child_starts(
+    production, tmp_path, monkeypatch
+):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    report_path = tmp_path / "session.json"
+    paths = {
+        "directory": tmp_path,
+        "report": report_path,
+        "logs": logs,
+        "capture_notification": tmp_path / "capture-notification.json",
+    }
+    report = {"phase": "stopped", "phase_seconds": {}, "active_process_group": None}
+    atomic_calls = []
+    started = {}
+
+    def atomic(*_args):
+        atomic_calls.append(True)
+
+    def invoke(_command, *, phase_on_start, **_kwargs):
+        assert atomic_calls == []
+        assert report["phase"] == "stopped"
+        started["phase"] = phase_on_start
+        report["phase"] = phase_on_start
+        report["active_process_group"] = 123
+        return 0, None, True
+
+    monkeypatch.setattr(production, "_atomic_report", atomic)
+    monkeypatch.setattr(production, "_invoke", invoke)
+
+    production._run_external_child(
+        ["child"],
+        directory=tmp_path,
+        operator=tmp_path / "operator",
+        paths=paths,
+        report=report,
+        deadline=time.monotonic() + 30,
+        label="refresh",
+        capture_id="a" * 32,
+        preserve_phase_until_start=True,
+    )
+
+    assert started["phase"] == "refresh"
+    assert report["phase"] == "refresh"
+    assert report["active_process_group"] == 123
+    assert report["phase_seconds"]["refresh"] >= 0
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [("active_process_group", 123), ("root_id", "d" * 32), ("session_id", "e" * 32)],
+)
+def test_initial_historical_cleanup_rejects_wrong_report_binding(
+    production, tmp_path, monkeypatch, field, expected
+):
+    directory = tmp_path / "production"
+    operator = directory / "operator"
+    operator.mkdir(parents=True)
+    report_path = directory / "runs" / ("a" * 32) / production.REPORT_NAME
+    report_path.parent.mkdir(parents=True)
+    report = {
+        "version": 1,
+        "mode": "historical",
+        "session_id": "a" * 32,
+        "capture_id": "b" * 32,
+        "root_id": "c" * 32,
+        "revision": "d" * 40,
+        "active_process_group": -1,
+    }
+    report[field] = expected
+    report_path.write_text(json.dumps(report))
+    monkeypatch.setattr(
+        production,
+        "_validate_offline_renewal_root",
+        lambda *_args, **_kwargs: pytest.fail("invalid report must fail before root validation"),
+    )
+
+    with pytest.raises(RuntimeError, match="session binding changed"):
+        production._validate_initial_historical_accounting_session(
+            operator,
+            directory,
+            report_path,
+            "b" * 32,
+            "c" * 32,
+            "d" * 40,
+        )
+
+
+def test_supervised_initial_historical_accounting_prunes_before_quota_admission(
+    production, tmp_path, monkeypatch
+):
+    (
+        directory,
+        operator,
+        _store,
+        _report_path,
+        report,
+        paths,
+        capture_id,
+        stage,
+        baseline_temporary_bytes,
+    ) = _initial_historical_accounting_fixture(production, tmp_path)
+    monkeypatch.setattr(
+        production,
+        "_sample_memory",
+        lambda group, **_kwargs: _memory_sample(group),
+    )
+    monkeypatch.setattr(
+        production.shutil,
+        "disk_usage",
+        lambda _directory: SimpleNamespace(free=1000 * 1024**3),
+    )
+    deadline = time.monotonic() + 60
+
+    before = production._resource_guard(
+        directory,
+        operator,
+        report=report,
+        deadline=deadline,
+        paths=paths,
+        capture_id=capture_id,
+    )
+    assert before["storage"]["temporary_bytes"] > baseline_temporary_bytes
+    assert stage.is_dir()
+    assert report["active_process_group"] is None
+
+    monkeypatch.setitem(production.RUN_LIMITS, "temporary_bytes", baseline_temporary_bytes)
+    after = production._resource_guard(
+        directory,
+        operator,
+        report=report,
+        deadline=deadline,
+        paths=paths,
+        capture_id=capture_id,
+        require_complete_accounting=False,
+        workflow_deadline=True,
+        cleanup_historical_stages=True,
+    )
+
+    assert not stage.exists()
+    assert after["storage"]["temporary_bytes"] == baseline_temporary_bytes
+    assert report["storage"]["operator_temporary_bytes"] == baseline_temporary_bytes
+    assert report["active_process_group"] is None
+    assert report["requests"] == 6 and report["downloaded_bytes"] == 1077
+    assert report["network_activity_this_invocation"] == {
+        "requests": 0,
+        "downloaded_bytes": 0,
+        "accounting_complete": True,
+    }
+
+
+def test_supervised_historical_cleanup_fails_closed_on_writer_lock_contention(
+    production, tmp_path, monkeypatch
+):
+    (
+        directory,
+        operator,
+        store,
+        _report_path,
+        report,
+        paths,
+        capture_id,
+        stage,
+        _baseline_temporary_bytes,
+    ) = _initial_historical_accounting_fixture(production, tmp_path)
+    monkeypatch.setattr(
+        production,
+        "_sample_memory",
+        lambda group, **_kwargs: _memory_sample(group),
+    )
+
+    with store.lock(), pytest.raises(
+        production.RunnerError, match="durable operator accounting or storage"
+    ):
+        production._resource_guard(
+            directory,
+            operator,
+            report=report,
+            deadline=time.monotonic() + 60,
+            paths=paths,
+            capture_id=capture_id,
+            require_complete_accounting=False,
+            workflow_deadline=True,
+            cleanup_historical_stages=True,
+        )
+
+    assert stage.is_dir()
+    assert report["active_process_group"] is None
 
 
 @pytest.mark.parametrize(
@@ -259,6 +883,10 @@ def test_normal_pressure_does_not_stop_on_logical_or_physical_compressor_bytes(
     assert report["resource_samples"][0]["system_compressor_occupied_bytes"] == 30 * 1024**3
     assert report["resource_samples"][0]["child_process_group_physical_footprint_bytes"] == 60 * 1024**3
     assert report["resource_samples"][0]["supervisor_physical_footprint_bytes"] == 70 * 1024**3
+    assert report["resource_samples"][0]["memory_policy_version"] == 2
+    assert report["invocation_peak_child_process_group_rss_bytes"] == 0
+    assert report["invocation_peak_child_process_group_physical_footprint_bytes"] == 60 * 1024**3
+    assert report["invocation_peak_supervisor_physical_footprint_bytes"] == 70 * 1024**3
 
 
 def test_resume_subtracts_trustworthy_prior_acquisition_from_aggregate_limits(production):

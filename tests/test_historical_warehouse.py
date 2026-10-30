@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import conftest
 import duckdb
@@ -10,7 +11,7 @@ from conftest import COMBO, HISTORICAL, FakeClient
 from kalshi_events import capture as acquisition
 from kalshi_events import normalize, warehouse
 from kalshi_events.capture import page_receipts
-from kalshi_events.common import CatalogueError, Limits, Store
+from kalshi_events.common import BudgetExceeded, CatalogueError, Limits, Store
 from kalshi_events.historical import HISTORICAL_CONTRACT, historical_selection
 
 
@@ -304,3 +305,221 @@ def test_historical_build_certifies_an_empty_selected_catalogue(store):
         )
         assert connection.execute("select count(*) from main.catalogue_coverage").fetchone() == (1,)
     assert warehouse.certified(store, state["capture_id"], catalogue_version=3) == receipt
+
+
+def _cleanup_capture(store):
+    return acquisition.capture(store, client_factory=_factory({}))
+
+
+def _historical_stage(store, capture_id, suffix):
+    relative = f"tmp/build-historical-{suffix}"
+    path = store.path(relative)
+    (path / "landing").mkdir(parents=True)
+    (path / "landing" / "receipt.bin").write_bytes(b"stage evidence")
+    return relative, path
+
+
+def test_abandoned_historical_stage_cleanup_prunes_only_owned_direct_stages(store):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    relative, stage = _historical_stage(store, capture_id, "a" * 32)
+    second_relative, second_stage = _historical_stage(store, capture_id, "b" * 32)
+    untouched = {
+        "tmp/build-historical-not-a-uuid": b"unknown name",
+        "tmp/build-v2-" + "c" * 32: b"v2 stage",
+        "tmp/replaced-" + "9" * 32 + "-v3/keep": b"replacement backup",
+        "tmp/parent-index-test/index.sqlite": b"parent index",
+        "tmp/recovery-index/cache/index.sqlite": b"recovery cache",
+        f"builds-historical/{capture_id}/warehouse.duckdb": b"published build",
+    }
+    for name, value in untouched.items():
+        path = store.path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    store.sync("tmp")
+    store.sync(f"builds-historical/{capture_id}")
+    before = store.usage()["temporary_bytes"]
+
+    with store.lock():
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+        assert store.check_storage()["temporary_bytes"] < before
+
+    assert not stage.exists()
+    assert not second_stage.exists()
+    assert store.usage()["temporary_bytes"] == before - len(b"stage evidence") * 2
+    for name, value in untouched.items():
+        assert store.path(name).read_bytes() == value
+    assert relative.startswith("tmp/build-historical-")
+    assert second_relative.startswith("tmp/build-historical-")
+
+
+def test_abandoned_historical_stage_cleanup_requires_lock_root_and_capture(store, tmp_path):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    _relative, stage = _historical_stage(store, capture_id, "d" * 32)
+    with pytest.raises(CatalogueError, match="canonical writer lock"):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert stage.exists()
+
+    with store.lock(), pytest.raises(CatalogueError):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, "0" * 32)
+    assert stage.exists()
+
+    scoped = Store(tmp_path / "scoped-root", series_ticker="SCOPED")
+    with scoped.lock(), pytest.raises(CatalogueError, match="unscoped"):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(scoped, capture_id)
+
+
+def test_abandoned_historical_cleanup_recovers_before_pruning(store, monkeypatch):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    _relative, stage = _historical_stage(store, capture_id, "e" * 32)
+    original_recover = warehouse._recover_build
+    calls = []
+
+    def record_recover(target_store, target_capture, version):
+        calls.append((target_capture, version))
+        assert stage.exists()
+        return original_recover(target_store, target_capture, version)
+
+    monkeypatch.setattr(warehouse, "_recover_build", record_recover)
+    with store.lock():
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert calls == [(capture_id, 3)]
+    assert not stage.exists()
+
+
+def test_abandoned_historical_cleanup_preserves_stages_when_backup_recovery_fails(
+    store, monkeypatch
+):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    _relative, stage = _historical_stage(store, capture_id, "f" * 32)
+    backup = store.path(f"tmp/replaced-{capture_id}-v3")
+    backup.mkdir(parents=True)
+    (backup / "keep").write_bytes(b"backup")
+
+    def fail_recover(*_args):
+        raise CatalogueError("synthetic recovery failure")
+
+    monkeypatch.setattr(warehouse, "_recover_build", fail_recover)
+    with store.lock(), pytest.raises(CatalogueError, match="synthetic"):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert (stage / "landing" / "receipt.bin").read_bytes() == b"stage evidence"
+    assert (backup / "keep").read_bytes() == b"backup"
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "hardlink", "special"])
+def test_abandoned_historical_cleanup_prevalidates_all_stages(store, tmp_path, unsafe):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    _safe_relative, safe_stage = _historical_stage(store, capture_id, "1" * 32)
+    _unsafe_relative, unsafe_stage = _historical_stage(store, capture_id, "2" * 32)
+    marker = tmp_path / "outside.bin"
+    marker.write_bytes(b"outside")
+    if unsafe == "symlink":
+        (unsafe_stage / "landing" / "unsafe-link").symlink_to(marker)
+    elif unsafe == "hardlink":
+        os.link(marker, unsafe_stage / "landing" / "hard-link")
+    else:
+        os.mkfifo(unsafe_stage / "landing" / "pipe")
+
+    with store.lock(), pytest.raises(CatalogueError, match="unsafe|hard-linked"):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert safe_stage.exists()
+    assert unsafe_stage.exists()
+    assert marker.read_bytes() == b"outside"
+
+
+@pytest.mark.parametrize("reference", ["pointer", "build_receipt", "release_manifest"])
+def test_abandoned_historical_cleanup_rejects_known_stage_references(store, reference):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    relative, stage = _historical_stage(store, capture_id, "3" * 32)
+    if reference == "pointer":
+        target = store.path("current-historical.json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"staging_path": relative}), encoding="utf-8")
+    elif reference == "release_manifest":
+        release_id = "a" * 64
+        pointer = store.path("current-historical.json")
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(json.dumps({"source_release_id": release_id}), encoding="utf-8")
+        target = store.path(f"releases/{release_id}/manifest.json")
+    else:
+        target = store.path(f"builds-historical/{capture_id}/build.json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if reference != "pointer":
+        target.write_text(json.dumps({"staging_path": relative}), encoding="utf-8")
+
+    with store.lock(), pytest.raises(CatalogueError, match="referenced"):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert (stage / "landing" / "receipt.bin").read_bytes() == b"stage evidence"
+
+
+def test_abandoned_historical_cleanup_uses_receipt_size_contract(store):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    _relative, stage = _historical_stage(store, capture_id, "6" * 32)
+    receipt = store.path(f"builds-historical/{capture_id}/build.json")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(json.dumps({"payload": "x" * (1024**2 + 16)}), encoding="utf-8")
+
+    with store.lock():
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert not stage.exists()
+
+
+def test_abandoned_historical_cleanup_rejects_receipts_over_canonical_limit(store, monkeypatch):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    _relative, stage = _historical_stage(store, capture_id, "7" * 32)
+    receipt = store.path(f"builds-historical/{capture_id}/build.json")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_bytes(b'{"payload":"' + b"x" * 1024 + b'"}')
+    monkeypatch.setattr(warehouse, "MAX_BUNDLE_BYTES", 1024)
+
+    with store.lock(), pytest.raises(CatalogueError, match="oversized"):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert stage.exists()
+
+
+def test_abandoned_historical_cleanup_rechecks_stage_inode_before_remove(store, monkeypatch):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    _relative, stage = _historical_stage(store, capture_id, "4" * 32)
+    moved = stage.with_name("retained-after-race")
+    validate = warehouse._validate_historical_stage
+
+    def replace_after_validation(path, root_device):
+        identity = validate(path, root_device)
+        path.rename(moved)
+        path.mkdir()
+        (path / "replacement").write_bytes(b"preserve")
+        return identity
+
+    monkeypatch.setattr(warehouse, "_validate_historical_stage", replace_after_validation)
+    with store.lock(), pytest.raises(CatalogueError, match="changed during cleanup"):
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+    assert stage.is_dir()
+    assert (stage / "replacement").read_bytes() == b"preserve"
+    assert moved.is_dir()
+    store.sync("tmp")
+
+
+def test_abandoned_historical_cleanup_releases_actual_temporary_budget(store):
+    state = _cleanup_capture(store)
+    capture_id = state["capture_id"]
+    relative, stage = _historical_stage(store, capture_id, "5" * 32)
+    payload = stage / "large.bin"
+    payload.write_bytes(b"x" * 4096)
+    store.sync(relative)
+    usage = store.usage()["temporary_bytes"]
+    store.limits = Limits(max_temp_bytes=usage - payload.stat().st_size + 1)
+
+    with store.lock():
+        with pytest.raises(BudgetExceeded, match="temporary storage"):
+            store.check_storage()
+        warehouse.recover_and_cleanup_abandoned_historical_stages(store, capture_id)
+        assert store.check_storage()["temporary_bytes"] < store.limits.max_temp_bytes
+    assert not stage.exists()

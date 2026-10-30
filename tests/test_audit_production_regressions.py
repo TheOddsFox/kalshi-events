@@ -227,6 +227,33 @@ def test_proven_no_start_preserves_exact_accounting_and_time_budget(
     assert json.loads(_paths["report"].read_text())["requests"] == 73
 
 
+def test_offline_historical_attempt_reports_zero_network_without_resetting_lifetime_accounting(
+    production, tmp_path, monkeypatch
+):
+    report, _paths, _snapshot, capture_id = _resume_harness(
+        production,
+        tmp_path,
+        monkeypatch,
+        status=(None, "memory pressure was not normal before supervised work", True),
+    )
+    report["mode"] = "historical"
+
+    result, code = production.run_production(
+        tmp_path,
+        capture_id=capture_id,
+        historical=True,
+    )
+
+    assert code == 3
+    assert result["network_activity_this_invocation"] == {
+        "requests": 0,
+        "downloaded_bytes": 0,
+        "accounting_complete": True,
+    }
+    assert result["requests"] == 73
+    assert result["downloaded_bytes"] == 8192
+
+
 @pytest.mark.parametrize(
     "reason",
     [
