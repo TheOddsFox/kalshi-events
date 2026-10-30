@@ -8,7 +8,7 @@ import pytest
 from conftest import COMBO, HISTORICAL, FakeClient
 
 from kalshi_events import capture as acquisition
-from kalshi_events import warehouse
+from kalshi_events import normalize, warehouse
 from kalshi_events.capture import page_receipts
 from kalshi_events.common import CatalogueError, Limits, Store
 from kalshi_events.historical import HISTORICAL_CONTRACT, historical_selection
@@ -89,6 +89,61 @@ def test_historical_build_uses_selected_evidence_when_global_capture_is_incomple
         warehouse.certified(store, capture_id, catalogue_version=3)
 
 
+def test_historical_disk_index_keeps_membership_and_eligibility_without_winners(store):
+    listed_page = {
+        "entity_kind": "events",
+        "endpoint": "/events",
+        "singular": False,
+        "status": 200,
+        "page_id": "1" * 32,
+        "request_id": "2" * 64,
+        "received_at": "2026-10-28T12:00:00Z",
+        "task_scope": "events_live",
+        "task_generation": 2,
+    }
+    listed_payload = {
+        "events": [{"event_ticker": "HISTORY-EVENT", "series_ticker": "HISTORY-SERIES"}],
+        "cursor": "",
+    }
+    missing_parent_page = {
+        "entity_kind": "events",
+        "endpoint": "/events/MISSING-EVENT",
+        "singular": True,
+        "status": 404,
+        "page_id": "3" * 32,
+        "request_id": "4" * 64,
+        "received_at": "2026-10-28T12:01:00Z",
+    }
+    state = {
+        "tasks": [acquisition.task("/events", "events")],
+        "task_scopes": {"0": "events_live"},
+    }
+    state["tasks"][0].update(done=True, restarts=2)
+    index = normalize.DiskParentIndex(store, collect_winners=False)
+    try:
+        index.add_page(listed_page, listed_payload)
+        index.add_page(missing_parent_page, {"message": "missing"})
+
+        assert list(index.stream_membership(state)) == [("events_live", "HISTORY-EVENT")]
+        assert list(index.stream_eligibility(state)) == [("events", "MISSING-EVENT", 404, "3" * 32)]
+        assert index.db.execute("select count(*) from winners").fetchone() == (0,)
+        with pytest.raises(CatalogueError, match="membership-only"):
+            list(index.stream_winners("events"))
+        with pytest.raises(CatalogueError, match="membership-only"):
+            list(index.missing_parent_batches(state))
+    finally:
+        index.close()
+
+    full_index = normalize.DiskParentIndex(store)
+    try:
+        full_index.add_page(listed_page, listed_payload)
+        winners = list(full_index.stream_winners("events"))
+        assert [row[0] for row in winners] == ["HISTORY-EVENT"]
+        assert winners[0][3] == "HISTORY-SERIES"
+    finally:
+        full_index.close()
+
+
 def test_historical_build_keeps_all_generations_combos_and_tie_winner(store, monkeypatch):
     timestamp = "2026-10-28T12:00:00Z"
     monkeypatch.setattr(acquisition, "now", lambda: timestamp)
@@ -152,7 +207,17 @@ def test_historical_build_keeps_all_generations_combos_and_tie_winner(store, mon
     v2_build.mkdir(parents=True)
     (v2_build / "keep").write_text("v2")
 
+    winner_modes = []
+    disk_index = warehouse.DiskParentIndex
+
+    class TrackingDiskParentIndex(disk_index):
+        def __init__(self, store, **options):
+            winner_modes.append(options.get("collect_winners", True))
+            super().__init__(store, **options)
+
+    monkeypatch.setattr(warehouse, "DiskParentIndex", TrackingDiskParentIndex)
     receipt = warehouse.build_historical(store, capture_id)
+    assert winner_modes == [False]
     assert (legacy_build / "keep").read_text() == "v1"
     assert (v2_build / "keep").read_text() == "v2"
     assert warehouse.build_directory(capture_id, 3) == f"builds-historical/{capture_id}"

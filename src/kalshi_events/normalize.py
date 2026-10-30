@@ -289,8 +289,9 @@ class ParentIndex:
 class DiskParentIndex:
     """Bounded-memory SQLite inventory used while replaying full catalogue captures."""
 
-    def __init__(self, store: Any):
+    def __init__(self, store: Any, *, collect_winners: bool = True):
         self.store = store
+        self.collect_winners = collect_winners
         self.processed: set[str] = set()
         self.defer_page_merges = False
         tmp = store.path("tmp")
@@ -385,18 +386,19 @@ class DiskParentIndex:
             self._translate_sql_deadline(exc)
 
     def _merge(self, page: ParentIndex) -> None:
-        for kind in ENTITY_KEYS:
-            for identity, winner in getattr(page, kind).items():
-                parent = winner[2] if kind == "events" or kind == "markets" else None
-                if kind == "events" and not parent:
-                    parent = None
-                self.db.execute(
-                    """insert into winners values(?,?,?,?,?) on conflict(kind,ticker) do update set
-                       received=excluded.received,observation_id=excluded.observation_id,parent=excluded.parent
-                       where (excluded.received,excluded.observation_id) >
-                             (winners.received,winners.observation_id)""",
-                    [kind, identity, winner[0], winner[1], parent],
-                )
+        if self.collect_winners:
+            for kind in ENTITY_KEYS:
+                for identity, winner in getattr(page, kind).items():
+                    parent = winner[2] if kind == "events" or kind == "markets" else None
+                    if kind == "events" and not parent:
+                        parent = None
+                    self.db.execute(
+                        """insert into winners values(?,?,?,?,?) on conflict(kind,ticker) do update set
+                           received=excluded.received,observation_id=excluded.observation_id,parent=excluded.parent
+                           where (excluded.received,excluded.observation_id) >
+                                 (winners.received,winners.observation_id)""",
+                        [kind, identity, winner[0], winner[1], parent],
+                    )
         for scope, generations in page.scope_membership.items():
             for generation, identities in generations.items():
                 self.db.executemany(
@@ -434,6 +436,8 @@ class DiskParentIndex:
         self._sync()
 
     def stream_winners(self, kind: str) -> Iterator[tuple[str, str, str, str | None]]:
+        if not self.collect_winners:
+            raise CatalogueError("winner index is unavailable in membership-only mode")
         yield from self.db.execute(
             "select ticker,received,observation_id,parent from winners where kind=? order by ticker",
             [kind],
@@ -557,6 +561,8 @@ class DiskParentIndex:
 
     def _missing_parent_batches(self, state: dict[str, Any]) -> Iterator[tuple[str, list[str]]]:
         """Stream sorted groups; table joins replace full-catalogue Python dictionaries and sets."""
+        if not self.collect_winners:
+            raise CatalogueError("parent closure is unavailable in membership-only mode")
         self._effective_lookups(state)
         self.db.execute("drop table if exists required_parents")
         self.db.execute(

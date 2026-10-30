@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import UserDict
 
 import pytest
 from conftest import FakeClient
@@ -34,6 +35,46 @@ def test_page_receipts_return_independent_list_and_row_copies(store):
     rows[0]["relative"] = "raw/changed/manifest.json"
     rows.append({"index": -1, "relative": "raw/extra/manifest.json"})
     assert state.page_rows == original
+
+
+def test_filtered_receipt_iteration_skips_copying_unselected_rows(store):
+    state = _incomplete_v2_state(store)
+
+    class CopyTracked(UserDict):
+        copies = 0
+
+        def keys(self):
+            self.copies += 1
+            return super().keys()
+
+    unselected = CopyTracked(index=999, relative="raw/unselected/manifest.json")
+    selected = CopyTracked(index=state.page_rows[0]["index"], relative="raw/selected/manifest.json")
+    state.page_rows = [unselected, selected]
+    expected = dict(selected)
+    selected.copies = 0
+
+    rows = list(acquisition._iter_page_receipts(store, state, task_indices={selected["index"]}))
+
+    assert rows == [expected]
+    assert rows[0] is not selected
+    assert unselected.copies == 0
+    assert selected.copies == 1
+
+
+def test_capture_pages_uses_filtered_receipts_without_public_projection(store, monkeypatch):
+    state = _incomplete_v2_state(store)
+    selected_index = state.page_rows[0]["index"]
+
+    monkeypatch.setattr(
+        acquisition,
+        "page_receipts",
+        lambda *_args: pytest.fail("filtered capture must not copy the public receipt list"),
+    )
+
+    pages = list(acquisition.capture_pages(store, state, task_indices={selected_index}))
+
+    assert pages
+    assert all(manifest["task_index"] == selected_index for manifest, _ in pages)
 
 
 def test_v2_replay_preserves_processed_membership(store):

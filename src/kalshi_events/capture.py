@@ -313,15 +313,22 @@ def _journal(state: dict[str, Any]) -> str:
     return f"captures/{state['capture_id']}/pages.jsonl"
 
 
-def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
+def _iter_page_receipts(
+    store: Store, state: dict[str, Any], *, task_indices: set[int] | None = None
+) -> Iterator[dict[str, Any]]:
     if state.get("journal_version") == JOURNAL_VERSION:
-        if isinstance(state, _CaptureState):
-            return [dict(row) for row in state.page_rows]
-        return _read_v2(store, state["capture_id"]).page_rows
+        rows = (
+            state.page_rows
+            if isinstance(state, _CaptureState)
+            else _read_v2(store, state["capture_id"]).page_rows
+        )
+        for row in rows:
+            if task_indices is None or row["index"] in task_indices:
+                yield dict(row)
+        return
     path = store.path(_journal(state))
     if not path.exists():
-        return []
-    rows = []
+        return
     for line in regular_bytes(path, store.limits.max_root_bytes).splitlines():
         row = decode(line)
         index = row.get("index") if isinstance(row, dict) else None
@@ -332,8 +339,12 @@ def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
             or not isinstance(index, int)
         ):
             raise CatalogueError("invalid page journal")
-        rows.append(row)
-    return rows
+        if task_indices is None or index in task_indices:
+            yield row
+
+
+def page_receipts(store: Store, state: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(_iter_page_receipts(store, state))
 
 
 def _seen_value(seen: dict[int, set[str]]) -> dict[str, list[str]]:
@@ -2168,9 +2179,7 @@ def capture_pages(
         for index in task_indices
     ):
         raise CatalogueError("capture page filter contains an invalid task index")
-    for row in page_receipts(store, state):
-        if task_indices is not None and row["index"] not in task_indices:
-            continue
+    for row in _iter_page_receipts(store, state, task_indices=task_indices):
         store.check_deadline()
         manifest, payload = read_page(
             store,

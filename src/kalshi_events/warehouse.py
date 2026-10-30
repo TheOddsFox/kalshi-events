@@ -32,8 +32,10 @@ from kalshi_events.capture import (
     CURRENT_ACQUISITION_PROTOCOL,
     _acquisition_protocol,
     _complete_capture,
+    _iter_page_receipts,
     capture_pages,
     page_receipts,
+    read_capture,
 )
 from kalshi_events.common import (
     BudgetExceeded,
@@ -246,8 +248,6 @@ def _profile_capture(
     if catalogue_version != 3:
         state = _complete_capture(store, capture_id, _state=state_hint)
         return state, page_receipts(store, state)
-    from kalshi_events.capture import read_capture
-
     state = read_capture(store, capture_id)
     if state.get("capture_id") != capture_id or (
         state_hint is not None
@@ -255,7 +255,7 @@ def _profile_capture(
     ):
         raise CatalogueError("historical capture state changed during the operation")
     _, indices = _historical_profile(state)
-    rows = [row for row in page_receipts(store, state) if row["index"] in indices]
+    rows = list(_iter_page_receipts(store, state, task_indices=indices))
     return state, rows
 
 
@@ -1978,7 +1978,7 @@ def _full_v2_build(
     staging.mkdir()
     verified_pages: dict[str, str] = {}
     index: ParentIndex | DiskParentIndex = (
-        DiskParentIndex(store)
+        DiskParentIndex(store, collect_winners=not historical)
         if store.scope is None and _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
         else ParentIndex()
     )
@@ -2078,7 +2078,8 @@ def build_historical(store: Store, capture_id: str, *, rebuild: bool = False) ->
         from kalshi_events.incremental import finish_pending_retirement
 
         finish_pending_retirement(store)
-        state, _ = _profile_capture(store, capture_id, 3)
+        state = read_capture(store, capture_id)
+        _historical_profile(state)
         if state.get("incremental"):
             raise CatalogueError("incremental captures cannot be built as historical catalogues")
         return _full_v2_build(store, state, rebuild=rebuild, historical=True)
