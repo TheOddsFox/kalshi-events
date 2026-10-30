@@ -214,6 +214,17 @@ def test_historical_flag_selects_offline_build_or_version_three_activation(produ
         )
         == "historical"
     )
+    assert (
+        production.validate_mode(
+            False,
+            CAPTURE_ID,
+            False,
+            historical=True,
+            offline_duration_seconds=3600,
+            supersede_offline_window=True,
+        )
+        == "historical"
+    )
     with pytest.raises(production.RunnerError):
         production.validate_mode(True, None, False, historical=True)
     with pytest.raises(production.RunnerError, match="--historical --capture-id"):
@@ -225,6 +236,14 @@ def test_historical_flag_selects_offline_build_or_version_three_activation(produ
             False,
             historical=True,
             renew_offline_window=True,
+        )
+    with pytest.raises(production.RunnerError, match="--supersede-offline-window"):
+        production.validate_mode(
+            False,
+            CAPTURE_ID,
+            False,
+            historical=True,
+            supersede_offline_window=True,
         )
     with pytest.raises(production.RunnerError, match="--renew-offline-window"):
         production.validate_mode(
@@ -460,9 +479,96 @@ def test_explicit_offline_window_renewal_accepts_expired_old_revision_without_mu
         )
 
 
-@pytest.mark.parametrize("history", [{}, [{}]])
+def test_explicit_supersede_archives_the_unchanged_window_and_preserves_budgets(
+    production, tmp_path, monkeypatch
+):
+    directory = tmp_path / "production"
+    report_path, report, _operator = _renewable_session(
+        directory, production, epoch_remaining=3600, monotonic_remaining=3600
+    )
+    old_window = dict(report["offline_historical_window"])
+    old_accounting = {
+        key: report.get(key)
+        for key in ("requests", "downloaded_bytes", "downloaded_bytes_upper_bound")
+    }
+    old_deadlines = {
+        key: report[key]
+        for key in (
+            "started_epoch",
+            "deadline_epoch",
+            "started_monotonic",
+            "deadline_monotonic",
+            "time_budget_started_epoch",
+            "time_budget_started_monotonic",
+        )
+    }
+    monkeypatch.setattr(production, "_revision", lambda: "e" * 40)
+    monkeypatch.setattr(production, "_boot_stamp", lambda: report["boot_stamp"])
+    monkeypatch.setattr(
+        production,
+        "_volume_uuid",
+        lambda _path: "ACAD66E7-42DA-426B-B20D-FB87A453396B",
+    )
+
+    with pytest.raises(production.RunnerError, match="both clocks to expire"):
+        production._load_resume(
+            directory,
+            CAPTURE_ID,
+            historical=True,
+            offline_duration_seconds=3600,
+            renew_offline_window=True,
+        )
+
+    loaded_path, loaded, _paths = production._load_resume(
+        directory,
+        CAPTURE_ID,
+        historical=True,
+        offline_duration_seconds=3600,
+        supersede_offline_window=True,
+    )
+    production._configure_offline_historical_window(
+        loaded,
+        CAPTURE_ID,
+        3600,
+        renew=True,
+        supersede=True,
+    )
+    production._atomic_report(loaded_path, loaded)
+
+    assert loaded["offline_historical_window_history"] == [old_window]
+    assert loaded["offline_historical_window"] != old_window
+    assert loaded["offline_historical_window"]["revision"] == "e" * 40
+    assert loaded["offline_historical_window"]["started_epoch"] < old_window["deadline_epoch"]
+    assert (
+        loaded["offline_historical_window"]["started_monotonic"] < old_window["deadline_monotonic"]
+    )
+    assert loaded["offline_historical_window_supersessions"] == [
+        {
+            "history_index": 0,
+            "window_started_epoch": old_window["started_epoch"],
+            "window_started_monotonic": old_window["started_monotonic"],
+            "window_deadline_epoch": old_window["deadline_epoch"],
+            "window_deadline_monotonic": old_window["deadline_monotonic"],
+            "successor_started_epoch": loaded["offline_historical_window"]["started_epoch"],
+            "successor_started_monotonic": loaded["offline_historical_window"]["started_monotonic"],
+        }
+    ]
+    assert {key: loaded[key] for key in old_accounting} == old_accounting
+    assert {key: loaded[key] for key in old_deadlines} == old_deadlines
+
+    _path, reloaded, _paths = production._load_resume(directory, CAPTURE_ID, historical=True)
+    assert reloaded["offline_historical_window_history"] == [old_window]
+    reloaded["offline_historical_window_supersessions"][0]["successor_started_epoch"] += 1
+    with pytest.raises(production.RunnerError, match="supersession history is invalid"):
+        production._validate_offline_historical_window(reloaded, CAPTURE_ID)
+
+
+@pytest.mark.parametrize(
+    ("history", "supersessions"),
+    [({}, []), ([{}], []), ([], {}), ([], [{}])],
+)
 def test_ordinary_first_offline_window_does_not_ignore_malformed_history(
-    production, tmp_path, monkeypatch, history
+    production, tmp_path, monkeypatch, history, supersessions
 ):
     directory = tmp_path / "production"
     directory.mkdir()
@@ -470,6 +576,7 @@ def test_ordinary_first_offline_window_does_not_ignore_malformed_history(
     operator = directory / "operator"
     report_path, report = _historical_report(directory, operator, production)
     report["offline_historical_window_history"] = history
+    report["offline_historical_window_supersessions"] = supersessions
     production._atomic_report(report_path, report)
     monkeypatch.setattr(production, "_boot_stamp", lambda: report["boot_stamp"])
 
@@ -483,6 +590,7 @@ def test_ordinary_first_offline_window_does_not_ignore_malformed_history(
     saved = production._strict_json(report_path)
     assert "offline_historical_window" not in saved
     assert saved["offline_historical_window_history"] == history
+    assert saved["offline_historical_window_supersessions"] == supersessions
 
 
 @pytest.mark.parametrize(
@@ -795,11 +903,12 @@ def test_offline_renewal_rejects_malformed_or_overlapping_window_history(
         )
 
 
-@pytest.mark.parametrize("offline_window", [False, True, "renew", "renew-atomic-fail"])
+@pytest.mark.parametrize("offline_window", [False, True, "renew", "supersede", "renew-atomic-fail"])
 def test_offline_historical_work_accepts_scoped_completion_without_faking_capture_completion(
     production, tmp_path, monkeypatch, offline_window
 ):
-    renewal = offline_window in {"renew", "renew-atomic-fail"}
+    renewal = offline_window in {"renew", "supersede", "renew-atomic-fail"}
+    supersede = offline_window == "supersede"
     atomic_failure = offline_window == "renew-atomic-fail"
     has_offline_window = bool(offline_window)
     directory = tmp_path / "production"
@@ -847,8 +956,8 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
             "started_at": production._utc(),
             "started_epoch": now_epoch - 7200,
             "started_monotonic": now_monotonic - 7200,
-            "deadline_epoch": now_epoch - 3600,
-            "deadline_monotonic": now_monotonic - 3600,
+            "deadline_epoch": now_epoch + 3600 if supersede else now_epoch - 3600,
+            "deadline_monotonic": (now_monotonic + 3600 if supersede else now_monotonic - 3600),
         }
         report["offline_historical_window"] = previous_window
         report["system"]["filesystem_volume_uuid"] = "ACAD66E7-42DA-426B-B20D-FB87A453396B"
@@ -1024,7 +1133,8 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
         capture_id=CAPTURE_ID,
         historical=True,
         offline_duration_seconds=3600 if offline_window else None,
-        renew_offline_window=renewal,
+        renew_offline_window=renewal and not supersede,
+        supersede_offline_window=supersede,
     )
 
     assert code == 0, result.get("error")
@@ -1058,8 +1168,13 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
         if renewal:
             assert result["offline_historical_window_history"] == [previous_window]
             assert previous_window["version"] == 1
-            assert window["started_epoch"] >= previous_window["deadline_epoch"]
-            assert window["started_monotonic"] >= previous_window["deadline_monotonic"]
+            if supersede:
+                assert window["started_epoch"] < previous_window["deadline_epoch"]
+                assert window["started_monotonic"] < previous_window["deadline_monotonic"]
+                assert len(result["offline_historical_window_supersessions"]) == 1
+            else:
+                assert window["started_epoch"] >= previous_window["deadline_epoch"]
+                assert window["started_monotonic"] >= previous_window["deadline_monotonic"]
             assert result.get("session_extension_history") == original_extension_history
             return
 

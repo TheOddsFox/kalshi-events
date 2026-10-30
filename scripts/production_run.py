@@ -173,6 +173,7 @@ def validate_mode(
     historical: bool = False,
     offline_duration_seconds: float | None = None,
     renew_offline_window: bool = False,
+    supersede_offline_window: bool = False,
 ) -> str:
     duration = _validate_offline_duration_seconds(offline_duration_seconds)
     if sum((full, capture_id is not None, activate_current)) != 1:
@@ -192,6 +193,11 @@ def validate_mode(
     if renew_offline_window and (mode != "historical" or duration is None):
         raise RunnerError(
             "--renew-offline-window requires --historical --capture-id and "
+            "--offline-duration-seconds"
+        )
+    if supersede_offline_window and (mode != "historical" or duration is None):
+        raise RunnerError(
+            "--supersede-offline-window requires --historical --capture-id and "
             "--offline-duration-seconds"
         )
     return mode
@@ -1665,9 +1671,18 @@ def _validate_initial_historical_accounting_session(
             allow_expired=True,
             allow_revision_change=True,
         )
-    elif "offline_historical_window_history" in report:
+    elif (
+        "offline_historical_window_history" in report
+        or "offline_historical_window_supersessions" in report
+    ):
         history = report.get("offline_historical_window_history")
-        if not isinstance(history, list) or history:
+        supersessions = report.get("offline_historical_window_supersessions", [])
+        if (
+            not isinstance(history, list)
+            or history
+            or not isinstance(supersessions, list)
+            or supersessions
+        ):
             raise RunnerError("offline historical window history has no current window")
     lock_path = root / "writer.lock"
     try:
@@ -2396,17 +2411,66 @@ def _validate_offline_historical_window_history(
     current = report.get("offline_historical_window")
     if not isinstance(history, list) or not isinstance(current, dict):
         raise RunnerError("offline historical window history is invalid")
-    previous: tuple[float, float, float, float] | None = None
-    for item in [*history, current]:
-        bounds = _offline_historical_window_bounds(
+    windows = [*history, current]
+    bounds = [
+        _offline_historical_window_bounds(
             report,
             capture_id,
             item,
             require_current_revision=(item is current and not allow_old_current_revision),
         )
-        if previous is not None and (bounds[0] < previous[1] or bounds[2] < previous[3]):
+        for item in windows
+    ]
+    supersessions = report.get("offline_historical_window_supersessions", [])
+    if not isinstance(supersessions, list):
+        raise RunnerError("offline historical window supersession history is invalid")
+    superseded_indices: set[int] = set()
+    fields = {
+        "history_index",
+        "window_started_epoch",
+        "window_started_monotonic",
+        "window_deadline_epoch",
+        "window_deadline_monotonic",
+        "successor_started_epoch",
+        "successor_started_monotonic",
+    }
+    for transition in supersessions:
+        if (
+            not isinstance(transition, dict)
+            or set(transition) != fields
+            or type(transition.get("history_index")) is not int
+        ):
+            raise RunnerError("offline historical window supersession history is invalid")
+        index = transition["history_index"]
+        if index < 0 or index >= len(history) or index in superseded_indices:
+            raise RunnerError("offline historical window supersession history is invalid")
+        values = [transition[field] for field in fields - {"history_index"}]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in values
+        ):
+            raise RunnerError("offline historical window supersession history is invalid")
+        previous, successor = bounds[index], bounds[index + 1]
+        expected = {
+            "window_started_epoch": previous[0],
+            "window_deadline_epoch": previous[1],
+            "window_started_monotonic": previous[2],
+            "window_deadline_monotonic": previous[3],
+            "successor_started_epoch": successor[0],
+            "successor_started_monotonic": successor[2],
+        }
+        if any(transition[field] != value for field, value in expected.items()):
+            raise RunnerError("offline historical window supersession history is invalid")
+        superseded_indices.add(index)
+
+    for index, (previous, successor) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+        if successor[0] < previous[0] or successor[2] < previous[2]:
+            raise RunnerError("offline historical window history is out of order")
+        overlaps = successor[0] < previous[1] or successor[2] < previous[3]
+        if overlaps != (index in superseded_indices):
             raise RunnerError("offline historical window history overlaps or is out of order")
-        previous = bounds
     return history
 
 
@@ -2444,9 +2508,14 @@ def _configure_offline_historical_window(
     duration_seconds: float | None,
     *,
     renew: bool = False,
+    supersede: bool = False,
 ) -> dict[str, Any] | None:
     duration = _validate_offline_duration_seconds(duration_seconds)
+    if supersede and not renew:
+        raise RunnerError("offline historical window supersession requires renewal")
     existing = report.get("offline_historical_window")
+    superseded_window = None
+    early_supersede = False
     if renew:
         if duration is None or not isinstance(existing, dict):
             raise RunnerError("offline historical window renewal requires an existing window")
@@ -2456,12 +2525,15 @@ def _configure_offline_historical_window(
             allow_expired=True,
             allow_revision_change=True,
         )
-        if time.time() < float(existing["deadline_epoch"]) or time.monotonic() < float(
+        expired = time.time() >= float(existing["deadline_epoch"]) and time.monotonic() >= float(
             existing["deadline_monotonic"]
-        ):
+        )
+        if not expired and not supersede:
             raise RunnerError("offline historical window renewal requires both clocks to expire")
+        early_supersede = not expired
+        superseded_window = dict(existing)
         history = list(report.get("offline_historical_window_history", []))
-        history.append(dict(existing))
+        history.append(superseded_window)
         report["offline_historical_window_history"] = history
         report["offline_historical_window"] = None
         existing = None
@@ -2488,6 +2560,21 @@ def _configure_offline_historical_window(
         "deadline_epoch": started_epoch + duration,
         "deadline_monotonic": started_monotonic + duration,
     }
+    if early_supersede:
+        history_index = len(report["offline_historical_window_history"]) - 1
+        supersessions = list(report.get("offline_historical_window_supersessions", []))
+        supersessions.append(
+            {
+                "history_index": history_index,
+                "window_started_epoch": superseded_window["started_epoch"],
+                "window_started_monotonic": superseded_window["started_monotonic"],
+                "window_deadline_epoch": superseded_window["deadline_epoch"],
+                "window_deadline_monotonic": superseded_window["deadline_monotonic"],
+                "successor_started_epoch": started_epoch,
+                "successor_started_monotonic": started_monotonic,
+            }
+        )
+        report["offline_historical_window_supersessions"] = supersessions
     return _validate_offline_historical_window(report, capture_id)
 
 
@@ -2586,6 +2673,7 @@ def run_production(
     historical: bool = False,
     offline_duration_seconds: float | None = None,
     renew_offline_window: bool = False,
+    supersede_offline_window: bool = False,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
     recover_reboot: bool = False,
@@ -2600,6 +2688,7 @@ def run_production(
         historical,
         offline_duration_seconds=offline_duration_seconds,
         renew_offline_window=renew_offline_window,
+        supersede_offline_window=supersede_offline_window,
     )
     _validate_runtime_versions(_package_versions())
     if reconcile_accounting and mode != "resume":
@@ -2635,6 +2724,7 @@ def run_production(
                     offline_duration_seconds if mode == "historical" else None
                 ),
                 renew_offline_window=renew_offline_window,
+                supersede_offline_window=supersede_offline_window,
                 reconcile_accounting=reconcile_accounting,
                 extend_session=extend_session,
                 recover_reboot=recover_reboot,
@@ -2726,7 +2816,7 @@ def run_production(
             return result, 3
         offline_window = None
         if mode == "historical":
-            if renew_offline_window:
+            if renew_offline_window or supersede_offline_window:
                 with _operator_writer_lock(operator) as writer_lock_identity:
                     operator_identity = _validate_offline_renewal_root(
                         directory,
@@ -2740,6 +2830,7 @@ def run_production(
                         str(capture_id),
                         offline_duration_seconds,
                         renew=True,
+                        supersede=supersede_offline_window,
                     )
                     try:
                         operator_after = os.stat(operator, follow_symlinks=False)
@@ -3415,6 +3506,11 @@ def main(argv: list[str] | None = None) -> int:
         help="explicitly grant a new offline window after the saved one expired",
     )
     parser.add_argument(
+        "--supersede-offline-window",
+        action="store_true",
+        help="explicitly replace an existing offline window before it expires",
+    )
+    parser.add_argument(
         "--reconcile-accounting",
         action="store_true",
         help="resume only after charging unfinished requests at their full durable reservation",
@@ -3442,6 +3538,7 @@ def main(argv: list[str] | None = None) -> int:
             args.historical,
             offline_duration_seconds=args.offline_duration_seconds,
             renew_offline_window=args.renew_offline_window,
+            supersede_offline_window=args.supersede_offline_window,
         )
     except RunnerError as exc:
         parser.error(str(exc))
@@ -3472,6 +3569,7 @@ def main(argv: list[str] | None = None) -> int:
                 historical=args.historical,
                 offline_duration_seconds=args.offline_duration_seconds,
                 renew_offline_window=args.renew_offline_window,
+                supersede_offline_window=args.supersede_offline_window,
                 reconcile_accounting=args.reconcile_accounting,
                 extend_session=args.extend_session,
                 recover_reboot=args.recover_reboot,
@@ -3559,15 +3657,17 @@ def _load_resume(
     historical: bool = False,
     offline_duration_seconds: float | None = None,
     renew_offline_window: bool = False,
+    supersede_offline_window: bool = False,
     reconcile_accounting: bool = False,
     extend_session: bool = False,
     recover_reboot: bool = False,
     recovery_volume_uuid: str | None = None,
 ) -> tuple[Path, dict[str, Any], dict[str, Path]]:
     duration = _validate_offline_duration_seconds(offline_duration_seconds)
+    renew_requested = renew_offline_window or supersede_offline_window
     if duration is not None and not historical:
         raise RunnerError("--offline-duration-seconds requires offline historical completion")
-    if renew_offline_window and (not historical or duration is None):
+    if renew_requested and (not historical or duration is None):
         raise RunnerError(
             "--renew-offline-window requires offline historical completion and an explicit duration"
         )
@@ -3700,14 +3800,23 @@ def _load_resume(
         _validate_offline_historical_window(
             report,
             capture_id,
-            allow_expired=renew_offline_window,
-            allow_revision_change=renew_offline_window,
+            allow_expired=renew_requested,
+            allow_revision_change=renew_requested,
         )
-    elif historical and "offline_historical_window_history" in report:
+    elif historical and (
+        "offline_historical_window_history" in report
+        or "offline_historical_window_supersessions" in report
+    ):
         history = report.get("offline_historical_window_history")
-        if not isinstance(history, list) or history:
+        supersessions = report.get("offline_historical_window_supersessions", [])
+        if (
+            not isinstance(history, list)
+            or history
+            or not isinstance(supersessions, list)
+            or supersessions
+        ):
             raise RunnerError("offline historical window history has no current window")
-    if renew_offline_window:
+    if renew_requested:
         window = report.get("offline_historical_window")
         if not isinstance(window, dict):
             raise RunnerError("offline historical window renewal requires an existing window")
@@ -3724,9 +3833,10 @@ def _load_resume(
             or report_path.parent.parent != run_root
         ):
             raise RunnerError("offline historical renewal report is outside its capture path")
-        if time.time() < float(window["deadline_epoch"]) or time.monotonic() < float(
+        expired = time.time() >= float(window["deadline_epoch"]) and time.monotonic() >= float(
             window["deadline_monotonic"]
-        ):
+        )
+        if not expired and not supersede_offline_window:
             raise RunnerError("offline historical window renewal requires both clocks to expire")
         if (
             not isinstance(saved_volume_uuid, str)

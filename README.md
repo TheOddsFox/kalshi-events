@@ -303,6 +303,13 @@ requesting a longer duration on an ordinary retry never extends them. This windo
 is separate from root storage, acquisition and release versions.
 Renewal cannot reset acquisition
 accounting, resource ceilings or consumed extensions, and cannot enable API requests.
+
+To replace an existing window before both clocks expire, use the same command with
+`--supersede-offline-window` instead of `--renew-offline-window`. This flag implies
+renewal; it keeps the old window unchanged in history and records the exact successor
+start that superseded it. The validator accepts overlapping windows only when that
+record matches both grants. The stopped-session, child, boot, volume, owner and root
+checks still apply, and cumulative acquisition limits remain unchanged.
 It grants processing time, not a promise that a large build will finish within 24 hours.
 
 `production.duckdb` is an atomically activated hard link to the certified warehouse, sharing its physical storage. It appears only after the workflow completes, standalone release verification passes, and fresh certification binds the database checksum to the expected publication. Open it read-only:
