@@ -1147,7 +1147,11 @@ def _monitor(
             next_sample = now + float(RUN_LIMITS["sample_seconds"])
         remaining = _child_time_remaining(deadline, wall_deadline_epoch)
         time.sleep(min(1.0, max(0.0, remaining - float(RUN_LIMITS["terminate_seconds"]))))
-    if storage_state is not None and storage_progress_path is not None and storage_external_paths is not None:
+    if (
+        storage_state is not None
+        and storage_progress_path is not None
+        and storage_external_paths is not None
+    ):
         try:
             storage_reason = _sample_live_storage(
                 directory,
@@ -1972,7 +1976,9 @@ def _read_accounting_worker(
                 expected_root_id,
                 expected_revision,
             )
-            from kalshi_events import warehouse
+            from kalshi_events import incremental, warehouse
+
+            incremental.finish_pending_retirement(store)
 
             cleanup = getattr(warehouse, "recover_and_cleanup_abandoned_historical_stages", None)
             if not callable(cleanup):
@@ -2212,6 +2218,7 @@ def _bounded_tree_bytes(
         return totals
     if not stat.S_ISDIR(root.st_mode) or root.st_dev != device:
         raise RunnerError(f"live storage workspace is unsafe: {path.name}")
+
     def walk(directory: Path) -> None:
         try:
             with os.scandir(directory) as entries:
@@ -2367,9 +2374,7 @@ def _live_workspace_snapshot(
             names.add(entry.name)
         return names, parent
 
-    build_names, _ = directory_names(
-        operator / "builds-historical", re.compile(r"[0-9a-f]{32}\Z")
-    )
+    build_names, _ = directory_names(operator / "builds-historical", re.compile(r"[0-9a-f]{32}\Z"))
     build_path = operator / "builds-historical" / capture_id
     try:
         build_info = build_path.lstat()
@@ -2660,7 +2665,9 @@ def _sample_live_storage(
     if new_entries - {name for name in new_entries if _ATOMIC_TEMP_NAME.fullmatch(name)}:
         raise RunnerError("unknown operator-root workspace appeared during live supervision")
     mutable_entries = mutable_top_level | {
-        name for name in set(baseline_entries) | set(current_entries) if _ATOMIC_TEMP_NAME.fullmatch(name)
+        name
+        for name in set(baseline_entries) | set(current_entries)
+        if _ATOMIC_TEMP_NAME.fullmatch(name)
     }
     for name in set(baseline_entries) & set(current_entries) - mutable_entries:
         if baseline_entries[name] != current_entries[name]:
@@ -2891,10 +2898,7 @@ def _stopped_worker_evidence(
         stdout_info = stdout.lstat()
     except OSError as exc:
         raise RunnerError("latest-launch stdout path is unsafe") from exc
-    if (
-        not stat.S_ISREG(stdout_info.st_mode)
-        or stdout.parent.parent != source_root.parent
-    ):
+    if not stat.S_ISREG(stdout_info.st_mode) or stdout.parent.parent != source_root.parent:
         raise RunnerError("latest-launch stdout path is outside its managed run")
     evidence_path = stdout.parent / "storage-safety-stop.json"
     try:
@@ -2949,9 +2953,7 @@ def _stopped_worker_evidence(
     return evidence, evidence_path, evidence_raw
 
 
-def _append_stopped_worker_audit(
-    operator: Path, record: dict[str, Any]
-) -> dict[str, Any]:
+def _append_stopped_worker_audit(operator: Path, record: dict[str, Any]) -> dict[str, Any]:
     from kalshi_events.common import fsync_directory
 
     path = operator / "stopped-worker-reconciliation.jsonl"
@@ -2961,7 +2963,11 @@ def _append_stopped_worker_audit(
         import stat
 
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != operator.stat().st_dev:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_dev != operator.stat().st_dev
+        ):
             raise RunnerError("stopped-worker audit log is unsafe")
         if info.st_size > MIB:
             raise RunnerError("stopped-worker audit log exceeded its byte bound")
@@ -2983,7 +2989,9 @@ def _append_stopped_worker_audit(
                     raise RunnerError("stopped-worker audit event conflicts with its prior record")
                 return entry
             if entry.get("session_id") == record["session_id"]:
-                raise RunnerError("this stopped session already has a different reconciliation audit")
+                raise RunnerError(
+                    "this stopped session already has a different reconciliation audit"
+                )
         body = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
         remaining = memoryview(body)
         while remaining:
@@ -4468,7 +4476,9 @@ def run_production(
                     if not isinstance(current_capture, str) or not CAPTURE_ID.fullmatch(
                         current_capture
                     ):
-                        raise RunnerError("current historical release has no exact capture identity")
+                        raise RunnerError(
+                            "current historical release has no exact capture identity"
+                        )
                     report["capture_id"] = current_capture
                     report["root_id"] = summary.get("root_id")
                 release = Path(str(current["output"]))

@@ -7,9 +7,12 @@ import json
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
+from kalshi_events import capture, common, incremental, warehouse
 
 RUNNER = Path(__file__).parents[1] / "scripts" / "production_run.py"
 
@@ -66,9 +69,7 @@ def _workspace(tmp_path: Path, production, *, external_size: int = 0):
     return directory, operator, run_root, logs, report_path, report, external_paths, progress
 
 
-def test_offline_workflow_reserves_twelfth_but_preserves_both_grant_clocks(
-    production, monkeypatch
-):
+def test_offline_workflow_reserves_twelfth_but_preserves_both_grant_clocks(production, monkeypatch):
     original = {
         "started_epoch": 1_000.0,
         "deadline_epoch": 87_400.0,
@@ -87,46 +88,37 @@ def test_offline_workflow_reserves_twelfth_but_preserves_both_grant_clocks(
     assert window == original
 
 
-def test_live_storage_stops_on_a_single_sample_above_database_threshold(
-    production, tmp_path
-):
+def test_live_storage_stops_on_a_single_sample_above_database_threshold(production, tmp_path):
     directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
         tmp_path, production
     )
-    state = production._begin_storage_supervision(
-        directory, operator, report, progress, external
-    )
+    state = production._begin_storage_supervision(directory, operator, report, progress, external)
     database = operator / "tmp" / f"build-historical-{report['capture_id']}" / "warehouse.duckdb"
     database.parent.mkdir(parents=True)
     with database.open("wb") as stream:
         stream.truncate(int(production.RUN_LIMITS["storage_category_stop_bytes"]) + 1)
-    reason = production._sample_live_storage(
-        directory, operator, report, state, progress, external
-    )
+    reason = production._sample_live_storage(directory, operator, report, state, progress, external)
     assert reason == "live database storage reached the 56 GiB stop threshold"
     assert state["current"]["operator_database_bytes"] == (
         int(production.RUN_LIMITS["storage_category_stop_bytes"]) + 1
     )
     assert state["target_interval_seconds"] == 1
-    assert state["current"]["operator_live_workspace_allocated_bytes"] < state["current"][
-        "operator_database_bytes"
-    ]
+    assert (
+        state["current"]["operator_live_workspace_allocated_bytes"]
+        < state["current"]["operator_database_bytes"]
+    )
 
 
 def test_live_storage_stops_on_temporary_burst_above_category_threshold(production, tmp_path):
     directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
         tmp_path, production
     )
-    state = production._begin_storage_supervision(
-        directory, operator, report, progress, external
-    )
+    state = production._begin_storage_supervision(directory, operator, report, progress, external)
     spool = operator / "tmp" / f"publish-{'c' * 32}" / "archive.tmp"
     spool.parent.mkdir(parents=True)
     with spool.open("wb") as stream:
         stream.truncate(int(production.RUN_LIMITS["storage_category_stop_bytes"]) + 1)
-    reason = production._sample_live_storage(
-        directory, operator, report, state, progress, external
-    )
+    reason = production._sample_live_storage(directory, operator, report, state, progress, external)
     assert reason == "live temporary storage reached the 56 GiB stop threshold"
 
 
@@ -198,15 +190,100 @@ def test_reconciliation_flag_requires_historical_capture_mode(production, tmp_pa
     assert raised.value.code == 2
 
 
+def test_initial_historical_preflight_finishes_validated_retirement_before_storage_snapshot(
+    production, monkeypatch, tmp_path
+):
+    events = []
+    root = tmp_path / "operator"
+    root.mkdir()
+    (root / "raw").mkdir()
+    capture_id = "a" * 32
+    root_id = "b" * 32
+
+    class FakeStore:
+        def __init__(self, store_root, _limits):
+            self.root = store_root
+            self.locked = False
+
+        @contextmanager
+        def lock(self):
+            events.append("lock-enter")
+            self.locked = True
+            try:
+                yield self
+            finally:
+                self.locked = False
+                events.append("lock-exit")
+
+        @property
+        def writer_locked_by_current_thread(self):
+            return self.locked
+
+        def path(self, relative):
+            return self.root / relative
+
+        def usage(self):
+            events.append("storage-snapshot")
+            return {"retained_bytes": 10, "temporary_bytes": 2, "database_bytes": 3}
+
+    monkeypatch.setattr(common, "Store", FakeStore)
+    monkeypatch.setattr(
+        capture,
+        "read_capture",
+        lambda _store, requested: {
+            "capture_id": requested,
+            "selected": None,
+            "incremental": False,
+            "acquisition_protocol": 5,
+            "max_response_bytes": int(production.RUN_LIMITS["response_bytes"]),
+        },
+    )
+    monkeypatch.setattr(
+        production,
+        "_validate_initial_historical_accounting_session",
+        lambda *_args, **_kwargs: events.append("session-identity-validated"),
+    )
+
+    def finish_retirement(store):
+        assert store.writer_locked_by_current_thread
+        events.append("finish-pending-retirement")
+
+    monkeypatch.setattr(incremental, "finish_pending_retirement", finish_retirement)
+    monkeypatch.setattr(
+        warehouse,
+        "recover_and_cleanup_abandoned_historical_stages",
+        lambda _store, _capture: events.append("historical-stage-cleanup"),
+    )
+    monkeypatch.setattr(production, "_root_id", lambda _store: root_id)
+
+    result = production._read_accounting_worker(
+        root,
+        capture_id,
+        cleanup_historical_stages=True,
+        expected_directory=tmp_path / "production",
+        report_path=tmp_path / "production" / "runs" / ("d" * 32) / "session.json",
+        expected_root_id=root_id,
+        expected_revision="c" * 40,
+    )
+
+    assert events.index("session-identity-validated") < events.index("finish-pending-retirement")
+    assert events.index("finish-pending-retirement") < events.index("historical-stage-cleanup")
+    assert events.index("historical-stage-cleanup") < events.index("storage-snapshot")
+    assert events[-1] == "lock-exit"
+    assert result["storage"] == {
+        "retained_bytes": 10,
+        "temporary_bytes": 2,
+        "database_bytes": 3,
+    }
+
+
 def test_live_storage_fails_closed_when_progress_or_external_file_is_missing_or_unsafe(
     production, tmp_path
 ):
     directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
         tmp_path, production
     )
-    state = production._begin_storage_supervision(
-        directory, operator, report, progress, external
-    )
+    state = production._begin_storage_supervision(directory, operator, report, progress, external)
     progress.unlink()
     with pytest.raises(production.RunnerError, match="storage progress report is missing"):
         production._sample_live_storage(directory, operator, report, state, progress, external)
@@ -290,9 +367,7 @@ def _stopped_session(tmp_path: Path, production, monkeypatch):
         "stdout": str(stdout),
         "started_at": started_at,
     }
-    (source_runtime / "latest-launch.json").write_text(
-        json.dumps(launch), encoding="utf-8"
-    )
+    (source_runtime / "latest-launch.json").write_text(json.dumps(launch), encoding="utf-8")
     evidence = {
         "capture_id": capture_id,
         "revision": report["revision"],
@@ -466,7 +541,9 @@ def test_started_child_with_missing_fresh_storage_report_fails_closed(
         return 0, None, True
 
     monkeypatch.setattr(production, "_invoke", started_without_report)
-    with pytest.raises(production.RunnerError, match="storage report disappeared after child start"):
+    with pytest.raises(
+        production.RunnerError, match="storage report disappeared after child start"
+    ):
         production._run_external_child(
             ["unused"],
             directory=directory,

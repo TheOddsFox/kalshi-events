@@ -543,3 +543,32 @@ The small fixture's combined SQLite inventory was 266,240 bytes for the referenc
 and retry cleanup, and establish no production-scale runtime guarantee. Full evidence,
 failed setup attempts and the unchanged strict comparison result are retained in
 `data/testing/memory-recovery-20261030/performance/REPORT.md`.
+
+
+## Historical compression investigation (30 October 2026)
+
+The stopped pre-compaction run had a 289,838,477,312-byte (269.9 GiB) staging database. Read-only catalog inspection found the data in landing_staging.observations, approximately 79.8 million estimated rows, with landing.observations empty and no public dbt models yet. Those catalog counts are estimates, not an independent count. Therefore duplicated final models do not explain that particular 270 GiB staging file. A bounded storage-segment inspection timed out; no codec conclusion is inferred from it.
+
+The compact design removes full-corpus merge staging for fresh historical builds, stores exact payloads once with native Zstandard, shares data through public views, and compresses historical exports. Measurements must cover canonical data, narrow keys, SQLite indexes, WAL/checkpoints, spill, exports and retained evidence. A smaller final file alone does not establish a smaller peak or faster runtime.
+
+Reference evidence is retained in ignored data/testing/historical-compact-20261030/reference. Representative performance work is limited to one hour including setup/reporting, 180 seconds per child and 16 GiB of generated artifacts. Require conservative projected peaks no greater than 48 GiB for each 64 GiB category before a full attempt. Compression and capacity results remain open until measured; do not extrapolate solely from repeated early pages or claim successful production from extracted Parquet.
+
+
+The bounded saved-input comparison used 11 data receipts plus a separately counted cutoff control, producing 20,323 observations. Its canonical 13 landing columns and all six public relations matched by schema and two-way EXCEPT ALL, including exact payload UTF-8. An initial query-qualification failure is retained in the original not-admitted report; successful read-only postcomparison and repeat evidence are separate.
+
+One warm-up and three alternating measured pairs used byte-identical clones of the frozen receipt fixture. Median loader time was 1.300 seconds for the existing dlt merge loader and 0.714 seconds for native loading. Median database sizes were 106,442,752 and 9,449,472 bytes respectively. Both workers used the new compact projection/export code, so these timings compare loading strategies, not the previous whole pipeline or API acquisition. Native worker peak RSS was about 879 MB versus about 739 MB for the reference: a reproducible increase, not a memory-saving claim.
+
+Full selected-task metadata contained 4,560 event data pages, 78,836 historical-market data pages and one series data page; controls are counted separately. The endpoint-weighted point database estimate was 62.6 GB (decimal), above the 48 GiB admission threshold. The twofold-population/20% mix sensitivity was 150.3 GB, not a formal upper bound. Full-population sort/join spill remains unbounded by the small sample, and wide-rule/high-entropy/duplicate strata were not demonstrated. Accordingly production admission is FALSE: no new 24-hour grant or production run is consumed.
+
+All measurements, failures, hashes and capacity assumptions remain under ignored data/testing/historical-compact-20261030/runs/20261030T164857Z/. Final production completion remains blocked by capacity and spill evidence. The retained 270 GiB uncertified staging database was not rewritten or deleted for these experiments.
+
+To reproduce a bounded diagnostic comparison with a new report directory (this command does not publish or resume production):
+
+```sh
+python scripts/benchmark-historical-compact.py \
+  --operator-root ./data/kalshi-production/operator \
+  --capture-id 19caddd934f74d13ad3d585b915601c9 \
+  --output-dir ./data/testing/historical-compact-comparison-new
+```
+
+The RSS increase was consistent across the three measured pairs. Direct Arrow registration may overlap batch/page buffers with DuckDB insert/compression buffers, unlike staged loading, but no allocation trace was collected and this explanation remains a hypothesis. No memory-leak claim or memory-saving claim follows. The original failed reports remain intact; the root/temp capacity correction is a separate artifact. The model preserves distinct 350 GiB root and 400 GiB aggregate limits and labels its 35 GB baseline assumption as unverified.

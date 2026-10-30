@@ -121,6 +121,7 @@ def _resume_harness(
         "logs": logs,
         "metrics": report_path.parent / "metrics.json",
         "metrics_progress": report_path.parent / "metrics.progress.json",
+        "storage_progress": report_path.parent / "storage.progress.json",
         "capture_notification": report_path.parent / "capture-notification.json",
     }
     snapshot = {
@@ -368,7 +369,7 @@ def test_signal_during_spawn_keeps_durable_process_group_when_reaping_fails(
     monkeypatch.setattr(production.subprocess, "Popen", spawn)
     monkeypatch.setattr(production, "_terminate", lambda _process: False)
 
-    with pytest.raises(production.RunnerError, match="could not be reaped"):
+    with pytest.raises(production.RunnerError, match="could not be confirmed reaped"):
         production._invoke(
             ["synthetic-child"],
             directory=tmp_path,

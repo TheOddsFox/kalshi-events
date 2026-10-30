@@ -25,7 +25,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 MAX_CAPTURE_BYTES = 512 * 1024**2
-MAX_CAPTURE_ENTRIES = 200_000
+MAX_CAPTURE_ENTRIES = 500_000
 MAX_SAMPLE_PAGES = 256
 MAX_SAMPLE_BYTES = 1024**3
 MAX_SAMPLE_ROWS = 1_000_000
@@ -33,10 +33,11 @@ MAX_ARTIFACT_BYTES = 16 * 1024**3
 MAX_CHILD_SECONDS = 180
 MAX_TOTAL_SECONDS = 3600
 UNKNOWN_POPULATION_MULTIPLIER = 2.0
-RAW_ROOT_BASELINE_BYTES = 35_000_000_000
+RAW_ROOT_BASELINE_ASSUMPTION_BYTES = 35_000_000_000
 SAFE_CATEGORY_BYTES = 48 * 1024**3
 CATEGORY_LIMIT_BYTES = 64 * 1024**3
-ROOT_AGGREGATE_LIMIT_BYTES = 400_000_000_000
+ROOT_LIMIT_BYTES = 350 * 1024**3
+AGGREGATE_LIMIT_BYTES = 400 * 1024**3
 MANIFEST_LIMIT_BYTES = 1024**2
 STATE_LIMIT_BYTES = 64 * 1024**2
 DEFAULT_CAPTURE_ID = "19caddd934f74d13ad3d585b915601c9"
@@ -133,17 +134,30 @@ def _capture_id(root: Path, requested: str | None) -> str:
     raise CatalogueError("pass --capture-id when the operator root has multiple captures")
 
 
+def _check_capture_entry_count(entry_count: int) -> None:
+    from kalshi_events.common import CatalogueError
+
+    if (
+        isinstance(entry_count, bool)
+        or not isinstance(entry_count, int)
+        or entry_count < 0
+        or entry_count > MAX_CAPTURE_ENTRIES
+    ):
+        raise CatalogueError("capture has too many receipt entries for bounded sampling")
+
+
 def _page_metadata(source: ReadOnlyStore, row: dict[str, Any], order: int) -> dict[str, Any]:
     from kalshi_events.common import CatalogueError
 
     relative = row.get("relative")
     if not isinstance(relative, str) or not relative.startswith("raw/"):
         raise CatalogueError("capture journal contains an invalid receipt path")
-    manifest_path = source.path((PurePosixPath(relative).parent / "manifest.json").as_posix())
+    receipt_directory = source.path(PurePosixPath(relative).parent.as_posix())
+    manifest_path = receipt_directory / "manifest.json"
     manifest = _read_json(manifest_path, MANIFEST_LIMIT_BYTES)
     if not isinstance(manifest, dict):
         raise CatalogueError("receipt manifest is not an object")
-    body_path = source.path((PurePosixPath(relative).parent / "body.bin").as_posix())
+    body_path = receipt_directory / "body.bin"
     if body_path.is_symlink() or not body_path.is_file():
         raise CatalogueError("sample receipt body is missing or unsafe")
     body_size = body_path.stat().st_size
@@ -172,11 +186,15 @@ def _page_metadata(source: ReadOnlyStore, row: dict[str, Any], order: int) -> di
     }
 
 
+def _is_control_page(page: dict[str, Any]) -> bool:
+    return page["status"] != 200 or page["endpoint"] == "/historical/cutoff"
+
+
 def _stratified_sample(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Choose deterministic position and size tails from every endpoint generation."""
     groups: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for page in pages:
-        if page["status"] == 200:
+        if page["status"] == 200 and not _is_control_page(page):
             groups[(page["endpoint"], page["generation"])].append(page)
     selected: dict[str, dict[str, Any]] = {}
     for group in groups.values():
@@ -192,6 +210,32 @@ def _stratified_sample(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ):
             selected[page["relative"]] = page
     return sorted(selected.values(), key=lambda page: page["order"])
+
+
+def _control_sample(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Select one real control receipt for each endpoint/generation/status stratum."""
+    groups: dict[tuple[str, int, Any], list[dict[str, Any]]] = defaultdict(list)
+    for page in pages:
+        if _is_control_page(page):
+            groups[(page["endpoint"], page["generation"], page["status"])].append(page)
+    return [
+        min(group, key=lambda page: page["order"])
+        for _, group in sorted(groups.items(), key=lambda item: str(item[0]))
+    ]
+
+
+def _control_receipt_counts(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts = Counter(
+        (page["endpoint"], page["generation"], page["status"])
+        for page in pages
+        if _is_control_page(page)
+    )
+    return [
+        {"endpoint": endpoint, "generation": generation, "status": status, "receipts": count}
+        for (endpoint, generation, status), count in sorted(
+            counts.items(), key=lambda item: str(item[0])
+        )
+    ]
 
 
 def _row_profile(rows: list[dict[str, Any]], payload: Any) -> dict[str, Any]:
@@ -265,7 +309,7 @@ def _verify_and_copy(
     state: dict[str, Any],
     selected: list[dict[str, Any]],
     fixture_roots: list[Path],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     checkout = _checkout()
     if str(checkout / "src") not in sys.path:
         sys.path.insert(0, str(checkout / "src"))
@@ -275,6 +319,7 @@ def _verify_and_copy(
     from kalshi_events.transport import read_page
 
     sample_rows = []
+    control_rows = []
     sample_bytes = 0
     observed_rows = 0
     entity_counts: dict[tuple[str, str], int] = defaultdict(int)
@@ -290,26 +335,39 @@ def _verify_and_copy(
         if not capture._receipt_matches_state_protocol(manifest, state):
             raise CatalogueError("sample receipt protocol differs from its capture")
         capture._validate_receipt_task_binding(manifest, state, page)
-        if manifest.get("status") != 200:
-            raise CatalogueError("sample contains a non-success receipt")
-        scoped = warehouse._scope_manifest(state, manifest)
-        rows = list(observations(((scoped, payload),)))
-        observed_rows += len(rows)
-        if observed_rows > MAX_SAMPLE_ROWS:
-            raise CatalogueError("sample contains too many observations to profile safely")
-        for row in rows:
-            entity_counts[(row["entity_kind"], row["entity_ticker"])] += 1
-        profile = _row_profile(rows, payload)
-        sample_rows.append(
-            {
-                "endpoint": page["endpoint"],
-                "generation": page["generation"],
-                "position": page["position"],
-                "encoded_bytes": page["encoded_bytes"],
-                "decoded_bytes": page["decoded_bytes"],
-                **profile,
-            }
-        )
+        if _is_control_page(page):
+            control_rows.append(
+                {
+                    "endpoint": page["endpoint"],
+                    "generation": page["generation"],
+                    "position": page["position"],
+                    "status": page["status"],
+                    "encoded_bytes": page["encoded_bytes"],
+                    "decoded_bytes": page["decoded_bytes"],
+                }
+            )
+        else:
+            if manifest.get("status") != 200:
+                raise CatalogueError("data sample contains a non-success receipt")
+            scoped = warehouse._scope_manifest(state, manifest)
+            rows = list(observations(((scoped, payload),)))
+            observed_rows += len(rows)
+            if observed_rows > MAX_SAMPLE_ROWS:
+                raise CatalogueError("sample contains too many observations to profile safely")
+            for row in rows:
+                identity_field = warehouse.ENTITY_KEYS[row["entity_kind"]]
+                entity_counts[(row["entity_kind"], row[identity_field])] += 1
+            profile = _row_profile(rows, payload)
+            sample_rows.append(
+                {
+                    "endpoint": page["endpoint"],
+                    "generation": page["generation"],
+                    "position": page["position"],
+                    "encoded_bytes": page["encoded_bytes"],
+                    "decoded_bytes": page["decoded_bytes"],
+                    **profile,
+                }
+            )
         sample_bytes += page["encoded_bytes"]
         page_rows.append({key: page[key] for key in ("index", "relative", "request_id")})
         for fixture_root in fixture_roots:
@@ -326,8 +384,6 @@ def _verify_and_copy(
 
     if sample_bytes > MAX_SAMPLE_BYTES or len(selected) > MAX_SAMPLE_PAGES:
         raise CatalogueError("selected receipt sample exceeds its fixed size bound")
-    if not sample_rows or not any(row["observations"] for row in sample_rows):
-        raise CatalogueError("verified receipt sample contains no observations")
     sample_rows.append(
         {
             "sample_duplicate_entities": sum(
@@ -358,7 +414,7 @@ def _verify_and_copy(
             for row in page_rows
         )
         (capture_directory / "pages.jsonl").write_bytes(journal)
-    return sample_rows
+    return sample_rows, control_rows
 
 
 def _tree_bytes(root: Path) -> tuple[int, int]:
@@ -431,6 +487,9 @@ def _run_child(
     env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONPATH"] = str(checkout / "src")
+    env["DLT_TELEMETRY"] = "0"
+    env["DLT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
+    env["DBT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
     with log_path.open("wb") as log:
         process = subprocess.Popen(
             command,
@@ -442,6 +501,9 @@ def _run_child(
         )
         started = time.monotonic()
         peak_temp_bytes = 0
+        build_peak_temp_bytes = 0
+        export_peak_temp_bytes = 0
+        phase_path = fixture_root / ".benchmark-phase"
         while process.poll() is None:
             if time.monotonic() >= deadline:
                 _terminate_group(process)
@@ -453,19 +515,36 @@ def _run_child(
             if size > MAX_ARTIFACT_BYTES:
                 _terminate_group(process)
                 raise RuntimeError("benchmark artifacts exceeded 16 GiB")
-            peak_temp_bytes = max(peak_temp_bytes, _tree_bytes(fixture_root / "tmp")[0])
+            temporary_bytes = _tree_bytes(fixture_root / "tmp")[0]
+            peak_temp_bytes = max(peak_temp_bytes, temporary_bytes)
+            try:
+                phase = phase_path.read_text(encoding="ascii")
+            except FileNotFoundError:
+                phase = ""
+            if phase == "build":
+                build_peak_temp_bytes = max(build_peak_temp_bytes, temporary_bytes)
+            elif phase == "export":
+                export_peak_temp_bytes = max(export_peak_temp_bytes, temporary_bytes)
             time.sleep(0.25)
         if process.returncode:
             raise RuntimeError(f"{method} worker failed; inspect {log_path}")
     result = _read_json(child_report, 1024**2)
-    result["peak_temporary_bytes"] = peak_temp_bytes
+    result["peak_temporary_bytes"] = max(
+        peak_temp_bytes, build_peak_temp_bytes, export_peak_temp_bytes
+    )
+    result["build_peak_temporary_bytes"] = max(
+        build_peak_temp_bytes, result.get("build_phase_temporary_bytes", 0)
+    )
+    result["export_peak_temporary_bytes"] = max(
+        export_peak_temp_bytes, result.get("export_phase_temporary_bytes", 0)
+    )
     return result
 
 
 def _compare_databases(legacy_path: Path, native_path: Path) -> dict[str, Any]:
     import duckdb
 
-    from kalshi_events.warehouse import RELATIONS
+    from kalshi_events.warehouse import _LANDING_SCHEMA, RELATIONS
 
     connection = duckdb.connect(str(native_path), read_only=True)
     try:
@@ -477,33 +556,60 @@ def _compare_databases(legacy_path: Path, native_path: Path) -> dict[str, Any]:
         }
         comparison = {}
         for label, (schema_name, table) in relations.items():
+            native_relation = f"{schema_name}.{table}"
+            legacy_relation = f"legacy.{schema_name}.{table}"
             native_schema = connection.execute(
-                f"describe select * from main.{schema_name}.{table}"
+                f"describe select * from {native_relation}"
             ).fetchall()
             legacy_schema = connection.execute(
-                f"describe select * from legacy.{schema_name}.{table}"
+                f"describe select * from {legacy_relation}"
             ).fetchall()
-            if native_schema != legacy_schema:
+            canonical_count = len(_LANDING_SCHEMA) if label == "landing.observations" else None
+            canonical_native = (
+                native_schema[:canonical_count] if canonical_count is not None else native_schema
+            )
+            canonical_legacy = (
+                legacy_schema[:canonical_count] if canonical_count is not None else legacy_schema
+            )
+            expected_landing_names = [field.name for field in _LANDING_SCHEMA]
+            if canonical_count is not None and (
+                [row[0] for row in canonical_native] != expected_landing_names
+                or [row[0] for row in canonical_legacy] != expected_landing_names
+            ):
+                raise RuntimeError("landing columns differ from the 13-column warehouse contract")
+            if canonical_native != canonical_legacy:
                 raise RuntimeError(f"legacy and native schemas differ for {label}")
-            names = [row[0] for row in native_schema]
+            names = [row[0] for row in canonical_native]
             projection = ", ".join(
                 f'encode("{name}") as "{name}"' if "VARCHAR" in row[1].upper() else f'"{name}"'
-                for name, row in zip(names, native_schema, strict=True)
+                for name, row in zip(names, canonical_native, strict=True)
             )
             differences = {}
             for left, right in (("main", "legacy"), ("legacy", "main")):
+                left_relation = native_relation if left == "main" else legacy_relation
+                right_relation = native_relation if right == "main" else legacy_relation
                 differences[f"{left}_minus_{right}"] = connection.execute(
-                    f"select count(*) from (select {projection} from {left}.{schema_name}.{table} "
-                    f"except all select {projection} from {right}.{schema_name}.{table})"
+                    f"select count(*) from (select {projection} from {left_relation} "
+                    f"except all select {projection} from {right_relation})"
                 ).fetchone()[0]
             counts = {
                 database: connection.execute(
-                    f"select count(*) from {database}.{schema_name}.{table}"
+                    f"select count(*) from "
+                    f"{native_relation if database == 'main' else legacy_relation}"
                 ).fetchone()[0]
                 for database in ("main", "legacy")
             }
             comparison[label] = {
-                "schema": native_schema,
+                "schema": canonical_native,
+                "physical_schema_columns": {
+                    "native": [row[0] for row in native_schema],
+                    "legacy": [row[0] for row in legacy_schema],
+                },
+                "legacy_internal_extra_columns": (
+                    [row[0] for row in legacy_schema[canonical_count:]]
+                    if canonical_count is not None
+                    else []
+                ),
                 "row_counts": counts,
                 "except_all_utf8_differences": differences,
                 "equal": counts["main"] == counts["legacy"] and not any(differences.values()),
@@ -620,6 +726,34 @@ def _sampling_coverage(
     }
 
 
+def _receipt_population_metadata(pages: list[dict[str, Any]]) -> dict[str, Any]:
+    data_groups: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    controls = []
+    for page in pages:
+        (
+            controls
+            if _is_control_page(page)
+            else data_groups[(page["endpoint"], page["generation"])]
+        ).append(page)
+    return {
+        "data_strata": [
+            {
+                "endpoint": endpoint,
+                "generation": generation,
+                "candidate_pages": len(group),
+                "encoded_bytes": sum(page["encoded_bytes"] for page in group),
+                "decoded_bytes": sum(page["decoded_bytes"] for page in group),
+                "median_decoded_page_bytes": _quantile(
+                    [page["decoded_bytes"] for page in group], 0.5
+                ),
+                "max_decoded_page_bytes": max(page["decoded_bytes"] for page in group),
+            }
+            for (endpoint, generation), group in sorted(data_groups.items())
+        ],
+        "control_receipts": _control_receipt_counts(controls),
+    }
+
+
 def _historical_task_plan(
     state: dict[str, Any],
 ) -> tuple[dict[str, Any], set[int], list[dict[str, Any]]]:
@@ -671,6 +805,7 @@ def _capacity_forecast(
     protected_index_bytes: int,
     abandoned_staging_bytes: int,
     target_observations: int,
+    receipt_population_metadata: list[dict[str, Any]],
 ) -> dict[str, Any]:
     from kalshi_events.common import CatalogueError
 
@@ -679,30 +814,97 @@ def _capacity_forecast(
     input_bytes = sum(page["landing_utf8_bytes"] for page in pages)
     native_db = native["database_bytes"]
     if rows <= 0 or input_bytes <= 0:
-        raise CatalogueError("capacity forecast requires a nonempty verified sample")
+        raise CatalogueError(
+            "capacity forecast unavailable: diagnostic sample has no observation rows or "
+            "landing bytes; this does not establish a zero-row full population"
+        )
     per_page = [
         page["landing_utf8_bytes"] / page["observations"] for page in pages if page["observations"]
     ]
     ratio = native_db / input_bytes
     mean_row_bytes = input_bytes / rows
     high_row_bytes = max(_quantile(per_page, 0.95), max(per_page))
-    point_database = math.ceil(target_observations * mean_row_bytes * ratio)
+
+    sample_groups: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for page in pages:
+        sample_groups[(page["endpoint"], page["generation"])].append(page)
+    weighted_groups = []
+    missing_metadata = []
+    estimated_capture_rows = 0
+    estimated_capture_landing_bytes = 0.0
+    for metadata in receipt_population_metadata:
+        key = (metadata["endpoint"], metadata["generation"])
+        group = sample_groups.get(key, [])
+        sample_decoded = sum(page["decoded_bytes"] for page in group)
+        sample_landing = sum(page["landing_utf8_bytes"] for page in group)
+        median_page_rows = _quantile([page["observations"] for page in group], 0.5)
+        if not group or sample_decoded <= 0 or median_page_rows <= 0:
+            missing_metadata.append({"endpoint": key[0], "generation": key[1]})
+            continue
+        estimated_rows = metadata["candidate_pages"] * median_page_rows
+        landing_per_decoded_byte = sample_landing / sample_decoded
+        landing_bytes = metadata["decoded_bytes"] * landing_per_decoded_byte
+        estimated_capture_rows += estimated_rows
+        estimated_capture_landing_bytes += landing_bytes
+        weighted_groups.append(
+            {
+                "endpoint": key[0],
+                "generation": key[1],
+                "candidate_pages": metadata["candidate_pages"],
+                "candidate_decoded_bytes": metadata["decoded_bytes"],
+                "sample_median_observations_per_page": median_page_rows,
+                "estimated_capture_observations": estimated_rows,
+                "sample_landing_per_decoded_byte": landing_per_decoded_byte,
+                "estimated_capture_landing_utf8_bytes": landing_bytes,
+            }
+        )
+    if estimated_capture_rows <= 0 or not weighted_groups:
+        raise CatalogueError("capacity forecast lacks endpoint-weighted observation metadata")
+    target_scale = target_observations / estimated_capture_rows
+    weighted_landing_bytes = estimated_capture_landing_bytes * target_scale
+    weighted_row_bytes = weighted_landing_bytes / target_observations
+    point_database = math.ceil(weighted_landing_bytes * ratio)
     upper_observations = math.ceil(target_observations * UNKNOWN_POPULATION_MULTIPLIER)
-    upper_database = math.ceil(upper_observations * high_row_bytes * ratio * 1.20)
+    weighted_upper_landing_bytes = weighted_landing_bytes * UNKNOWN_POPULATION_MULTIPLIER * 1.20
+    upper_database = math.ceil(weighted_upper_landing_bytes * ratio)
+    max_all_strata_database_sensitivity = math.ceil(
+        upper_observations * high_row_bytes * ratio * 1.20
+    )
     point_export = math.ceil(target_observations * export_bytes / rows)
     upper_export = math.ceil(point_export * UNKNOWN_POPULATION_MULTIPLIER * 1.20)
-    point_temp = math.ceil(target_observations * native["peak_temporary_bytes"] / rows)
-    measured_temp_upper = math.ceil(
-        upper_observations * native["peak_temporary_bytes"] / rows * 1.20
-    )
-    upper_spill_reserve = 4 * 1024**3
+    build_peak = native.get("build_peak_temporary_bytes", native["peak_temporary_bytes"])
+    export_peak = native.get("export_peak_temporary_bytes", native["peak_temporary_bytes"])
+    point_build_temp = math.ceil(target_observations * build_peak / rows)
+    point_export_temp = math.ceil(target_observations * export_peak / rows)
+    measured_build_temp_upper = math.ceil(upper_observations * build_peak / rows * 1.20)
+    measured_export_temp_upper = math.ceil(upper_observations * export_peak / rows * 1.20)
+    spill_scenario_reserve = 4 * 1024**3
     wal_reserve = 256 * 1024**2
-    projected_database = retained_baseline["database_bytes"] + upper_database
-    projected_temp = protected_index_bytes + max(
-        measured_temp_upper,
-        upper_database + upper_export + upper_spill_reserve + wal_reserve,
+    parent_index_upper = math.ceil(
+        upper_observations * native.get("parent_index_bytes", 0) / rows * 1.20
     )
-    projected_root = raw_root_baseline_bytes + retained_baseline["total_bytes"] + projected_temp
+    projected_database = retained_baseline["database_bytes"] + upper_database
+    projected_build_temp = protected_index_bytes + measured_build_temp_upper + wal_reserve
+    projected_export_temp_scenario = (
+        protected_index_bytes + measured_export_temp_upper + spill_scenario_reserve
+    )
+    projected_temp_scenario = max(projected_build_temp, projected_export_temp_scenario)
+    projected_root_build = (
+        raw_root_baseline_bytes
+        + retained_baseline["total_bytes"]
+        + protected_index_bytes
+        + measured_build_temp_upper
+        + wal_reserve
+    )
+    projected_root_export = (
+        raw_root_baseline_bytes
+        + retained_baseline["total_bytes"]
+        + protected_index_bytes
+        + upper_database
+        + upper_export
+        + spill_scenario_reserve
+    )
+    projected_root_scenario = max(projected_root_build, projected_root_export)
     unknown_edges = [
         name
         for name, present in (
@@ -716,27 +918,70 @@ def _capacity_forecast(
         )
         if not present
     ]
-    covered = sample[-1].get("metadata_coverage_complete") is True and not unknown_edges
-    forecast_fits = (
-        projected_database <= SAFE_CATEGORY_BYTES
-        and projected_temp <= SAFE_CATEGORY_BYTES
-        and projected_database <= CATEGORY_LIMIT_BYTES
-        and projected_temp <= CATEGORY_LIMIT_BYTES
-        and projected_root <= ROOT_AGGREGATE_LIMIT_BYTES
+    covered = (
+        sample[-1].get("metadata_coverage_complete") is True
+        and not unknown_edges
+        and not missing_metadata
     )
-    preconditions_clear = abandoned_staging_bytes == 0
+    root_scenario_fits = projected_root_scenario <= ROOT_LIMIT_BYTES
+    aggregate_scenario_fits = projected_root_scenario <= AGGREGATE_LIMIT_BYTES
+    raw_root_baseline_verified = False
+    known_components_fit = (
+        projected_database <= SAFE_CATEGORY_BYTES
+        and projected_database <= CATEGORY_LIMIT_BYTES
+        and projected_temp_scenario <= SAFE_CATEGORY_BYTES
+        and projected_temp_scenario <= CATEGORY_LIMIT_BYTES
+        and root_scenario_fits
+        and aggregate_scenario_fits
+    )
+    spill_upper_known = False
+    forecast_fits = (
+        known_components_fit and covered and spill_upper_known and raw_root_baseline_verified
+    )
+    preconditions_clear = abandoned_staging_bytes == 0 and raw_root_baseline_verified
     forecast_status = (
         "insufficient_sample_coverage"
         if not covered
+        else "not_admitted_spill_upper_unknown"
+        if not spill_upper_known or not raw_root_baseline_verified
         else "sensitivity_exceeds_capacity"
-        if not forecast_fits
+        if not known_components_fit
         else "sensitivity_fits; fresh admission still required"
     )
+    forecast_blockers = []
+    if not covered:
+        forecast_blockers.append(
+            "sample coverage is insufficient for one or more content edge strata"
+        )
+    if not spill_upper_known:
+        forecast_blockers.append(
+            "no defensible upper bound for full-population build/key-join and export sort spill"
+        )
+    if projected_database > SAFE_CATEGORY_BYTES:
+        forecast_blockers.append("database sensitivity exceeds the 48 GiB admission threshold")
+    if projected_temp_scenario > SAFE_CATEGORY_BYTES:
+        forecast_blockers.append("known temporary scenario exceeds the 48 GiB admission threshold")
+    if not root_scenario_fits:
+        forecast_blockers.append("modeled root scenario exceeds the 350 GiB root limit")
+    if not aggregate_scenario_fits:
+        forecast_blockers.append("modeled aggregate scenario exceeds the 400 GiB aggregate limit")
+    if not raw_root_baseline_verified:
+        forecast_blockers.append(
+            "35 GB raw-root baseline is an assumption; fresh root inventory is required"
+        )
     return {
         "target_observations_estimate": target_observations,
         "population_sensitivity_multiplier": UNKNOWN_POPULATION_MULTIPLIER,
-        "upper_observations": upper_observations,
+        "twofold_population_sensitivity_observations": upper_observations,
+        "upper_observations": None,
+        "sensitivity_is_formal_bound": False,
         "sample_observations": rows,
+        "estimated_capture_observations_from_endpoint_pages": estimated_capture_rows,
+        "endpoint_observation_target_scale": target_scale,
+        "endpoint_weighted_population": weighted_groups,
+        "endpoint_groups_missing_sample_coverage": missing_metadata,
+        "sample_weighted_landing_utf8_bytes": weighted_landing_bytes,
+        "sample_weighted_row_bytes_per_observation": weighted_row_bytes,
         "legacy_database_bytes": legacy["database_bytes"],
         "sample_landing_utf8_bytes": input_bytes,
         "native_compression_ratio_to_landing_utf8": ratio,
@@ -744,46 +989,79 @@ def _capacity_forecast(
             "mean": mean_row_bytes,
             "p95_page": _quantile(per_page, 0.95),
             "observed_max_page": max(per_page),
+            "max_all_strata_twofold_database_sensitivity": max_all_strata_database_sensitivity,
         },
         "projected_database_bytes": {
             "point": retained_baseline["database_bytes"] + point_database,
-            "upper": projected_database,
+            "sensitivity": projected_database,
+            "upper": None,
             "retained_baseline": retained_baseline["database_bytes"],
         },
         "projected_temporary_peak_bytes": {
-            "point": protected_index_bytes + point_temp,
-            "upper": projected_temp,
-            "components_upper": {
-                "native_database": upper_database,
-                "zstd6_export": upper_export,
+            "point": protected_index_bytes + max(point_build_temp, point_export_temp),
+            "upper": None,
+            "known_components_fit": known_components_fit,
+            "scenario_with_4_gib_spill_reserve": projected_temp_scenario,
+            "spill_upper_known": spill_upper_known,
+            "components_sensitivity": {
+                "build_phase_peak_scaled": measured_build_temp_upper,
+                "export_phase_peak_scaled": measured_export_temp_upper,
+                "build_phase_with_wal": projected_build_temp,
+                "export_phase_with_sort_spill_reserve": projected_export_temp_scenario,
+                "native_database_population_sensitivity": upper_database,
+                "zstd6_exports_population_sensitivity": upper_export,
                 "protected_index_baseline": protected_index_bytes,
-                "measured_temporary_peak_scaled": measured_temp_upper,
-                "minimum_spill_reserve": upper_spill_reserve,
+                "new_parent_index_scaled": parent_index_upper,
+                "sort_spill_reserve_scenario_only": spill_scenario_reserve,
                 "wal_reserve": wal_reserve,
             },
         },
         "projected_root_bytes": {
-            "upper": projected_root,
-            "raw_root_baseline_unscaled": raw_root_baseline_bytes,
+            "upper": None,
+            "scenario_with_4_gib_spill_reserve": projected_root_scenario,
+            "limit_bytes": ROOT_LIMIT_BYTES,
+            "scenario_fits_limit": root_scenario_fits,
+            "raw_root_baseline_assumption_unscaled": raw_root_baseline_bytes,
+            "raw_root_baseline_verified": raw_root_baseline_verified,
             "retained_baseline": retained_baseline["total_bytes"],
+            "new_database_population_sensitivity": upper_database,
+            "new_zstd6_exports_population_sensitivity": upper_export,
+            "protected_index_baseline": protected_index_bytes,
+            "build_phase_upper": projected_root_build,
+            "export_phase_upper": projected_root_export,
+            "transient_sort_spill_reserve_scenario_only": spill_scenario_reserve,
+            "transient_wal_reserve": wal_reserve,
+        },
+        "projected_aggregate_bytes": {
+            "known_components_scenario": projected_root_scenario,
+            "upper": None,
+            "limit_bytes": AGGREGATE_LIMIT_BYTES,
+            "scenario_fits_limit": aggregate_scenario_fits,
+            "additional_aggregate_occupancy_bytes": None,
         },
         "preexisting_abandoned_staging_bytes": abandoned_staging_bytes,
         "operational_preconditions_clear": preconditions_clear,
         "fresh_post_cleanup_admission_required": True,
+        "fresh_root_inventory_required": True,
         "category_limit_bytes": CATEGORY_LIMIT_BYTES,
         "admission_threshold_bytes": SAFE_CATEGORY_BYTES,
-        "root_aggregate_limit_bytes": ROOT_AGGREGATE_LIMIT_BYTES,
+        "root_limit_bytes": ROOT_LIMIT_BYTES,
+        "aggregate_limit_bytes": AGGREGATE_LIMIT_BYTES,
         "sample_coverage_sufficient": covered,
         "unknown_sample_strata": unknown_edges,
         "forecast_fits": forecast_fits,
         "forecast_status": forecast_status,
+        "forecast_blockers": forecast_blockers,
+        "spill_upper_known": spill_upper_known,
         "capacity_admitted": False,
         "production_admitted": False,
         "limitations": [
             "the catalog row estimate is uncertain; capacity sensitivity doubles the population estimate",
-            "the sampled maximum page size and 20% mix margin form a conservative sensitivity range, not a formal confidence interval",
-            "the temporary peak is sampled during a bounded diagnostic run and scaled by the twofold population sensitivity",
+            "endpoint weights use full selected-task page counts and decoded-byte inventory with sampled median rows per page and landing-to-decoded ratios; the 20% mix margin is not a formal confidence interval",
+            "the all-strata maximum-per-row result is reported as a separate sensitivity; the capacity model uses endpoint-weighted source metadata",
+            "temporary capacity is the maximum of build and export phases because the diagnostic database is moved out of tmp and the parent index closes before exports",
             "database size includes compact views and key tables; exports use measured ZSTD level 6 Parquet output",
+            "the unscaled 35 GB raw-root baseline is an assumption, not a fresh inventory; root and aggregate scenario checks require updated accounting",
         ],
     }
 
@@ -821,6 +1099,8 @@ def _worker(args: argparse.Namespace) -> int:
     )
     started = time.monotonic()
     cpu_started = time.process_time()
+    phase_path = fixture_root / ".benchmark-phase"
+    phase_path.write_text("build", encoding="ascii")
     native_loader = warehouse._land_historical_rows
     selected_loader = warehouse._land if args.worker == "legacy" else native_loader
     directory = store.path("tmp/compact-benchmark")
@@ -860,8 +1140,23 @@ def _worker(args: argparse.Namespace) -> int:
         },
     )
     store.sync(directory.relative_to(store.root).as_posix())
+    build_database_bytes = database.stat().st_size
+    build_wal = database.with_name(database.name + ".wal")
+    build_wal_bytes = build_wal.stat().st_size if build_wal.exists() else 0
+    parent_index_bytes = index.path.stat().st_size
+    build_phase_temporary_bytes = _tree_bytes(fixture_root / "tmp")[0]
+    index.close()
+    diagnostic_database = store.path(f"diagnostic-builds/{args.capture_id}/warehouse.duckdb")
+    diagnostic_database.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(database, diagnostic_database)
+    if build_wal.exists():
+        os.replace(build_wal, diagnostic_database.with_name(diagnostic_database.name + ".wal"))
+    database = diagnostic_database
+    store.sync("tmp")
+    store.sync("diagnostic-builds")
     export_dir = store.path("tmp/compact-exports")
     export_dir.mkdir(parents=True)
+    phase_path.write_text("export", encoding="ascii")
     with publish._export_connection(store, database, export_dir) as connection:
         for name, table in publish.RELATIONS.items():
             destination = export_dir / f"{name}.parquet"
@@ -870,7 +1165,9 @@ def _worker(args: argparse.Namespace) -> int:
                 "to ? (format parquet, compression zstd, compression_level 6)",
                 [str(destination)],
             )
+        export_phase_temporary_bytes = _tree_bytes(fixture_root / "tmp")[0]
     store.sync("tmp/compact-exports")
+    phase_path.unlink(missing_ok=True)
     total_bytes, _ = _tree_bytes(fixture_root)
     export_bytes = sum(path.stat().st_size for path in export_dir.glob("*.parquet"))
     verified = verified_pages
@@ -889,6 +1186,11 @@ def _worker(args: argparse.Namespace) -> int:
         "verified_pages": len(verified),
         "verified_evidence_sha256": verified,
         "database_bytes": database.stat().st_size,
+        "build_database_bytes": build_database_bytes,
+        "build_wal_bytes": build_wal_bytes,
+        "parent_index_bytes": parent_index_bytes,
+        "build_phase_temporary_bytes": build_phase_temporary_bytes,
+        "export_phase_temporary_bytes": export_phase_temporary_bytes,
         "wal_bytes": database.with_name(database.name + ".wal").stat().st_size
         if database.with_name(database.name + ".wal").exists()
         else 0,
@@ -904,7 +1206,6 @@ def _worker(args: argparse.Namespace) -> int:
         "peak_rss_bytes": int(rss),
         "database": str(database),
     }
-    index.close()
     atomic_json(report_path, report)
     return 0
 
@@ -967,8 +1268,7 @@ def _benchmark(args: argparse.Namespace) -> int:
         selection, task_indices, retired_scopes_excluded = _historical_task_plan(state)
         candidates = []
         bytes_scanned = 0
-        if len(state.page_rows) > MAX_CAPTURE_ENTRIES:
-            raise CatalogueError("capture has too many receipt entries for bounded sampling")
+        _check_capture_entry_count(len(state.page_rows))
         for order, row in enumerate(state.page_rows):
             source.check_deadline()
             if row["index"] not in task_indices:
@@ -978,27 +1278,44 @@ def _benchmark(args: argparse.Namespace) -> int:
             if bytes_scanned > MAX_CAPTURE_BYTES:
                 raise CatalogueError("receipt metadata scan exceeds its byte bound")
             candidates.append(meta)
-        selected = _stratified_sample(candidates)
+        data_candidates = [page for page in candidates if not _is_control_page(page)]
+        controls = [page for page in candidates if _is_control_page(page)]
+        selected = _stratified_sample(data_candidates)
+        selected_controls = _control_sample(controls)
+        selected_all = sorted([*selected, *selected_controls], key=lambda page: page["order"])
         if (
-            len(selected) > MAX_SAMPLE_PAGES
-            or sum(page["encoded_bytes"] for page in selected) > MAX_SAMPLE_BYTES
+            len(selected_all) > MAX_SAMPLE_PAGES
+            or sum(page["encoded_bytes"] for page in selected_all) > MAX_SAMPLE_BYTES
         ):
             raise CatalogueError("stratified sample exceeds its fixed page or byte bound")
-        # Record the position within each endpoint/generation used by the sample.
-        group_positions: dict[tuple[str, int], int] = defaultdict(int)
-        for page in candidates:
-            key = (page["endpoint"], page["generation"])
+        # Record independent positions for data and control receipt strata.
+        group_positions: dict[tuple[str, int, Any], int] = defaultdict(int)
+        for page in data_candidates:
+            key = (page["endpoint"], page["generation"], None)
             page["position"] = group_positions[key]
             group_positions[key] += 1
         for page in selected:
             group = [
                 candidate
-                for candidate in candidates
+                for candidate in data_candidates
                 if (candidate["endpoint"], candidate["generation"])
                 == (page["endpoint"], page["generation"])
             ]
             page["position"] = group.index(page)
-        coverage = _sampling_coverage(candidates, selected)
+        for page in controls:
+            key = (page["endpoint"], page["generation"], page["status"])
+            page["position"] = group_positions[key]
+            group_positions[key] += 1
+        for page in selected_controls:
+            group = [
+                candidate
+                for candidate in controls
+                if (candidate["endpoint"], candidate["generation"], candidate["status"])
+                == (page["endpoint"], page["generation"], page["status"])
+            ]
+            page["position"] = group.index(page)
+        coverage = _sampling_coverage(data_candidates, selected)
+        receipt_population_metadata = _receipt_population_metadata(candidates)
         report.update(
             capture_id=capture_id,
             capture_revision=state.get("revision"),
@@ -1006,14 +1323,18 @@ def _benchmark(args: argparse.Namespace) -> int:
             selected_task_indices=sorted(task_indices),
             historical_selection=selection,
             retired_scopes_excluded=retired_scopes_excluded,
-            sampled_receipts=len(selected),
-            sampled_encoded_bytes=sum(page["encoded_bytes"] for page in selected),
+            sampled_data_receipts=len(selected),
+            sampled_control_receipts=len(selected_controls),
+            control_receipt_counts=_control_receipt_counts(controls),
+            sampled_receipts=len(selected_all),
+            sampled_encoded_bytes=sum(page["encoded_bytes"] for page in selected_all),
             sampled_strata=sorted(
                 {f"{page['endpoint']}#g{page['generation']}" for page in selected}
             ),
+            receipt_population_metadata=receipt_population_metadata,
         )
         fixture_roots = [output / "fixture-legacy", output / "fixture-native"]
-        profiles = _verify_and_copy(source, state, selected, fixture_roots)
+        profiles, verified_controls = _verify_and_copy(source, state, selected_all, fixture_roots)
         duplicate_summary = profiles.pop()
         profiles.append(
             {
@@ -1023,26 +1344,32 @@ def _benchmark(args: argparse.Namespace) -> int:
         )
         report["sampling_coverage"] = coverage
         report["sample_profiles"] = profiles
+        report["verified_control_receipts"] = verified_controls
         after_fixture_bytes, _ = _tree_bytes(output)
         if after_fixture_bytes > MAX_ARTIFACT_BYTES:
             raise CatalogueError("sample fixtures exceed the 16 GiB artifact limit")
         save("sampled")
 
         worker_reports = []
+        report["workers"] = worker_reports
         for method, fixture_root in zip(("legacy", "native"), fixture_roots, strict=True):
             worker_reports.append(
                 _run_child(method, fixture_root, output, deadline, capture_id, task_indices)
             )
-        report["workers"] = worker_reports
+            report["workers"] = worker_reports
+            save("worker_progress", workers=worker_reports)
         legacy = next(item for item in worker_reports if item["method"] == "legacy")
         native = next(item for item in worker_reports if item["method"] == "native")
         parity = _compare_databases(Path(legacy["database"]), Path(native["database"]))
         report["parity"] = parity
+        report["comparison_pairs_completed"] = 1
+        report["comparison_pairs_missed"] = 0
         export_bytes = native["export_bytes"]
         report["historical_zstd6_export_bytes"] = export_bytes
         retained_baseline = _retained_baseline(source.root)
         report["retained_baseline"] = retained_baseline
-        report["raw_root_baseline_bytes"] = RAW_ROOT_BASELINE_BYTES
+        report["raw_root_baseline_bytes"] = RAW_ROOT_BASELINE_ASSUMPTION_BYTES
+        report["raw_root_baseline_basis"] = "35 GB assumption; not freshly inventoried"
         protected_index_bytes = _protected_index_bytes(source.root)
         report["protected_index_baseline_bytes"] = protected_index_bytes
         abandoned_staging_bytes = _abandoned_staging_bytes(source.root)
@@ -1065,10 +1392,11 @@ def _benchmark(args: argparse.Namespace) -> int:
             native,
             export_bytes,
             retained_baseline,
-            RAW_ROOT_BASELINE_BYTES,
+            RAW_ROOT_BASELINE_ASSUMPTION_BYTES,
             protected_index_bytes,
             abandoned_staging_bytes,
             target_observations,
+            receipt_population_metadata["data_strata"],
         )
         report["timing_interpretation"] = (
             "loader_seconds compares legacy dlt merge landing with native landing; both workers "
@@ -1086,6 +1414,9 @@ def _benchmark(args: argparse.Namespace) -> int:
             production_admitted=False,
         )
         return 0 if diagnostic_complete else 2
+    except KeyboardInterrupt:
+        save("cancelled", error="KeyboardInterrupt: benchmark stopped before completion")
+        return 2
     except Exception as exc:
         save("not_admitted", error=f"{type(exc).__name__}: {exc}")
         return 2
