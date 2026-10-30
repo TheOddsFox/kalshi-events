@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -628,6 +629,162 @@ def _land_rows(
             raise budget from exc
     store.sync(str(directory.relative_to(store.root)))
     store.check_storage()
+    return observation_count
+
+
+def _land_historical_rows(
+    store: Store,
+    state: dict[str, Any],
+    directory: Path,
+    *,
+    verified_pages: dict[str, str],
+    parent_index: ParentIndex | DiskParentIndex,
+    task_indices: set[int],
+) -> int:
+    """Append selected historical observations directly into a fresh DuckDB table."""
+    database = directory / "warehouse.duckdb"
+    wal = database.with_name(database.name + ".wal")
+    if any(path.exists() or path.is_symlink() for path in (database, wal)):
+        raise CatalogueError("historical landing requires a fresh database without a WAL")
+
+    capture_id = state["capture_id"]
+    observation_count = 0
+    seen_pages: dict[str, str] = {}
+    store.check_deadline()
+    store.check_storage()
+
+    def rows():
+        nonlocal observation_count
+        for receipts_verified, (manifest, payload) in enumerate(
+            capture_pages(store, state, evidence=verified_pages, task_indices=task_indices),
+            start=1,
+        ):
+            store.check_deadline()
+            _report_landing_progress(receipts_verified=receipts_verified)
+            manifest = _scope_manifest(state, manifest)
+            page_id = manifest.get("page_id")
+            if not isinstance(page_id, str) or not page_id:
+                raise CatalogueError("historical receipt lacks a page identity")
+            page_context = digest(json_bytes(manifest))
+            previous = seen_pages.get(page_id)
+            if previous is not None:
+                if previous != page_context:
+                    raise CatalogueError("historical page identity has contradictory context")
+                continue
+            seen_pages[page_id] = page_context
+            parent_index.add_page(manifest, payload)
+            for row in observations(((manifest, payload),)):
+                store.check_deadline()
+                observation_count += 1
+                kind = row["entity_kind"]
+                values = {
+                    "observation_id": row["observation_id"],
+                    "capture_id": capture_id,
+                    "entity_kind": kind,
+                    "entity_ticker": row[ENTITY_KEYS[kind]],
+                    "received_at": row["received_at"],
+                    "provider_updated_at": row["provider_updated_at"],
+                    "source_endpoint": row["source_endpoint"],
+                    "source_kind": row["source_kind"],
+                    "payload_json": row["payload_json"],
+                    "event_ticker": row.get("event_ticker"),
+                    "series_ticker": row.get("series_ticker"),
+                    "task_scope": manifest.get("task_scope"),
+                    "task_generation": str(manifest.get("task_generation", "")),
+                }
+                yield {key: _legacy_landing_text(value) for key, value in values.items()}
+
+    database_relative = database.relative_to(store.root).as_posix()
+    wal_relative = f"{database_relative}.wal"
+    spill_relative = f"{directory.relative_to(store.root).as_posix()}/duckdb-spill"
+    spill_directory = directory / "duckdb-spill"
+
+    def sync_database() -> None:
+        store.sync_file(database_relative)
+        if wal.exists() or wal.is_symlink():
+            store.sync_file(wal_relative)
+        else:
+            store.sync(wal_relative)
+        if spill_directory.exists():
+            store.sync(spill_relative)
+        store.check_storage()
+
+    def execute(connection: duckdb.DuckDBPyConnection, statement: str) -> None:
+        try:
+            with interrupt_at_deadline(store, connection.interrupt):
+                connection.execute(statement)
+        except duckdb.Error as exc:
+            try:
+                store.check_deadline()
+            except BudgetExceeded as budget:
+                raise budget from exc
+            raise
+
+    last_checkpoint = time.monotonic()
+    checkpoint_bytes = 0
+    checkpoint_after_bytes = 256 * 1024 * 1024
+    with (
+        _duckdb_work_config(store, directory) as config,
+        duckdb.connect(str(database), config=config) as connection,
+    ):
+        execute(connection, "create schema landing")
+        execute(
+            connection,
+            """create table landing.observations (
+                 observation_id varchar not null,
+                 capture_id varchar not null,
+                 entity_kind varchar not null,
+                 entity_ticker varchar not null,
+                 received_at varchar not null,
+                 provider_updated_at varchar,
+                 source_endpoint varchar not null,
+                 source_kind varchar not null,
+                 payload_json varchar using compression zstd not null,
+                 event_ticker varchar,
+                 series_ticker varchar,
+                 task_scope varchar,
+                 task_generation varchar not null
+             )""",
+        )
+        sync_database()
+        for batch in _landing_arrow_batches(rows()):
+            store.check_deadline()
+            registered = False
+            try:
+                connection.register("historical_landing_batch", batch)
+                registered = True
+                execute(
+                    connection,
+                    "insert into landing.observations "
+                    "select observation_id, capture_id, entity_kind, entity_ticker, received_at, "
+                    "provider_updated_at, source_endpoint, source_kind, payload_json, event_ticker, "
+                    "series_ticker, task_scope, task_generation "
+                    "from historical_landing_batch",
+                )
+            finally:
+                if registered:
+                    connection.unregister("historical_landing_batch")
+            store.check_deadline()
+            sync_database()
+            checkpoint_bytes += sum(
+                buffer.size
+                for column in batch.columns
+                for chunk in column.chunks
+                if (buffer := chunk.buffers()[2]) is not None
+            )
+            checkpoint_due = (
+                checkpoint_bytes >= checkpoint_after_bytes
+                or time.monotonic() - last_checkpoint >= 60
+            )
+            if checkpoint_due:
+                execute(connection, "checkpoint")
+                sync_database()
+                checkpoint_bytes = 0
+                last_checkpoint = time.monotonic()
+        store.check_deadline()
+        execute(connection, "checkpoint")
+        sync_database()
+    sync_database()
     return observation_count
 
 
@@ -2218,14 +2375,15 @@ def _full_v2_build(
     )
     try:
         if historical:
-            _land(
-                store,
-                state,
-                staging,
-                verified_pages=verified_pages,
-                parent_index=index,
-                task_indices=historical_indices,
-            )
+            with metrics.phase("landing"):
+                _land_historical_rows(
+                    store,
+                    state,
+                    staging,
+                    verified_pages=verified_pages,
+                    parent_index=index,
+                    task_indices=historical_indices,
+                )
         else:
             source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
             source_exists = store.scope is None and store.path(source_relative).exists()
@@ -2268,6 +2426,7 @@ def _full_v2_build(
                 "incremental_update": False,
                 "current_capture_id": capture_id,
                 "delta_capture_id": capture_id,
+                **({"historical_compact": True} if historical else {}),
             },
         )
         store.sync(staging_relative)

@@ -225,27 +225,27 @@ def test_historical_build_keeps_all_generations_combos_and_tie_winner(store, mon
 
     monkeypatch.setattr(warehouse, "DiskParentIndex", TrackingDiskParentIndex)
     original_connect = warehouse.duckdb.connect
-    projection_settings = []
+    historical_settings = []
 
     def record_projection(*args, **kwargs):
         connection = original_connect(*args, **kwargs)
         database = args[0] if args else kwargs.get("database")
         config = kwargs.get("config") or {}
         if "build-historical-" in str(database) and config.get("memory_limit"):
-            projection_settings.append((dict(config), _duckdb_settings(connection)))
+            historical_settings.append((dict(config), _duckdb_settings(connection)))
         return connection
 
     monkeypatch.setattr(warehouse.duckdb, "connect", record_projection)
     receipt = warehouse.build_historical(store, capture_id)
     assert winner_modes == [False]
-    assert len(projection_settings) == 1
-    projection_config, actual_settings = projection_settings[0]
-    assert projection_config["memory_limit"] == warehouse.DBT_MEMORY_LIMIT
-    assert projection_config["threads"] == str(warehouse.DBT_THREADS)
-    assert projection_config["temp_directory"].endswith("/duckdb-spill")
-    expected_connection = original_connect(config=projection_config)
-    assert actual_settings == _duckdb_settings(expected_connection)
-    expected_connection.close()
+    assert len(historical_settings) == 2
+    for historical_config, actual_settings in historical_settings:
+        assert historical_config["memory_limit"] == warehouse.DBT_MEMORY_LIMIT
+        assert historical_config["threads"] == str(warehouse.DBT_THREADS)
+        assert historical_config["temp_directory"].endswith("/duckdb-spill")
+        expected_connection = original_connect(config=historical_config)
+        assert actual_settings == _duckdb_settings(expected_connection)
+        expected_connection.close()
     assert (legacy_build / "keep").read_text() == "v1"
     assert (v2_build / "keep").read_text() == "v2"
     assert warehouse.build_directory(capture_id, 3) == f"builds-historical/{capture_id}"
