@@ -189,6 +189,8 @@ def _resume_harness(
     [
         "insufficient time remains to start and reap a child",
         "insufficient wall-clock time remains to start and reap a child",
+        "memory metrics unavailable before supervised work",
+        "memory pressure was not normal before supervised work",
     ],
 )
 def test_proven_no_start_preserves_exact_accounting_and_time_budget(
@@ -225,10 +227,17 @@ def test_proven_no_start_preserves_exact_accounting_and_time_budget(
     assert json.loads(_paths["report"].read_text())["requests"] == 73
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "insufficient time remains to start and reap a child",
+        "memory metrics unavailable before supervised work",
+        "memory pressure was not normal before supervised work",
+    ],
+)
 def test_proven_no_start_preserves_verified_conservative_bound_for_reconciliation(
-    production, tmp_path, monkeypatch
+    production, tmp_path, monkeypatch, reason
 ):
-    reason = "insufficient time remains to start and reap a child"
     report, _paths, _snapshot, capture_id = _resume_harness(
         production,
         tmp_path,
@@ -316,6 +325,19 @@ def test_signal_during_spawn_keeps_durable_process_group_when_reaping_fails(
     monkeypatch.setattr(production, "_PENDING_STOP_SIGNAL", None)
     monkeypatch.setattr(production, "_STOP_IN_PROGRESS", False)
     monkeypatch.setattr(production, "_SPAWNING_CHILD", False)
+    monkeypatch.setattr(
+        production,
+        "_sample_memory",
+        lambda group, **_kw: {
+            "child_process_group_rss_bytes": None if group is None else 0,
+            "system_compressed_bytes": 0,
+            "system_compressor_occupied_bytes": 0,
+            "system_memory_pressure": "normal",
+            "system_memory_pressure_observed_monotonic": time.monotonic(),
+            "child_process_group_physical_footprint_bytes": None if group is None else 0,
+            "supervisor_physical_footprint_bytes": 0,
+        },
+    )
     monkeypatch.setattr(production.subprocess, "Popen", spawn)
     monkeypatch.setattr(production, "_terminate", lambda _process: False)
 

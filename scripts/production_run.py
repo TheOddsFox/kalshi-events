@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -76,7 +78,8 @@ RUN_LIMITS: dict[str, int | float | str] = {
     "minimum_free_bytes": 150 * GIB,
     "peak_rss_bytes": 24 * GIB,
     "peak_rss_seconds": 60,
-    "compressed_memory_stop_bytes": 20 * GIB,
+    "memory_pressure_warn_seconds": 60,
+    "memory_pressure_max_gap_seconds": 22.5,
     "sample_seconds": 15,
     "terminate_seconds": 5,
     "rate": 5,
@@ -100,6 +103,8 @@ NO_CHILD_START_REASONS = frozenset(
     {
         "insufficient time remains to start and reap a child",
         "insufficient wall-clock time remains to start and reap a child",
+        "memory metrics unavailable before supervised work",
+        "memory pressure was not normal before supervised work",
     }
 )
 RECOVERABLE_ACCOUNTING_STOP_REASONS = frozenset(
@@ -112,6 +117,11 @@ RECOVERABLE_ACCOUNTING_STOP_REASONS = frozenset(
         "resource accounting failed: process-group RSS sampling timed out",
         "process-group RSS exceeded 24 GiB for 60 seconds",
         "system compressed memory reached the conservative stop threshold",
+        "system memory pressure reached critical",
+        "system memory pressure remained warning for 60 seconds",
+        "resource accounting failed: memory snapshot unavailable",
+        "memory metrics unavailable before supervised work",
+        "memory pressure was not normal before supervised work",
         "SSD free space fell below 150 GiB",
     }
 )
@@ -722,6 +732,8 @@ def _monitor(
     wall_deadline_epoch: float | None = None,
 ) -> tuple[int | None, str | None, bool]:
     samples: list[tuple[float, int]] = []
+    warning_started: float | None = None
+    previous_pressure_sample: float | None = None
     next_sample = time.monotonic()
     stop_reason = None
     reaped = True
@@ -740,22 +752,22 @@ def _monitor(
                 free = shutil.disk_usage(directory).free
                 if original_device is not None and directory.stat().st_dev != original_device:
                     raise RunnerError("production filesystem mount changed during the run")
-                rss = _process_group_rss(
-                    process.pid,
-                    timeout=min(5.0, max(0.01, remaining - float(RUN_LIMITS["terminate_seconds"]))),
-                )
                 remaining = _child_time_remaining(deadline, wall_deadline_epoch)
                 if remaining <= float(RUN_LIMITS["terminate_seconds"]):
                     stop_reason = "session or workflow deadline reached termination reserve"
                     reaped = _terminate(process)
                     terminated = True
                     break
-                compressed = _system_compressed_bytes(
-                    timeout=min(
-                        5.0,
-                        max(0.01, remaining - float(RUN_LIMITS["terminate_seconds"])),
-                    )
+                timeout = min(
+                    5.0,
+                    remaining - float(RUN_LIMITS["terminate_seconds"]),
                 )
+                if timeout <= 0:
+                    stop_reason = "session or workflow deadline reached termination reserve"
+                    reaped = _terminate(process)
+                    terminated = True
+                    break
+                memory = _sample_memory(process.pid, timeout=timeout)
                 if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
                     RUN_LIMITS["terminate_seconds"]
                 ):
@@ -763,24 +775,55 @@ def _monitor(
                     reaped = _terminate(process)
                     terminated = True
                     break
+            except RunnerInterrupted:
+                raise
             except (OSError, subprocess.SubprocessError, RunnerError) as exc:
                 if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
                     RUN_LIMITS["terminate_seconds"]
                 ):
                     stop_reason = "session or workflow deadline reached termination reserve"
+                elif isinstance(exc, RunnerError) and str(exc).startswith(
+                    "bounded memory sample"
+                ):
+                    stop_reason = "resource accounting failed: memory snapshot unavailable"
                 else:
                     stop_reason = f"resource accounting failed: {exc}"
                 reaped = _terminate(process)
                 terminated = True
                 break
-            samples.append((now, rss))
+            observed_at = memory["system_memory_pressure_observed_monotonic"]
+            rss = memory["child_process_group_rss_bytes"]
+            pressure = memory["system_memory_pressure"]
+            samples.append((observed_at, rss))
             samples = samples[-8:]
+            if (
+                previous_pressure_sample is not None
+                and observed_at - previous_pressure_sample
+                > float(RUN_LIMITS["memory_pressure_max_gap_seconds"])
+            ):
+                warning_started = None
+            previous_pressure_sample = observed_at
+            if pressure == "normal":
+                warning_started = None
+            elif pressure == "warn":
+                warning_started = observed_at if warning_started is None else warning_started
             report["resource_samples"].append(
                 {
                     "at": _utc(),
                     "ssd_free_bytes": free,
                     "child_process_group_rss_bytes": rss,
-                    "system_compressed_bytes": compressed,
+                    "system_compressed_bytes": memory["system_compressed_bytes"],
+                    "system_compressor_occupied_bytes": memory[
+                        "system_compressor_occupied_bytes"
+                    ],
+                    "system_memory_pressure": pressure,
+                    "system_memory_pressure_observed_monotonic": observed_at,
+                    "child_process_group_physical_footprint_bytes": memory[
+                        "child_process_group_physical_footprint_bytes"
+                    ],
+                    "supervisor_physical_footprint_bytes": memory[
+                        "supervisor_physical_footprint_bytes"
+                    ],
                 }
             )
             report["last_observed_epoch"] = time.time()
@@ -791,8 +834,15 @@ def _monitor(
                 stop_reason = "SSD free space fell below 150 GiB"
             elif rss_limit_exceeded(samples):
                 stop_reason = "process-group RSS exceeded 24 GiB for 60 seconds"
-            elif compressed >= int(RUN_LIMITS["compressed_memory_stop_bytes"]):
-                stop_reason = "system compressed memory reached the conservative stop threshold"
+            elif pressure == "critical":
+                stop_reason = "system memory pressure reached critical"
+            elif (
+                pressure == "warn"
+                and warning_started is not None
+                and observed_at - warning_started
+                >= float(RUN_LIMITS["memory_pressure_warn_seconds"])
+            ):
+                stop_reason = "system memory pressure remained warning for 60 seconds"
             if stop_reason:
                 reaped = _terminate(process)
                 terminated = True
@@ -821,7 +871,7 @@ def _monitor(
 
 
 def _system_compressed_bytes(timeout: float = 5.0) -> int:
-    """Read macOS compressor pages so swapped/compressed memory cannot evade RSS limits."""
+    """Return logical compressor-stored bytes for legacy report compatibility."""
     result = subprocess.run(
         ["vm_stat"], check=True, capture_output=True, text=True, timeout=timeout
     )
@@ -830,6 +880,257 @@ def _system_compressed_bytes(timeout: float = 5.0) -> int:
     if page_size is None or compressed_pages is None or int(page_size.group(1)) <= 0:
         raise RunnerError("macOS compressed-memory accounting is unavailable")
     return int(page_size.group(1)) * int(compressed_pages.group(1))
+
+
+def _memory_pressure_name(flags: int) -> str:
+    # Apple exposes this private sysctl as USERSPACE flags, not the kernel's internal enum.
+    states = {1: "normal", 2: "warn", 4: "critical"}
+    if type(flags) is not int or flags not in states:
+        raise RunnerError("macOS memory-pressure flags are unknown")
+    return states[flags]
+
+
+def _vm_stat_compressor_metrics(text: str) -> tuple[int, int]:
+    page_size = re.findall(
+        r"^Mach Virtual Memory Statistics: \(page size of (\d+) bytes\)\s*$", text, re.M
+    )
+    stored_pages = re.findall(r"^Pages stored in compressor:\s*(\d+)\.\s*$", text, re.M)
+    occupied_pages = re.findall(r"^Pages occupied by compressor:\s*(\d+)\.\s*$", text, re.M)
+    if (
+        len(page_size) != 1
+        or len(stored_pages) != 1
+        or len(occupied_pages) != 1
+        or int(page_size[0]) <= 0
+    ):
+        raise RunnerError("macOS compressor metrics are unavailable")
+    size = int(page_size[0])
+    return int(stored_pages[0]) * size, int(occupied_pages[0]) * size
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_in_group(pid: int, group: int) -> bool:
+    try:
+        process_group = os.getpgid(pid)
+    except ProcessLookupError:
+        if not _pid_exists(pid):
+            return False
+        raise RunnerError("owned process group could not be verified") from None
+    if process_group != group:
+        if not _pid_exists(pid):
+            return False
+        raise RunnerError("process escaped its supervised process group")
+    return True
+
+
+def _proc_pid_footprint(proc_pid_rusage: Any, pid: int) -> int | None:
+    identities = []
+    footprints = []
+    for _ in range(2):
+        buffer = ctypes.create_string_buffer(96)
+        ctypes.set_errno(0)
+        if proc_pid_rusage(pid, 0, ctypes.byref(buffer)) != 0:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH and not _pid_exists(pid):
+                return None
+            raise OSError(error, os.strerror(error), f"proc_pid_rusage({pid})")
+        # rusage_info_v0 is 96 bytes; ri_phys_footprint and ri_proc_start_abstime are at 72 and 80.
+        raw = buffer.raw
+        footprints.append(int.from_bytes(raw[72:80], sys.byteorder))
+        identities.append(int.from_bytes(raw[80:88], sys.byteorder))
+    if identities[0] == 0 or identities[0] != identities[1]:
+        raise RunnerError("process identity changed during physical-footprint sampling")
+    return footprints[1]
+
+
+def _memory_sample_worker(group: int | None) -> dict[str, Any]:
+    if group is not None and (type(group) is not int or group <= 0):
+        raise RunnerError("memory sampler process group is invalid")
+    vm = subprocess.run(
+        ["vm_stat"], check=True, capture_output=True, text=True, timeout=1.0
+    )
+    stored_bytes, occupied_bytes = _vm_stat_compressor_metrics(vm.stdout)
+    pressure_result = subprocess.run(
+        ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+    )
+    pressure_text = pressure_result.stdout.strip()
+    if not re.fullmatch(r"\d+", pressure_text):
+        raise RunnerError("macOS memory-pressure measurement is malformed")
+    pressure = _memory_pressure_name(int(pressure_text))
+    pressure_observed = time.monotonic()
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError as exc:
+        raise RunnerError("macOS process physical-footprint accounting is unavailable") from exc
+    proc_pid_rusage = libproc.proc_pid_rusage
+    proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    proc_pid_rusage.restype = ctypes.c_int
+    supervisor_footprint = _proc_pid_footprint(proc_pid_rusage, os.getppid())
+    if supervisor_footprint is None:
+        raise RunnerError("production supervisor exited during memory sampling")
+
+    rss_bytes = footprint_bytes = None
+    if group is not None:
+        result = subprocess.run(
+            ["ps", "-g", str(group), "-o", "pgid=,pid=,rss="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        if result.returncode not in {0, 1}:
+            raise RunnerError("process-group memory sampling failed")
+        rows = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if (
+                len(fields) != 3
+                or any(not field.isascii() or not field.isdigit() for field in fields)
+                or int(fields[0]) != group
+                or int(fields[1]) <= 0
+            ):
+                raise RunnerError("process-group memory output is malformed or unscoped")
+            rows.append((int(fields[1]), int(fields[2]) * 1024))
+        if not rows and _process_group_exists(group):
+            raise RunnerError("process-group memory sampling found no live processes")
+        rss_bytes = sum(rss for _pid, rss in rows)
+        footprint_bytes = 0
+        for pid, _rss in rows:
+            if not _pid_in_group(pid, group):
+                continue
+            footprint = _proc_pid_footprint(proc_pid_rusage, pid)
+            if footprint is None:
+                continue
+            if not _pid_in_group(pid, group):
+                continue
+            footprint_bytes += footprint
+    return {
+        "child_process_group_rss_bytes": rss_bytes,
+        "system_compressed_bytes": stored_bytes,
+        "system_compressor_occupied_bytes": occupied_bytes,
+        "system_memory_pressure": pressure,
+        "system_memory_pressure_observed_monotonic": pressure_observed,
+        "child_process_group_physical_footprint_bytes": footprint_bytes,
+        "supervisor_physical_footprint_bytes": supervisor_footprint,
+    }
+
+
+def _sample_memory(group: int | None, *, timeout: float = 5.0) -> dict[str, Any]:
+    if isinstance(group, bool) or (group is not None and (not isinstance(group, int) or group <= 0)):
+        raise RunnerError("memory sampler process group is invalid")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise RunnerError("memory sampler timeout is invalid")
+    sample_started = time.monotonic()
+    sample_deadline = sample_started + min(5.0, timeout)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--_memory-sample",
+        "-" if group is None else str(group),
+    ]
+    try:
+        worker = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RunnerError("bounded memory sample worker failed to start") from exc
+    try:
+        cleanup_reserve = min(0.5, (sample_deadline - time.monotonic()) / 4)
+        work_timeout = sample_deadline - time.monotonic() - cleanup_reserve
+        if work_timeout <= 0:
+            raise subprocess.TimeoutExpired(command, min(5.0, timeout))
+        stdout, _stderr = worker.communicate(timeout=work_timeout)
+    except subprocess.TimeoutExpired as exc:
+        _stop_memory_sample_worker(worker, sample_deadline)
+        raise RunnerError("bounded memory sample worker timed out") from exc
+    except BaseException:
+        _stop_memory_sample_worker(worker, sample_deadline)
+        raise
+    sample_completed = time.monotonic()
+    try:
+        value = json.loads(stdout)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError("bounded memory sample returned malformed JSON") from exc
+    if worker.returncode != 0 or not isinstance(value, dict):
+        message = value.get("error") if isinstance(value, dict) else None
+        raise RunnerError(
+            f"bounded memory sample failed: {message}"
+            if isinstance(message, str)
+            else "bounded memory sample failed"
+        )
+    expected = {
+        "child_process_group_rss_bytes",
+        "system_compressed_bytes",
+        "system_compressor_occupied_bytes",
+        "system_memory_pressure",
+        "system_memory_pressure_observed_monotonic",
+        "child_process_group_physical_footprint_bytes",
+        "supervisor_physical_footprint_bytes",
+    }
+    if set(value) != expected:
+        raise RunnerError("bounded memory sample is incomplete")
+    pressure = value["system_memory_pressure"]
+    if pressure not in {"normal", "warn", "critical"}:
+        raise RunnerError("bounded memory sample has unknown pressure state")
+    pressure_observed = value["system_memory_pressure_observed_monotonic"]
+    if (
+        isinstance(pressure_observed, bool)
+        or not isinstance(pressure_observed, (int, float))
+        or not math.isfinite(pressure_observed)
+        or not sample_started <= pressure_observed <= sample_completed
+    ):
+        raise RunnerError("bounded memory sample has invalid pressure timestamp")
+    for name in (
+        "system_compressed_bytes",
+        "system_compressor_occupied_bytes",
+        "supervisor_physical_footprint_bytes",
+    ):
+        if type(value[name]) is not int or value[name] < 0:
+            raise RunnerError("bounded memory sample has invalid system metrics")
+    group_rss = value["child_process_group_rss_bytes"]
+    group_footprint = value["child_process_group_physical_footprint_bytes"]
+    if group is None:
+        if group_rss is not None or group_footprint is not None:
+            raise RunnerError("preflight memory sample unexpectedly contains a child group")
+    elif any(type(metric) is not int or metric < 0 for metric in (group_rss, group_footprint)):
+        raise RunnerError("bounded memory sample has invalid child metrics")
+    if time.monotonic() > sample_deadline:
+        raise RunnerError("bounded memory sample exceeded its time budget")
+    return value
+
+
+def _stop_memory_sample_worker(worker: subprocess.Popen[Any], deadline: float) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(worker.pid, signal.SIGKILL)
+    try:
+        worker.communicate(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError("memory sample worker could not be reaped") from exc
+
+
+def _memory_sample_worker_main(group: int | None) -> int:
+    try:
+        print(json.dumps(_memory_sample_worker(group), sort_keys=True, allow_nan=False))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        return 1
 
 
 def _invoke(
@@ -869,6 +1170,42 @@ def _invoke(
         RUN_LIMITS["terminate_seconds"]
     ):
         return None, "insufficient wall-clock time remains to start and reap a child", True
+    remaining = _child_time_remaining(deadline, wall_deadline_epoch)
+    if remaining <= float(RUN_LIMITS["terminate_seconds"]):
+        reason = (
+            "insufficient wall-clock time remains to start and reap a child"
+            if wall_deadline_epoch is not None
+            and time.time() >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+            else "insufficient time remains to start and reap a child"
+        )
+        return None, reason, True
+    try:
+        memory_preflight = _sample_memory(
+            None,
+            timeout=min(5.0, remaining - float(RUN_LIMITS["terminate_seconds"])),
+        )
+    except RunnerInterrupted:
+        raise
+    except (OSError, subprocess.SubprocessError, RunnerError) as exc:
+        report["memory_preflight_error"] = str(exc)
+        _atomic_report(report_path, report)
+        return None, "memory metrics unavailable before supervised work", True
+    report.pop("memory_preflight_error", None)
+    report.setdefault("memory_preflight_samples", []).append(
+        {"at": _utc(), **memory_preflight}
+    )
+    if memory_preflight["system_memory_pressure"] != "normal":
+        _atomic_report(report_path, report)
+        return None, "memory pressure was not normal before supervised work", True
+    remaining = _child_time_remaining(deadline, wall_deadline_epoch)
+    if remaining <= float(RUN_LIMITS["terminate_seconds"]):
+        reason = (
+            "insufficient wall-clock time remains to start and reap a child"
+            if wall_deadline_epoch is not None
+            and time.time() >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+            else "insufficient time remains to start and reap a child"
+        )
+        return None, reason, True
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         process: subprocess.Popen[Any] | None = None
         try:
@@ -3474,6 +3811,7 @@ def _main_hidden(argv: list[str]) -> int | None:
     parser.add_argument("--_account-root", type=Path)
     parser.add_argument("--_account-recovery", nargs=2)
     parser.add_argument("--_root-summary", type=Path)
+    parser.add_argument("--_memory-sample", nargs=1)
     parser.add_argument("--_refresh-worker", nargs=7)
     parser.add_argument("--_activate-current", nargs=3)
     args, rest = parser.parse_known_args(argv)
@@ -3483,6 +3821,13 @@ def _main_hidden(argv: list[str]) -> int | None:
         return _accounting_worker_main(Path(args._account_recovery[0]), args._account_recovery[1])
     if args._root_summary is not None and not rest:
         return _root_summary_worker_main(args._root_summary)
+    if args._memory_sample is not None and not rest:
+        group = args._memory_sample[0]
+        if group == "-":
+            return _memory_sample_worker_main(None)
+        if not re.fullmatch(r"[1-9]\d*", group):
+            return _memory_sample_worker_main(0)
+        return _memory_sample_worker_main(int(group))
     if args._refresh_worker is not None and not rest:
         operator, report, metrics_path, notification_path, mode, capture_id, limits = (
             args._refresh_worker

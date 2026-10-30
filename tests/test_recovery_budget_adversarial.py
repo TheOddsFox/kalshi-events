@@ -166,6 +166,20 @@ def test_memory_guard_counts_logical_compressor_pages_not_only_resident_pages(
         lambda *_args, **_kwargs: SimpleNamespace(stdout=text),
     )
     assert production_recovery._system_compressed_bytes() == 2_000_000 * page_size
+    assert "compressed_memory_stop_bytes" not in production_recovery.RUN_LIMITS
+
+
+@pytest.mark.parametrize(
+    ("flags", "state"), [(1, "normal"), (2, "warn"), (4, "critical")]
+)
+def test_memory_pressure_maps_verified_userspace_flags(production_recovery, flags, state):
+    assert production_recovery._memory_pressure_name(flags) == state
+
+
+@pytest.mark.parametrize("flags", [0, 3, 5, 8])
+def test_unknown_memory_pressure_flags_fail_closed(production_recovery, flags):
+    with pytest.raises(RuntimeError, match="flags are unknown"):
+        production_recovery._memory_pressure_name(flags)
 
 
 @pytest.mark.parametrize(

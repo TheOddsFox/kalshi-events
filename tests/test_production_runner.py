@@ -18,6 +18,32 @@ import pytest
 SCRIPT = Path(__file__).parents[1] / "scripts" / "production_run.py"
 
 
+def _memory_sample(
+    group,
+    *,
+    rss=0,
+    pressure="normal",
+    stored=0,
+    occupied=0,
+    pressure_at=None,
+    group_footprint=0,
+    supervisor_footprint=0,
+):
+    return {
+        "child_process_group_rss_bytes": None if group is None else rss,
+        "system_compressed_bytes": stored,
+        "system_compressor_occupied_bytes": occupied,
+        "system_memory_pressure": pressure,
+        "system_memory_pressure_observed_monotonic": (
+            time.monotonic() if pressure_at is None else pressure_at
+        ),
+        "child_process_group_physical_footprint_bytes": (
+            None if group is None else group_footprint
+        ),
+        "supervisor_physical_footprint_bytes": supervisor_footprint,
+    }
+
+
 def _checkout(path: Path) -> Path:
     path.mkdir(parents=True)
     (path / ".git").mkdir()
@@ -89,6 +115,150 @@ def test_under_limit_rss_sample_resets_the_continuous_stop_window(production):
 def test_missed_rss_samples_do_not_establish_a_continuous_minute(production):
     limit = 24 * 1024**3
     assert not production.rss_limit_exceeded([(0, limit + 1), (60, limit + 1)])
+
+
+@pytest.mark.parametrize(
+    ("pressures", "expected_samples", "stale_first_sample"),
+    [
+        (["warn"] * 5, 5, False),
+        (["warn", "warn", "normal", "warn", "warn", "warn", "warn", "warn"], 8, False),
+        (["warn"] * 6, 6, True),
+    ],
+)
+def test_memory_pressure_warning_requires_continuity_and_resets(
+    production, tmp_path, monkeypatch, pressures, expected_samples, stale_first_sample
+):
+    clock = [100.0]
+    terminated = []
+
+    class Child:
+        pid = 123
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, *, timeout):
+            return -15
+
+    child = Child()
+    pressure_iter = iter(pressures)
+    atomic_calls = []
+
+    def sample(group, *, timeout):
+        return _memory_sample(
+            group,
+            pressure=next(pressure_iter),
+            pressure_at=clock[0],
+        )
+
+    def atomic(*_args):
+        if stale_first_sample and not atomic_calls:
+            clock[0] += 23
+        atomic_calls.append(True)
+
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(production.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(production, "_sample_memory", sample)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    monkeypatch.setattr(production, "_terminate", lambda _child: terminated.append(True) or True)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
+    monkeypatch.setattr(production, "_atomic_report", atomic)
+    monkeypatch.setattr(production, "_utc", lambda: "test")
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+    report = {"resource_samples": [], "peak_child_process_group_rss_bytes": 0}
+
+    code, reason, reaped = production._monitor(
+        child, tmp_path, tmp_path / "operator", report, tmp_path / "session.json", 300
+    )
+
+    assert code == -15 and reaped
+    assert reason == "system memory pressure remained warning for 60 seconds"
+    assert len(report["resource_samples"]) == expected_samples
+    assert terminated == [True]
+
+
+def test_memory_pressure_critical_stops_on_first_sample(production, tmp_path, monkeypatch):
+    class Child:
+        pid = 123
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, *, timeout):
+            return -15
+
+    child = Child()
+    terminated = []
+    monkeypatch.setattr(
+        production, "_sample_memory", lambda group, **_kw: _memory_sample(group, pressure="critical")
+    )
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    monkeypatch.setattr(production, "_terminate", lambda _child: terminated.append(True) or True)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    monkeypatch.setattr(production, "_utc", lambda: "test")
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+    report = {"resource_samples": [], "peak_child_process_group_rss_bytes": 0}
+
+    code, reason, reaped = production._monitor(
+        child, tmp_path, tmp_path / "operator", report, tmp_path / "session.json", time.monotonic() + 30
+    )
+
+    assert code == -15 and reaped
+    assert reason == "system memory pressure reached critical"
+    assert len(report["resource_samples"]) == 1
+    assert terminated == [True]
+
+
+def test_normal_pressure_does_not_stop_on_logical_or_physical_compressor_bytes(
+    production, tmp_path, monkeypatch
+):
+    class Child:
+        pid = 123
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 0
+
+        def wait(self, *, timeout):
+            return 0
+
+    monkeypatch.setattr(
+        production,
+        "_sample_memory",
+        lambda group, **_kw: _memory_sample(
+            group,
+            stored=50 * 1024**3,
+            occupied=30 * 1024**3,
+            group_footprint=60 * 1024**3,
+            supervisor_footprint=70 * 1024**3,
+        ),
+    )
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
+    monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
+    monkeypatch.setattr(production, "_utc", lambda: "test")
+    monkeypatch.setattr(
+        production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
+    )
+    report = {"resource_samples": [], "peak_child_process_group_rss_bytes": 0}
+
+    code, reason, reaped = production._monitor(
+        Child(), tmp_path, tmp_path / "operator", report, tmp_path / "session.json", time.monotonic() + 30
+    )
+
+    assert code == 0 and reason is None and reaped
+    assert report["resource_samples"][0]["system_compressed_bytes"] == 50 * 1024**3
+    assert report["resource_samples"][0]["system_compressor_occupied_bytes"] == 30 * 1024**3
+    assert report["resource_samples"][0]["child_process_group_physical_footprint_bytes"] == 60 * 1024**3
+    assert report["resource_samples"][0]["supervisor_physical_footprint_bytes"] == 70 * 1024**3
 
 
 def test_resume_subtracts_trustworthy_prior_acquisition_from_aggregate_limits(production):
@@ -356,6 +526,215 @@ def test_vm_stat_compressed_logical_pages_are_parsed_and_bounded(production, mon
     assert production._system_compressed_bytes() == 16 * 1024**3
 
 
+def _fake_rusage_buffer(production, footprint, start_abstime):
+    value = bytearray(96)
+    value[72:80] = footprint.to_bytes(8, production.sys.byteorder)
+    value[80:88] = start_abstime.to_bytes(8, production.sys.byteorder)
+    return bytes(value)
+
+
+def test_proc_pid_footprint_uses_v0_and_rejects_pid_reuse(production):
+    class ProcCall:
+        def __init__(self, samples):
+            self.samples = iter(samples)
+
+        def __call__(self, pid, flavor, buffer):
+            assert pid == 77
+            assert flavor == 0
+            production.ctypes.memmove(buffer, next(self.samples), 96)
+            return 0
+
+    assert production._proc_pid_footprint(
+        ProcCall([_fake_rusage_buffer(production, 100, 123), _fake_rusage_buffer(production, 200, 123)]),
+        77,
+    ) == 200
+    with pytest.raises(production.RunnerError, match="identity changed"):
+        production._proc_pid_footprint(
+            ProcCall([_fake_rusage_buffer(production, 100, 123), _fake_rusage_buffer(production, 200, 124)]),
+            77,
+        )
+
+
+@pytest.mark.parametrize("still_exists", [False, True])
+def test_proc_pid_rusage_esrch_is_ignored_only_after_exit_confirmation(
+    production, monkeypatch, still_exists
+):
+    def vanished(*_args):
+        production.ctypes.set_errno(production.errno.ESRCH)
+        return -1
+
+    monkeypatch.setattr(production, "_pid_exists", lambda _pid: still_exists)
+    if still_exists:
+        with pytest.raises(OSError):
+            production._proc_pid_footprint(vanished, 77)
+    else:
+        assert production._proc_pid_footprint(vanished, 77) is None
+
+
+def test_vm_stat_snapshot_keeps_logical_and_physical_compressor_pages_separate(production):
+    text = (
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+        "Pages stored in compressor: 10.\n"
+        "Pages occupied by compressor: 3.\n"
+    )
+    assert production._vm_stat_compressor_metrics(text) == (10 * 16384, 3 * 16384)
+    with pytest.raises(production.RunnerError):
+        production._vm_stat_compressor_metrics(text.replace("Pages occupied by compressor: 3.\n", ""))
+
+
+def test_memory_sample_collects_pressure_rss_and_separate_footprints(
+    production, monkeypatch
+):
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        if command == ["vm_stat"]:
+            stdout = (
+                "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+                "Pages stored in compressor: 10.\n"
+                "Pages occupied by compressor: 3.\n"
+            )
+        elif command == ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]:
+            stdout = "1\n"
+        else:
+            assert command == ["ps", "-g", "123", "-o", "pgid=,pid=,rss="]
+            stdout = "123 456 7\n"
+        return SimpleNamespace(returncode=0, stdout=stdout)
+
+    class ProcCall:
+        def __init__(self):
+            self.samples = iter(
+                [
+                    _fake_rusage_buffer(production, 400, 99),
+                    _fake_rusage_buffer(production, 500, 99),
+                    _fake_rusage_buffer(production, 100, 33),
+                    _fake_rusage_buffer(production, 200, 33),
+                ]
+            )
+
+        def __call__(self, _pid, flavor, buffer):
+            assert flavor == 0
+            production.ctypes.memmove(buffer, next(self.samples), 96)
+            return 0
+
+    proc_call = ProcCall()
+    monkeypatch.setattr(production.subprocess, "run", run)
+    monkeypatch.setattr(production.ctypes, "CDLL", lambda *_a, **_kw: SimpleNamespace(proc_pid_rusage=proc_call))
+    monkeypatch.setattr(production.os, "getppid", lambda: 999)
+    monkeypatch.setattr(production.os, "getpgid", lambda _pid: 123)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: True)
+
+    sample = production._memory_sample_worker(123)
+
+    assert commands == [
+        ["vm_stat"],
+        ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+        ["ps", "-g", "123", "-o", "pgid=,pid=,rss="],
+    ]
+    assert sample["child_process_group_rss_bytes"] == 7 * 1024
+    assert sample["system_compressed_bytes"] == 10 * 16384
+    assert sample["system_compressor_occupied_bytes"] == 3 * 16384
+    assert sample["system_memory_pressure"] == "normal"
+    assert sample["child_process_group_physical_footprint_bytes"] == 200
+    assert sample["supervisor_physical_footprint_bytes"] == 500
+    assert isinstance(sample["system_memory_pressure_observed_monotonic"], float)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.pop("system_compressor_occupied_bytes"),
+        lambda value: value.update(system_memory_pressure="unknown"),
+        lambda value: value.update(system_memory_pressure_observed_monotonic=float("nan")),
+        lambda value: value.update(system_memory_pressure_observed_monotonic=101.0),
+        lambda value: value.update(system_compressed_bytes=True),
+        lambda value: value.update(child_process_group_physical_footprint_bytes=None),
+    ],
+)
+def test_sample_memory_rejects_partial_or_invalid_metrics(production, monkeypatch, mutate):
+    value = _memory_sample(123, pressure_at=100.0)
+    mutate(value)
+    monkeypatch.setattr(production.time, "monotonic", lambda: 100.0)
+
+    class Worker:
+        returncode = 0
+
+        def communicate(self, *, timeout):
+            assert 0 < timeout <= 5
+            return json.dumps(value, allow_nan=True), ""
+
+    monkeypatch.setattr(production.subprocess, "Popen", lambda *_a, **_kw: Worker())
+
+    with pytest.raises(production.RunnerError):
+        production._sample_memory(123)
+
+
+def test_sample_memory_timeout_kills_and_reaps_inside_its_five_second_budget(
+    production, monkeypatch
+):
+    clock = [10.0]
+    timeouts = []
+    killed = []
+
+    class Worker:
+        pid = 777
+        returncode = None
+
+        def communicate(self, *, timeout):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                clock[0] += timeout
+                raise production.subprocess.TimeoutExpired("memory sampler", timeout)
+            clock[0] += 0.2
+            self.returncode = -9
+            return "", ""
+
+    worker = Worker()
+    monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(production.subprocess, "Popen", lambda *_a, **_kw: worker)
+    monkeypatch.setattr(
+        production.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+    )
+
+    with pytest.raises(production.RunnerError, match="timed out"):
+        production._sample_memory(None)
+
+    assert timeouts == [4.5, 0.5]
+    assert clock[0] <= 15
+    assert killed == [(777, production.signal.SIGKILL)]
+
+
+def test_sample_memory_propagates_operator_interrupt_after_reaping_worker(
+    production, monkeypatch
+):
+    killed = []
+
+    class Worker:
+        pid = 778
+        returncode = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, *, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                raise production.RunnerInterrupted("operator stop")
+            self.returncode = -9
+            return "", ""
+
+    worker = Worker()
+    monkeypatch.setattr(production.subprocess, "Popen", lambda *_a, **_kw: worker)
+    monkeypatch.setattr(production.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    with pytest.raises(production.RunnerInterrupted, match="operator stop"):
+        production._sample_memory(None)
+
+    assert worker.returncode == -9
+    assert killed == [(778, production.signal.SIGKILL)]
+
+
 def test_process_group_rss_retries_one_timeout_within_the_same_budget(production, monkeypatch):
     clock = [100.0]
     timeouts = []
@@ -427,7 +806,7 @@ def test_process_group_rss_does_not_retry_after_the_total_budget_is_spent(produc
     assert timeouts == [0.125]
 
 
-def test_monitor_stops_and_reaps_after_persistent_rss_sampling_timeouts(
+def test_monitor_stops_and_reaps_after_memory_sampling_timeout(
     production, tmp_path, monkeypatch
 ):
     clock = [100.0]
@@ -446,10 +825,10 @@ def test_monitor_stops_and_reaps_after_persistent_rss_sampling_timeouts(
 
     child = Child()
 
-    def run(command, *, timeout, **_kwargs):
+    def sample(_group, *, timeout):
         calls.append(timeout)
         clock[0] += timeout
-        raise subprocess.TimeoutExpired(command, timeout)
+        raise production.RunnerError("memory sample timed out")
 
     def terminate(actual):
         assert actual is child
@@ -458,7 +837,7 @@ def test_monitor_stops_and_reaps_after_persistent_rss_sampling_timeouts(
         return True
 
     monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(production.subprocess, "run", run)
+    monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production, "_terminate", terminate)
     monkeypatch.setattr(production, "_merge_capture_notification", lambda *_args: None)
@@ -478,9 +857,9 @@ def test_monitor_stops_and_reaps_after_persistent_rss_sampling_timeouts(
     )
 
     assert code == -15
-    assert reason == "resource accounting failed: process-group RSS sampling timed out"
+    assert reason == "resource accounting failed: memory sample timed out"
     assert reaped is True
-    assert calls == [2.5, 2.5]
+    assert calls == [5.0]
     assert terminated == [True]
     assert report["resource_samples"] == []
 
@@ -580,7 +959,7 @@ def test_process_group_rss_includes_real_descendants_in_the_group(production, mo
 
 
 @pytest.mark.parametrize("clock_source", ["monotonic", "wall"])
-def test_monitor_rechecks_both_deadlines_after_rss_before_compressor_probe(
+def test_monitor_rechecks_both_deadlines_after_memory_sample(
     production, tmp_path, monkeypatch, clock_source
 ):
     clock = {"monotonic": 100.0, "wall": 200.0}
@@ -595,19 +974,15 @@ def test_monitor_rechecks_both_deadlines_after_rss_before_compressor_probe(
         def wait(self, *, timeout):
             return -15
 
-    def advance_rss(_pid, *, timeout):
+    def advance_sample(group, *, timeout):
+        assert group == 123
         assert timeout == 1.0
         clock[clock_source] += 1
-        return 0
+        return _memory_sample(group)
 
     monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
-    monkeypatch.setattr(production, "_process_group_rss", advance_rss)
-    monkeypatch.setattr(
-        production,
-        "_system_compressed_bytes",
-        lambda **_kw: pytest.fail("compressor probe started inside termination reserve"),
-    )
+    monkeypatch.setattr(production, "_sample_memory", advance_sample)
     monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
     monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
     monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
@@ -634,7 +1009,7 @@ def test_monitor_rechecks_both_deadlines_after_rss_before_compressor_probe(
 
 
 @pytest.mark.parametrize("clock_source", ["monotonic", "wall"])
-def test_monitor_clamps_compressor_timeout_to_fresh_deadline_remainder(
+def test_monitor_clamps_memory_sample_to_fresh_deadline_remainder(
     production, tmp_path, monkeypatch, clock_source
 ):
     clock = {"monotonic": 100.0, "wall": 200.0}
@@ -649,20 +1024,14 @@ def test_monitor_clamps_compressor_timeout_to_fresh_deadline_remainder(
         def wait(self, *, timeout):
             return -15
 
-    def advance_rss(_pid, *, timeout):
-        assert timeout == 4.0
-        clock[clock_source] += 2
-        return 0
-
-    def compressed(*, timeout):
+    def sample(group, *, timeout):
         probe_timeouts.append(timeout)
-        return production.RUN_LIMITS["compressed_memory_stop_bytes"]
+        return _memory_sample(group, pressure="critical")
 
     terminated = []
     monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
-    monkeypatch.setattr(production, "_process_group_rss", advance_rss)
-    monkeypatch.setattr(production, "_system_compressed_bytes", compressed)
+    monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
     monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
     monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
@@ -683,9 +1052,9 @@ def test_monitor_clamps_compressor_timeout_to_fresh_deadline_remainder(
     )
 
     assert code == -15
-    assert reason == "system compressed memory reached the conservative stop threshold"
+    assert reason == "system memory pressure reached critical"
     assert reaped is True
-    assert probe_timeouts == [2.0]
+    assert probe_timeouts == [4.0]
     assert terminated == [True]
 
 
@@ -697,7 +1066,7 @@ def test_monitor_clamps_compressor_timeout_to_fresh_deadline_remainder(
         ("wall", 1, 210, False),
     ],
 )
-def test_monitor_rechecks_deadlines_after_successful_compressor_probe_before_persisting(
+def test_monitor_rechecks_deadlines_after_successful_memory_sample_before_persisting(
     production, tmp_path, monkeypatch, clock_source, advance, wall_deadline, expect_stop
 ):
     clock = {"monotonic": 100.0, "wall": 200.0}
@@ -719,10 +1088,10 @@ def test_monitor_rechecks_deadlines_after_successful_compressor_probe_before_per
         def wait(self, *, timeout):
             return -15 if expect_stop else 0
 
-    def compressed(*, timeout):
+    def sample(group, *, timeout):
         assert timeout == 5.0
         clock[clock_source] += advance
-        return 0
+        return _memory_sample(group)
 
     monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
@@ -731,8 +1100,7 @@ def test_monitor_rechecks_deadlines_after_successful_compressor_probe_before_per
         "sleep",
         lambda delay: clock.__setitem__("monotonic", clock["monotonic"] + delay),
     )
-    monkeypatch.setattr(production, "_process_group_rss", lambda _pid, **_kw: 0)
-    monkeypatch.setattr(production, "_system_compressed_bytes", compressed)
+    monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
     monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
     monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
@@ -770,7 +1138,7 @@ def test_monitor_rechecks_deadlines_after_successful_compressor_probe_before_per
 
 
 @pytest.mark.parametrize("clock_source", ["monotonic", "wall"])
-def test_monitor_preserves_deadline_reason_when_compressor_probe_times_out(
+def test_monitor_preserves_deadline_reason_when_memory_sample_times_out(
     production, tmp_path, monkeypatch, clock_source
 ):
     clock = {"monotonic": 100.0, "wall": 200.0}
@@ -785,21 +1153,15 @@ def test_monitor_preserves_deadline_reason_when_compressor_probe_times_out(
         def wait(self, *, timeout):
             return -15
 
-    def advance_rss(_pid, *, timeout):
-        assert timeout == 4.0
-        clock[clock_source] += 1
-        return 0
-
-    def timed_out(*, timeout):
+    def timed_out(_group, *, timeout):
         probe_timeouts.append(timeout)
         clock[clock_source] += 4
-        raise production.subprocess.TimeoutExpired("vm_stat", timeout)
+        raise production.RunnerError("memory sampler timed out")
 
     terminated = []
     monkeypatch.setattr(production.time, "monotonic", lambda: clock["monotonic"])
     monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
-    monkeypatch.setattr(production, "_process_group_rss", advance_rss)
-    monkeypatch.setattr(production, "_system_compressed_bytes", timed_out)
+    monkeypatch.setattr(production, "_sample_memory", timed_out)
     monkeypatch.setattr(production, "_terminate", lambda _process: terminated.append(True) or True)
     monkeypatch.setattr(production, "_process_group_exists", lambda _pid: False)
     monkeypatch.setattr(production, "_merge_capture_notification", lambda *_a: None)
@@ -822,7 +1184,7 @@ def test_monitor_preserves_deadline_reason_when_compressor_probe_times_out(
     assert code == -15
     assert reason == "session or workflow deadline reached termination reserve"
     assert reaped is True
-    assert probe_timeouts == [3.0]
+    assert probe_timeouts == [4.0]
     assert terminated == [True]
 
 
@@ -886,6 +1248,7 @@ def test_child_startup_failure_does_not_proceed_to_monitoring(production, tmp_pa
         assert kwargs["start_new_session"] is True
         raise OSError("injected child startup failure")
 
+    monkeypatch.setattr(production, "_sample_memory", lambda group, **_kw: _memory_sample(group))
     monkeypatch.setattr(production.subprocess, "Popen", fail_start)
     monkeypatch.setattr(
         production, "_monitor", lambda *_a, **_kw: pytest.fail("monitor ran without a child")
@@ -921,14 +1284,13 @@ def test_report_failure_after_child_startup_still_terminates_the_child(
         if len(writes) == fail_at:
             raise OSError("injected report synchronization failure")
 
-    def rss(_group, *, timeout):
+    def sample(group, *, timeout):
         assert 0 < timeout <= 5
-        return 0
+        return _memory_sample(group)
 
     monkeypatch.setattr(production.subprocess, "Popen", start)
     monkeypatch.setattr(production, "_atomic_report", fail_report)
-    monkeypatch.setattr(production, "_process_group_rss", rss)
-    monkeypatch.setattr(production, "_system_compressed_bytes", lambda **_kw: 0)
+    monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(
         production.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1000 * 1024**3)
     )
@@ -1154,18 +1516,20 @@ def test_resource_monitor_stops_and_reaps_without_starting_more_work(
         child.returncode = -15
         return True
 
-    def rss(_group, *, timeout):
+    def sample(group, *, timeout):
         assert 0 < timeout <= 5
         if stop == "unknown_resources":
-            raise OSError("resource inspection unavailable")
-        return 24 * 1024**3 + 1 if stop == "rss" else 0
+            raise production.RunnerError("bounded memory sample failed: resource inspection unavailable")
+        return _memory_sample(
+            group, rss=24 * 1024**3 + 1 if stop == "rss" else 0
+        )
 
     free = production.RUN_LIMITS["minimum_free_bytes"] - (1 if stop == "free_space" else 0)
     monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
         production.time, "sleep", lambda duration: clock.__setitem__(0, clock[0] + duration)
     )
-    monkeypatch.setattr(production, "_process_group_rss", rss)
+    monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production, "_terminate", terminate)
     monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
@@ -1187,6 +1551,9 @@ def test_resource_monitor_stops_and_reaps_without_starting_more_work(
     if stop == "rss":
         assert terminated == [160]
         assert len(report["resource_samples"]) == 5
+    elif stop == "unknown_resources":
+        assert reason == "resource accounting failed: memory snapshot unavailable"
+        assert reason in production.RECOVERABLE_ACCOUNTING_STOP_REASONS
     else:
         assert terminated == [100]
 
@@ -1235,15 +1602,15 @@ def test_allocation_survives_parent_heartbeat_before_child_result_is_available(
 
     child = Child()
 
-    def allocate_during_sample(_group, *, timeout):
+    def allocate_during_sample(group, *, timeout):
         assert 0 < timeout <= 5
-        production._write_capture_notification(notification, "b" * 32, "a" * 32)
-        child.returncode = -15
-        return 0
+        if group is not None:
+            production._write_capture_notification(notification, "b" * 32, "a" * 32)
+            child.returncode = -15
+        return _memory_sample(group)
 
     monkeypatch.setattr(production.subprocess, "Popen", lambda *_a, **_kw: child)
-    monkeypatch.setattr(production, "_process_group_rss", allocate_during_sample)
-    monkeypatch.setattr(production, "_system_compressed_bytes", lambda **_kw: 0)
+    monkeypatch.setattr(production, "_sample_memory", allocate_during_sample)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production.time, "sleep", lambda _duration: None)
     monkeypatch.setattr(
@@ -1266,6 +1633,132 @@ def test_allocation_survives_parent_heartbeat_before_child_result_is_available(
     assert report["accounting_complete"] is False
     assert report["resumable"] is None
     assert json.loads(notification.read_text())["capture_id"] == "b" * 32
+
+
+@pytest.mark.parametrize("pressure", ["warn", "critical"])
+def test_invoke_requires_normal_pressure_before_starting_any_child(
+    production, tmp_path, monkeypatch, pressure
+):
+    monkeypatch.setattr(
+        production,
+        "_sample_memory",
+        lambda group, **_kw: _memory_sample(group, pressure=pressure),
+    )
+    monkeypatch.setattr(
+        production.subprocess,
+        "Popen",
+        lambda *_a, **_kw: pytest.fail("child started without NORMAL preflight pressure"),
+    )
+    report = {"system": {"filesystem_device": tmp_path.stat().st_dev}}
+
+    result = production._invoke(
+        ["synthetic-child"],
+        directory=tmp_path,
+        operator=tmp_path / "operator",
+        report=report,
+        report_path=tmp_path / "session.json",
+        deadline=time.monotonic() + 30,
+        stdout_path=tmp_path / "stdout",
+        stderr_path=tmp_path / "stderr",
+    )
+
+    assert result == (None, "memory pressure was not normal before supervised work", True)
+    saved = json.loads((tmp_path / "session.json").read_text())
+    assert saved["memory_preflight_samples"][0]["system_memory_pressure"] == pressure
+    assert not (tmp_path / "stdout").exists()
+    assert not (tmp_path / "stderr").exists()
+
+
+def test_invoke_fails_closed_when_preflight_metrics_are_unknown(production, tmp_path, monkeypatch):
+    def missing(_group, **_kwargs):
+        raise production.RunnerError("compressor measurement missing")
+
+    monkeypatch.setattr(production, "_sample_memory", missing)
+    monkeypatch.setattr(
+        production.subprocess,
+        "Popen",
+        lambda *_a, **_kw: pytest.fail("child started without complete memory metrics"),
+    )
+    report = {"system": {"filesystem_device": tmp_path.stat().st_dev}}
+
+    result = production._invoke(
+        ["synthetic-child"],
+        directory=tmp_path,
+        operator=tmp_path / "operator",
+        report=report,
+        report_path=tmp_path / "session.json",
+        deadline=time.monotonic() + 30,
+        stdout_path=tmp_path / "stdout",
+        stderr_path=tmp_path / "stderr",
+    )
+
+    assert result == (None, "memory metrics unavailable before supervised work", True)
+    assert "compressor measurement missing" in report["memory_preflight_error"]
+
+
+def test_invoke_does_not_convert_operator_interrupt_into_preflight_failure(
+    production, tmp_path, monkeypatch
+):
+    def interrupt(*_args, **_kwargs):
+        raise production.RunnerInterrupted("operator stop")
+
+    monkeypatch.setattr(production, "_sample_memory", interrupt)
+    monkeypatch.setattr(
+        production.subprocess,
+        "Popen",
+        lambda *_a, **_kw: pytest.fail("child started after operator interrupt"),
+    )
+
+    with pytest.raises(production.RunnerInterrupted, match="operator stop"):
+        production._invoke(
+            ["synthetic-child"],
+            directory=tmp_path,
+            operator=tmp_path / "operator",
+            report={"system": {"filesystem_device": tmp_path.stat().st_dev}},
+            report_path=tmp_path / "session.json",
+            deadline=time.monotonic() + 30,
+            stdout_path=tmp_path / "stdout",
+            stderr_path=tmp_path / "stderr",
+        )
+
+
+def test_invoke_clamps_preflight_to_shared_deadline_and_records_metrics(
+    production, tmp_path, monkeypatch
+):
+    timeouts = []
+
+    class Child:
+        pid = 123
+
+        def poll(self):
+            return 0
+
+        def wait(self, *, timeout):
+            return 0
+
+    monkeypatch.setattr(
+        production,
+        "_sample_memory",
+        lambda group, *, timeout: timeouts.append(timeout) or _memory_sample(group),
+    )
+    monkeypatch.setattr(production.subprocess, "Popen", lambda *_a, **_kw: Child())
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+    report = {"system": {"filesystem_device": tmp_path.stat().st_dev}}
+
+    result = production._invoke(
+        ["synthetic-child"],
+        directory=tmp_path,
+        operator=tmp_path / "operator",
+        report=report,
+        report_path=tmp_path / "session.json",
+        deadline=time.monotonic() + 8,
+        stdout_path=tmp_path / "stdout",
+        stderr_path=tmp_path / "stderr",
+    )
+
+    assert result == (0, None, True)
+    assert len(timeouts) == 1 and 2 < timeouts[0] <= 3
+    assert report["memory_preflight_samples"][0]["system_memory_pressure"] == "normal"
 
 
 def test_refresh_worker_rejects_nonpublic_origin_before_creating_operator_data(
@@ -1348,7 +1841,7 @@ def test_public_supervisor_signal_reaps_its_isolated_worker_and_records_uncertai
     directory = tmp_path / "production"
     ready = tmp_path / "worker.json"
     harness = """
-import json,os,pathlib,runpy,sys
+import json,os,pathlib,runpy,sys,time
 from types import SimpleNamespace
 sys.path.insert(0,sys.argv[1])
 import production_run as runner
@@ -1356,6 +1849,7 @@ from kalshi_events import transport
 runner._revision=lambda:'a'*40
 runner._boot_stamp=lambda:'test boot'
 runner._system_info=lambda directory:{'filesystem_device':directory.stat().st_dev}
+runner._sample_memory=lambda group,**kw:{'child_process_group_rss_bytes':None if group is None else 0,'system_compressed_bytes':0,'system_compressor_occupied_bytes':0,'system_memory_pressure':'normal','system_memory_pressure_observed_monotonic':time.monotonic(),'child_process_group_physical_footprint_bytes':None if group is None else 0,'supervisor_physical_footprint_bytes':0}
 runner.shutil.disk_usage=lambda directory:SimpleNamespace(free=1000*1024**3)
 transport.source_url=lambda:transport.BASE_URL
 worker=('import json,os,sys,time; '
@@ -1582,15 +2076,15 @@ def test_active_monitor_rechecks_wall_deadline_without_extending_monotonic_limit
         child.returncode = -15
         return True
 
-    def rss(_group, *, timeout):
+    def sample(group, *, timeout):
         assert 0 < timeout <= 5
         timeouts.append(timeout)
-        return 0
+        return _memory_sample(group)
 
     monkeypatch.setattr(production.time, "monotonic", lambda: clock["mono"])
     monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
     monkeypatch.setattr(production.time, "sleep", sleep)
-    monkeypatch.setattr(production, "_process_group_rss", rss)
+    monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production, "_terminate", terminate)
     monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
@@ -1651,9 +2145,9 @@ def test_active_monitor_reserves_five_wall_seconds_and_clamps_ps_timeout_and_sle
         clock["mono"] += duration
         clock["wall"] += duration
 
-    def rss(_group, *, timeout):
+    def sample(group, *, timeout):
         timeouts.append(timeout)
-        return 0
+        return _memory_sample(group)
 
     def terminate(_child):
         stops.append(clock.copy())
@@ -1663,7 +2157,7 @@ def test_active_monitor_reserves_five_wall_seconds_and_clamps_ps_timeout_and_sle
     monkeypatch.setattr(production.time, "monotonic", lambda: clock["mono"])
     monkeypatch.setattr(production.time, "time", lambda: clock["wall"])
     monkeypatch.setattr(production.time, "sleep", sleep)
-    monkeypatch.setattr(production, "_process_group_rss", rss)
+    monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production, "_terminate", terminate)
     monkeypatch.setattr(production, "_atomic_report", lambda *_a: None)
