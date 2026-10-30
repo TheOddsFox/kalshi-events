@@ -436,3 +436,29 @@ python /absolute/kalshi-market-data/scripts/check-handoff.py \
 This harness uses a synthetic loopback exchange, proves capture through publication and metadata transfer, exercises all market-data feeds and intervals, checks persistent refresh/replay/recovery, and performs no live acquisition.
 
 For acquisition protocol 3, its synthetic exchange must honor `/markets?tickers=...` and singular-event `exclude_markets=true`. Older consumer fixtures ignore these filters and return unrequested markets, which the producer correctly rejects. The installed handoff for this change passed with a private fixture copy implementing those two filters; the consumer repository and installed applications were unchanged.
+
+
+### Compact saved-evidence historical builds
+
+Fresh historical builds use native Arrow-to-DuckDB inserts instead of dlt merge staging. They retain the 13 logical landing columns, exact payload text and every distinct observation; other workflows retain their existing dlt loader. Payloads use native DuckDB Zstandard compression and are stored once. Historical history/current relations expose compatible views over canonical data and narrow winner selections. The resulting database remains self-contained for ordinary DuckDB 2 read-only consumers.
+
+New historical Parquet exports use Zstandard level 6. Their schemas, values and deterministic row order are preserved; compressed file checksums and release IDs change. Existing releases and other catalogue/metadata/series export settings remain unchanged. Raw receipt bytes are never repacked.
+
+The production runner supports `--reconcile-stopped-worker` only for an exact historical capture. Use it to validate a stopped worker's absence under the supervisor and writer locks before clearing a stale process marker; never edit session fields by hand. A live, reused or ambiguous process identity blocks recovery. Primary stop reasons and uncertain shutdown outcomes remain in history.
+
+The historical completion policy keeps 64 GiB database and temporary ceilings, with a 56 GiB protective stop threshold and capacity admission at a conservative projected peak of 48 GiB per category. Active measurements include database, WAL and spill, not just output after a load returns. Sampling and cooperative checks can overshoot; they do not provide filesystem-enforced quotas (WORK-42 remains open). A staged database counts toward both database and temporary usage.
+
+One admitted offline attempt must preserve all cumulative acquisition accounting, use only saved evidence, and retain the 400 GiB session, 350 GiB root, 150 GiB free-space and existing memory safeguards. Reserve the final two hours of a 24-hour attempt for independent verification, activation and reporting. If the capacity forecast fails, do not launch or silently raise limits. Partial extraction is not a production publication.
+
+
+After final source verification and a passing capacity admission, an explicitly authorized stopped historical attempt can use:
+
+```sh
+python scripts/run-production.py \
+  --directory ./data/kalshi-production \
+  --historical --capture-id CAPTURE_ID \
+  --reconcile-stopped-worker --supersede-offline-window \
+  --offline-duration-seconds 86280
+```
+
+This grants at most 23 hours 58 minutes inside an outer 24-hour session, preserving startup/reporting headroom. It never resets acquisition consumption or automatically retries. The October 30 compression experiment did **not** pass capacity admission; do not run this command for that capture until the unresolved capacity gate is satisfied.
