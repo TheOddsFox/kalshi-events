@@ -1,4 +1,9 @@
-{% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
+{% if var('historical_compact', false) %}{{ config(materialized='view') }}
+select s.series_ticker, s.observation_id, s.capture_id, s.received_at,
+       s.provider_updated_at, s.source_endpoint, h.payload_json
+from {{ ref('_historical_current_series') }} s
+join {{ ref('observation_history') }} h using (observation_id)
+{% else %}{% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
 {{ config(materialized='incremental', incremental_strategy='append') }}
 {% endif %}
 {% if var('catalogue_version', 1) == 2 %}
@@ -47,4 +52,4 @@ select entity_ticker as series_ticker, observation_id, capture_id, received_at,
 from {{ ref('observation_history') }}
 where entity_kind = 'series'
 qualify row_number() over (partition by entity_ticker order by received_at desc, observation_id desc) = 1
-{% endif %}
+{% endif %}{% endif %}

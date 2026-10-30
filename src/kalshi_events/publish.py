@@ -575,8 +575,11 @@ def _publish(
                     f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
                 ).fetchone():
                     raise CatalogueError(f"non-unique publication ordering key: {name}")
+                compression = (
+                    ", compression zstd, compression_level 6" if catalogue_version == 3 else ""
+                )
                 connection.execute(
-                    f"copy (select * from main.{table} order by {keys}) to ? (format parquet)",
+                    f"copy (select * from main.{table} order by {keys}) to ? (format parquet{compression})",
                     [str(destination)],
                 )
         coverage_row = {
@@ -601,7 +604,12 @@ def _publish(
             coverage_row.update(release_metadata)
         coverage = [coverage_row]
         store.check_deadline()
-        pq.write_table(pa.Table.from_pylist(coverage), temporary / "coverage.parquet")
+        coverage_options = (
+            {"compression": "zstd", "compression_level": 6} if catalogue_version == 3 else {}
+        )
+        pq.write_table(
+            pa.Table.from_pylist(coverage), temporary / "coverage.parquet", **coverage_options
+        )
         for name in FILES:
             fsync_file(temporary / name)
         fsync_directory(temporary)
