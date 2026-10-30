@@ -451,13 +451,22 @@ The historical completion policy keeps 64 GiB database and temporary ceilings, w
 One admitted offline attempt must preserve all cumulative acquisition accounting, use only saved evidence, and retain the 400 GiB session, 350 GiB root, 150 GiB free-space and existing memory safeguards. Reserve the final two hours of a 24-hour attempt for independent verification, activation and reporting. If the capacity forecast fails, do not launch or silently raise limits. Partial extraction is not a production publication.
 
 
-After final source verification and a passing capacity admission, an explicitly authorized stopped historical attempt can use:
+After final source verification and a passing capacity admission, reconcile an explicitly authorized stopped historical attempt first:
 
 ```sh
 python scripts/run-production.py \
   --directory ./data/kalshi-production \
   --historical --capture-id CAPTURE_ID \
-  --reconcile-stopped-worker --supersede-offline-window \
+  --reconcile-stopped-worker
+```
+
+Reconciliation starts no worker and grants no processing time. After it succeeds, start the separately authorized bounded resume:
+
+```sh
+python scripts/run-production.py \
+  --directory ./data/kalshi-production \
+  --historical --capture-id CAPTURE_ID \
+  --supersede-offline-window \
   --offline-duration-seconds 86280
 ```
 
