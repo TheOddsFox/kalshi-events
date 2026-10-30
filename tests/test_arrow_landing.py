@@ -7,8 +7,9 @@ from decimal import Decimal
 import dlt
 import duckdb
 import pytest
+from dlt.common.schema import Schema
 
-from kalshi_events import warehouse
+from kalshi_events import normalize, warehouse
 
 
 def _row(**updates):
@@ -31,6 +32,13 @@ def _row(**updates):
         }
     )
     return row
+
+
+def _duckdb_settings(connection):
+    return connection.execute(
+        """select current_setting('memory_limit'), current_setting('threads'),
+                  current_setting('temp_directory'), current_setting('max_temp_directory_size')"""
+    ).fetchone()
 
 
 def test_landing_arrow_batches_bound_rows_and_utf8_bytes():
@@ -145,16 +153,34 @@ def test_arrow_merge_replays_dict_landed_database_with_text_coercion(store, monk
         ),
         loader_file_format="parquet",
     )
-    manifest = {
-        "capture_id": capture_id,
-        "page_id": "page-0",
-        "received_at": "2026-10-18T00:00:00Z",
-        "endpoint": "/series",
-        "sha256": "f" * 64,
-        "status": 200,
-    }
-    monkeypatch.setattr(warehouse, "capture_pages", lambda *_args, **_kwargs: [(manifest, {})])
-    monkeypatch.setattr(warehouse, "observations", lambda _pages: iter(source_rows))
+    baseline_connection = duckdb.connect(str(database))
+    baseline_settings = _duckdb_settings(baseline_connection)
+    baseline_connection.close()
+    store.sync("tmp/arrow-landing")
+    pages = [
+        (
+            {
+                "capture_id": capture_id,
+                "page_id": f"page-{index}",
+                "received_at": "2026-10-18T00:00:00Z",
+                "endpoint": "/series",
+                "sha256": "f" * 64,
+                "status": 200,
+                "entity_kind": "series",
+                "task_scope": "series",
+                "task_generation": 0,
+            },
+            {"series": [{"ticker": f"SERIES-PAGE-{index}"}]},
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(warehouse, "capture_pages", lambda *_args, **_kwargs: iter(pages))
+
+    def page_observations(page_rows):
+        manifest, _payload = next(iter(page_rows))
+        return iter(source_rows if manifest["page_id"] == "page-0" else ())
+
+    monkeypatch.setattr(warehouse, "observations", page_observations)
     from dlt.common.configuration.container import Container
     from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
     from dlt.common.storages.data_item_storage import BufferedDataWriter
@@ -168,10 +194,72 @@ def test_arrow_merge_replays_dict_landed_database_with_text_coercion(store, monk
 
     monkeypatch.setattr(BufferedDataWriter, "__init__", record_writer_limit)
 
-    assert warehouse._land_rows(store, {"capture_id": capture_id}, directory) == len(values)
-    assert warehouse._land_rows(store, {"capture_id": capture_id}, directory) == len(values)
+    from dlt.destinations.impl.duckdb.configuration import DuckDbConnectionPool
+
+    original_factory = dlt.destinations.duckdb
+    destination_configs = []
+
+    def record_destination(**kwargs):
+        usage = store.usage()
+        spill_budget = min(
+            store.limits.max_temp_bytes - usage["temporary_bytes"],
+            store.limits.max_root_bytes - usage["retained_bytes"],
+        )
+        destination_configs.append((kwargs["credentials"]["global_config"], spill_budget))
+        return original_factory(**kwargs)
+
+    monkeypatch.setattr(warehouse.dlt.destinations, "duckdb", record_destination)
+    original_borrow = DuckDbConnectionPool.borrow_conn
+    worker_settings = []
+
+    def record_worker_settings(pool, *args, **kwargs):
+        connection = original_borrow(pool, *args, **kwargs)
+        worker_settings.append((dict(pool.credentials.global_config), _duckdb_settings(connection)))
+        return connection
+
+    monkeypatch.setattr(DuckDbConnectionPool, "borrow_conn", record_worker_settings)
+    monkeypatch.setattr(warehouse, "_LANDING_BATCH_ROWS", 1)
+
+    parent_index = normalize.DiskParentIndex(store, collect_winners=False)
+    try:
+        with dlt.config.values({"load.workers": 4}):
+            assert warehouse._land_rows(
+                store,
+                {"capture_id": capture_id},
+                directory,
+                parent_index=parent_index,
+            ) == len(values)
+            assert warehouse._land_rows(
+                store,
+                {"capture_id": capture_id},
+                directory,
+                parent_index=parent_index,
+            ) == len(values)
+        assert parent_index.db.execute("select count(*) from membership").fetchone() == (2,)
+    finally:
+        parent_index.close()
+
     assert len(writer_limits) >= 4
     assert all(limit == 1 for limit, _sections in writer_limits), writer_limits
+    assert len(destination_configs) == 2
+    for config, spill_budget in destination_configs:
+        assert spill_budget > 0
+        assert config == {
+            "memory_limit": warehouse.DBT_MEMORY_LIMIT,
+            "threads": str(warehouse.DBT_THREADS),
+            "temp_directory": str(directory / "duckdb-spill"),
+            "max_temp_directory_size": f"{spill_budget}B",
+        }
+    assert len(worker_settings) >= 2
+    for config, actual_settings in worker_settings:
+        expected_connection = duckdb.connect(config=config)
+        try:
+            assert actual_settings == _duckdb_settings(expected_connection)
+        finally:
+            expected_connection.close()
+    reopened = duckdb.connect(str(database))
+    assert _duckdb_settings(reopened) == baseline_settings
+    reopened.close()
     with duckdb.connect(str(database), read_only=True) as connection:
         arrow_schema = {
             row[0]: (row[1], row[2])
@@ -253,9 +341,42 @@ def test_arrow_pipeline_failure_restores_scoped_dlt_config(store, monkeypatch, t
     monkeypatch.setattr(warehouse.dlt, "pipeline", original_pipeline)
 
 
+def test_duckdb_global_config_failure_closes_pool_and_restores_settings(store):
+    directory = store.path("tmp/dlt-config-failure")
+    directory.mkdir(parents=True)
+    database = directory / "warehouse.duckdb"
+    connection = duckdb.connect(str(database))
+    baseline_settings = _duckdb_settings(connection)
+    connection.close()
+
+    destination = dlt.destinations.duckdb(
+        credentials={
+            "database": str(database),
+            "global_config": {"memory_limit": "80MB", "not_a_duckdb_setting": "1"},
+        }
+    )
+    initial = destination.spec()
+    initial.dataset_name = "failure"
+    initial.local_dir = str(directory)
+    client = destination.client(Schema("failure"), initial)
+
+    with pytest.raises(Exception, match="not_a_duckdb_setting"):
+        client.sql_client.open_connection()
+    assert client.config.credentials.conn_pool._conn is None
+
+    reopened = duckdb.connect(str(database))
+    assert _duckdb_settings(reopened) == baseline_settings
+    reopened.close()
+
+
 def test_empty_arrow_landing_keeps_legacy_empty_table(store, monkeypatch):
     directory = store.path("tmp/arrow-empty")
     directory.mkdir(parents=True)
+    usage = store.usage()
+    spill_budget = min(
+        store.limits.max_temp_bytes - usage["temporary_bytes"],
+        store.limits.max_root_bytes - usage["retained_bytes"],
+    )
     manifest = {
         "capture_id": "0" * 32,
         "page_id": "page-0",
@@ -267,8 +388,29 @@ def test_empty_arrow_landing_keeps_legacy_empty_table(store, monkeypatch):
     monkeypatch.setattr(warehouse, "capture_pages", lambda *_args, **_kwargs: [(manifest, {})])
     monkeypatch.setattr(warehouse, "observations", lambda _pages: iter(()))
     monkeypatch.setattr(warehouse.dlt, "pipeline", lambda **_kwargs: pytest.fail("empty landing"))
+    original_connect = warehouse.duckdb.connect
+    observed = []
+
+    def record_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        if not kwargs.get("read_only"):
+            observed.append((kwargs["config"], _duckdb_settings(connection)))
+        return connection
+
+    monkeypatch.setattr(warehouse.duckdb, "connect", record_connect)
 
     assert warehouse._land_rows(store, {"capture_id": "0" * 32}, directory) == 0
+    assert len(observed) == 1
+    config, actual_settings = observed[0]
+    assert config == {
+        "memory_limit": warehouse.DBT_MEMORY_LIMIT,
+        "threads": str(warehouse.DBT_THREADS),
+        "temp_directory": str(directory / "duckdb-spill"),
+        "max_temp_directory_size": f"{spill_budget}B",
+    }
+    expected_connection = original_connect(config=config)
+    assert actual_settings == _duckdb_settings(expected_connection)
+    expected_connection.close()
     with duckdb.connect(str(directory / "warehouse.duckdb"), read_only=True) as connection:
         schema = connection.execute("describe landing.observations").fetchall()
         assert [row[0] for row in schema] == list(warehouse._LANDING_COLUMNS)

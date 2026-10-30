@@ -123,6 +123,33 @@ def _legacy_landing_text(value: Any) -> str | None:
     return coerce_value("text", py_type_to_sc_type(type(value)), value)
 
 
+@contextmanager
+def _duckdb_work_config(store: Store, directory: Path):
+    relative = directory.relative_to(store.root).as_posix()
+    usage = store.usage()
+    spill_budget = min(
+        store.limits.max_temp_bytes - usage["temporary_bytes"],
+        store.limits.max_root_bytes - usage["retained_bytes"],
+    )
+    if spill_budget < 1:
+        raise BudgetExceeded("no bounded temporary storage is available for DuckDB work")
+    # The iterator may still write to the same Store while DuckDB consumes its batches.
+    spill_relative = f"{relative}/duckdb-spill"
+    spill_directory = None
+    try:
+        spill_directory = store.path(spill_relative)
+        durable_mkdir(spill_directory)
+        yield {
+            "memory_limit": DBT_MEMORY_LIMIT,
+            "threads": str(DBT_THREADS),
+            "temp_directory": str(spill_directory),
+            "max_temp_directory_size": f"{spill_budget}B",
+        }
+    finally:
+        if spill_directory is not None and spill_directory.exists():
+            store.sync(spill_relative)
+
+
 def build_directory(capture_id: str, catalogue_version: int = 1) -> str:
     if catalogue_version == 3:
         return f"builds-historical/{capture_id}"
@@ -511,26 +538,37 @@ def _land_rows(
     batches = iter(_landing_arrow_batches(rows()))
     first = next(batches, None)
     if first is None:
-        with duckdb.connect(str(database)) as connection:
+        with (
+            _duckdb_work_config(store, directory) as config,
+            duckdb.connect(str(database), config=config) as connection,
+        ):
             connection.execute("create schema if not exists landing")
             connection.execute(
                 "create table if not exists landing.observations (observation_id varchar, capture_id varchar, entity_kind varchar, entity_ticker varchar, received_at varchar, provider_updated_at varchar, source_endpoint varchar, source_kind varchar, payload_json varchar, event_ticker varchar, series_ticker varchar, task_scope varchar, task_generation varchar)"
             )
     else:
         try:
-            with dlt.config.values(
-                {
-                    # dlt resolves the extractor writer inside these source/resource sections.
-                    "kalshi_catalogue.sources.kalshi_catalogue.kalshi_catalogue.data_writer.buffer_max_items": 1,
-                    "kalshi_catalogue.normalize.data_writer.buffer_max_items": 1,
-                    "kalshi_catalogue.normalize.parquet_normalizer.add_dlt_load_id": True,
-                    "kalshi_catalogue.normalize.parquet_normalizer.add_dlt_id": True,
-                }
+            with (
+                _duckdb_work_config(store, directory) as duckdb_config,
+                dlt.config.values(
+                    {
+                        # dlt resolves the extractor writer inside these source/resource sections.
+                        "kalshi_catalogue.sources.kalshi_catalogue.kalshi_catalogue.data_writer.buffer_max_items": 1,
+                        "kalshi_catalogue.normalize.data_writer.buffer_max_items": 1,
+                        "kalshi_catalogue.normalize.parquet_normalizer.add_dlt_load_id": True,
+                        "kalshi_catalogue.normalize.parquet_normalizer.add_dlt_id": True,
+                    }
+                ),
             ):
                 pipeline = dlt.pipeline(
                     pipeline_name="kalshi_catalogue",
                     pipelines_dir=str(directory / "landing"),
-                    destination=dlt.destinations.duckdb(str(database)),
+                    destination=dlt.destinations.duckdb(
+                        credentials={
+                            "database": str(database),
+                            "global_config": duckdb_config,
+                        }
+                    ),
                     dataset_name="landing",
                 )
                 pipeline.run(
@@ -2013,7 +2051,8 @@ def _full_v2_build(
                     parent_index=index,
                 )
         with (
-            duckdb.connect(str(staging / "warehouse.duckdb")) as connection,
+            _duckdb_work_config(store, staging) if historical else nullcontext({}) as config,
+            duckdb.connect(str(staging / "warehouse.duckdb"), config=config) as connection,
             metrics.phase("current_projection"),
         ):
             _projection_membership(store, state, index, connection)
@@ -2021,6 +2060,8 @@ def _full_v2_build(
                 _write_historical_coverage(connection, state)
             else:
                 _parent_closure_is_fresh(connection, state, index)
+        if historical:
+            store.sync_file(f"{staging_relative}/warehouse.duckdb")
         dbt(
             store,
             ["build"],
