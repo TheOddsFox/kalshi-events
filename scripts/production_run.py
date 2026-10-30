@@ -405,12 +405,8 @@ def _effective_memory_policy() -> dict[str, Any]:
         "process_group_rss_limit_bytes": int(RUN_LIMITS["peak_rss_bytes"]),
         "process_group_rss_continuous_seconds": int(RUN_LIMITS["peak_rss_seconds"]),
         "process_group_rss_limit_is_strict": True,
-        "warning_pressure_continuous_seconds": int(
-            RUN_LIMITS["memory_pressure_warn_seconds"]
-        ),
-        "pressure_sample_max_gap_seconds": float(
-            RUN_LIMITS["memory_pressure_max_gap_seconds"]
-        ),
+        "warning_pressure_continuous_seconds": int(RUN_LIMITS["memory_pressure_warn_seconds"]),
+        "pressure_sample_max_gap_seconds": float(RUN_LIMITS["memory_pressure_max_gap_seconds"]),
         "preflight_pressure": "normal",
         "warn_pressure_resets_on_normal_or_sample_gap": True,
         "critical_pressure_stops_on_first_sample": True,
@@ -419,16 +415,18 @@ def _effective_memory_policy() -> dict[str, Any]:
 
 
 def _resource_sample_archive_path(report_path: Path) -> Path:
-    return report_path.with_name(
-        f"{report_path.stem}.before-resource-ring{report_path.suffix}"
-    )
+    return report_path.with_name(f"{report_path.stem}.before-resource-ring{report_path.suffix}")
 
 
-def _validate_resource_archive(
-    archive: dict[str, Any], report: dict[str, Any]
-) -> None:
-    samples = archive.get("resource_samples")
-    if not isinstance(samples, list) or len(samples) < RESOURCE_SAMPLE_LIMIT:
+def _validate_resource_archive(archive: dict[str, Any], report: dict[str, Any]) -> None:
+    resource_samples = archive.get("resource_samples")
+    preflight_samples = archive.get("memory_preflight_samples")
+    if not (
+        isinstance(resource_samples, list)
+        and len(resource_samples) >= RESOURCE_SAMPLE_LIMIT
+        or isinstance(preflight_samples, list)
+        and len(preflight_samples) >= RESOURCE_SAMPLE_LIMIT
+    ):
         raise RunnerError("resource sample archive is invalid")
     for key in ("session_id", "capture_id"):
         expected = report.get(key)
@@ -436,9 +434,7 @@ def _validate_resource_archive(
             raise RunnerError("resource sample archive belongs to another session")
 
 
-def _archive_resource_samples_once(
-    report_path: Path, report: dict[str, Any]
-) -> None:
+def _archive_resource_samples_once(report_path: Path, report: dict[str, Any]) -> None:
     archive_path = _resource_sample_archive_path(report_path)
     archive_name = archive_path.name
     recorded = report.get("resource_samples_archive")
@@ -536,6 +532,54 @@ def _append_resource_sample(
         dropped += trim
     report["resource_samples_total"] = total
     report["resource_samples_dropped"] = dropped
+
+
+def _memory_preflight_sample_state(
+    report: dict[str, Any], report_path: Path
+) -> tuple[list[dict[str, Any]], int, int]:
+    samples = report.setdefault("memory_preflight_samples", [])
+    if not isinstance(samples, list) or any(not isinstance(row, dict) for row in samples):
+        raise RunnerError("memory preflight sample history is invalid")
+    total = report.get("memory_preflight_samples_total")
+    dropped = report.get("memory_preflight_samples_dropped")
+    if total is None and dropped is None:
+        total, dropped = len(samples), 0
+    elif (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < 0
+        or isinstance(dropped, bool)
+        or not isinstance(dropped, int)
+        or dropped < 0
+        or total - dropped != len(samples)
+    ):
+        raise RunnerError("memory preflight sample counters are invalid")
+    if len(samples) > RESOURCE_SAMPLE_LIMIT:
+        report["memory_preflight_samples_total"] = total
+        report["memory_preflight_samples_dropped"] = dropped
+        _archive_resource_samples_once(report_path, report)
+        trim = len(samples) - RESOURCE_SAMPLE_LIMIT
+        del samples[:trim]
+        dropped += trim
+    report["memory_preflight_samples_total"] = total
+    report["memory_preflight_samples_dropped"] = dropped
+    return samples, total, dropped
+
+
+def _append_memory_preflight_sample(
+    report: dict[str, Any], report_path: Path, sample: dict[str, Any]
+) -> None:
+    samples, total, dropped = _memory_preflight_sample_state(report, report_path)
+    if len(samples) >= RESOURCE_SAMPLE_LIMIT:
+        _archive_resource_samples_once(report_path, report)
+    samples.append({"at": _utc(), **sample, "memory_policy_version": 2})
+    total += 1
+    if len(samples) > RESOURCE_SAMPLE_LIMIT:
+        trim = len(samples) - RESOURCE_SAMPLE_LIMIT
+        del samples[:trim]
+        dropped += trim
+    report["memory_preflight_samples_total"] = total
+    report["memory_preflight_samples_dropped"] = dropped
 
 
 def _external_path(path: Path) -> Path:
@@ -947,9 +991,7 @@ def _monitor(
                     RUN_LIMITS["terminate_seconds"]
                 ):
                     stop_reason = "session or workflow deadline reached termination reserve"
-                elif isinstance(exc, RunnerError) and str(exc).startswith(
-                    "bounded memory sample"
-                ):
+                elif isinstance(exc, RunnerError) and str(exc).startswith("bounded memory sample"):
                     stop_reason = "resource accounting failed: memory snapshot unavailable"
                 else:
                     stop_reason = f"resource accounting failed: {exc}"
@@ -980,9 +1022,7 @@ def _monitor(
                     "ssd_free_bytes": free,
                     "child_process_group_rss_bytes": rss,
                     "system_compressed_bytes": memory["system_compressed_bytes"],
-                    "system_compressor_occupied_bytes": memory[
-                        "system_compressor_occupied_bytes"
-                    ],
+                    "system_compressor_occupied_bytes": memory["system_compressor_occupied_bytes"],
                     "system_memory_pressure": pressure,
                     "system_memory_pressure_observed_monotonic": observed_at,
                     "child_process_group_physical_footprint_bytes": memory[
@@ -1118,9 +1158,7 @@ def _proc_pid_footprint(proc_pid_rusage: Any, pid: int) -> int | None:
 def _memory_sample_worker(group: int | None) -> dict[str, Any]:
     if group is not None and (type(group) is not int or group <= 0):
         raise RunnerError("memory sampler process group is invalid")
-    vm = subprocess.run(
-        ["vm_stat"], check=True, capture_output=True, text=True, timeout=1.0
-    )
+    vm = subprocess.run(["vm_stat"], check=True, capture_output=True, text=True, timeout=1.0)
     stored_bytes, occupied_bytes = _vm_stat_compressor_metrics(vm.stdout)
     pressure_result = subprocess.run(
         ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
@@ -1192,9 +1230,16 @@ def _memory_sample_worker(group: int | None) -> dict[str, Any]:
 
 
 def _sample_memory(group: int | None, *, timeout: float = 5.0) -> dict[str, Any]:
-    if isinstance(group, bool) or (group is not None and (not isinstance(group, int) or group <= 0)):
+    if isinstance(group, bool) or (
+        group is not None and (not isinstance(group, int) or group <= 0)
+    ):
         raise RunnerError("memory sampler process group is invalid")
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
         raise RunnerError("memory sampler timeout is invalid")
     sample_started = time.monotonic()
     sample_deadline = sample_started + min(5.0, timeout)
@@ -1356,9 +1401,7 @@ def _invoke(
         _atomic_report(report_path, report)
         return None, "memory metrics unavailable before supervised work", True
     report.pop("memory_preflight_error", None)
-    report.setdefault("memory_preflight_samples", []).append(
-        {"at": _utc(), **memory_preflight}
-    )
+    _append_memory_preflight_sample(report, report_path, memory_preflight)
     if memory_preflight["system_memory_pressure"] != "normal":
         _atomic_report(report_path, report)
         return None, "memory pressure was not normal before supervised work", True
@@ -1488,6 +1531,7 @@ def _child_accounting(
         stdout_path=stdout,
         stderr_path=stderr,
         workflow_deadline=workflow_deadline,
+        phase_on_start="accounting" if cleanup_historical_stages else None,
     )
     value = _strict_json(stdout)
     if reason in DEADLINE_STOP_REASONS:
@@ -2891,12 +2935,6 @@ def run_production(
                     report["requests"] = None
                     report["downloaded_bytes"] = None
                     report["consumption_state"] = "in_progress"
-                else:
-                    report["network_activity_this_invocation"] = {
-                        "requests": None,
-                        "downloaded_bytes": None,
-                        "accounting_complete": False,
-                    }
                 code, stop_reason, reaped, stdout_path, stderr_path = _run_external_child(
                     command,
                     directory=directory,
@@ -3038,11 +3076,6 @@ def run_production(
                             accounting_basis="offline-historical-accounting-changed",
                             accounting_bound_verified=False,
                             consumption_state="unknown",
-                            network_activity_this_invocation={
-                                "requests": None,
-                                "downloaded_bytes": None,
-                                "accounting_complete": False,
-                            },
                         )
                         raise RunnerError("offline historical work changed acquisition accounting")
                     _check_accounting_match(snapshot, after)
@@ -3500,6 +3533,9 @@ def _session_report(
         "resource_samples": [],
         "resource_samples_total": 0,
         "resource_samples_dropped": 0,
+        "memory_preflight_samples": [],
+        "memory_preflight_samples_total": 0,
+        "memory_preflight_samples_dropped": 0,
         "peak_child_process_group_rss_bytes": 0,
         "peak_child_process_group_physical_footprint_bytes": 0,
         "peak_supervisor_physical_footprint_bytes": 0,
@@ -3800,6 +3836,7 @@ def _load_resume(
             }
         ]
         _atomic_report(report_path, report)
+    _memory_preflight_sample_state(report, report_path)
     previous_error = report.get("error")
     previous_recovery = report.get("recovery")
     previous_phase = report.get("phase")
@@ -4208,7 +4245,9 @@ def _main_hidden(argv: list[str]) -> int | None:
     if args._account_recovery is not None and not rest:
         return _accounting_worker_main(Path(args._account_recovery[0]), args._account_recovery[1])
     if args._account_historical_initial is not None and not rest:
-        operator, directory, report, capture_id, root_id, revision = args._account_historical_initial
+        operator, directory, report, capture_id, root_id, revision = (
+            args._account_historical_initial
+        )
         return _accounting_worker_main(
             Path(operator),
             capture_id,

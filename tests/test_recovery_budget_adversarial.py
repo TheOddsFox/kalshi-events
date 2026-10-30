@@ -169,9 +169,7 @@ def test_memory_guard_counts_logical_compressor_pages_not_only_resident_pages(
     assert "compressed_memory_stop_bytes" not in production_recovery.RUN_LIMITS
 
 
-@pytest.mark.parametrize(
-    ("flags", "state"), [(1, "normal"), (2, "warn"), (4, "critical")]
-)
+@pytest.mark.parametrize(("flags", "state"), [(1, "normal"), (2, "warn"), (4, "critical")])
 def test_memory_pressure_maps_verified_userspace_flags(production_recovery, flags, state):
     assert production_recovery._memory_pressure_name(flags) == state
 

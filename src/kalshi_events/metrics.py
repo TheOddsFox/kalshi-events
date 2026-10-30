@@ -378,6 +378,8 @@ def collect(progress_path: str | os.PathLike[str] | None = None) -> Iterator[Met
     finally:
         try:
             metrics._finish_progress(operation_failed)
+        except OSError:
+            metrics.add("progress_write_failures")
         except BaseException:
             if not operation_failed:
                 raise
@@ -416,7 +418,10 @@ def phase(name: str) -> Iterator[None]:
         yield
         return
     if name in _PROGRESS_PHASES:
-        metrics.progress(name)
+        try:
+            metrics.progress(name)
+        except OSError:
+            metrics.add("progress_write_failures")
     started = time.perf_counter()
     try:
         yield

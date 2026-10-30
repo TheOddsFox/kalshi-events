@@ -512,3 +512,34 @@ version 2 operational window; it does not widen the old grant or reset acquisiti
 accounting. Storage, memory and free-space safeguards still apply. This authorization
 is not a completed run or a performance result; publication and activation require their
 own verified outcomes.
+
+
+## Memory supervision investigation (2026-10-30)
+
+The saved-evidence-only attempt at revision `6e2bccf` ran from 29 October 17:37:50 UTC to 19:04:43 UTC. Within that invocation, sampled worker-group RSS peaked at 1,419,034,624 bytes; the final sample was 838,975,488 bytes. The stop was triggered by 21,733,228,544 bytes of logical contents stored in the system compressor. The report's larger cumulative RSS peak came from earlier invocations. These readings identify the guard that fired; they do not establish a worker leak or identify the owners of compressed pages.
+
+At interruption, dlt had written a 10,835,085,387-byte Parquet normalization job while the staged DuckDB remained 12,288 bytes. An earlier abandoned stage held another 15,868,783,532-byte job. The disposable SQLite inventory occupied 8,139,677,696 bytes and was not a usable certified warehouse. Growing normalization output must not be interpreted as a completed load or a reliable completion percentage.
+
+The current fix replaces the logical-compressor cutoff with pressure-aware supervision, removes unnecessary receipt-list retention and historical winner-index writes, configures DuckDB managed memory, and reclaims validated abandoned historical stages before quota admission. Arrow batches remain bounded inputs; aggregate Parquet output and SQLite membership remain proportional to the workload. These mechanisms do not prove the source of earlier system-wide compression or guarantee a full-run speedup. Development comparisons and the separate bounded saved-evidence acceptance result must be recorded before claiming measured improvements or production completion.
+
+Reference source, lockfile and stop measurements are retained under ignored `data/testing/memory-recovery-20261030/reference/`. No API acquisition is needed for this investigation or acceptance.
+
+
+A bounded comparison completed one warm-up and three alternating measured pairs against
+archived `6e2bccf` and phase-3 candidate `07b0ebc`. On a 100,000-receipt in-memory fixture
+selecting 3,000 receipts, dictionary copies fell from 100,000 to 3,000. Median selection
+time was 0.386729 versus 0.074438 seconds; incremental tracemalloc peaks were 19,202,710
+versus 6,903 bytes. The original receipt inventory was retained before timing. This is
+one metadata-selection phase, not total recovery memory or end-to-end ingestion time.
+
+The 200-market-per-tier historical fixture completed all paired runs. Six data-relation
+Parquet files had identical bytes and ordered rows. The coverage relation differed only
+in `warehouse_sha256`, which also varied across repeated builds of the unchanged reference;
+that propagated to coverage bytes and release IDs. The original exact-identity comparison
+therefore remains recorded as false. Database checksums must continue to describe actual
+files; they must not be replaced with a fabricated constant to make comparisons pass.
+The small fixture's combined SQLite inventory was 266,240 bytes for the reference and
+229,376 bytes for the candidate. These measurements exclude phase-4 progress/reporting
+and retry cleanup, and establish no production-scale runtime guarantee. Full evidence,
+failed setup attempts and the unchanged strict comparison result are retained in
+`data/testing/memory-recovery-20261030/performance/REPORT.md`.

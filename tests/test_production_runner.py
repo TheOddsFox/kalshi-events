@@ -267,9 +267,7 @@ def test_resource_samples_keep_a_bounded_tail_archive_once_and_accumulate_peaks(
         production._append_resource_sample(report, report_path, _resource_row(number))
 
     assert len(report["resource_samples"]) == production.RESOURCE_SAMPLE_LIMIT
-    assert [row["sample_number"] for row in report["resource_samples"]] == list(
-        range(14, 270)
-    )
+    assert [row["sample_number"] for row in report["resource_samples"]] == list(range(14, 270))
     assert report["resource_samples_total"] == 270
     assert report["resource_samples_dropped"] == 14
     assert report["peak_child_process_group_rss_bytes"] == 269
@@ -281,9 +279,7 @@ def test_resource_samples_keep_a_bounded_tail_archive_once_and_accumulate_peaks(
 
     archive_path = production._resource_sample_archive_path(report_path)
     archived = json.loads(archive_path.read_text())
-    assert [row["sample_number"] for row in archived["resource_samples"]] == list(
-        range(256)
-    )
+    assert [row["sample_number"] for row in archived["resource_samples"]] == list(range(256))
     before = archive_path.read_bytes()
     production._append_resource_sample(report, report_path, _resource_row(270))
     assert archive_path.read_bytes() == before
@@ -318,9 +314,12 @@ def test_legacy_resource_samples_are_archived_before_trimming_without_retagging(
     assert report["peak_supervisor_physical_footprint_bytes"] == 995
     assert report["peak_system_compressed_bytes"] == 998
     assert report["peak_system_compressor_occupied_bytes"] == 997
-    assert json.loads(
-        production._resource_sample_archive_path(report_path).read_text()
-    )["resource_samples"] == archived_rows
+    assert (
+        json.loads(production._resource_sample_archive_path(report_path).read_text())[
+            "resource_samples"
+        ]
+        == archived_rows
+    )
 
 
 def test_resource_sample_archive_failure_does_not_truncate_or_append(
@@ -347,6 +346,97 @@ def test_resource_sample_archive_failure_does_not_truncate_or_append(
     assert report["resource_samples"] == rows
     assert report["resource_samples_total"] == 256
     assert report["resource_samples_dropped"] == 0
+    assert "resource_samples_archive" not in report
+
+
+def test_memory_preflight_samples_keep_bounded_tail_and_archive_once(production, tmp_path):
+    report_path = tmp_path / "runs" / ("d" * 32) / "session.json"
+    report_path.parent.mkdir(parents=True)
+    report = {
+        "memory_preflight_samples": [],
+        "memory_preflight_samples_total": 0,
+        "memory_preflight_samples_dropped": 0,
+    }
+
+    for number in range(270):
+        production._append_memory_preflight_sample(
+            report, report_path, {"sample_number": number, "system_memory_pressure": "normal"}
+        )
+
+    samples = report["memory_preflight_samples"]
+    assert len(samples) == production.RESOURCE_SAMPLE_LIMIT
+    assert [row["sample_number"] for row in samples] == list(range(14, 270))
+    assert report["memory_preflight_samples_total"] == 270
+    assert report["memory_preflight_samples_dropped"] == 14
+    assert {row["memory_policy_version"] for row in samples} == {2}
+
+    archive_path = production._resource_sample_archive_path(report_path)
+    archived = json.loads(archive_path.read_text())
+    assert [row["sample_number"] for row in archived["memory_preflight_samples"]] == list(
+        range(256)
+    )
+    before = archive_path.read_bytes()
+    production._append_memory_preflight_sample(
+        report, report_path, {"sample_number": 270, "system_memory_pressure": "normal"}
+    )
+    assert archive_path.read_bytes() == before
+    assert report["memory_preflight_samples_total"] == 271
+    assert report["memory_preflight_samples_dropped"] == 15
+
+
+def test_legacy_memory_preflight_samples_archive_before_trimming_without_retagging(
+    production, tmp_path
+):
+    report_path = tmp_path / "runs" / ("e" * 32) / "session.json"
+    report_path.parent.mkdir(parents=True)
+    legacy_rows = [
+        {"sample_number": index, "system_memory_pressure": "normal"} for index in range(260)
+    ]
+    archived_rows = [dict(row) for row in legacy_rows]
+    report = {
+        "memory_preflight_samples": legacy_rows,
+        "limits": {"legacy_system_compressed_bytes": 123},
+    }
+
+    samples, total, dropped = production._memory_preflight_sample_state(report, report_path)
+
+    assert len(samples) == 256
+    assert total == 260 and dropped == 4
+    assert "memory_policy_version" not in samples[0]
+    assert report["memory_preflight_samples_total"] == 260
+    assert report["memory_preflight_samples_dropped"] == 4
+    assert report["limits"] == {"legacy_system_compressed_bytes": 123}
+    assert (
+        json.loads(production._resource_sample_archive_path(report_path).read_text())[
+            "memory_preflight_samples"
+        ]
+        == archived_rows
+    )
+
+
+def test_memory_preflight_archive_failure_does_not_truncate_or_append(
+    production, tmp_path, monkeypatch
+):
+    report_path = tmp_path / "runs" / ("f" * 32) / "session.json"
+    report_path.parent.mkdir(parents=True)
+    rows = [{"sample_number": index} for index in range(256)]
+    report = {
+        "memory_preflight_samples": rows.copy(),
+        "memory_preflight_samples_total": 256,
+        "memory_preflight_samples_dropped": 0,
+    }
+    monkeypatch.setattr(
+        production,
+        "_atomic_report",
+        lambda path, _report: (_ for _ in ()).throw(OSError("archive write failed")),
+    )
+
+    with pytest.raises(OSError, match="archive write failed"):
+        production._append_memory_preflight_sample(report, report_path, {"sample_number": 256})
+
+    assert report["memory_preflight_samples"] == rows
+    assert report["memory_preflight_samples_total"] == 256
+    assert report["memory_preflight_samples_dropped"] == 0
     assert "resource_samples_archive" not in report
 
 
@@ -380,10 +470,30 @@ def test_validated_resume_clears_current_stop_and_preserves_legacy_limits(
     assert report["limits"] == original["limits"]
     assert report["requests"] == 17 and report["downloaded_bytes"] == 1234
     assert report["peak_child_process_group_rss_bytes"] == 20 * 1024**3
-    assert report["previous_stop"]["resource_peaks"][
-        "invocation_peak_child_process_group_rss_bytes"
-    ] == 19 * 1024**3
+    assert (
+        report["previous_stop"]["resource_peaks"]["invocation_peak_child_process_group_rss_bytes"]
+        == 19 * 1024**3
+    )
     assert report["invocation_peak_child_process_group_rss_bytes"] == 0
+
+
+def test_validated_resume_bounds_legacy_memory_preflight_history(production, tmp_path, monkeypatch):
+    directory, report_path, original, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch
+    )
+    original["memory_preflight_samples"] = [{"sample_number": index} for index in range(260)]
+    report_path.write_text(json.dumps(original))
+
+    _path, report, _paths = production._load_resume(directory, capture_id)
+
+    samples = report["memory_preflight_samples"]
+    assert len(samples) == 256
+    assert [row["sample_number"] for row in samples] == list(range(4, 260))
+    assert "memory_policy_version" not in samples[0]
+    assert report["memory_preflight_samples_total"] == 260
+    assert report["memory_preflight_samples_dropped"] == 4
+    archive = json.loads(production._resource_sample_archive_path(report_path).read_text())
+    assert [row["sample_number"] for row in archive["memory_preflight_samples"]] == list(range(260))
 
 
 def test_crash_before_historical_child_keeps_expired_grant_renewable(
@@ -433,18 +543,14 @@ def test_crash_before_historical_child_keeps_expired_grant_renewable(
     assert resumed["publication_state"] == "unknown"
     assert resumed["effective_memory_policy"]["version"] == 2
 
-    production._configure_offline_historical_window(
-        resumed, capture_id, 3600, renew=True
-    )
+    production._configure_offline_historical_window(resumed, capture_id, 3600, renew=True)
     production._atomic_report(_path, resumed)
     renewed_window = resumed["offline_historical_window"]
     assert resumed["phase"] == "stopped"
     assert resumed["offline_historical_window_history"] == [original_window]
     assert resumed["requests"] == 17 and resumed["downloaded_bytes"] == 1234
 
-    monkeypatch.setattr(
-        production.time, "time", lambda: renewed_window["deadline_epoch"] + 1
-    )
+    monkeypatch.setattr(production.time, "time", lambda: renewed_window["deadline_epoch"] + 1)
     monkeypatch.setattr(
         production.time,
         "monotonic",
@@ -483,8 +589,9 @@ def test_initial_historical_accounting_uses_closed_cleanup_command(
     }
     captured = {}
 
-    def invoke(command, *, stdout_path, **_kwargs):
+    def invoke(command, *, stdout_path, phase_on_start, **_kwargs):
         captured["command"] = command
+        captured["phase_on_start"] = phase_on_start
         stdout_path.write_text(
             json.dumps(
                 {
@@ -520,6 +627,7 @@ def test_initial_historical_accounting_uses_closed_cleanup_command(
         "b" * 32,
         "c" * 40,
     ]
+    assert captured["phase_on_start"] == "accounting"
     assert value["storage"]["retained_bytes"] == 1
 
 
@@ -551,9 +659,7 @@ def test_initial_historical_accounting_cleanup_refuses_prior_active_group(
         )
 
 
-def test_offline_refresh_phase_is_durable_only_when_child_starts(
-    production, tmp_path, monkeypatch
-):
+def test_offline_refresh_phase_is_durable_only_when_child_starts(production, tmp_path, monkeypatch):
     logs = tmp_path / "logs"
     logs.mkdir()
     report_path = tmp_path / "session.json"
@@ -702,6 +808,114 @@ def test_supervised_initial_historical_accounting_prunes_before_quota_admission(
     }
 
 
+def test_interrupted_historical_refresh_preserves_zero_network_activity_and_accounting(
+    production, tmp_path, monkeypatch
+):
+    (
+        directory,
+        _operator,
+        _store,
+        report_path,
+        report,
+        paths,
+        capture_id,
+        _stage,
+        _baseline_temporary_bytes,
+    ) = _initial_historical_accounting_fixture(production, tmp_path)
+    report.update(
+        mode="historical",
+        phase="stopped",
+        accounting_complete=True,
+        publication_state="unknown",
+        production_state="not_attempted",
+        error="previous stop",
+        recovery="retry offline",
+    )
+    production._atomic_report(report_path, report)
+    phase_during_child = []
+    original_atomic_report = production._atomic_report
+    original_invoke = production._invoke
+
+    class AwakeGuard:
+        pid = 987654
+
+    def atomic_report(path, value):
+        if path == report_path and value.get("active_process_group") is not None:
+            phase_during_child.append(value["phase"])
+        original_atomic_report(path, value)
+
+    def invoke(command, *, phase_on_start=None, report: dict, report_path: Path, **kwargs):
+        if phase_on_start != "refresh":
+            return original_invoke(
+                command,
+                phase_on_start=phase_on_start,
+                report=report,
+                report_path=report_path,
+                **kwargs,
+            )
+        report["phase"] = phase_on_start
+        report["active_process_group"] = 987653
+        atomic_report(report_path, report)
+        report["active_process_group"] = None
+        raise production.RunnerInterrupted("simulated historical child interruption")
+
+    original_popen = production.subprocess.Popen
+
+    def popen(command, *args, **kwargs):
+        if command[0] == "caffeinate":
+            return AwakeGuard()
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(production, "_validate_runtime_versions", lambda _versions: None)
+    monkeypatch.setattr(production, "prepare_directory", lambda _directory, _mode: directory)
+    monkeypatch.setattr(
+        production, "_load_resume", lambda *_args, **_kwargs: (report_path, report, paths)
+    )
+    monkeypatch.setattr(production, "_revision", lambda: "d" * 40)
+    monkeypatch.setattr(
+        production,
+        "_system_info",
+        lambda _directory: {"filesystem_device": directory.stat().st_dev},
+    )
+    monkeypatch.setattr(
+        production.shutil,
+        "disk_usage",
+        lambda _directory: SimpleNamespace(
+            free=200 * 1024**3,
+            total=250 * 1024**3,
+            used=50 * 1024**3,
+        ),
+    )
+    monkeypatch.setattr(
+        production, "_sample_memory", lambda group, **_kwargs: _memory_sample(group)
+    )
+    monkeypatch.setattr(production.subprocess, "Popen", popen)
+    monkeypatch.setattr(production, "_kill_awake_guard", lambda _process: None)
+    monkeypatch.setattr(production, "_atomic_report", atomic_report)
+    monkeypatch.setattr(production, "_invoke", invoke)
+
+    result, code = production.run_production(
+        directory,
+        capture_id=capture_id,
+        historical=True,
+    )
+
+    saved = json.loads(report_path.read_text())
+    assert code == 3
+    assert result["phase"] == "stopped"
+    assert phase_during_child[0] == "accounting"
+    assert "refresh" in phase_during_child
+    assert saved["phase"] == "stopped"
+    assert saved["error"] == "simulated historical child interruption"
+    assert saved["requests"] == 6 and saved["downloaded_bytes"] == 1077
+    assert saved["accounting_complete"] is True
+    assert saved["network_activity_this_invocation"] == {
+        "requests": 0,
+        "downloaded_bytes": 0,
+        "accounting_complete": True,
+    }
+
+
 def test_supervised_historical_cleanup_fails_closed_on_writer_lock_contention(
     production, tmp_path, monkeypatch
 ):
@@ -722,8 +936,9 @@ def test_supervised_historical_cleanup_fails_closed_on_writer_lock_contention(
         lambda group, **_kwargs: _memory_sample(group),
     )
 
-    with store.lock(), pytest.raises(
-        production.RunnerError, match="durable operator accounting or storage"
+    with (
+        store.lock(),
+        pytest.raises(production.RunnerError, match="durable operator accounting or storage"),
     ):
         production._resource_guard(
             directory,
@@ -782,7 +997,9 @@ def test_memory_pressure_warning_requires_continuity_and_resets(
         atomic_calls.append(True)
 
     monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(production.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(
+        production.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)
+    )
     monkeypatch.setattr(production, "_sample_memory", sample)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production, "_terminate", lambda _child: terminated.append(True) or True)
@@ -818,7 +1035,9 @@ def test_memory_pressure_critical_stops_on_first_sample(production, tmp_path, mo
     child = Child()
     terminated = []
     monkeypatch.setattr(
-        production, "_sample_memory", lambda group, **_kw: _memory_sample(group, pressure="critical")
+        production,
+        "_sample_memory",
+        lambda group, **_kw: _memory_sample(group, pressure="critical"),
     )
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
     monkeypatch.setattr(production, "_terminate", lambda _child: terminated.append(True) or True)
@@ -831,7 +1050,12 @@ def test_memory_pressure_critical_stops_on_first_sample(production, tmp_path, mo
     report = {"resource_samples": [], "peak_child_process_group_rss_bytes": 0}
 
     code, reason, reaped = production._monitor(
-        child, tmp_path, tmp_path / "operator", report, tmp_path / "session.json", time.monotonic() + 30
+        child,
+        tmp_path,
+        tmp_path / "operator",
+        report,
+        tmp_path / "session.json",
+        time.monotonic() + 30,
     )
 
     assert code == -15 and reaped
@@ -875,13 +1099,21 @@ def test_normal_pressure_does_not_stop_on_logical_or_physical_compressor_bytes(
     report = {"resource_samples": [], "peak_child_process_group_rss_bytes": 0}
 
     code, reason, reaped = production._monitor(
-        Child(), tmp_path, tmp_path / "operator", report, tmp_path / "session.json", time.monotonic() + 30
+        Child(),
+        tmp_path,
+        tmp_path / "operator",
+        report,
+        tmp_path / "session.json",
+        time.monotonic() + 30,
     )
 
     assert code == 0 and reason is None and reaped
     assert report["resource_samples"][0]["system_compressed_bytes"] == 50 * 1024**3
     assert report["resource_samples"][0]["system_compressor_occupied_bytes"] == 30 * 1024**3
-    assert report["resource_samples"][0]["child_process_group_physical_footprint_bytes"] == 60 * 1024**3
+    assert (
+        report["resource_samples"][0]["child_process_group_physical_footprint_bytes"]
+        == 60 * 1024**3
+    )
     assert report["resource_samples"][0]["supervisor_physical_footprint_bytes"] == 70 * 1024**3
     assert report["resource_samples"][0]["memory_policy_version"] == 2
     assert report["invocation_peak_child_process_group_rss_bytes"] == 0
@@ -1172,13 +1404,26 @@ def test_proc_pid_footprint_uses_v0_and_rejects_pid_reuse(production):
             production.ctypes.memmove(buffer, next(self.samples), 96)
             return 0
 
-    assert production._proc_pid_footprint(
-        ProcCall([_fake_rusage_buffer(production, 100, 123), _fake_rusage_buffer(production, 200, 123)]),
-        77,
-    ) == 200
+    assert (
+        production._proc_pid_footprint(
+            ProcCall(
+                [
+                    _fake_rusage_buffer(production, 100, 123),
+                    _fake_rusage_buffer(production, 200, 123),
+                ]
+            ),
+            77,
+        )
+        == 200
+    )
     with pytest.raises(production.RunnerError, match="identity changed"):
         production._proc_pid_footprint(
-            ProcCall([_fake_rusage_buffer(production, 100, 123), _fake_rusage_buffer(production, 200, 124)]),
+            ProcCall(
+                [
+                    _fake_rusage_buffer(production, 100, 123),
+                    _fake_rusage_buffer(production, 200, 124),
+                ]
+            ),
             77,
         )
 
@@ -1207,12 +1452,12 @@ def test_vm_stat_snapshot_keeps_logical_and_physical_compressor_pages_separate(p
     )
     assert production._vm_stat_compressor_metrics(text) == (10 * 16384, 3 * 16384)
     with pytest.raises(production.RunnerError):
-        production._vm_stat_compressor_metrics(text.replace("Pages occupied by compressor: 3.\n", ""))
+        production._vm_stat_compressor_metrics(
+            text.replace("Pages occupied by compressor: 3.\n", "")
+        )
 
 
-def test_memory_sample_collects_pressure_rss_and_separate_footprints(
-    production, monkeypatch
-):
+def test_memory_sample_collects_pressure_rss_and_separate_footprints(production, monkeypatch):
     commands = []
 
     def run(command, **_kwargs):
@@ -1248,7 +1493,9 @@ def test_memory_sample_collects_pressure_rss_and_separate_footprints(
 
     proc_call = ProcCall()
     monkeypatch.setattr(production.subprocess, "run", run)
-    monkeypatch.setattr(production.ctypes, "CDLL", lambda *_a, **_kw: SimpleNamespace(proc_pid_rusage=proc_call))
+    monkeypatch.setattr(
+        production.ctypes, "CDLL", lambda *_a, **_kw: SimpleNamespace(proc_pid_rusage=proc_call)
+    )
     monkeypatch.setattr(production.os, "getppid", lambda: 999)
     monkeypatch.setattr(production.os, "getpgid", lambda _pid: 123)
     monkeypatch.setattr(production, "_process_group_exists", lambda _group: True)
@@ -1321,9 +1568,7 @@ def test_sample_memory_timeout_kills_and_reaps_inside_its_five_second_budget(
     worker = Worker()
     monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(production.subprocess, "Popen", lambda *_a, **_kw: worker)
-    monkeypatch.setattr(
-        production.os, "killpg", lambda pid, sig: killed.append((pid, sig))
-    )
+    monkeypatch.setattr(production.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
 
     with pytest.raises(production.RunnerError, match="timed out"):
         production._sample_memory(None)
@@ -1333,9 +1578,7 @@ def test_sample_memory_timeout_kills_and_reaps_inside_its_five_second_budget(
     assert killed == [(777, production.signal.SIGKILL)]
 
 
-def test_sample_memory_propagates_operator_interrupt_after_reaping_worker(
-    production, monkeypatch
-):
+def test_sample_memory_propagates_operator_interrupt_after_reaping_worker(production, monkeypatch):
     killed = []
 
     class Worker:
@@ -1434,9 +1677,7 @@ def test_process_group_rss_does_not_retry_after_the_total_budget_is_spent(produc
     assert timeouts == [0.125]
 
 
-def test_monitor_stops_and_reaps_after_memory_sampling_timeout(
-    production, tmp_path, monkeypatch
-):
+def test_monitor_stops_and_reaps_after_memory_sampling_timeout(production, tmp_path, monkeypatch):
     clock = [100.0]
     calls = []
     terminated = []
@@ -2147,10 +2388,10 @@ def test_resource_monitor_stops_and_reaps_without_starting_more_work(
     def sample(group, *, timeout):
         assert 0 < timeout <= 5
         if stop == "unknown_resources":
-            raise production.RunnerError("bounded memory sample failed: resource inspection unavailable")
-        return _memory_sample(
-            group, rss=24 * 1024**3 + 1 if stop == "rss" else 0
-        )
+            raise production.RunnerError(
+                "bounded memory sample failed: resource inspection unavailable"
+            )
+        return _memory_sample(group, rss=24 * 1024**3 + 1 if stop == "rss" else 0)
 
     free = production.RUN_LIMITS["minimum_free_bytes"] - (1 if stop == "free_space" else 0)
     monkeypatch.setattr(production.time, "monotonic", lambda: clock[0])
@@ -2293,6 +2534,9 @@ def test_invoke_requires_normal_pressure_before_starting_any_child(
     assert result == (None, "memory pressure was not normal before supervised work", True)
     saved = json.loads((tmp_path / "session.json").read_text())
     assert saved["memory_preflight_samples"][0]["system_memory_pressure"] == pressure
+    assert saved["memory_preflight_samples"][0]["memory_policy_version"] == 2
+    assert saved["memory_preflight_samples_total"] == 1
+    assert saved["memory_preflight_samples_dropped"] == 0
     assert not (tmp_path / "stdout").exists()
     assert not (tmp_path / "stderr").exists()
 
@@ -2387,6 +2631,8 @@ def test_invoke_clamps_preflight_to_shared_deadline_and_records_metrics(
     assert result == (0, None, True)
     assert len(timeouts) == 1 and 2 < timeouts[0] <= 3
     assert report["memory_preflight_samples"][0]["system_memory_pressure"] == "normal"
+    assert report["memory_preflight_samples"][0]["memory_policy_version"] == 2
+    assert report["memory_preflight_samples_total"] == 1
 
 
 def test_refresh_worker_rejects_nonpublic_origin_before_creating_operator_data(

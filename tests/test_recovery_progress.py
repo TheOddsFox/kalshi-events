@@ -151,6 +151,46 @@ def test_offline_build_progress_rejects_invalid_counts(tmp_path, counter):
         metrics.progress("landing", **counter)
 
 
+def test_phase_progress_io_failure_does_not_abort_work(tmp_path, monkeypatch):
+    with metrics.collect(progress_path=tmp_path / "metrics.json.progress.json") as measured:
+
+        def unavailable(*_args, **_kwargs):
+            raise OSError("progress companion temporarily unavailable")
+
+        monkeypatch.setattr(measured, "progress", unavailable)
+        with metrics.phase("landing"):
+            measured.add("observations_emitted", 1)
+        assert measured.counters["observations_emitted"] == 1
+        assert measured.counters["progress_write_failures"] == 1
+        assert "landing" in measured.timings
+
+
+def test_phase_progress_io_failure_preserves_work_exception(tmp_path, monkeypatch):
+    with metrics.collect(progress_path=tmp_path / "metrics.json.progress.json") as measured:
+
+        def unavailable(*_args, **_kwargs):
+            raise OSError("progress companion temporarily unavailable")
+
+        monkeypatch.setattr(measured, "progress", unavailable)
+        with (
+            pytest.raises(RuntimeError, match="actual work failure"),
+            metrics.phase("landing"),
+        ):
+            raise RuntimeError("actual work failure")
+
+
+def test_final_progress_io_failure_does_not_change_success(tmp_path, monkeypatch):
+    def unavailable_finish(self, failed):
+        assert failed is False
+        raise OSError("final progress write unavailable")
+
+    monkeypatch.setattr(metrics.Metrics, "_finish_progress", unavailable_finish)
+    with metrics.collect(progress_path=tmp_path / "metrics.json.progress.json") as measured:
+        measured.add("completed_work", 1)
+    assert measured.counters["completed_work"] == 1
+    assert measured.counters["progress_write_failures"] == 1
+
+
 def test_first_data_request_progress_uses_non_cutoff_http_attempt_time(tmp_path, monkeypatch):
     clock = {"now": 0.0}
     monkeypatch.setattr("kalshi_events.transport.time.monotonic", lambda: clock["now"])
