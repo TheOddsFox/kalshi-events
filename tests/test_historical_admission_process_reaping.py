@@ -302,17 +302,18 @@ def test_worker_rejects_invalid_or_out_of_range_supervisor_deadlines():
 
 
 def test_real_native_worker_supervisor_completes_all_four_row_phases(tmp_path):
-    capture_id, task_indices = _write_four_row_worker_fixture(tmp_path / "fixture")
     operator_root = tmp_path / "operator"
     output_root = tmp_path / "supervisor-output"
     operator_root.mkdir()
     output_root.mkdir()
+    fixture_root = output_root / "fixture"
+    capture_id, task_indices = _write_four_row_worker_fixture(fixture_root)
     started = time.monotonic()
 
-    result = admission._run_admission_child(
+    child_args = dict(
         benchmark=benchmark,
         output_root=output_root,
-        fixture_root=tmp_path / "fixture",
+        fixture_root=fixture_root,
         capture_id=capture_id,
         task_indices=task_indices,
         target=4,
@@ -321,6 +322,15 @@ def test_real_native_worker_supervisor_completes_all_four_row_phases(tmp_path):
         device=tmp_path.stat().st_dev,
         operator_root=operator_root,
     )
+    marker = (fixture_root / ".diagnostic-sample.json").read_bytes()
+    result = admission._run_admission_child(**child_args)
+
+    assert (fixture_root / "tmp" / "verification").is_dir()
+    admission._clear_worker_outputs(fixture_root, capture_id)
+    assert not (fixture_root / "tmp" / "verification").exists()
+    assert (fixture_root / ".diagnostic-sample.json").read_bytes() == marker
+
+    result = admission._run_admission_child(**child_args)
 
     assert result["observations"] == 4
     assert result["complete"] is False
@@ -346,6 +356,100 @@ def test_real_native_worker_supervisor_completes_all_four_row_phases(tmp_path):
     assert type(result["verification_peak_temporary_allocated_bytes"]) is int
 
 
+def test_supervisor_build_database_high_water_includes_coexisting_wal_and_index(tmp_path):
+    worker = tmp_path / "burst_worker.py"
+    worker.write_text(
+        """\
+import json, sys, time
+from pathlib import Path
+arguments = sys.argv
+fixture = Path(arguments[arguments.index('--fixture-root') + 1])
+report = Path(arguments[arguments.index('--worker-report') + 1])
+deadline = float(arguments[arguments.index('--admission-deadline-monotonic') + 1])
+phase = fixture / '.benchmark-phase'
+temporary = fixture / 'tmp'
+temporary.mkdir(exist_ok=True)
+database = temporary / 'warehouse.duckdb'
+wal = temporary / 'warehouse.duckdb.wal'
+index = temporary / 'index.sqlite'
+database.write_bytes(b'd' * (2 * 1024 * 1024))
+wal.write_bytes(b'w' * (1024 * 1024))
+index.write_bytes(b'i' * (256 * 1024))
+phase.write_text('build', encoding='ascii')
+time.sleep(0.65)
+database.write_bytes(b'd' * 4096)
+wal.unlink()
+index.write_bytes(b'i' * 1024)
+phase.write_text('export', encoding='ascii')
+time.sleep(0.35)
+phase.write_text('verification', encoding='ascii')
+time.sleep(0.35)
+phase.unlink()
+report.write_text(json.dumps({
+    'effective_deadline_kind': 'absolute_monotonic_from_supervisor',
+    'effective_deadline_monotonic': deadline,
+    'effective_deadline_remaining_at_worker_entry_seconds': 1100,
+    'effective_store_limit_seconds': 1000,
+    'complete': False,
+    'certified': False,
+    'published': False,
+    'verification': {'complete': True},
+    'verification_seconds': 0.1,
+    'elapsed_seconds': 1.2,
+    'build_database_component_bytes': 8192,
+    'build_database_allocated_component_bytes': 4096,
+    'build_phase_temporary_bytes': 0,
+    'build_phase_temporary_allocated_bytes': 0,
+    'export_phase_temporary_bytes': 0,
+    'export_phase_temporary_allocated_bytes': 0,
+    'verification_phase_temporary_bytes': 0,
+    'verification_phase_temporary_allocated_bytes': 0,
+    'export_bytes': 1,
+    'spill_limit_enforced_by_store': True,
+    'spill_directory_configured': True,
+    'spill_limit_bytes': 1024,
+}), encoding='utf-8')
+""",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "supervisor-output"
+    output_root.mkdir()
+    fixture_root = output_root / "fixture"
+    fixture_root.mkdir()
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    started = time.monotonic()
+    fake_benchmark = SimpleNamespace(
+        __file__=worker,
+        _checkout=lambda: REPO,
+        _read_json=lambda path, _limit: json.loads(Path(path).read_text(encoding="utf-8")),
+    )
+
+    result = admission._run_admission_child(
+        benchmark=fake_benchmark,
+        output_root=output_root,
+        fixture_root=fixture_root,
+        capture_id="c" * 32,
+        task_indices=[0],
+        target=4,
+        start=started,
+        total_deadline=started + 2 * 60 * 60,
+        device=tmp_path.stat().st_dev,
+        operator_root=operator_root,
+    )
+
+    build = result["supervisor"]["phase_high_water"]["build"]
+    assert build["database_component_high_water_bytes"] >= 3 * 1024**2
+    assert build["database_component_allocated_high_water_bytes"] >= 3 * 1024**2
+    assert result["build_database_component_bytes"] == build["database_component_high_water_bytes"]
+    assert result["build_database_component_bytes"] > 8192
+    assert (
+        result["build_database_allocated_component_bytes"]
+        == build["database_component_allocated_high_water_bytes"]
+    )
+    assert result["build_database_allocated_component_bytes"] > 4096
+
+
 def test_failed_worker_preserves_partial_source_and_supervisor_evidence(tmp_path):
     worker = tmp_path / "failed_worker.py"
     worker.write_text(
@@ -359,6 +463,10 @@ temporary = fixture / 'tmp'
 temporary.mkdir(exist_ok=True)
 (fixture / '.benchmark-phase').write_text('build', encoding='ascii')
 (temporary / 'build.bin').write_bytes(b'b' * 1048576)
+(fixture / 'diagnostic-builds' / 'capture').mkdir(parents=True)
+(fixture / 'diagnostic-builds' / 'capture' / 'warehouse.duckdb').write_bytes(b'd' * 1048576)
+(fixture / 'diagnostic-builds' / 'capture' / 'warehouse.duckdb.wal').write_bytes(b'w' * 524288)
+(fixture / 'index.sqlite').write_bytes(b'i' * 262144)
 time.sleep(0.7)
 (fixture / '.benchmark-phase').write_text('export', encoding='ascii')
 (temporary / 'export.bin').write_bytes(b'e' * 2097152)
@@ -399,10 +507,10 @@ raise SystemExit(2)
 """,
         encoding="utf-8",
     )
-    fixture_root = tmp_path / "fixture"
-    (fixture_root / "tmp").mkdir(parents=True)
     output_root = tmp_path / "supervisor-output"
     output_root.mkdir()
+    fixture_root = output_root / "fixture"
+    (fixture_root / "tmp").mkdir(parents=True)
     operator_root = tmp_path / "operator"
     operator_root.mkdir()
     source_sample = {
@@ -451,6 +559,16 @@ raise SystemExit(2)
     assert partial["worker_progress"]["export_completed_relations"] == ["series"]
     assert partial["supervisor"]["phase_sample_coverage"]["build"] > 0
     assert partial["supervisor"]["phase_sample_coverage"]["export"] > 0
+    assert (
+        partial["supervisor"]["phase_high_water"]["build"]["database_component_high_water_bytes"]
+        >= 1_835_008
+    )
+    assert (
+        partial["supervisor"]["phase_high_water"]["build"][
+            "database_component_allocated_high_water_bytes"
+        ]
+        >= 1_835_008
+    )
     assert partial["build_peak_temporary_bytes"] >= 1_048_576
     assert partial["export_peak_temporary_bytes"] >= 3_145_728
     assert partial["verification_peak_temporary_bytes"] is None

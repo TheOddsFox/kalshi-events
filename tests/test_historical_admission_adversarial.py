@@ -28,6 +28,38 @@ benchmark = _load(
 admission = _load("historical_admission", REPO / "scripts/historical_admission.py")
 
 
+def _inject_scandir_stat_errors(monkeypatch, missing_path: Path, failures: int):
+    real_scandir = admission.os.scandir
+    attempts = {"missing_stat": 0}
+
+    class Entry:
+        def __init__(self, entry):
+            self.entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def stat(self, *, follow_symlinks=True):
+            if Path(self.path).absolute() == missing_path.absolute():
+                attempts["missing_stat"] += 1
+                if attempts["missing_stat"] <= failures:
+                    raise FileNotFoundError(2, "injected vanished entry", self.path)
+            return self.entry.stat(follow_symlinks=follow_symlinks)
+
+    class Scandir:
+        def __init__(self, path):
+            self.iterator = real_scandir(path)
+
+        def __enter__(self):
+            entries = sorted(self.iterator.__enter__(), key=lambda entry: entry.name)
+            return iter(Entry(entry) for entry in entries)
+
+        def __exit__(self, exception_type, exception, traceback):
+            return self.iterator.__exit__(exception_type, exception, traceback)
+
+    monkeypatch.setattr(admission.os, "scandir", lambda path: Scandir(path))
+    return attempts
+
+
 class _CaptureState(dict):
     verified_snapshot_sha256 = "c" * 64
 
@@ -558,6 +590,41 @@ def test_database_scenario_includes_existing_database_and_wal_baseline():
     assert any("database baseline plus" in item for item in forecast["blockers"])
 
 
+def test_build_database_phase_high_water_crosses_database_forecast_limit():
+    population, stages, baseline, old_stress = _forecast_inputs()
+    for stage in stages:
+        target = stage["target_observations"]
+        stage["build_database_component_bytes"] = target * 50
+        stage["build_database_allocated_component_bytes"] = target * 45
+
+    terminal_size = admission._admission_forecast(population, stages, baseline, old_stress)
+    assert terminal_size["supported"] is True
+
+    for stage in stages:
+        target = stage["target_observations"]
+        stage["build_database_component_bytes"] = target * 50_000
+        stage["build_database_allocated_component_bytes"] = target * 40_000
+
+    high_water = admission._admission_forecast(population, stages, baseline, old_stress)
+
+    assert high_water["supported"] is False
+    assert high_water["endpoint_weighted"]["database_scenario_total_bytes"] > 96 * 1024**3
+    assert any("database baseline plus" in item for item in high_water["blockers"])
+
+
+def test_missing_build_database_phase_high_water_does_not_fall_back_to_terminal_size():
+    population, stages, baseline, old_stress = _forecast_inputs()
+    for stage in stages:
+        stage.pop("build_database_component_bytes")
+
+    forecast = admission._admission_forecast(population, stages, baseline, old_stress)
+
+    assert forecast["supported"] is False
+    assert any(
+        "multi-scale resource telemetry is incomplete" in item for item in forecast["blockers"]
+    )
+
+
 def test_verification_workspace_is_included_in_phase_and_temporary_scenarios():
     population, stages, baseline, old_stress = _forecast_inputs()
     for stage in stages:
@@ -667,6 +734,124 @@ def test_storage_accounting_counts_database_and_tmp_logically_but_deduplicates_i
     assert measured["aggregate_allocated_bytes"] == (
         database.stat().st_blocks * 512 + output_file.stat().st_blocks * 512
     )
+
+
+def test_nested_and_separate_output_roots_have_the_same_storage_totals(tmp_path):
+    production = tmp_path / "production"
+    operator = production / "operator"
+    operator.mkdir(parents=True)
+    (operator / "warehouse.duckdb").write_bytes(b"o" * 7)
+    nested_output = production / "diagnostic-output"
+    nested_output.mkdir()
+    (nested_output / "report.json").write_bytes(b"n" * 11)
+    separate_output = tmp_path / "separate-output"
+
+    nested = admission._measure_admission_storage(
+        operator, production, nested_output, device=operator.stat().st_dev
+    )
+    nested_output.rename(separate_output)
+    separate = admission._measure_admission_storage(
+        operator, production, separate_output, device=operator.stat().st_dev
+    )
+
+    assert nested["external"]["logical_bytes"] == 0
+    assert nested["aggregate_logical_bytes"] == 18
+    assert nested["aggregate_logical_bytes"] == separate["aggregate_logical_bytes"]
+    assert nested["aggregate_allocated_bytes"] == separate["aggregate_allocated_bytes"]
+
+
+def test_tree_inventory_retries_one_enoent_without_double_counts_or_inode_loss(
+    tmp_path, monkeypatch
+):
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir()
+    prior_file = prior_root / "prior.bin"
+    prior_file.write_bytes(b"p" * 13)
+    allocated_inodes = set()
+    prior_totals = admission._measure_tree(prior_root, allocated_inodes=allocated_inodes)
+    prior_snapshot = dict(prior_totals)
+    previous_inodes = set(allocated_inodes)
+
+    root = tmp_path / "tree"
+    first_file = root / "a-first.bin"
+    vanished_file = root / "b-dir" / "z-vanish.wal"
+    vanished_file.parent.mkdir(parents=True)
+    first_file.write_bytes(b"a" * 17)
+    vanished_file.write_bytes(b"v" * 19)
+    failures = _inject_scandir_stat_errors(monkeypatch, vanished_file, failures=1)
+
+    measured = admission._measure_tree(
+        root, device=root.stat().st_dev, allocated_inodes=allocated_inodes
+    )
+
+    expected_inodes = {
+        (path.stat().st_dev, path.stat().st_ino) for path in (first_file, vanished_file)
+    }
+    expected_allocated = sum(path.stat().st_blocks * 512 for path in (first_file, vanished_file))
+    assert failures["missing_stat"] == 2
+    assert measured["logical_bytes"] == first_file.stat().st_size + vanished_file.stat().st_size
+    assert measured["entries"] == 3
+    assert measured["allocated_bytes"] == expected_allocated
+    assert allocated_inodes == previous_inodes | expected_inodes
+    assert prior_totals == prior_snapshot
+
+
+def test_tree_inventory_fails_after_three_enoent_retries_without_mutating_prior_inodes(
+    tmp_path, monkeypatch
+):
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir()
+    prior_file = prior_root / "prior.bin"
+    prior_file.write_bytes(b"p" * 13)
+    allocated_inodes = set()
+    prior_totals = admission._measure_tree(prior_root, allocated_inodes=allocated_inodes)
+    prior_snapshot = dict(prior_totals)
+    previous_inodes = set(allocated_inodes)
+
+    root = tmp_path / "tree"
+    (root / "b-dir").mkdir(parents=True)
+    (root / "a-first.bin").write_bytes(b"a" * 17)
+    vanished_file = root / "b-dir" / "z-vanish.wal"
+    vanished_file.write_bytes(b"v" * 19)
+    failures = _inject_scandir_stat_errors(monkeypatch, vanished_file, failures=3)
+
+    with pytest.raises(FileNotFoundError):
+        admission._measure_tree(root, device=root.stat().st_dev, allocated_inodes=allocated_inodes)
+
+    assert failures["missing_stat"] == 3
+    assert allocated_inodes == previous_inodes
+    assert prior_totals == prior_snapshot
+
+
+def test_tree_inventory_does_not_retry_permission_errors_or_symlinks(tmp_path, monkeypatch):
+    root = tmp_path / "permission-tree"
+    denied = root / "b-denied"
+    denied.mkdir(parents=True)
+    (root / "a-first.bin").write_bytes(b"a" * 17)
+    real_scandir = admission.os.scandir
+    attempts = {"denied": 0}
+
+    def deny_directory(path):
+        if Path(path).absolute() == denied.absolute():
+            attempts["denied"] += 1
+            raise PermissionError("injected denied directory")
+        return real_scandir(path)
+
+    monkeypatch.setattr(admission.os, "scandir", deny_directory)
+    allocated_inodes = set()
+    with pytest.raises(PermissionError):
+        admission._measure_tree(root, device=root.stat().st_dev, allocated_inodes=allocated_inodes)
+    assert attempts["denied"] == 1
+    assert allocated_inodes == set()
+
+    monkeypatch.setattr(admission.os, "scandir", real_scandir)
+    symlink_root = tmp_path / "symlink-tree"
+    symlink_root.mkdir()
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"target")
+    (symlink_root / "linked.bin").symlink_to(target)
+    with pytest.raises(RuntimeError, match="link or crossed filesystem"):
+        admission._measure_tree(symlink_root, device=symlink_root.stat().st_dev)
 
 
 def test_verification_duckdb_config_is_bounded_and_spill_is_in_all_categories(tmp_path):

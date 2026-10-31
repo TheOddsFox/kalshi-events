@@ -631,6 +631,12 @@ compression tails, and observed repeated-entity and combo characteristics.
 
 Record database plus WAL, indexes, spill, export and verification workspaces
 throughout their phases, including logical and allocated bytes and sample gaps.
+Database forecasts use the sampled coexisting database/WAL/index peak as well as
+the checkpointed size; a smaller file after checkpointing cannot erase a WAL peak.
+Between sample targets, clear only recognized diagnostic build, export and
+verification workspaces, retaining the selected receipts for the next target.
+Inventory scans allow at most three attempts for transient file disappearance; persistent
+churn, unsafe paths or other errors still stop the diagnostic.
 Observed peaks can miss short bursts; they are not hard quotas. A staged database
 counts as both database and temporary storage. Retained database and exports must
 coexist in export/verification forecasts even after the database leaves `tmp/`.

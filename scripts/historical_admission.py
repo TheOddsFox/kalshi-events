@@ -496,39 +496,13 @@ def _measure_tree(
 ) -> dict[str, Any]:
     root = root.absolute()
     exclude = set() if exclude is None else {path.absolute() for path in exclude}
-    allocated_inodes = set() if allocated_inodes is None else allocated_inodes
-    totals = {
-        "logical_bytes": 0,
-        "allocated_bytes": 0,
-        "database_bytes": 0,
-        "database_allocated_bytes": 0,
-        "temporary_bytes": 0,
-        "temporary_allocated_bytes": 0,
-        "index_bytes": 0,
-        "index_allocated_bytes": 0,
-        "spill_bytes": 0,
-        "spill_allocated_bytes": 0,
-        "export_bytes": 0,
-        "export_allocated_bytes": 0,
-        "verification_bytes": 0,
-        "verification_allocated_bytes": 0,
-        "entries": 0,
-        "device": device,
-    }
-    try:
-        root_info = root.lstat()
-    except FileNotFoundError:
-        totals["logical_minus_allocated_bytes"] = 0
-        return totals
-    if device is None:
-        device = root_info.st_dev
-        totals["device"] = device
-    if not stat.S_ISDIR(root_info.st_mode) or root_info.st_dev != device:
-        raise RuntimeError(f"admission inventory root is unsafe or crossed devices: {root}")
-    if totals["device"] is None:
-        totals["device"] = root_info.st_dev
 
-    def walk(directory: Path, parts: tuple[str, ...]) -> None:
+    def walk(
+        directory: Path,
+        parts: tuple[str, ...],
+        totals: dict[str, Any],
+        attempt_allocated_inodes: set[tuple[int, int]],
+    ) -> None:
         with os.scandir(directory) as children:
             for child in children:
                 path = Path(child.path).absolute()
@@ -541,17 +515,17 @@ def _measure_tree(
                 if info.st_dev != totals["device"] or stat.S_ISLNK(info.st_mode):
                     raise RuntimeError("admission inventory contains a link or crossed filesystem")
                 if stat.S_ISDIR(info.st_mode):
-                    walk(path, (*parts, child.name))
+                    walk(path, (*parts, child.name), totals, attempt_allocated_inodes)
                     continue
                 if not stat.S_ISREG(info.st_mode):
                     raise RuntimeError("admission inventory contains a nonregular artifact")
                 totals["logical_bytes"] += info.st_size
                 identity = (info.st_dev, info.st_ino)
                 allocated = 0
-                if identity not in allocated_inodes:
+                if identity not in attempt_allocated_inodes:
                     allocated = info.st_blocks * 512
                     totals["allocated_bytes"] += allocated
-                    allocated_inodes.add(identity)
+                    attempt_allocated_inodes.add(identity)
                 if child.name.endswith((".duckdb", ".wal")):
                     totals["database_bytes"] += info.st_size
                     totals["database_allocated_bytes"] += allocated
@@ -574,9 +548,54 @@ def _measure_tree(
                     totals["verification_bytes"] += info.st_size
                     totals["verification_allocated_bytes"] += allocated
 
-    walk(root, ())
-    totals["logical_minus_allocated_bytes"] = totals["logical_bytes"] - totals["allocated_bytes"]
-    return totals
+    for attempt in range(3):
+        totals = {
+            "logical_bytes": 0,
+            "allocated_bytes": 0,
+            "database_bytes": 0,
+            "database_allocated_bytes": 0,
+            "temporary_bytes": 0,
+            "temporary_allocated_bytes": 0,
+            "index_bytes": 0,
+            "index_allocated_bytes": 0,
+            "spill_bytes": 0,
+            "spill_allocated_bytes": 0,
+            "export_bytes": 0,
+            "export_allocated_bytes": 0,
+            "verification_bytes": 0,
+            "verification_allocated_bytes": 0,
+            "entries": 0,
+            "device": device,
+        }
+        attempt_allocated_inodes = set(allocated_inodes or ())
+        try:
+            root_info = root.lstat()
+        except FileNotFoundError:
+            if attempt:
+                raise
+            totals["logical_minus_allocated_bytes"] = 0
+            return totals
+        if device is None:
+            device = root_info.st_dev
+        if not stat.S_ISDIR(root_info.st_mode) or root_info.st_dev != device:
+            raise RuntimeError(f"admission inventory root is unsafe or crossed devices: {root}")
+        if totals["device"] is None:
+            totals["device"] = root_info.st_dev
+
+        try:
+            walk(root, (), totals, attempt_allocated_inodes)
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+            continue
+
+        totals["logical_minus_allocated_bytes"] = (
+            totals["logical_bytes"] - totals["allocated_bytes"]
+        )
+        if allocated_inodes is not None:
+            allocated_inodes.update(attempt_allocated_inodes)
+        return totals
+    raise RuntimeError("admission inventory did not complete")
 
 
 def _measure_admission_storage(
@@ -592,7 +611,7 @@ def _measure_admission_storage(
         production_root,
         device=device,
         allocated_inodes=inodes,
-        exclude={operator_root},
+        exclude={operator_root, output_root},
     )
     output = _measure_tree(output_root, device=device, allocated_inodes=inodes)
     return {
@@ -1545,6 +1564,7 @@ def _clear_worker_outputs(fixture_root: Path, capture_id: str) -> None:
         "tmp/compact-benchmark",
         "tmp/compact-exports",
         f"diagnostic-builds/{capture_id}",
+        "tmp/verification",
     ):
         path = fixture_root / relative
         if path.is_symlink():
@@ -1918,6 +1938,8 @@ def _run_admission_child(
                             "samples": 0,
                             "logical_high_water_bytes": 0,
                             "allocated_high_water_bytes": 0,
+                            "database_component_high_water_bytes": 0,
+                            "database_component_allocated_high_water_bytes": 0,
                             "temporary_high_water_bytes": 0,
                             "temporary_allocated_high_water_bytes": 0,
                             "spill_high_water_bytes": 0,
@@ -1956,6 +1978,14 @@ def _run_admission_child(
                     )
                     current_phase["allocated_high_water_bytes"] = max(
                         current_phase["allocated_high_water_bytes"], current["allocated_bytes"]
+                    )
+                    current_phase["database_component_high_water_bytes"] = max(
+                        current_phase["database_component_high_water_bytes"],
+                        current["database_bytes"] + current["index_bytes"],
+                    )
+                    current_phase["database_component_allocated_high_water_bytes"] = max(
+                        current_phase["database_component_allocated_high_water_bytes"],
+                        current["database_allocated_bytes"] + current["index_allocated_bytes"],
                     )
                     current_phase["temporary_high_water_bytes"] = max(
                         current_phase["temporary_high_water_bytes"], temporary["logical_bytes"]
@@ -2095,6 +2125,29 @@ def _run_admission_child(
             certified=False,
             published=False,
             complete=False,
+        )
+        build_phase = phase_totals.get("build", {})
+        build_database_peak = build_phase.get("database_component_high_water_bytes")
+        build_database_allocated_peak = build_phase.get(
+            "database_component_allocated_high_water_bytes"
+        )
+        terminal_database_component_bytes = result.get("build_database_component_bytes")
+        terminal_database_allocated_component_bytes = result.get(
+            "build_database_allocated_component_bytes"
+        )
+        result["build_database_component_bytes"] = (
+            max(terminal_database_component_bytes, build_database_peak)
+            if build_phase.get("samples", 0) > 0
+            and _is_size(terminal_database_component_bytes)
+            and _is_size(build_database_peak)
+            else None
+        )
+        result["build_database_allocated_component_bytes"] = (
+            max(terminal_database_allocated_component_bytes, build_database_allocated_peak)
+            if build_phase.get("samples", 0) > 0
+            and _is_size(terminal_database_allocated_component_bytes)
+            and _is_size(build_database_allocated_peak)
+            else None
         )
         result["telemetry_complete"] = result["supervisor"]["telemetry_complete"]
         result["verification_complete"] = result.get("verification", {}).get("complete") is True
