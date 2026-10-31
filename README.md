@@ -4,6 +4,9 @@ Independent, operator-invoked historical catalogue of public Kalshi event contra
 
 See [native contracts and storage/publication formats](docs/contracts.md) for compatibility, recovery and incremental freshness boundaries.
 
+See [historical production completion](docs/remaining-work.md) for verified defects,
+capacity and storage blockers, and the remaining acceptance gates.
+
 Python 3.12 and uv are required:
 
 ```sh

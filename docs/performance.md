@@ -453,7 +453,7 @@ The session begins after code verification and records the frozen revision, inst
 
 Limits are 850,000 attempts, 256 GiB encoded downloads, 400 GiB aggregate retained session storage, a 350 GiB operator-root ceiling, and 64 GiB temporary/database sublimits. At least 150 GiB of SSD space must remain free. Each response is bounded at 384 MiB encoded and 768 MiB decoded. Every 15 seconds the supervisor samples free space and process resources; summed descendant RSS above 24 GiB for 60 seconds stops work. Shared pages can be counted repeatedly in that conservative RSS sum. These checks do not turn dlt's post-load accounting into a hard write quota.
 
-The supervisor also stops at 20 GiB of logical pages stored in the macOS compressor, measured system-wide; other applications can contribute to that threshold. RSS alone misses compressed or swapped allocations. Resource probes use fresh remaining UTC and monotonic allowances so monitoring preserves the termination reserve. An explicitly reconciled resume may use validated download upper bounds after a resolved resource stop, without resetting the session or claiming exact downloaded bytes. `--extend-session` can consume one fixed 48-hour window per report only with the exact capture and explicit accounting reconciliation; the grant is recorded and consumed before offline accounting preflight, which counts against the window. Ordinary resume keeps the effective clock, and attempt, download and storage ceilings remain cumulative.
+The supervisor requires valid macOS memory-pressure telemetry and NORMAL pressure before processing. During work, NORMAL resets the warning timer, WARN stops work after 60 continuously observed seconds, and CRITICAL stops work at the first observed sample. Samples are taken every 15 seconds; gaps above 22.5 seconds cannot establish continuous warning or RSS duration. Unavailable telemetry fails closed. Logical contents stored in the compressor and physical compressor occupancy are reported separately as system-wide measurements; neither alone triggers a stop or establishes worker responsibility. RSS alone misses compressed or swapped allocations. Resource probes use fresh remaining UTC and monotonic allowances so monitoring preserves the termination reserve. An explicitly reconciled resume may use validated download upper bounds after a resolved resource stop, without resetting the session or claiming exact downloaded bytes. `--extend-session` can consume one fixed 48-hour window per report only with the exact capture and explicit accounting reconciliation; the grant is recorded and consumed before offline accounting preflight, which counts against the window. Ordinary resume keeps the effective clock, and attempt, download and storage ceilings remain cumulative.
 
 Protocol-5 unscoped full-capture recovery can reuse a private persistent SQLite parent index, with an 8 MiB page cache and memory mapping disabled, only when the root already has a validated logical root ID. Without that ID, acquisition-first recovery still applies using the disposable index; the cache does not create a root ID. The index is an ordered-prefix hint bound to the root, sealed capture settings, protocol, normalization version and journal anchor; it is never evidence or certification. Resume validates the durable snapshot/journal first, prioritizes available acquisition requests, and then indexes older verified receipts in journal order. This ordering depends on a validated snapshot; if it is absent, recovery may need to replay the full authoritative journal before networking begins. Its separate checkpoint is a soft trigger after 100 indexed pages or five seconds at a page boundary. A stale, ahead, incompatible or corrupt cache can be discarded and rebuilt, subject to the original storage and time budgets, while unsafe settings, journal or evidence still fail closed. Completion requires current-invocation verified receipts and a fresh parent-closure check; warm cache rows are reset before that pass, while a cold clean accumulator can be reused. Legacy, targeted, scoped-series and incremental capture behavior is unchanged; published builds remain independently verified.
 
@@ -572,3 +572,38 @@ python scripts/benchmark-historical-compact.py \
 ```
 
 The RSS increase was consistent across the three measured pairs. Direct Arrow registration may overlap batch/page buffers with DuckDB insert/compression buffers, unlike staged loading, but no allocation trace was collected and this explanation remains a hypothesis. No memory-leak claim or memory-saving claim follows. The original failed reports remain intact; the root/temp capacity correction is a separate artifact. The model preserves distinct 350 GiB root and 400 GiB aggregate limits and labels its 35 GB baseline assumption as unverified.
+
+
+## October 31 historical completion investigation
+
+A fresh stratified saved-evidence sample contained 143 data receipts plus one
+cutoff control, yielding 116,323 observations. Compact storage used 72,888,320
+bytes. An exact reversible rule-template/dictionary experiment used 100,151,296
+bytes after checkpoint: 37.4% larger. All payload strings were distinct; repeated
+rule strings did not establish a useful complete-payload deduplication opportunity.
+Both layouts matched all landing columns and six public relations by two-way
+`EXCEPT ALL`; the experimental database opened standalone. The experimental
+layout was rejected and is not shipped in the historical loader.
+
+Using the prior endpoint-weighted landing estimate only as a sensitivity gives
+53,209,532,054 bytes for compact storage and 73,111,900,436 bytes for the
+experiment. Both exceed 48 GiB. Wide/high-entropy rules and full-scale spill
+remain unmeasured, so neither is a formal upper bound or an admission result.
+Artifacts and parity receipts remain under ignored
+`data/testing/consolidation-20261031/capacity/`.
+
+After repairing its observer signature, the offline recovery harness completed one
+1,000-page primary-cold measured pair without warmup. Time to the first new data
+attempt was 1.565 seconds for frozen reference `4d9da926` and 0.551 seconds for
+the candidate worktree based on `9f33ae8`; old prefix body reads were 1,000 and
+zero respectively. This worker-only smoke uses a fake HTTP client and excludes
+production supervisor preflight/accounting. It is not evidence for the complete
+five-minute startup target.
+
+The 163,000-page fixture seeded in 116.9 seconds, but copying it for the reference
+run exceeded the unchanged 180-second child allowance. No representative timing
+pair resulted; warm/hydration target runs and the requested warmup/three pairs
+remain unmeasured. Failed reports were preserved under ignored
+`data/testing/consolidation-20261031/recovery/`. No networking, production cleanup,
+new grant, publication or activation occurred. Historical production is still
+not admitted; see [remaining work](remaining-work.md).
