@@ -483,7 +483,7 @@ def test_missing_delta_persists_fresh_cumulative_receipts_for_safe_reconciliatio
     assert stopped_again["downloaded_bytes"] is None
     assert stopped_again["downloaded_bytes_upper_bound"] == charge * 2
     assert stopped_again["accounting_complete"] is False
-    first_limits = json.loads(workflow.commands[0][-1])
+    first_limits = json.loads(workflow.commands[0][-2])
     assert first_limits["max-requests"] == production.RUN_LIMITS["attempts"] - 10
     assert first_limits["max-download-bytes"] == production.RUN_LIMITS["downloaded_bytes"] - charge
 
@@ -505,7 +505,7 @@ def test_missing_delta_persists_fresh_cumulative_receipts_for_safe_reconciliatio
     )
 
     assert code == 0, recovered
-    second_limits = json.loads(workflow.commands[1][-1])
+    second_limits = json.loads(workflow.commands[1][-2])
     assert second_limits["max-requests"] == production.RUN_LIMITS["attempts"] - 12
     assert (
         second_limits["max-download-bytes"]

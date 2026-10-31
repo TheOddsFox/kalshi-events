@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,104 @@ def _benchmark_args(operator_root, output_dir):
         output_dir=output_dir,
         capture_id="a" * 32,
     )
+
+
+def test_protected_index_bytes_keeps_legacy_parent_index_control(tmp_path):
+    root = tmp_path / "operator"
+    index = root / "tmp" / "parent-index-1-0123456789ab" / "index.sqlite"
+    index.parent.mkdir(parents=True)
+    index.write_bytes(b"legacy index")
+
+    assert benchmark._protected_index_bytes(root) == len(b"legacy index")
+
+
+def test_protected_index_bytes_counts_recovery_tree_and_all_sidecars(tmp_path):
+    root = tmp_path / "operator"
+    temporary = root / "tmp"
+    parent = temporary / "parent-index-1-0123456789ab"
+    recovery = temporary / "recovery-index" / "capture"
+    unrelated = temporary / "build-historical-run"
+    parent.mkdir(parents=True)
+    recovery.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    protected = {
+        parent / "index.sqlite": b"p-index",
+        parent / "index.sqlite-wal": b"p-wal",
+        parent / "metadata.json": b"p-metadata",
+        recovery / "index.sqlite": b"r-index",
+        recovery / "index.sqlite-journal": b"r-journal",
+        recovery / "index.sqlite-wal": b"r-wal",
+        recovery / "index.sqlite-shm": b"r-shm",
+    }
+    for path, content in protected.items():
+        path.write_bytes(content)
+    (unrelated / "warehouse.duckdb").write_bytes(b"not protected")
+
+    assert benchmark._protected_index_bytes(root) == sum(map(len, protected.values()))
+
+
+def test_protected_index_bytes_accepts_absent_and_empty_tmp(tmp_path):
+    root = tmp_path / "operator"
+
+    assert benchmark._protected_index_bytes(root) == 0
+    (root / "tmp").mkdir(parents=True)
+    assert benchmark._protected_index_bytes(root) == 0
+
+
+@pytest.mark.parametrize(
+    "linked_path",
+    (
+        "tmp",
+        "tmp/parent-index-link",
+        "tmp/recovery-index/link-dir",
+        "tmp/recovery-index/cache/index.sqlite",
+    ),
+)
+def test_protected_index_bytes_rejects_symlinks_in_index_paths(tmp_path, linked_path):
+    root = tmp_path / "operator"
+    target = tmp_path / "outside"
+    target.mkdir()
+    if linked_path.endswith("index.sqlite"):
+        target = target / "index.sqlite"
+        target.write_bytes(b"outside")
+    link = root / linked_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target, target_is_directory=target.is_dir())
+
+    with pytest.raises(CatalogueError):
+        benchmark._protected_index_bytes(root)
+
+
+def test_protected_index_bytes_rejects_symlinked_root_ancestor(tmp_path):
+    actual = tmp_path / "actual"
+    (actual / "tmp" / "recovery-index").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(CatalogueError):
+        benchmark._protected_index_bytes(alias)
+
+
+def test_protected_index_bytes_rejects_nonregular_index_entries(tmp_path):
+    root = tmp_path / "operator"
+    recovery = root / "tmp" / "recovery-index"
+    recovery.mkdir(parents=True)
+    os.mkfifo(recovery / "fifo")
+
+    with pytest.raises(CatalogueError):
+        benchmark._protected_index_bytes(root)
+
+
+def test_protected_index_bytes_enforces_a_shared_entry_bound(tmp_path, monkeypatch):
+    root = tmp_path / "operator"
+    parent = root / "tmp" / "parent-index-1-0123456789ab"
+    parent.mkdir(parents=True)
+    (parent / "index.sqlite").write_bytes(b"index")
+    (parent / "metadata.json").write_bytes(b"metadata")
+    monkeypatch.setattr(benchmark, "MAX_CAPTURE_ENTRIES", 2)
+
+    with pytest.raises(CatalogueError):
+        benchmark._protected_index_bytes(root)
 
 
 def test_sample_selects_page_positions_and_size_tails_per_generation():

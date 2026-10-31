@@ -86,7 +86,7 @@ def workflow(production, historical_production_root, tmp_path, monkeypatch):
             settings = state.outcomes.pop(0) if state.outcomes else {}
             no_result = settings.pop("_no_result", False)
             if state.actual:
-                values = json.loads(command[-1])
+                values = json.loads(command[-2])
                 values.update(settings)
                 captured = io.StringIO()
                 with contextlib.redirect_stdout(captured):
@@ -95,16 +95,17 @@ def workflow(production, historical_production_root, tmp_path, monkeypatch):
                         paths["report"],
                         paths["metrics"],
                         paths["capture_notification"],
-                        command[-3],
-                        None if command[-2] == "-" else command[-2],
+                        command[-4],
+                        None if command[-3] == "-" else command[-3],
                         json.dumps(values),
+                        command[-1],
                     )
                 value = json.loads(captured.getvalue())
                 production._merge_capture_notification(report, paths["capture_notification"])
             else:
                 if not operator.exists():
                     shutil.copytree(source, operator)
-                production._bind_owner(directory, snapshot["root_id"], command[-3])
+                production._bind_owner(directory, snapshot["root_id"], command[-4])
                 value = {
                     "complete": True,
                     "capture_id": manifest["capture_id"],
@@ -211,12 +212,12 @@ def test_full_workflow_verifies_before_activating_a_single_production_database(
     assert not (workflow.directory / "operator" / "current.json").exists()
     assert (workflow.directory / "operator" / "current-historical.json").is_file()
     command = workflow.commands[0]
-    assert command[-3] == "full"
-    limits = json.loads(command[-1])
+    assert command[-4] == "full"
+    limits = json.loads(command[-2])
     assert limits["max-rate"] == 5
     assert limits["compression"] == "gzip"
     assert limits["max-requests"] == 850000
-    assert workflow.commands[-1][-1] == f"historical:{workflow.manifest['source_release_id']}"
+    assert workflow.commands[-1][-3] == f"historical:{workflow.manifest['source_release_id']}"
 
 
 def test_complete_historical_capture_resumes_and_activates_v3(production, workflow):
@@ -252,15 +253,15 @@ def test_complete_historical_capture_resumes_and_activates_v3(production, workfl
     assert complete["error"] is None
     assert complete["recovery"] is None
     command = workflow.commands[1]
-    assert command[-3] == "resume"
-    assert command[-2] == workflow.manifest["capture_id"]
-    assert json.loads(command[-1])["max-requests"] == (
+    assert command[-4] == "resume"
+    assert command[-3] == workflow.manifest["capture_id"]
+    assert json.loads(command[-2])["max-requests"] == (
         production.RUN_LIMITS["attempts"] - partial["requests"]
     )
     assert complete["requests"] == partial["requests"]
     assert complete["downloaded_bytes"] == partial["downloaded_bytes"]
     assert complete["coverage_scope"] == "historical"
-    assert workflow.commands[-1][-1] == f"historical:{workflow.manifest['source_release_id']}"
+    assert workflow.commands[-1][-3] == f"historical:{workflow.manifest['source_release_id']}"
 
 
 def test_legacy_capture_resume_keeps_v2_activation(
@@ -302,7 +303,7 @@ def test_legacy_capture_resume_keeps_v2_activation(
     assert code == 0, result
     assert result["coverage_scope"] == "catalogue"
     assert result["production_state"] == "verified"
-    assert workflow.commands[-1][-1] == manifest["source_release_id"]
+    assert workflow.commands[-1][-3] == manifest["source_release_id"]
 
 
 def test_unknown_child_accounting_blocks_verification_activation_and_follow_on_networking(

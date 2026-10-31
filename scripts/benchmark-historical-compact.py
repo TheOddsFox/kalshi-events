@@ -421,7 +421,7 @@ def _verify_and_copy(
     return sample_rows, control_rows
 
 
-def _tree_bytes(root: Path) -> tuple[int, int]:
+def _tree_bytes(root: Path, entry_limit: int = 1_000_000) -> tuple[int, int]:
     if not root.exists():
         return 0, 0
     total = entries = 0
@@ -431,7 +431,7 @@ def _tree_bytes(root: Path) -> tuple[int, int]:
         with os.scandir(directory) as children:
             for child in children:
                 entries += 1
-                if entries > 1_000_000 or child.is_symlink():
+                if entries > entry_limit or child.is_symlink():
                     raise RuntimeError(
                         "benchmark artifact tree is unsafe or exceeds its entry bound"
                     )
@@ -669,16 +669,37 @@ def _retained_baseline(root: Path) -> dict[str, int]:
 
 
 def _protected_index_bytes(root: Path) -> int:
-    from kalshi_events.common import CatalogueError
+    from kalshi_events.common import CatalogueError, safe_path
 
-    directory = root / "tmp"
-    if not directory.exists():
+    directory = safe_path(root / "tmp")
+    try:
+        directory_info = directory.lstat()
+    except FileNotFoundError:
         return 0
-    total = 0
-    for path in directory.glob("parent-index-*/index.sqlite"):
-        if path.is_symlink() or not path.is_file():
-            raise CatalogueError("protected parent index is missing or unsafe")
-        total += path.stat().st_size
+    except OSError as error:
+        raise CatalogueError("temporary index inventory is unavailable or unsafe") from error
+    if not stat.S_ISDIR(directory_info.st_mode):
+        raise CatalogueError("temporary index inventory is not a directory")
+
+    total = entries = 0
+    with os.scandir(directory) as children:
+        for child in children:
+            entries += 1
+            if entries > MAX_CAPTURE_ENTRIES:
+                raise CatalogueError("temporary index inventory exceeds its entry bound")
+            if child.name != "recovery-index" and not child.name.startswith("parent-index-"):
+                continue
+            path = safe_path(Path(child.path))
+            if not stat.S_ISDIR(path.lstat().st_mode):
+                raise CatalogueError("protected index tree is not a directory")
+            try:
+                size, descendants = _tree_bytes(path, MAX_CAPTURE_ENTRIES - entries)
+            except (OSError, RuntimeError) as error:
+                raise CatalogueError(
+                    "protected index tree is unsafe or exceeds its entry bound"
+                ) from error
+            total += size
+            entries += descendants
     return total
 
 

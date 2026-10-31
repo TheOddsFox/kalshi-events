@@ -96,11 +96,11 @@ def test_live_storage_stops_on_a_single_sample_above_database_threshold(producti
     database = operator / "tmp" / f"build-historical-{report['capture_id']}" / "warehouse.duckdb"
     database.parent.mkdir(parents=True)
     with database.open("wb") as stream:
-        stream.truncate(int(production.RUN_LIMITS["storage_category_stop_bytes"]) + 1)
+        stream.truncate(int(production.RUN_LIMITS["storage_database_stop_bytes"]) + 1)
     reason = production._sample_live_storage(directory, operator, report, state, progress, external)
     assert reason == "live database storage reached the 56 GiB stop threshold"
     assert state["current"]["operator_database_bytes"] == (
-        int(production.RUN_LIMITS["storage_category_stop_bytes"]) + 1
+        int(production.RUN_LIMITS["storage_database_stop_bytes"]) + 1
     )
     assert state["target_interval_seconds"] == 1
     assert (
@@ -117,9 +117,94 @@ def test_live_storage_stops_on_temporary_burst_above_category_threshold(producti
     spool = operator / "tmp" / f"publish-{'c' * 32}" / "archive.tmp"
     spool.parent.mkdir(parents=True)
     with spool.open("wb") as stream:
-        stream.truncate(int(production.RUN_LIMITS["storage_category_stop_bytes"]) + 1)
+        stream.truncate(int(production.RUN_LIMITS["storage_temporary_stop_bytes"]) + 1)
     reason = production._sample_live_storage(directory, operator, report, state, progress, external)
     assert reason == "live temporary storage reached the 56 GiB stop threshold"
+
+
+@pytest.mark.parametrize(
+    ("category", "stop_key", "workspace", "filename", "threshold_gib"),
+    [
+        ("database", "storage_database_stop_bytes", "build-historical", "warehouse.duckdb", 112),
+        ("temporary", "storage_temporary_stop_bytes", "publish", "spill.bin", 168),
+    ],
+)
+def test_expanded_storage_stops_at_exact_threshold(
+    production, tmp_path, category, stop_key, workspace, filename, threshold_gib
+):
+    directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
+        tmp_path, production
+    )
+    token = production._ACTIVE_LIMITS.set(production._limits_for_profile("expanded"))
+    try:
+        state = production._begin_storage_supervision(
+            directory, operator, report, progress, external
+        )
+        capture_id = report["capture_id"]
+        if category == "database":
+            target = operator / "tmp" / f"{workspace}-{capture_id}" / filename
+        else:
+            target = operator / "tmp" / f"{workspace}-{capture_id}" / filename
+        target.parent.mkdir(parents=True)
+        with target.open("wb") as stream:
+            stream.truncate(int(production._limits_for_profile("expanded")[stop_key]))
+        reason = production._sample_live_storage(
+            directory, operator, report, state, progress, external
+        )
+        assert reason == f"live {category} storage reached the {threshold_gib} GiB stop threshold"
+    finally:
+        production._ACTIVE_LIMITS.reset(token)
+    assert (
+        production._effective_limits()["database_bytes"] == production.RUN_LIMITS["database_bytes"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "admission_bytes", "stop_bytes", "stop_gib"),
+    [
+        ("database", 96 * 1024**3, 112 * 1024**3, 112),
+        ("temporary", 144 * 1024**3, 168 * 1024**3, 168),
+    ],
+)
+def test_expanded_storage_baseline_uses_stop_threshold_not_forecast_admission(
+    production, tmp_path, category, admission_bytes, stop_bytes, stop_gib
+):
+    directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
+        tmp_path, production
+    )
+    field = f"operator_{category}_bytes"
+    token = production._ACTIVE_LIMITS.set(production._limits_for_profile("expanded"))
+    try:
+        report["storage"][field] = admission_bytes + 1
+        production._begin_storage_supervision(directory, operator, report, progress, external)
+        progress.unlink()
+        report["storage"][field] = stop_bytes
+        with pytest.raises(
+            production.RunnerError,
+            match=f"verified {category} storage baseline reaches the {stop_gib} GiB stop threshold",
+        ):
+            production._begin_storage_supervision(directory, operator, report, progress, external)
+    finally:
+        production._ACTIVE_LIMITS.reset(token)
+
+
+@pytest.mark.parametrize("category", ["database", "temporary"])
+def test_default_storage_baseline_keeps_strict_56_gib_stop(production, tmp_path, category):
+    directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
+        tmp_path, production
+    )
+    field = f"operator_{category}_bytes"
+    threshold = production.RUN_LIMITS[f"storage_{category}_stop_bytes"]
+    report["storage"][field] = threshold
+    production._begin_storage_supervision(directory, operator, report, progress, external)
+    progress.unlink()
+    report["storage"][field] = threshold + 1
+
+    with pytest.raises(
+        production.RunnerError,
+        match=f"verified {category} storage baseline reaches the 56 GiB stop threshold",
+    ):
+        production._begin_storage_supervision(directory, operator, report, progress, external)
 
 
 def test_live_storage_fails_closed_on_unknown_or_symlink_tmp_entries(production, tmp_path):
@@ -426,6 +511,31 @@ def test_stopped_worker_reconciliation_audits_then_clears_only_stale_group(
     assert saved["downloaded_bytes"] == original["downloaded_bytes"]
     assert saved["offline_historical_window"] == original["offline_historical_window"]
     assert audit["stale_process_group"] == child_group
+
+
+def test_stopped_worker_reconciliation_uses_saved_expanded_database_limit(
+    production, tmp_path, monkeypatch
+):
+    directory, operator, report_path, original, _child_group, _supervisor_pid = _stopped_session(
+        tmp_path, production, monkeypatch
+    )
+    production._bind_report_resource_profile(original, "expanded", transition=True)
+    report_path.write_text(json.dumps(original), encoding="utf-8")
+    runtime_root = production.SOURCE_ROOT / "data" / "runtime" / "run-1"
+    evidence_path = runtime_root / "logs" / "storage-safety-stop.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["database_limit_bytes"] = 128 * 1024**3
+    evidence["observed_database_bytes"] = 128 * 1024**3 + 1
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    monkeypatch.setattr(production, "_pid_exists", lambda _pid: False)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+
+    result = production._reconcile_stopped_worker(directory, original["capture_id"])
+
+    assert result["active_process_group"] is None
+    assert result["resource_profile"] == "expanded"
+    assert result["error"] == original["error"]
+    assert (operator / "stopped-worker-reconciliation.jsonl").is_file()
 
 
 def test_stopped_worker_reconciliation_rejects_reused_child_pid_in_another_group(

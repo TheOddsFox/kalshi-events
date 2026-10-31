@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -48,6 +49,26 @@ def candidate(certified_production_root, tmp_path):
     root = directory / "operator"
     shutil.copytree(source, root)
     warehouse = root / "builds-v2" / manifest["capture_id"] / "warehouse.duckdb"
+    return directory, root, warehouse, manifest
+
+
+@pytest.fixture(scope="module")
+def certified_historical_production_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp("historical-production-source") / "operator"
+    store = Store(root)
+    state = capture.capture(store, client_factory=FakeClient)
+    assert state["complete"] is True
+    manifest = publish.publish(store, state["capture_id"], catalogue_version=3)
+    return root, manifest
+
+
+@pytest.fixture
+def historical_candidate(certified_historical_production_root, tmp_path):
+    source, manifest = certified_historical_production_root
+    directory = tmp_path / "production"
+    root = directory / "operator"
+    shutil.copytree(source, root)
+    warehouse = root / "builds-historical" / manifest["capture_id"] / "warehouse.duckdb"
     return directory, root, warehouse, manifest
 
 
@@ -95,6 +116,146 @@ def test_activation_rejects_repository_code_paths_before_opening_store(productio
             expected_release_id="a" * 64,
         )
     assert not (source / "production.duckdb").exists()
+
+
+def test_expanded_activation_accepts_a_mocked_sparse_warehouse_over_64_gib(
+    production, historical_candidate, monkeypatch
+):
+    from kalshi_events import common
+
+    directory, _root, warehouse_path, manifest = historical_candidate
+    alias = directory / "production.duckdb"
+    real_lstat = Path.lstat
+    real_file_digest = common.file_digest
+    observed_limits = []
+    sparse_size = 70 * 1024**3
+
+    def sparse_lstat(path):
+        details = real_lstat(path)
+        if path == warehouse_path:
+            return SimpleNamespace(
+                st_dev=details.st_dev,
+                st_ino=details.st_ino,
+                st_mode=details.st_mode,
+                st_nlink=details.st_nlink,
+                st_size=sparse_size,
+            )
+        return details
+
+    def sparse_digest(path, max_bytes=None):
+        if path in {warehouse_path, alias}:
+            observed_limits.append(max_bytes)
+            return manifest["warehouse_sha256"], sparse_size
+        return real_file_digest(path, max_bytes)
+
+    monkeypatch.setattr(Path, "lstat", sparse_lstat)
+    monkeypatch.setattr(common, "file_digest", sparse_digest)
+    result = production.activate_current(
+        historical_candidate[1],
+        directory,
+        expected_release_id=manifest["source_release_id"],
+        catalogue_version=3,
+        max_database_bytes=128 * 1024**3,
+        max_temp_bytes=192 * 1024**3,
+    )
+
+    assert result["state"] == "verified"
+    assert observed_limits == [128 * 1024**3, 128 * 1024**3]
+
+
+def test_historical_activation_only_rejects_over_default_database_limit(
+    production, historical_candidate, monkeypatch, capsys
+):
+    directory, root, warehouse_path, manifest = historical_candidate
+    monkeypatch.setattr(production, "_revision", lambda: "d" * 40)
+    report_path, _report, _paths = production._session_report(
+        directory, "activate-historical", manifest["capture_id"]
+    )
+    real_lstat = Path.lstat
+    real_activate = production.activate_current
+
+    def sparse_lstat(path):
+        details = real_lstat(path)
+        if path == warehouse_path:
+            return SimpleNamespace(
+                st_dev=details.st_dev,
+                st_ino=details.st_ino,
+                st_mode=details.st_mode,
+                st_nlink=details.st_nlink,
+                st_size=65 * 1024**3,
+            )
+        return details
+
+    monkeypatch.setattr(Path, "lstat", sparse_lstat)
+    monkeypatch.setattr(
+        production,
+        "activate_current",
+        lambda *_args, **_kwargs: pytest.fail("oversized activation should be stopped"),
+    )
+    code = production._activation_worker(
+        root,
+        directory,
+        f"historical:{manifest['source_release_id']}",
+        report_path,
+        "default",
+    )
+
+    assert code == 1
+    assert (
+        "resume the exact capture with --historical-resource-profile expanded"
+        in capsys.readouterr().out
+    )
+    assert not (directory / "production.duckdb").exists()
+    monkeypatch.setattr(production, "activate_current", real_activate)
+
+
+def test_activation_worker_propagates_sealed_expanded_limits(
+    production, historical_candidate, monkeypatch, capsys
+):
+    directory, root, _warehouse, manifest = historical_candidate
+    monkeypatch.setattr(production, "_revision", lambda: "d" * 40)
+    report_path, report, _paths = production._session_report(
+        directory, "historical", manifest["capture_id"]
+    )
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    production._atomic_report(report_path, report)
+    captured = {}
+
+    def activate(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"state": "verified"}
+
+    monkeypatch.setattr(production, "activate_current", activate)
+    code = production._activation_worker(
+        root,
+        directory,
+        f"historical:{manifest['source_release_id']}",
+        report_path,
+        "expanded",
+    )
+
+    assert code == 0
+    assert captured["max_database_bytes"] == 128 * 1024**3
+    assert captured["max_temp_bytes"] == 192 * 1024**3
+    assert captured["expected_capture_id"] == manifest["capture_id"]
+    assert json.loads(capsys.readouterr().out)["state"] == "verified"
+
+
+def test_activation_rejects_expanded_session_capture_mismatch_before_linking(
+    production, historical_candidate
+):
+    directory, root, _warehouse, manifest = historical_candidate
+    with pytest.raises(RuntimeError, match="different capture"):
+        production.activate_current(
+            root,
+            directory,
+            expected_release_id=manifest["source_release_id"],
+            expected_capture_id="a" * 32,
+            catalogue_version=3,
+            max_database_bytes=128 * 1024**3,
+            max_temp_bytes=192 * 1024**3,
+        )
+    assert not (directory / "production.duckdb").exists()
 
 
 def update_manifest(candidate, change):

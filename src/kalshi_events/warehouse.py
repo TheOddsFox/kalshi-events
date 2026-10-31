@@ -943,6 +943,13 @@ def dbt(
     try:
         project = runtime / "project"
         shutil.copytree(Path(str(files("kalshi_events").joinpath("dbt"))), project)
+        usage = store.usage()
+        spill_budget = min(
+            store.limits.max_temp_bytes - usage["temporary_bytes"],
+            store.limits.max_root_bytes - usage["retained_bytes"],
+        )
+        if spill_budget < 1:
+            raise BudgetExceeded("no bounded temporary storage is available for dbt work")
         profiles = {
             "kalshi_events": {
                 "target": "local",
@@ -951,10 +958,12 @@ def dbt(
                         "type": "duckdb",
                         "path": str(store.path(database)),
                         "threads": DBT_THREADS,
+                        "config_options": {
+                            "temp_directory": str(runtime / "spill"),
+                            "max_temp_directory_size": f"{spill_budget}B",
+                        },
                         "settings": {
                             "memory_limit": DBT_MEMORY_LIMIT,
-                            "temp_directory": str(runtime / "spill"),
-                            "max_temp_directory_size": str(store.limits.max_temp_bytes) + "B",
                         },
                     }
                 },

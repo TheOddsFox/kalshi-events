@@ -477,6 +477,344 @@ def test_validated_resume_clears_current_stop_and_preserves_legacy_limits(
     assert report["invocation_peak_child_process_group_rss_bytes"] == 0
 
 
+def test_legacy_default_historical_resume_normalizes_resource_profile(
+    production, tmp_path, monkeypatch
+):
+    directory, report_path, _original, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical", phase="stopped"
+    )
+
+    _path, report, _paths = production._load_resume(
+        directory,
+        capture_id,
+        historical=True,
+    )
+
+    assert report["resource_profile"] == "default"
+    assert "resource_profile_history" not in report
+
+
+def test_expanded_profile_transitions_only_with_explicit_offline_selection(
+    production, tmp_path, monkeypatch
+):
+    directory, report_path, original, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical", phase="stopped"
+    )
+    original["error"] = "child could not be reaped after supervision failure"
+    original["active_process_group"] = None
+    original["capture_complete"] = False
+    original["source_capture_complete"] = False
+    original["stopped_worker_reconciliation"] = {
+        "event_id": "f" * 64,
+        "audit_file": "stopped-worker-reconciliation.jsonl",
+        "stale_process_group": 12345,
+        "supervisor_pid": 12346,
+        "primary_stop_reason": original["error"],
+        "termination_evidence_sha256": "e" * 64,
+        "session_before_sha256": "d" * 64,
+    }
+    monkeypatch.setattr(production, "_revision", lambda: "c" * 40)
+    production._configure_offline_historical_window(original, capture_id, 3600)
+    original_window = json.loads(json.dumps(original["offline_historical_window"]))
+    report_path.write_text(json.dumps(original))
+
+    _path, expanded, _paths = production._load_resume(
+        directory,
+        capture_id,
+        historical=True,
+        resource_profile="expanded",
+    )
+
+    assert expanded["resource_profile"] == "expanded"
+    assert expanded["limits"]["database_bytes"] == 128 * 1024**3
+    assert expanded["limits"]["temporary_bytes"] == 192 * 1024**3
+    assert expanded["effective_resource_policy"]["overshoot_acknowledged"] is True
+    assert expanded["effective_resource_policy"]["database_bytes"]["admission"] == 96 * 1024**3
+    assert expanded["effective_resource_policy"]["temporary_bytes"]["admission"] == 144 * 1024**3
+    assert [entry["profile"] for entry in expanded["resource_profile_history"]] == [
+        "default",
+        "expanded",
+    ]
+    assert expanded["resource_profile_history"][-1]["policy"]["version"] == 1
+    assert expanded["resource_profile_history"][0]["limits"] == production._limits_from_report(
+        original, "default"
+    )
+    assert expanded["previous_stop"]["error"] == original["error"]
+    assert expanded["requests"] == original["requests"]
+    assert expanded["downloaded_bytes"] == original["downloaded_bytes"]
+    assert expanded["capture_complete"] is False
+    assert expanded["source_capture_complete"] is False
+    assert expanded["offline_historical_window"] == original_window
+
+    production._atomic_report(report_path, expanded)
+    _path, inherited, _paths = production._load_resume(directory, capture_id, historical=True)
+    assert inherited["resource_profile"] == "expanded"
+    assert len(inherited["resource_profile_history"]) == 2
+    with pytest.raises(production.RunnerError, match="conflicting historical resource profile"):
+        production._load_resume(
+            directory,
+            capture_id,
+            historical=True,
+            resource_profile="default",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("root_bytes", 700 * 1024**3),
+        ("aggregate_bytes", 800 * 1024**3),
+        ("minimum_free_bytes", 1),
+        ("peak_rss_bytes", 32 * 1024**3),
+        ("unrecognized_limit", 1),
+        ("root_bytes", True),
+    ],
+)
+def test_sealed_expanded_profile_rejects_unapproved_policy_changes(
+    production, tmp_path, monkeypatch, field, value
+):
+    directory, report_path, report, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical", phase="stopped"
+    )
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    report["limits"][field] = value
+    report["resource_profile_history"][-1]["limits"][field] = value
+    report_path.write_text(json.dumps(report))
+
+    with pytest.raises(production.RunnerError, match="do not match its profile"):
+        production._session_resource_profile(report_path, "expanded", capture_id)
+
+
+def test_legacy_resource_limits_use_fixed_default_policy(production):
+    report = {
+        "limits": {
+            "root_bytes": 700 * 1024**3,
+            "aggregate_bytes": 800 * 1024**3,
+            "minimum_free_bytes": 1,
+            "unrecognized_limit": 17,
+        }
+    }
+    expected = production._limits_for_profile("default")
+
+    assert production._limits_from_report(report, "default") == expected
+
+
+def test_sealed_resource_profile_history_rejects_unknown_fields(production, tmp_path, monkeypatch):
+    _directory, report_path, report, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical", phase="stopped"
+    )
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    report["resource_profile_history"][-1]["unreviewed_limit"] = 1
+    report_path.write_text(json.dumps(report))
+
+    with pytest.raises(production.RunnerError, match="do not match its profile"):
+        production._session_resource_profile(report_path, "expanded", capture_id)
+
+
+def test_sealed_resource_profile_requires_profile_selection(production, tmp_path, monkeypatch):
+    _directory, report_path, report, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical", phase="stopped"
+    )
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    del report["resource_profile"]
+    report_path.write_text(json.dumps(report))
+
+    with pytest.raises(production.RunnerError, match="do not match its profile"):
+        production._session_resource_profile(report_path, capture_id=capture_id)
+
+
+def test_profile_limits_are_invocation_scoped_and_restored(production):
+    original_limits = production.RUN_LIMITS
+    original_values = dict(original_limits)
+
+    @production._resource_profile_scope
+    def inspect_limits(*, resource_profile=None, fail=False):
+        selected = production._effective_limits()["database_bytes"]
+        if fail:
+            raise RuntimeError("expected failure")
+        return selected
+
+    assert inspect_limits(resource_profile="expanded") == 128 * 1024**3
+    assert production.RUN_LIMITS is original_limits
+    assert original_values == production.RUN_LIMITS
+    assert production._effective_limits()["database_bytes"] == original_values["database_bytes"]
+    with pytest.raises(RuntimeError, match="expected failure"):
+        inspect_limits(resource_profile="expanded", fail=True)
+    assert production._effective_limits()["database_bytes"] == original_values["database_bytes"]
+
+
+def test_expanded_profile_cannot_leak_into_network_resume_or_hidden_workers(
+    production, tmp_path, monkeypatch
+):
+    directory, report_path, report, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="full", phase="stopped"
+    )
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    report_path.write_text(json.dumps(report))
+
+    with pytest.raises(production.RunnerError, match="restricted to offline historical"):
+        production._load_resume(directory, capture_id)
+    with pytest.raises(production.RunnerError, match="does not match its session report"):
+        production._session_resource_profile(report_path, "default", capture_id)
+
+
+def test_expanded_profile_propagates_to_refresh_and_accounting_workers(
+    production, tmp_path, monkeypatch
+):
+    report_path = tmp_path / "session.json"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    paths = {
+        "directory": tmp_path,
+        "report": report_path,
+        "logs": logs,
+        "metrics": tmp_path / "metrics.json",
+        "capture_notification": tmp_path / "notification.json",
+    }
+    profile = "expanded"
+    limits = production._limits_for_profile(profile)
+    refresh = production._refresh_command(
+        tmp_path / "operator", paths, "historical", "a" * 32, limits, profile
+    )
+    assert refresh[-1] == profile
+    assert json.loads(refresh[-2]) == limits
+
+    captured = {}
+
+    def invoke(command, **kwargs):
+        captured["command"] = command
+        Path(kwargs["stdout_path"]).write_text(
+            json.dumps({"accounting_complete": True, "storage": {"retained_bytes": 1}})
+        )
+        return 0, None, True
+
+    monkeypatch.setattr(production, "_invoke", invoke)
+    report = {"resource_profile": profile}
+    production._child_accounting(
+        tmp_path / "operator",
+        time.monotonic() + 30,
+        paths,
+        report,
+        capture_id="a" * 32,
+    )
+    assert captured["command"][2] == "--_account-recovery"
+    assert captured["command"][-1] == profile
+
+
+def test_expanded_refresh_worker_rejects_network_mode_before_store_or_url(
+    production, tmp_path, monkeypatch, capsys
+):
+    from kalshi_events import common, transport
+
+    directory, report_path, report, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="resume"
+    )
+    operator = directory / "operator"
+    operator.mkdir()
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    production._atomic_report(report_path, report)
+    calls = []
+    monkeypatch.setattr(transport, "source_url", lambda: calls.append("url"))
+    monkeypatch.setattr(common, "Store", lambda *_args, **_kwargs: calls.append("store"))
+
+    code = production._refresh_worker_main(
+        operator,
+        report_path,
+        directory / "metrics.json",
+        directory / "notification.json",
+        "resume",
+        capture_id,
+        "{}",
+        "expanded",
+    )
+
+    assert code == 1
+    assert calls == []
+    assert "offline historical refresh" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_expanded_activation_binds_report_to_exact_current_capture(
+    production, tmp_path, monkeypatch, capsys
+):
+    from kalshi_events.common import digest
+
+    directory, report_path, report, _capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical"
+    )
+    operator = directory / "operator"
+    operator.mkdir()
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    report_path.write_text(json.dumps(report))
+    current_capture = "b" * 32
+    release_id = "c" * 64
+    release_directory = operator / "releases" / release_id
+    release_directory.mkdir(parents=True)
+    manifest_bytes = json.dumps(
+        {
+            "contract": "oddsfox.kalshi.historical.v1",
+            "source_release_id": release_id,
+            "capture_id": current_capture,
+        },
+        sort_keys=True,
+    ).encode()
+    (release_directory / "manifest.json").write_bytes(manifest_bytes)
+    (operator / "current-historical.json").write_text(
+        json.dumps({"manifest_sha256": digest(manifest_bytes), "source_release_id": release_id})
+    )
+    called = []
+    monkeypatch.setattr(
+        production,
+        "activate_current",
+        lambda *_args, **_kwargs: called.append("activated") or {"state": "verified"},
+    )
+
+    code = production._activation_worker(
+        operator,
+        directory,
+        f"historical:{release_id}",
+        report_path,
+        "expanded",
+    )
+
+    assert code == 1
+    assert called == []
+    assert (
+        "does not match its stopped session capture" in json.loads(capsys.readouterr().out)["error"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("full", "capture_id", "activate", "historical"),
+    [
+        (True, None, False, False),
+        (False, None, True, True),
+        (False, "a" * 32, False, False),
+    ],
+)
+def test_historical_resource_profile_cli_requires_historical_capture_id(
+    production, full, capture_id, activate, historical
+):
+    with pytest.raises(production.RunnerError, match="requires --historical --capture-id"):
+        production.validate_mode(
+            full,
+            capture_id,
+            activate,
+            historical,
+            resource_profile="expanded",
+        )
+
+
+def test_stopped_worker_reconciliation_cannot_select_a_new_resource_profile(production, tmp_path):
+    with pytest.raises(production.RunnerError, match="only --historical --capture-id"):
+        production.run_production(
+            tmp_path / "production",
+            capture_id="a" * 32,
+            historical=True,
+            reconcile_stopped_worker=True,
+            resource_profile="expanded",
+        )
+
+
 def test_validated_resume_bounds_legacy_memory_preflight_history(production, tmp_path, monkeypatch):
     directory, report_path, original, capture_id, _root_id = _resume_report_fixture(
         production, tmp_path, monkeypatch
@@ -626,6 +964,7 @@ def test_initial_historical_accounting_uses_closed_cleanup_command(
         "d" * 32,
         "b" * 32,
         "c" * 40,
+        "default",
     ]
     assert captured["phase_on_start"] == "accounting"
     assert value["storage"]["retained_bytes"] == 1

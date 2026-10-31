@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import ctypes
 import errno
 import fcntl
@@ -21,6 +22,7 @@ import sys
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -66,7 +68,7 @@ SUPPORTED_RUNTIME_VERSIONS = {
     "httpx": "0.28.1",
     "httpcore": "1.0.9",
 }
-RUN_LIMITS: dict[str, int | float | str] = {
+RUN_LIMITS: dict[str, int | float | str | bool] = {
     "session_seconds": 48 * 3600,
     "workflow_seconds": 46 * 3600,
     "active_cutoff_seconds": 47 * 3600 + 50 * 60,
@@ -80,7 +82,12 @@ RUN_LIMITS: dict[str, int | float | str] = {
     "decoded_response_bytes": 768 * MIB,
     "minimum_free_bytes": 150 * GIB,
     "storage_sample_seconds": 1,
-    "storage_category_stop_bytes": 56 * GIB,
+    "storage_database_admission_bytes": 56 * GIB,
+    "storage_temporary_admission_bytes": 56 * GIB,
+    "storage_database_stop_bytes": 56 * GIB,
+    "storage_temporary_stop_bytes": 56 * GIB,
+    "storage_database_stop_inclusive": False,
+    "storage_temporary_stop_inclusive": False,
     "storage_inventory_entries": 65536,
     "storage_release_directories": 4096,
     "peak_rss_bytes": 24 * GIB,
@@ -93,6 +100,22 @@ RUN_LIMITS: dict[str, int | float | str] = {
     "compression": "gzip",
     "rate_policy": "decrease-on-429",
 }
+RESOURCE_PROFILES = {
+    "default": {},
+    "expanded": {
+        "database_bytes": 128 * GIB,
+        "temporary_bytes": 192 * GIB,
+        "storage_database_admission_bytes": 96 * GIB,
+        "storage_temporary_admission_bytes": 144 * GIB,
+        "storage_database_stop_bytes": 112 * GIB,
+        "storage_temporary_stop_bytes": 168 * GIB,
+        "storage_database_stop_inclusive": True,
+        "storage_temporary_stop_inclusive": True,
+    },
+}
+_ACTIVE_LIMITS: contextvars.ContextVar[dict[str, int | float | str | bool] | None] = (
+    contextvars.ContextVar("production_run_limits", default=None)
+)
 MAX_LEGACY_OFFLINE_HISTORICAL_SECONDS = 4 * 3600
 MAX_OFFLINE_HISTORICAL_SECONDS = 24 * 3600
 CAPTURE_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -173,6 +196,85 @@ class RunnerInterrupted(RunnerError):
     """The operator requested a clean stop while a supervised stage was running."""
 
 
+def _effective_limits() -> dict[str, int | float | str | bool]:
+    return _ACTIVE_LIMITS.get() or RUN_LIMITS
+
+
+def _limits_for_profile(profile: str) -> dict[str, int | float | str | bool]:
+    if not isinstance(profile, str) or profile not in RESOURCE_PROFILES:
+        raise RunnerError("resource profile is invalid")
+    return {**RUN_LIMITS, **RESOURCE_PROFILES[profile]}
+
+
+def _same_typed_json(value: Any, expected: Any) -> bool:
+    if type(value) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return value.keys() == expected.keys() and all(
+            _same_typed_json(value[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return len(value) == len(expected) and all(
+            _same_typed_json(item, expected_item)
+            for item, expected_item in zip(value, expected, strict=True)
+        )
+    return value == expected
+
+
+def _sealed_profile_limits(profile: str, saved: Any) -> dict[str, Any]:
+    expected = _limits_for_profile(profile)
+    if not _same_typed_json(saved, expected):
+        raise RunnerError("session resource limits do not match their sealed profile")
+    return expected
+
+
+def _limits_from_report(
+    report: dict[str, Any], profile: str
+) -> dict[str, int | float | str | bool]:
+    if report.get("resource_profile_history") is None:
+        if profile != "default":
+            raise RunnerError("sealed resource profile history is missing")
+        # Legacy reports did not select limits; retain the runner's fixed policy.
+        return _limits_for_profile("default")
+    _bind_report_resource_profile(report, profile)
+    return _sealed_profile_limits(profile, report.get("limits"))
+
+
+def _resource_policy_record(profile: str, limits: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "profile": profile,
+        "enforcement": "one-second monitoring with cooperative stop; no hard quota",
+        "overshoot_acknowledged": True,
+        "database_bytes": {
+            "limit": int(limits["database_bytes"]),
+            "admission": int(limits["storage_database_admission_bytes"]),
+            "stop": int(limits["storage_database_stop_bytes"]),
+            "stop_inclusive": bool(limits["storage_database_stop_inclusive"]),
+        },
+        "temporary_bytes": {
+            "limit": int(limits["temporary_bytes"]),
+            "admission": int(limits["storage_temporary_admission_bytes"]),
+            "stop": int(limits["storage_temporary_stop_bytes"]),
+            "stop_inclusive": bool(limits["storage_temporary_stop_inclusive"]),
+        },
+    }
+
+
+def _resource_profile_scope(function: Any) -> Any:
+    """Keep selected limits local to one production invocation."""
+
+    @wraps(function)
+    def scoped(*args: Any, **kwargs: Any) -> Any:
+        token = _ACTIVE_LIMITS.set(_limits_for_profile(kwargs.get("resource_profile") or "default"))
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _ACTIVE_LIMITS.reset(token)
+
+    return scoped
+
+
 def validate_mode(
     full: bool,
     capture_id: str | None,
@@ -181,12 +283,19 @@ def validate_mode(
     offline_duration_seconds: float | None = None,
     renew_offline_window: bool = False,
     supersede_offline_window: bool = False,
+    resource_profile: str | None = None,
 ) -> str:
     duration = _validate_offline_duration_seconds(offline_duration_seconds)
     if sum((full, capture_id is not None, activate_current)) != 1:
         raise RunnerError("choose exactly one of --full, --capture-id or --activate-current")
     if historical and (full or (capture_id is None and not activate_current)):
         raise RunnerError("--historical requires --capture-id or --activate-current")
+    if resource_profile is not None and (
+        not isinstance(resource_profile, str) or resource_profile not in RESOURCE_PROFILES
+    ):
+        raise RunnerError("--historical-resource-profile must be default or expanded")
+    if resource_profile is not None and (not historical or capture_id is None):
+        raise RunnerError("--historical-resource-profile requires --historical --capture-id")
     if capture_id is not None and (
         not isinstance(capture_id, str) or not CAPTURE_ID.fullmatch(capture_id)
     ):
@@ -208,6 +317,108 @@ def validate_mode(
             "--offline-duration-seconds"
         )
     return mode
+
+
+def _bind_report_resource_profile(
+    report: dict[str, Any], profile: str, *, transition: bool = False
+) -> None:
+    history = report.get("resource_profile_history")
+    legacy_history = history is None
+    if history is None:
+        if report.get("resource_profile", "default") != "default":
+            raise RunnerError("session resource profile history is missing")
+        if not transition:
+            if profile != "default":
+                raise RunnerError("legacy session requires an explicit resource-profile transition")
+            report["resource_profile"] = "default"
+            return
+        prior_limits = _limits_from_report(report, "default")
+        history = [
+            {
+                "profile": "default",
+                "limits": prior_limits,
+                "policy": _resource_policy_record("default", prior_limits),
+                "selected_at": report.get("started_at"),
+                "reason": "legacy session policy",
+            }
+        ]
+    if not isinstance(history, list):
+        raise RunnerError("session resource profile history is invalid")
+    for entry in history:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"profile", "limits", "policy", "selected_at", "reason"}
+            or (entry.get("selected_at") is not None and not isinstance(entry["selected_at"], str))
+            or not isinstance(entry.get("reason"), str)
+        ):
+            raise RunnerError("session resource profile history is invalid")
+        entry_profile = entry.get("profile")
+        if not isinstance(entry_profile, str) or entry_profile not in RESOURCE_PROFILES:
+            raise RunnerError("session resource profile history is invalid")
+        entry_limits = _sealed_profile_limits(entry_profile, entry.get("limits"))
+        expected_policy = _resource_policy_record(entry_profile, entry_limits)
+        if not _same_typed_json(entry.get("policy"), expected_policy):
+            raise RunnerError("session resource profile history is invalid")
+    current_profile = report.get("resource_profile", "default")
+    if (
+        not isinstance(current_profile, str)
+        or current_profile not in RESOURCE_PROFILES
+        or not history
+        or (not legacy_history and "resource_profile" not in report)
+        or history[-1]["profile"] != current_profile
+    ):
+        raise RunnerError("session resource profile history does not match its sealed profile")
+    if not legacy_history:
+        sealed_limits = _sealed_profile_limits(current_profile, report.get("limits"))
+        if not _same_typed_json(history[-1]["limits"], sealed_limits):
+            raise RunnerError("session resource limits differ from their sealed history")
+        expected_policy = _resource_policy_record(current_profile, sealed_limits)
+        if not _same_typed_json(report.get("effective_resource_policy"), expected_policy):
+            raise RunnerError("session effective resource policy differs from its sealed profile")
+    if transition:
+        limits = _limits_for_profile(profile)
+        history.append(
+            {
+                "profile": profile,
+                "limits": limits,
+                "policy": _resource_policy_record(profile, limits),
+                "selected_at": _utc(),
+                "reason": "explicit offline historical resource-profile transition",
+            }
+        )
+    elif not legacy_history:
+        return
+    report["resource_profile"] = profile
+    report["resource_profile_history"] = history
+    report["limits"] = limits = _limits_for_profile(profile)
+    report["effective_resource_policy"] = _resource_policy_record(profile, limits)
+
+
+def _session_resource_profile(
+    report_path: Path,
+    expected_profile: str | None = None,
+    capture_id: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    report = _strict_json(report_path)
+    if report is None or (capture_id is not None and report.get("capture_id") != capture_id):
+        raise RunnerError("hidden worker session report does not match its capture")
+    profile = report.get("resource_profile", "default")
+    if (
+        not isinstance(profile, str)
+        or profile not in RESOURCE_PROFILES
+        or (expected_profile is not None and expected_profile != profile)
+    ):
+        raise RunnerError("hidden worker resource profile does not match its session report")
+    history = report.get("resource_profile_history")
+    if history is None and profile == "default":
+        return profile, report
+    if not isinstance(history, list) or not history:
+        raise RunnerError("hidden worker session resource profile history is invalid")
+    try:
+        _bind_report_resource_profile(report, profile)
+    except RunnerError as exc:
+        raise RunnerError("hidden worker session resource limits do not match its profile") from exc
+    return profile, report
 
 
 def _validate_offline_duration_seconds(value: float | None) -> float | None:
@@ -261,32 +472,33 @@ def remaining_allowances(
         else elapsed
     )
     workflow_remaining = min(
-        float(RUN_LIMITS["workflow_seconds"]) - elapsed,
-        float(RUN_LIMITS["active_cutoff_seconds"]) - elapsed,
-        float(RUN_LIMITS["session_seconds"]) - elapsed,
-        float(RUN_LIMITS["workflow_seconds"]) - wall_elapsed,
-        float(RUN_LIMITS["active_cutoff_seconds"]) - wall_elapsed,
-        float(RUN_LIMITS["session_seconds"]) - wall_elapsed,
+        float(_effective_limits()["workflow_seconds"]) - elapsed,
+        float(_effective_limits()["active_cutoff_seconds"]) - elapsed,
+        float(_effective_limits()["session_seconds"]) - elapsed,
+        float(_effective_limits()["workflow_seconds"]) - wall_elapsed,
+        float(_effective_limits()["active_cutoff_seconds"]) - wall_elapsed,
+        float(_effective_limits()["session_seconds"]) - wall_elapsed,
     )
     max_root = min(
-        int(RUN_LIMITS["root_bytes"]), int(RUN_LIMITS["aggregate_bytes"]) - external_reserved_bytes
+        int(_effective_limits()["root_bytes"]),
+        int(_effective_limits()["aggregate_bytes"]) - external_reserved_bytes,
     )
-    attempts = int(RUN_LIMITS["attempts"]) - accounting["attempts"]
-    downloads = int(RUN_LIMITS["downloaded_bytes"]) - accounting[byte_field]
+    attempts = int(_effective_limits()["attempts"]) - accounting["attempts"]
+    downloads = int(_effective_limits()["downloaded_bytes"]) - accounting[byte_field]
     if min(workflow_remaining, attempts, downloads, max_root) <= 0:
         raise BudgetStop("approved session allowance is exhausted")
     return {
         "max-requests": attempts,
         "max-download-bytes": downloads,
         "max-root-bytes": max_root,
-        "max-temp-bytes": int(RUN_LIMITS["temporary_bytes"]),
-        "max-database-bytes": int(RUN_LIMITS["database_bytes"]),
-        "max-response-bytes": min(int(RUN_LIMITS["response_bytes"]), downloads),
-        "max-decoded-response-bytes": int(RUN_LIMITS["decoded_response_bytes"]),
+        "max-temp-bytes": int(_effective_limits()["temporary_bytes"]),
+        "max-database-bytes": int(_effective_limits()["database_bytes"]),
+        "max-response-bytes": min(int(_effective_limits()["response_bytes"]), downloads),
+        "max-decoded-response-bytes": int(_effective_limits()["decoded_response_bytes"]),
         "max-duration-seconds": workflow_remaining,
-        "max-rate": float(RUN_LIMITS["rate"]),
-        "compression": str(RUN_LIMITS["compression"]),
-        "rate-policy": str(RUN_LIMITS["rate_policy"]),
+        "max-rate": float(_effective_limits()["rate"]),
+        "compression": str(_effective_limits()["compression"]),
+        "rate-policy": str(_effective_limits()["rate_policy"]),
     }
 
 
@@ -307,7 +519,7 @@ def _time_budget_started(report: dict[str, Any], clock: str) -> float:
 def _time_budget_deadline(report: dict[str, Any], clock: str) -> float:
     start = _time_budget_started(report, clock)
     key = f"deadline_{clock}"
-    value = report.get(key, start + float(RUN_LIMITS["session_seconds"]))
+    value = report.get(key, start + float(_effective_limits()["session_seconds"]))
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RunnerError("session time budget deadline is invalid")
     try:
@@ -316,7 +528,7 @@ def _time_budget_deadline(report: dict[str, Any], clock: str) -> float:
         raise RunnerError("session time budget deadline is invalid") from exc
     if not math.isfinite(value):
         raise RunnerError("session time budget deadline is invalid")
-    derived = start + float(RUN_LIMITS["session_seconds"])
+    derived = start + float(_effective_limits()["session_seconds"])
     if not math.isfinite(derived):
         raise RunnerError("session time budget deadline is invalid")
     return min(value, derived)
@@ -324,14 +536,18 @@ def _time_budget_deadline(report: dict[str, Any], clock: str) -> float:
 
 def rss_limit_exceeded(
     samples: list[tuple[float, int]],
-    limit: int = int(RUN_LIMITS["peak_rss_bytes"]),
-    sustained: float = float(RUN_LIMITS["peak_rss_seconds"]),
+    limit: int | None = None,
+    sustained: float | None = None,
 ) -> bool:
     """Detect uninterrupted above-limit RSS over promptly sampled timestamps."""
+    limit = int(_effective_limits()["peak_rss_bytes"]) if limit is None else limit
+    sustained = float(_effective_limits()["peak_rss_seconds"]) if sustained is None else sustained
     above_since: float | None = None
     previous: float | None = None
     for instant, rss in samples:
-        if previous is not None and instant - previous > 1.5 * float(RUN_LIMITS["sample_seconds"]):
+        if previous is not None and instant - previous > 1.5 * float(
+            _effective_limits()["sample_seconds"]
+        ):
             above_since = None
         if rss > limit:
             if above_since is None:
@@ -413,13 +629,17 @@ def _effective_memory_policy() -> dict[str, Any]:
     """Describe the current closed memory policy without rewriting legacy limits."""
     return {
         "version": 2,
-        "sample_interval_seconds": float(RUN_LIMITS["sample_seconds"]),
+        "sample_interval_seconds": float(_effective_limits()["sample_seconds"]),
         "sample_timeout_seconds": 5,
-        "process_group_rss_limit_bytes": int(RUN_LIMITS["peak_rss_bytes"]),
-        "process_group_rss_continuous_seconds": int(RUN_LIMITS["peak_rss_seconds"]),
+        "process_group_rss_limit_bytes": int(_effective_limits()["peak_rss_bytes"]),
+        "process_group_rss_continuous_seconds": int(_effective_limits()["peak_rss_seconds"]),
         "process_group_rss_limit_is_strict": True,
-        "warning_pressure_continuous_seconds": int(RUN_LIMITS["memory_pressure_warn_seconds"]),
-        "pressure_sample_max_gap_seconds": float(RUN_LIMITS["memory_pressure_max_gap_seconds"]),
+        "warning_pressure_continuous_seconds": int(
+            _effective_limits()["memory_pressure_warn_seconds"]
+        ),
+        "pressure_sample_max_gap_seconds": float(
+            _effective_limits()["memory_pressure_max_gap_seconds"]
+        ),
         "preflight_pressure": "normal",
         "warn_pressure_resets_on_normal_or_sample_gap": True,
         "critical_pressure_stops_on_first_sample": True,
@@ -931,7 +1151,7 @@ def _terminate(process: subprocess.Popen[Any]) -> bool:
     was_stopping = _STOP_IN_PROGRESS
     _STOP_IN_PROGRESS = True
     try:
-        grace_deadline = time.monotonic() + float(RUN_LIMITS["terminate_seconds"])
+        grace_deadline = time.monotonic() + float(_effective_limits()["terminate_seconds"])
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -1028,7 +1248,7 @@ def _monitor(
     while process.poll() is None:
         now = time.monotonic()
         remaining = _child_time_remaining(deadline, wall_deadline_epoch)
-        if remaining <= float(RUN_LIMITS["terminate_seconds"]):
+        if remaining <= float(_effective_limits()["terminate_seconds"]):
             stop_reason = "session or workflow deadline reached termination reserve"
             terminate()
             break
@@ -1050,7 +1270,9 @@ def _monitor(
                 )
             except (OSError, RunnerError) as exc:
                 stop_reason = f"resource accounting failed: {exc}"
-            next_storage_sample = sample_started + float(RUN_LIMITS["storage_sample_seconds"])
+            next_storage_sample = sample_started + float(
+                _effective_limits()["storage_sample_seconds"]
+            )
             if stop_reason:
                 terminate()
                 break
@@ -1061,13 +1283,13 @@ def _monitor(
                 if original_device is not None and directory.stat().st_dev != original_device:
                     raise RunnerError("production filesystem mount changed during the run")
                 remaining = _child_time_remaining(deadline, wall_deadline_epoch)
-                if remaining <= float(RUN_LIMITS["terminate_seconds"]):
+                if remaining <= float(_effective_limits()["terminate_seconds"]):
                     stop_reason = "session or workflow deadline reached termination reserve"
                     terminate()
                     break
                 timeout = min(
                     5.0,
-                    remaining - float(RUN_LIMITS["terminate_seconds"]),
+                    remaining - float(_effective_limits()["terminate_seconds"]),
                 )
                 if timeout <= 0:
                     stop_reason = "session or workflow deadline reached termination reserve"
@@ -1075,7 +1297,7 @@ def _monitor(
                     break
                 memory = _sample_memory(process.pid, timeout=timeout)
                 if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
-                    RUN_LIMITS["terminate_seconds"]
+                    _effective_limits()["terminate_seconds"]
                 ):
                     stop_reason = "session or workflow deadline reached termination reserve"
                     terminate()
@@ -1084,7 +1306,7 @@ def _monitor(
                 raise
             except (OSError, subprocess.SubprocessError, RunnerError) as exc:
                 if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
-                    RUN_LIMITS["terminate_seconds"]
+                    _effective_limits()["terminate_seconds"]
                 ):
                     stop_reason = "session or workflow deadline reached termination reserve"
                 elif isinstance(exc, RunnerError) and str(exc).startswith("bounded memory sample"):
@@ -1101,7 +1323,7 @@ def _monitor(
             if (
                 previous_pressure_sample is not None
                 and observed_at - previous_pressure_sample
-                > float(RUN_LIMITS["memory_pressure_max_gap_seconds"])
+                > float(_effective_limits()["memory_pressure_max_gap_seconds"])
             ):
                 warning_started = None
             previous_pressure_sample = observed_at
@@ -1129,7 +1351,7 @@ def _monitor(
                 },
             )
             report["last_observed_epoch"] = time.time()
-            if free < int(RUN_LIMITS["minimum_free_bytes"]):
+            if free < int(_effective_limits()["minimum_free_bytes"]):
                 stop_reason = "SSD free space fell below 150 GiB"
             elif rss_limit_exceeded(samples):
                 stop_reason = "process-group RSS exceeded 24 GiB for 60 seconds"
@@ -1139,7 +1361,7 @@ def _monitor(
                 pressure == "warn"
                 and warning_started is not None
                 and observed_at - warning_started
-                >= float(RUN_LIMITS["memory_pressure_warn_seconds"])
+                >= float(_effective_limits()["memory_pressure_warn_seconds"])
             ):
                 stop_reason = "system memory pressure remained warning for 60 seconds"
             if stop_reason:
@@ -1147,9 +1369,9 @@ def _monitor(
                 break
             report["last_observed_at"] = _utc()
             _atomic_report(report_path, report)
-            next_sample = now + float(RUN_LIMITS["sample_seconds"])
+            next_sample = now + float(_effective_limits()["sample_seconds"])
         remaining = _child_time_remaining(deadline, wall_deadline_epoch)
-        time.sleep(min(1.0, max(0.0, remaining - float(RUN_LIMITS["terminate_seconds"]))))
+        time.sleep(min(1.0, max(0.0, remaining - float(_effective_limits()["terminate_seconds"]))))
     if (
         storage_state is not None
         and storage_progress_path is not None
@@ -1515,29 +1737,29 @@ def _invoke(
         raise RunnerError("production filesystem changed since session preflight")
     stdout_path = safe_path(stdout_path)
     stderr_path = safe_path(stderr_path)
-    if time.monotonic() >= deadline - float(RUN_LIMITS["terminate_seconds"]):
+    if time.monotonic() >= deadline - float(_effective_limits()["terminate_seconds"]):
         return None, "insufficient time remains to start and reap a child", True
     wall_deadline_epoch = _child_wall_deadline_epoch(
         report, deadline, workflow_deadline=workflow_deadline
     )
     wall_now = time.time()
     if wall_deadline_epoch is not None and wall_now >= wall_deadline_epoch - float(
-        RUN_LIMITS["terminate_seconds"]
+        _effective_limits()["terminate_seconds"]
     ):
         return None, "insufficient wall-clock time remains to start and reap a child", True
     remaining = _child_time_remaining(deadline, wall_deadline_epoch)
-    if remaining <= float(RUN_LIMITS["terminate_seconds"]):
+    if remaining <= float(_effective_limits()["terminate_seconds"]):
         reason = (
             "insufficient wall-clock time remains to start and reap a child"
             if wall_deadline_epoch is not None
-            and time.time() >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+            and time.time() >= wall_deadline_epoch - float(_effective_limits()["terminate_seconds"])
             else "insufficient time remains to start and reap a child"
         )
         return None, reason, True
     try:
         memory_preflight = _sample_memory(
             None,
-            timeout=min(5.0, remaining - float(RUN_LIMITS["terminate_seconds"])),
+            timeout=min(5.0, remaining - float(_effective_limits()["terminate_seconds"])),
         )
     except RunnerInterrupted:
         raise
@@ -1551,11 +1773,11 @@ def _invoke(
         _atomic_report(report_path, report)
         return None, "memory pressure was not normal before supervised work", True
     remaining = _child_time_remaining(deadline, wall_deadline_epoch)
-    if remaining <= float(RUN_LIMITS["terminate_seconds"]):
+    if remaining <= float(_effective_limits()["terminate_seconds"]):
         reason = (
             "insufficient wall-clock time remains to start and reap a child"
             if wall_deadline_epoch is not None
-            and time.time() >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+            and time.time() >= wall_deadline_epoch - float(_effective_limits()["terminate_seconds"])
             else "insufficient time remains to start and reap a child"
         )
         return None, reason, True
@@ -1566,14 +1788,16 @@ def _invoke(
         try:
             global _PENDING_STOP_SIGNAL, _SPAWNING_CHILD
             wall_now = time.time()
-            if time.monotonic() >= deadline - float(RUN_LIMITS["terminate_seconds"]) or (
+            if time.monotonic() >= deadline - float(_effective_limits()["terminate_seconds"]) or (
                 wall_deadline_epoch is not None
-                and wall_now >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+                and wall_now
+                >= wall_deadline_epoch - float(_effective_limits()["terminate_seconds"])
             ):
                 reason = (
                     "insufficient wall-clock time remains to start and reap a child"
                     if wall_deadline_epoch is not None
-                    and wall_now >= wall_deadline_epoch - float(RUN_LIMITS["terminate_seconds"])
+                    and wall_now
+                    >= wall_deadline_epoch - float(_effective_limits()["terminate_seconds"])
                     else "insufficient time remains to start and reap a child"
                 )
                 return None, reason, True
@@ -1710,9 +1934,16 @@ def _child_accounting(
             capture_id,
             expected_root_id,
             str(report.get("revision", "")),
+            str(report.get("resource_profile", "default")),
         ]
     elif capture_id is not None:
-        command += ["--_account-recovery", str(operator), capture_id]
+        command += [
+            "--_account-recovery",
+            str(operator),
+            capture_id,
+            str(paths["report"]),
+            str(report.get("resource_profile", "default")),
+        ]
     else:
         command += ["--_account-root", str(operator)]
     run_id = uuid.uuid4().hex
@@ -1789,7 +2020,7 @@ def _release_verify(
         "--release",
         str(release),
         "--max-root-bytes",
-        str(int(RUN_LIMITS["root_bytes"])),
+        str(int(_effective_limits()["root_bytes"])),
     ]
     stdout = paths["logs"] / "release-verify.stdout.json"
     stderr = paths["logs"] / "release-verify.stderr.log"
@@ -1938,15 +2169,15 @@ def _read_accounting_worker(
     store = Store(
         root,
         Limits(
-            max_rate=float(RUN_LIMITS["rate"]),
-            max_requests=int(RUN_LIMITS["attempts"]),
-            max_download_bytes=int(RUN_LIMITS["downloaded_bytes"]),
-            max_response_bytes=int(RUN_LIMITS["response_bytes"]),
-            max_decoded_response_bytes=int(RUN_LIMITS["decoded_response_bytes"]),
-            max_duration_seconds=float(RUN_LIMITS["session_seconds"]),
-            max_root_bytes=int(RUN_LIMITS["root_bytes"]),
-            max_temp_bytes=int(RUN_LIMITS["temporary_bytes"]),
-            max_database_bytes=int(RUN_LIMITS["database_bytes"]),
+            max_rate=float(_effective_limits()["rate"]),
+            max_requests=int(_effective_limits()["attempts"]),
+            max_download_bytes=int(_effective_limits()["downloaded_bytes"]),
+            max_response_bytes=int(_effective_limits()["response_bytes"]),
+            max_decoded_response_bytes=int(_effective_limits()["decoded_response_bytes"]),
+            max_duration_seconds=float(_effective_limits()["session_seconds"]),
+            max_root_bytes=int(_effective_limits()["root_bytes"]),
+            max_temp_bytes=int(_effective_limits()["temporary_bytes"]),
+            max_database_bytes=int(_effective_limits()["database_bytes"]),
         ),
     )
     with store.lock():
@@ -1960,7 +2191,8 @@ def _read_accounting_worker(
                 or capture_state.get("selected") is not None
                 or capture_state.get("incremental") is True
                 or capture_state.get("acquisition_protocol") != 5
-                or capture_state.get("max_response_bytes") != int(RUN_LIMITS["response_bytes"])
+                or capture_state.get("max_response_bytes")
+                != int(_effective_limits()["response_bytes"])
             ):
                 raise RunnerError(
                     "recovery capture does not match the session's sealed full-scope policy"
@@ -2010,7 +2242,7 @@ def _read_accounting_worker(
                 if "reserved_bytes" in receipt and (
                     isinstance(reservation, bool)
                     or not isinstance(reservation, int)
-                    or not 0 < reservation <= int(RUN_LIMITS["response_bytes"])
+                    or not 0 < reservation <= int(_effective_limits()["response_bytes"])
                 ):
                     raise RunnerError("finalized receipt has invalid reservation metadata")
                 amount = receipt.get("downloaded_bytes", receipt.get("size"))
@@ -2019,7 +2251,7 @@ def _read_accounting_worker(
                     or not isinstance(amount, int)
                     or not 0
                     <= amount
-                    <= int(RUN_LIMITS["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
+                    <= int(_effective_limits()["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
                 ):
                     raise RunnerError("finalized receipt has invalid downloaded-byte accounting")
                 status = receipt.get("status")
@@ -2034,11 +2266,13 @@ def _read_accounting_worker(
             if complete is not False:
                 raise RunnerError("durable receipt accounting state is malformed")
             accounting_complete = False
-            downloaded_or_reserved += int(RUN_LIMITS["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
+            downloaded_or_reserved += (
+                int(_effective_limits()["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
+            )
             if (
                 isinstance(reservation, bool)
                 or not isinstance(reservation, int)
-                or not 0 < reservation <= int(RUN_LIMITS["response_bytes"])
+                or not 0 < reservation <= int(_effective_limits()["response_bytes"])
             ):
                 raise RunnerError("unfinished receipt has invalid reservation metadata")
             if receipt.get("status") is not None:
@@ -2095,7 +2329,7 @@ def _read_root_summary(root: Path) -> dict[str, Any]:
     from kalshi_events import publish
     from kalshi_events.common import Limits, Store
 
-    store = Store(root, Limits(max_root_bytes=int(RUN_LIMITS["root_bytes"])))
+    store = Store(root, Limits(max_root_bytes=int(_effective_limits()["root_bytes"])))
     result: dict[str, Any] = {
         "root_id": _root_id(store),
         "current_v2": None,
@@ -2129,8 +2363,11 @@ def activate_current(
     production_directory: Path,
     *,
     expected_release_id: str | None = None,
+    expected_capture_id: str | None = None,
     standalone_verified: dict[str, Any] | None = None,
     catalogue_version: int = 2,
+    max_database_bytes: int = 64 * GIB,
+    max_temp_bytes: int = 64 * GIB,
     link_fn: Any = None,
     replace_fn: Any = None,
     sync_fn: Any = None,
@@ -2142,8 +2379,11 @@ def activate_current(
         operator_root,
         production_directory,
         expected_release_id=expected_release_id,
+        expected_capture_id=expected_capture_id,
         standalone_verified=standalone_verified,
         catalogue_version=catalogue_version,
+        max_database_bytes=max_database_bytes,
+        max_temp_bytes=max_temp_bytes,
         link_fn=link_fn,
         replace_fn=replace_fn,
         sync_fn=sync_fn,
@@ -2227,7 +2467,7 @@ def _bounded_tree_bytes(
             with os.scandir(directory) as entries:
                 for entry in entries:
                     count[0] += 1
-                    if count[0] > int(RUN_LIMITS["storage_inventory_entries"]):
+                    if count[0] > int(_effective_limits()["storage_inventory_entries"]):
                         raise RunnerError("live storage inventory exceeded its entry bound")
                     try:
                         info = entry.stat(follow_symlinks=False)
@@ -2298,7 +2538,7 @@ def _live_workspace_snapshot(
                 ]
     except OSError as exc:
         raise RunnerError("operator root could not be inventoried") from exc
-    if len(operator_entries) > int(RUN_LIMITS["storage_inventory_entries"]):
+    if len(operator_entries) > int(_effective_limits()["storage_inventory_entries"]):
         raise RunnerError("operator root exceeded its direct-entry bound")
     pointer_entry = operator_entries.get("current-historical.json")
     if pointer_entry is not None:
@@ -2327,7 +2567,7 @@ def _live_workspace_snapshot(
                 names = list(entries)
         except OSError as exc:
             raise RunnerError("operator temporary namespace could not be listed") from exc
-        if len(names) > int(RUN_LIMITS["storage_inventory_entries"]):
+        if len(names) > int(_effective_limits()["storage_inventory_entries"]):
             raise RunnerError("operator temporary namespace exceeded its entry bound")
         for entry in names:
             if entry.name == "recovery-index":
@@ -2368,7 +2608,7 @@ def _live_workspace_snapshot(
                 rows = list(entries)
         except OSError as exc:
             raise RunnerError(f"live storage directory could not be listed: {parent.name}") from exc
-        if len(rows) > int(RUN_LIMITS["storage_release_directories"]):
+        if len(rows) > int(_effective_limits()["storage_release_directories"]):
             raise RunnerError(f"live storage directory exceeded its entry bound: {parent.name}")
         names = set()
         for entry in rows:
@@ -2439,7 +2679,7 @@ def _live_external_paths(paths: dict[str, Path], directory: Path) -> dict[str, P
                 rows = list(entries)
         except OSError as exc:
             raise RunnerError("live external artifact directory could not be listed") from exc
-        if len(rows) > int(RUN_LIMITS["storage_inventory_entries"]):
+        if len(rows) > int(_effective_limits()["storage_inventory_entries"]):
             raise RunnerError("live external artifact inventory exceeded its entry bound")
         for entry in rows:
             if pattern.fullmatch(entry.name):
@@ -2449,7 +2689,7 @@ def _live_external_paths(paths: dict[str, Path], directory: Path) -> dict[str, P
             root_rows = list(entries)
     except OSError as exc:
         raise RunnerError("production directory could not be inventoried") from exc
-    if len(root_rows) > int(RUN_LIMITS["storage_inventory_entries"]):
+    if len(root_rows) > int(_effective_limits()["storage_inventory_entries"]):
         raise RunnerError("production directory exceeded its direct-entry bound")
     fixed_root_entries = {
         OWNER_MARKER: "file",
@@ -2516,6 +2756,14 @@ def _live_external_allocated_bytes(
     return total
 
 
+def _storage_stop_reached(observed: int, category: str) -> bool:
+    limits = _effective_limits()
+    threshold = int(limits[f"storage_{category}_stop_bytes"])
+    if bool(limits[f"storage_{category}_stop_inclusive"]):
+        return observed >= threshold
+    return observed > threshold
+
+
 def _begin_storage_supervision(
     directory: Path,
     operator: Path,
@@ -2549,12 +2797,19 @@ def _begin_storage_supervision(
     )
     if any(_ATOMIC_TEMP_NAME.fullmatch(name) for name in workspace["operator_entries"]):
         raise RunnerError("operator root contains a stale atomic-write temporary")
-    if (
-        saved["operator_database_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"])
-        or saved["operator_temporary_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"])
-        or saved["operator_retained_bytes"] > int(RUN_LIMITS["root_bytes"])
-        or saved["aggregate_estimate_bytes"] > int(RUN_LIMITS["aggregate_bytes"])
-    ):
+    if _storage_stop_reached(saved["operator_database_bytes"], "database"):
+        threshold = int(_effective_limits()["storage_database_stop_bytes"])
+        raise RunnerError(
+            f"verified database storage baseline reaches the {threshold // GIB} GiB stop threshold"
+        )
+    if _storage_stop_reached(saved["operator_temporary_bytes"], "temporary"):
+        threshold = int(_effective_limits()["storage_temporary_stop_bytes"])
+        raise RunnerError(
+            f"verified temporary storage baseline reaches the {threshold // GIB} GiB stop threshold"
+        )
+    if saved["operator_retained_bytes"] > int(_effective_limits()["root_bytes"]) or saved[
+        "aggregate_estimate_bytes"
+    ] > int(_effective_limits()["aggregate_bytes"]):
         raise RunnerError("verified storage baseline exceeds a live admission threshold")
     external = _live_external_files(
         external_paths,
@@ -2573,7 +2828,7 @@ def _begin_storage_supervision(
     }
     state = {
         "version": 1,
-        "target_interval_seconds": int(RUN_LIMITS["storage_sample_seconds"]),
+        "target_interval_seconds": int(_effective_limits()["storage_sample_seconds"]),
         "sample_count": 0,
         "last_sample_monotonic": None,
         "max_interval_seconds": 0.0,
@@ -2722,15 +2977,17 @@ def _sample_live_storage(
         key: value for key, value in state.items() if key != "baseline"
     }
     _write_storage_progress(progress_path, state)
-    if current["operator_database_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"]):
-        return "live database storage reached the 56 GiB stop threshold"
-    if current["operator_temporary_bytes"] > int(RUN_LIMITS["storage_category_stop_bytes"]):
-        return "live temporary storage reached the 56 GiB stop threshold"
-    if current["operator_retained_bytes"] > int(RUN_LIMITS["root_bytes"]):
+    database_stop = int(_effective_limits()["storage_database_stop_bytes"])
+    if _storage_stop_reached(current["operator_database_bytes"], "database"):
+        return f"live database storage reached the {database_stop // GIB} GiB stop threshold"
+    temporary_stop = int(_effective_limits()["storage_temporary_stop_bytes"])
+    if _storage_stop_reached(current["operator_temporary_bytes"], "temporary"):
+        return f"live temporary storage reached the {temporary_stop // GIB} GiB stop threshold"
+    if current["operator_retained_bytes"] > int(_effective_limits()["root_bytes"]):
         return "live operator root storage allowance was exceeded"
-    if current["aggregate_estimate_bytes"] > int(RUN_LIMITS["aggregate_bytes"]):
+    if current["aggregate_estimate_bytes"] > int(_effective_limits()["aggregate_bytes"]):
         return "live aggregate storage allowance was exceeded"
-    if free < int(RUN_LIMITS["minimum_free_bytes"]):
+    if free < int(_effective_limits()["minimum_free_bytes"]):
         return "SSD free space fell below 150 GiB"
     return None
 
@@ -2816,6 +3073,10 @@ def _stopped_worker_evidence(
 ) -> tuple[dict[str, Any], Path, bytes]:
     from kalshi_events.common import regular_bytes, safe_path
 
+    profile, sealed_report = _session_resource_profile(report_path, capture_id=capture_id)
+    if sealed_report != report:
+        raise RunnerError("stopped-worker session report changed during profile validation")
+    database_limit = int(_limits_from_report(sealed_report, profile)["database_bytes"])
     source_value = report.get("source_root")
     if not isinstance(source_value, str):
         raise RunnerError("stopped-worker reconciliation has no saved source root")
@@ -2925,7 +3186,6 @@ def _stopped_worker_evidence(
     except ValueError as exc:
         raise RunnerError("stopped-worker process start identity is invalid") from exc
     original_group = report.get("active_process_group")
-    database_limit = int(RUN_LIMITS["database_bytes"])
     activity = evidence.get("network_activity_this_invocation")
     if (
         launch_started.tzinfo is None
@@ -3290,14 +3550,14 @@ def _resource_guard(
         raise RunnerError("operator storage accounting is invalid")
     physical_estimate = retained + external
     if (
-        retained > int(RUN_LIMITS["root_bytes"])
-        or temporary > int(RUN_LIMITS["temporary_bytes"])
-        or database > int(RUN_LIMITS["database_bytes"])
-        or physical_estimate > int(RUN_LIMITS["aggregate_bytes"])
+        retained > int(_effective_limits()["root_bytes"])
+        or temporary > int(_effective_limits()["temporary_bytes"])
+        or database > int(_effective_limits()["database_bytes"])
+        or physical_estimate > int(_effective_limits()["aggregate_bytes"])
     ):
         raise BudgetStop("production storage allowance was exceeded")
     free = shutil.disk_usage(directory).free
-    if free < int(RUN_LIMITS["minimum_free_bytes"]):
+    if free < int(_effective_limits()["minimum_free_bytes"]):
         raise BudgetStop("SSD free space fell below 150 GiB")
     report["storage"] = {
         "operator_retained_bytes": retained,
@@ -3343,7 +3603,9 @@ def _check_accounting_match(snapshot: dict[str, Any], expected: dict[str, Any]) 
 
 def _monitor_deadline(report: dict[str, Any], *, workflow: bool) -> float:
     ceiling = float(
-        RUN_LIMITS["workflow_seconds"] if workflow else RUN_LIMITS["active_cutoff_seconds"]
+        _effective_limits()["workflow_seconds"]
+        if workflow
+        else _effective_limits()["active_cutoff_seconds"]
     )
     if _ACTIVE_OFFLINE_HISTORICAL_WINDOW is not None:
         window = _ACTIVE_OFFLINE_HISTORICAL_WINDOW
@@ -3373,9 +3635,9 @@ def _child_wall_deadline_epoch(
     if _ACTIVE_OFFLINE_HISTORICAL_WINDOW is not None:
         window = _ACTIVE_OFFLINE_HISTORICAL_WINDOW
         stage_seconds = float(
-            RUN_LIMITS["workflow_seconds"]
+            _effective_limits()["workflow_seconds"]
             if workflow_deadline
-            else RUN_LIMITS["active_cutoff_seconds"]
+            else _effective_limits()["active_cutoff_seconds"]
         )
         reserve = _offline_workflow_reserve(window) if workflow_deadline else 0.0
         wall_now = time.time()
@@ -3394,12 +3656,14 @@ def _child_wall_deadline_epoch(
             raise RunnerError("session time budget start is invalid")
         started = float(value)
     stage_seconds = float(
-        RUN_LIMITS["workflow_seconds"] if workflow_deadline else RUN_LIMITS["active_cutoff_seconds"]
+        _effective_limits()["workflow_seconds"]
+        if workflow_deadline
+        else _effective_limits()["active_cutoff_seconds"]
     )
     wall_now = time.time()
     deadlines = [
         started + stage_seconds,
-        started + float(RUN_LIMITS["active_cutoff_seconds"]),
+        started + float(_effective_limits()["active_cutoff_seconds"]),
         wall_now + max(0.0, monotonic_deadline - time.monotonic()),
     ]
     deadlines.append(_time_budget_deadline(report, "epoch"))
@@ -3774,6 +4038,7 @@ def _kill_awake_guard(process: subprocess.Popen[Any]) -> None:
             process.wait(timeout=3)
 
 
+@_resource_profile_scope
 def run_production(
     directory: Path,
     *,
@@ -3789,6 +4054,7 @@ def run_production(
     recover_reboot: bool = False,
     recovery_volume_uuid: str | None = None,
     reconcile_stopped_worker: bool = False,
+    resource_profile: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded catalogue refresh/resume or verify-and-activate a publication."""
     preflight_started = time.monotonic()
@@ -3800,10 +4066,12 @@ def run_production(
         offline_duration_seconds=offline_duration_seconds,
         renew_offline_window=renew_offline_window,
         supersede_offline_window=supersede_offline_window,
+        resource_profile=resource_profile,
     )
     if reconcile_stopped_worker:
         if (
             mode != "historical"
+            or resource_profile is not None
             or offline_duration_seconds is not None
             or renew_offline_window
             or supersede_offline_window
@@ -3853,7 +4121,10 @@ def run_production(
                 extend_session=extend_session,
                 recover_reboot=recover_reboot,
                 recovery_volume_uuid=recovery_volume_uuid,
+                resource_profile=resource_profile,
             )
+            profile = report.get("resource_profile", "default")
+            _ACTIVE_LIMITS.set(_limits_from_report(report, profile))
             if reconcile_accounting:
                 saved_system = report["system"]
                 report.setdefault("original_revision", report.get("revision"))
@@ -3887,6 +4158,8 @@ def run_production(
                 raise RunnerError("resume root identity was not durably recorded")
         else:
             report_path, report, paths = _session_report(directory, mode)
+            profile = report.get("resource_profile", "default")
+            _ACTIVE_LIMITS.set(_limits_from_report(report, profile))
             paths = _prepare_run_paths(directory, report_path)
             report["metrics_file"] = str(paths["metrics"])
             report["metrics_progress_file"] = str(paths["metrics_progress"])
@@ -3935,7 +4208,7 @@ def run_production(
         report["last_observed_epoch"] = time.time()
         report["last_observed_at"] = _utc()
         _atomic_report(report_path, report)
-        if shutil.disk_usage(directory).free < int(RUN_LIMITS["minimum_free_bytes"]):
+        if shutil.disk_usage(directory).free < int(_effective_limits()["minimum_free_bytes"]):
             report["error"] = "SSD free space is below 150 GiB before work"
             report["phase"] = "stopped"
             _atomic_report(report_path, report)
@@ -4002,7 +4275,7 @@ def run_production(
         try:
             if mode not in {"activate-current", "activate-historical"} and _monitor_deadline(
                 report, workflow=True
-            ) <= time.monotonic() + float(RUN_LIMITS["terminate_seconds"]):
+            ) <= time.monotonic() + float(_effective_limits()["terminate_seconds"]):
                 raise BudgetStop("workflow deadline reached before supervised work could start")
             session_deadline = _monitor_deadline(report, workflow=False)
             standalone_result: dict[str, Any] | None = None
@@ -4120,17 +4393,19 @@ def run_production(
                         refresh_deadline - time.monotonic(),
                     )
                     allowances = {
-                        "max-requests": int(RUN_LIMITS["attempts"]),
-                        "max-download-bytes": int(RUN_LIMITS["downloaded_bytes"]),
-                        "max-root-bytes": int(RUN_LIMITS["root_bytes"]),
-                        "max-temp-bytes": int(RUN_LIMITS["temporary_bytes"]),
-                        "max-database-bytes": int(RUN_LIMITS["database_bytes"]),
-                        "max-response-bytes": int(RUN_LIMITS["response_bytes"]),
-                        "max-decoded-response-bytes": int(RUN_LIMITS["decoded_response_bytes"]),
+                        "max-requests": int(_effective_limits()["attempts"]),
+                        "max-download-bytes": int(_effective_limits()["downloaded_bytes"]),
+                        "max-root-bytes": int(_effective_limits()["root_bytes"]),
+                        "max-temp-bytes": int(_effective_limits()["temporary_bytes"]),
+                        "max-database-bytes": int(_effective_limits()["database_bytes"]),
+                        "max-response-bytes": int(_effective_limits()["response_bytes"]),
+                        "max-decoded-response-bytes": int(
+                            _effective_limits()["decoded_response_bytes"]
+                        ),
                         "max-duration-seconds": duration,
-                        "max-rate": float(RUN_LIMITS["rate"]),
-                        "compression": str(RUN_LIMITS["compression"]),
-                        "rate-policy": str(RUN_LIMITS["rate_policy"]),
+                        "max-rate": float(_effective_limits()["rate"]),
+                        "compression": str(_effective_limits()["compression"]),
+                        "rate-policy": str(_effective_limits()["rate_policy"]),
                     }
                 else:
                     refresh_deadline = None
@@ -4146,7 +4421,14 @@ def run_production(
                         max(0.0, session_deadline - time.monotonic()),
                     )
                     allowances["max-duration-seconds"] = duration
-                command = _refresh_command(operator, paths, mode, capture_id, allowances)
+                command = _refresh_command(
+                    operator,
+                    paths,
+                    mode,
+                    capture_id,
+                    allowances,
+                    str(report.get("resource_profile", "default")),
+                )
                 if reconcile_accounting:
                     report["error"] = None
                     report["recovery"] = None
@@ -4523,6 +4805,8 @@ def run_production(
                 f"historical:{expected_release}"
                 if catalogue_version == 3
                 else str(expected_release),
+                str(paths["report"]),
+                str(report.get("resource_profile", "default")),
             ]
             code, stop_reason, reaped, activation_stdout, activation_stderr = _run_external_child(
                 command,
@@ -4604,21 +4888,95 @@ def run_production(
             _kill_awake_guard(awake)
 
 
-def _activation_worker(operator: Path, directory: Path, expected: str) -> int:
+def _activation_worker(
+    operator: Path,
+    directory: Path,
+    expected: str,
+    report_path: Path | None = None,
+    expected_profile: str | None = None,
+) -> int:
     try:
         directory = _external_path(directory)
         operator = _external_path(operator)
+        if report_path is not None:
+            report_path = _external_path(report_path)
         if operator != directory / "operator":
             raise RunnerError("activation operator root must belong to its production directory")
+        profile = "default"
+        session_report = None
+        if report_path is not None:
+            profile, session_report = _session_resource_profile(report_path, expected_profile)
+        elif expected_profile not in {None, "default"}:
+            raise RunnerError("expanded activation requires its bound session report")
         catalogue_version = 3 if expected.startswith("historical:") else 2
         release_id = expected.removeprefix("historical:")
         if not re.fullmatch(r"[0-9a-f]{64}", release_id):
             raise RunnerError("activation release ID is invalid")
+        if profile == "expanded" and catalogue_version != 3:
+            raise RunnerError("expanded resource profile only supports historical activation")
+        limits = (
+            _limits_from_report(session_report, profile)
+            if session_report is not None
+            else _limits_for_profile(profile)
+        )
+        if catalogue_version == 3:
+            current = _strict_json(operator / "current-historical.json")
+            if current is None or current.get("source_release_id") != release_id:
+                raise RunnerError(
+                    "historical activation pointer does not match the expected release"
+                )
+            manifest_path = operator / "releases" / release_id / "manifest.json"
+            manifest = _strict_json(manifest_path)
+            from kalshi_events.common import digest, regular_bytes
+
+            if (
+                manifest is None
+                or current.get("manifest_sha256") != digest(regular_bytes(manifest_path, 1024**2))
+                or manifest.get("source_release_id") != release_id
+                or manifest.get("contract") != "oddsfox.kalshi.historical.v1"
+                or not isinstance(manifest.get("capture_id"), str)
+                or not CAPTURE_ID.fullmatch(manifest["capture_id"])
+            ):
+                raise RunnerError(
+                    "historical activation pointer does not bind a valid release manifest"
+                )
+            current_capture = manifest["capture_id"]
+            if profile == "expanded" and (
+                session_report is None
+                or session_report.get("mode") not in {"full", "resume", "historical"}
+                or session_report.get("capture_id") != current_capture
+            ):
+                raise RunnerError(
+                    "expanded activation release does not match its stopped session capture"
+                )
+            if profile == "default":
+                source = operator / "builds-historical" / current_capture / "warehouse.duckdb"
+                try:
+                    source_info = source.lstat()
+                except OSError:
+                    source_info = None
+                if (
+                    source_info is not None
+                    and source.is_file()
+                    and not source.is_symlink()
+                    and source_info.st_size > int(limits["database_bytes"])
+                ):
+                    raise RunnerError(
+                        "historical activation exceeds the default database limit; "
+                        "resume the exact capture with --historical-resource-profile expanded"
+                    )
         result = activate_current(
             operator,
             directory,
             expected_release_id=release_id,
+            expected_capture_id=(
+                str(session_report["capture_id"])
+                if profile == "expanded" and session_report is not None
+                else None
+            ),
             catalogue_version=catalogue_version,
+            max_database_bytes=int(limits["database_bytes"]),
+            max_temp_bytes=int(limits["temporary_bytes"]),
         )
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return 0
@@ -4644,6 +5002,11 @@ def main(argv: list[str] | None = None) -> int:
         "--historical",
         action="store_true",
         help="finish saved evidence offline or activate the historical publication",
+    )
+    parser.add_argument(
+        "--historical-resource-profile",
+        choices=tuple(RESOURCE_PROFILES),
+        help="select the sealed storage policy for offline historical completion",
     )
     parser.add_argument(
         "--offline-duration-seconds",
@@ -4694,6 +5057,7 @@ def main(argv: list[str] | None = None) -> int:
             offline_duration_seconds=args.offline_duration_seconds,
             renew_offline_window=args.renew_offline_window,
             supersede_offline_window=args.supersede_offline_window,
+            resource_profile=args.historical_resource_profile,
         )
     except RunnerError as exc:
         parser.error(str(exc))
@@ -4702,6 +5066,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.reconcile_stopped_worker and (
         not args.historical
         or not args.capture_id
+        or args.historical_resource_profile is not None
         or args.offline_duration_seconds is not None
         or args.renew_offline_window
         or args.supersede_offline_window
@@ -4742,6 +5107,7 @@ def main(argv: list[str] | None = None) -> int:
                 recover_reboot=args.recover_reboot,
                 recovery_volume_uuid=args.recovery_volume_uuid,
                 reconcile_stopped_worker=args.reconcile_stopped_worker,
+                resource_profile=args.historical_resource_profile,
             )
     except (BudgetStop, RunnerInterrupted) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
@@ -4774,9 +5140,9 @@ def _session_report(
         "mode": mode,
         "started_at": _utc(),
         "started_epoch": now,
-        "deadline_epoch": now + float(RUN_LIMITS["session_seconds"]),
+        "deadline_epoch": now + float(_effective_limits()["session_seconds"]),
         "started_monotonic": mono,
-        "deadline_monotonic": mono + float(RUN_LIMITS["session_seconds"]),
+        "deadline_monotonic": mono + float(_effective_limits()["session_seconds"]),
         "time_budget_started_epoch": now,
         "time_budget_started_monotonic": mono,
         "last_observed_at": _utc(),
@@ -4795,7 +5161,18 @@ def _session_report(
         "phase": "preflight",
         "phase_seconds": {},
         "metrics_file": str(paths["metrics"]),
-        "limits": dict(RUN_LIMITS),
+        "limits": dict(_effective_limits()),
+        "resource_profile": "default",
+        "effective_resource_policy": _resource_policy_record("default", _effective_limits()),
+        "resource_profile_history": [
+            {
+                "profile": "default",
+                "limits": dict(_effective_limits()),
+                "policy": _resource_policy_record("default", _effective_limits()),
+                "selected_at": _utc(),
+                "reason": "initial session policy",
+            }
+        ],
         "resource_samples": [],
         "resource_samples_total": 0,
         "resource_samples_dropped": 0,
@@ -4814,6 +5191,7 @@ def _session_report(
         "error": None,
         "recovery": None,
     }
+    _bind_report_resource_profile(report, "default")
     _atomic_report(paths["report"], report)
     return paths["report"], report, paths
 
@@ -4830,6 +5208,7 @@ def _load_resume(
     extend_session: bool = False,
     recover_reboot: bool = False,
     recovery_volume_uuid: str | None = None,
+    resource_profile: str | None = None,
 ) -> tuple[Path, dict[str, Any], dict[str, Path]]:
     duration = _validate_offline_duration_seconds(offline_duration_seconds)
     renew_requested = renew_offline_window or supersede_offline_window
@@ -4862,6 +5241,49 @@ def _load_resume(
     if len(matches) != 1:
         raise RunnerError("resume requires one durable session report for this capture ID")
     report_path, report = matches[0]
+    saved_profile = report.get("resource_profile", "default")
+    if not isinstance(saved_profile, str) or saved_profile not in RESOURCE_PROFILES:
+        raise RunnerError("session resource profile is invalid")
+    selected_profile = resource_profile or saved_profile
+    profile_transition = selected_profile != saved_profile
+    if not historical and selected_profile != "default":
+        raise RunnerError(
+            "expanded resource profile is restricted to offline historical completion"
+        )
+    reconciliation = report.get("stopped_worker_reconciliation")
+    reconciled_stop = (
+        isinstance(reconciliation, dict)
+        and re.fullmatch(r"[0-9a-f]{64}", str(reconciliation.get("event_id", ""))) is not None
+        and reconciliation.get("audit_file") == "stopped-worker-reconciliation.jsonl"
+        and reconciliation.get("primary_stop_reason") == report.get("error")
+        and type(reconciliation.get("stale_process_group")) is int
+        and reconciliation["stale_process_group"] > 1
+        and type(reconciliation.get("supervisor_pid")) is int
+        and reconciliation["supervisor_pid"] > 1
+        and isinstance(reconciliation.get("termination_evidence_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", reconciliation["termination_evidence_sha256"]) is not None
+        and isinstance(reconciliation.get("session_before_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", reconciliation["session_before_sha256"]) is not None
+    )
+    zero_network_stop = report.get("network_activity_this_invocation") == {
+        "requests": 0,
+        "downloaded_bytes": 0,
+        "accounting_complete": True,
+    }
+    if profile_transition and not (
+        saved_profile == "default"
+        and selected_profile == "expanded"
+        and historical
+        and report.get("mode") in {"full", "resume", "historical"}
+        and report.get("phase") == "stopped"
+        and report.get("active_process_group") is None
+        and (zero_network_stop or reconciled_stop)
+        and report.get("production_state") != "verified"
+    ):
+        raise RunnerError(
+            "conflicting historical resource profile requires an eligible stopped capture"
+        )
+    _bind_report_resource_profile(report, selected_profile, transition=profile_transition)
     recoverable_accounting_stop = _is_recoverable_accounting_stop(
         report, capture_id, reconcile_accounting
     )
@@ -5095,8 +5517,8 @@ def _load_resume(
         old_deadline_monotonic = _time_budget_deadline(report, "monotonic")
         now = time.time()
         mono = time.monotonic()
-        deadline_epoch = now + float(RUN_LIMITS["session_seconds"])
-        deadline_monotonic = mono + float(RUN_LIMITS["session_seconds"])
+        deadline_epoch = now + float(_effective_limits()["session_seconds"])
+        deadline_monotonic = mono + float(_effective_limits()["session_seconds"])
         granting_revision = _revision()
         report["time_budget_started_epoch"] = now
         report["time_budget_started_monotonic"] = mono
@@ -5212,12 +5634,12 @@ def _reserved_upper_bound(snapshot: dict[str, Any], capture_id: str) -> dict[str
             or request_id in ids
             or isinstance(reservation, bool)
             or not isinstance(reservation, int)
-            or not 0 < reservation <= int(RUN_LIMITS["response_bytes"])
+            or not 0 < reservation <= int(_effective_limits()["response_bytes"])
         ):
             raise RunnerError("unfinished receipt cannot be safely charged")
         ids.add(request_id)
         inventory.append((request_id, receipt["capture_id"], reservation))
-        charges += int(RUN_LIMITS["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
+        charges += int(_effective_limits()["response_bytes"]) + HTTPX_MAX_RAW_CHUNK_BYTES
     if amount < charges or attempts < len(pending):
         raise RunnerError("durable reservation totals are contradictory")
     return {
@@ -5227,7 +5649,8 @@ def _reserved_upper_bound(snapshot: dict[str, Any], capture_id: str) -> dict[str
         "accounting_basis": "reserved-upper-bound",
         "accounting_bound_verified": True,
         "unfinished_reservations": len(pending),
-        "unfinished_response_ceiling_bytes": len(pending) * int(RUN_LIMITS["response_bytes"]),
+        "unfinished_response_ceiling_bytes": len(pending)
+        * int(_effective_limits()["response_bytes"]),
         "unfinished_chunk_slack_bytes": len(pending) * HTTPX_MAX_RAW_CHUNK_BYTES,
         "unfinished_reservation_ids": sorted(ids),
         "reservation_inventory_sha256": hashlib.sha256(
@@ -5282,6 +5705,7 @@ def _refresh_command(
     mode: str,
     capture_id: str | None,
     limits: dict[str, Any],
+    resource_profile: str = "default",
 ) -> list[str]:
     return [
         sys.executable,
@@ -5294,6 +5718,7 @@ def _refresh_command(
         mode,
         capture_id or "-",
         json.dumps(limits, sort_keys=True, allow_nan=False),
+        resource_profile,
     ]
 
 
@@ -5311,18 +5736,32 @@ def _accounting_worker_main(
     report_path: Path | None = None,
     expected_root_id: str | None = None,
     expected_revision: str | None = None,
+    resource_profile: str | None = None,
 ) -> int:
     try:
         root = _existing_operator_root(root)
-        value = _read_accounting_worker(
-            root,
-            capture_id,
-            cleanup_historical_stages=cleanup_historical_stages,
-            expected_directory=expected_directory,
-            report_path=report_path,
-            expected_root_id=expected_root_id,
-            expected_revision=expected_revision,
+        profile = "default"
+        if report_path is not None:
+            profile, _report = _session_resource_profile(report_path, resource_profile, capture_id)
+        elif resource_profile not in {None, "default"}:
+            raise RunnerError("expanded accounting requires its bound session report")
+        token = _ACTIVE_LIMITS.set(
+            _limits_from_report(_report, profile)
+            if report_path is not None
+            else _limits_for_profile(profile)
         )
+        try:
+            value = _read_accounting_worker(
+                root,
+                capture_id,
+                cleanup_historical_stages=cleanup_historical_stages,
+                expected_directory=expected_directory,
+                report_path=(report_path if cleanup_historical_stages else None),
+                expected_root_id=expected_root_id,
+                expected_revision=expected_revision,
+            )
+        finally:
+            _ACTIVE_LIMITS.reset(token)
         print(json.dumps(value, sort_keys=True, allow_nan=False))
         return 0
     except Exception as exc:
@@ -5364,6 +5803,7 @@ def _refresh_worker_main(
     mode: str,
     capture_id: str | None,
     raw_limits: str,
+    expected_profile: str | None = None,
 ) -> int:
     from kalshi_events import metrics, refresh
     from kalshi_events.common import Limits, Store
@@ -5388,7 +5828,15 @@ def _refresh_worker_main(
     if report is None:
         print(json.dumps({**result, "error": "session report is missing"}))
         return 1
+    token = None
     try:
+        profile, _ = _session_resource_profile(
+            report_path, expected_profile, capture_id if mode != "full" else None
+        )
+        if profile == "expanded" and mode != "historical":
+            raise RunnerError(
+                "expanded resource profile is restricted to offline historical refresh"
+            )
         if mode != "historical":
             from kalshi_events.transport import BASE_URL, source_url
 
@@ -5403,6 +5851,15 @@ def _refresh_worker_main(
                 if key not in {"compression", "rate-policy"}
             }
         )
+        sealed_limits = _limits_from_report(report, profile)
+        if (
+            not isinstance(sealed_limits, dict)
+            or limits.max_temp_bytes != sealed_limits.get("temporary_bytes")
+            or limits.max_database_bytes != sealed_limits.get("database_bytes")
+            or profile not in RESOURCE_PROFILES
+        ):
+            raise RunnerError("refresh worker limits do not match its session resource profile")
+        token = _ACTIVE_LIMITS.set(_limits_from_report(report, profile))
         compression = values["compression"]
         rate_policy = values["rate-policy"]
         progress_path = metrics_path.with_name(f"{metrics_path.name}.progress.json")
@@ -5457,9 +5914,13 @@ def _refresh_worker_main(
                     metrics.write_report(metrics_path, measured, stream)
                 finally:
                     stream.close()
+        _ACTIVE_LIMITS.reset(token)
+        token = None
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return exit_code
     except Exception as exc:
+        if token is not None:
+            _ACTIVE_LIMITS.reset(token)
         result["complete"] = False
         result["error"] = result.get("error") or str(exc)
         print(json.dumps(result, sort_keys=True, allow_nan=False))
@@ -5500,12 +5961,12 @@ def _merge_capture_notification(report: dict[str, Any], path: Path | None) -> No
 def _main_hidden(argv: list[str]) -> int | None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--_account-root", type=Path)
-    parser.add_argument("--_account-recovery", nargs=2)
-    parser.add_argument("--_account-historical-initial", nargs=6)
+    parser.add_argument("--_account-recovery", nargs="+")
+    parser.add_argument("--_account-historical-initial", nargs=7)
     parser.add_argument("--_root-summary", type=Path)
     parser.add_argument("--_memory-sample", nargs=1)
-    parser.add_argument("--_refresh-worker", nargs=7)
-    parser.add_argument("--_activate-current", nargs=3)
+    parser.add_argument("--_refresh-worker", nargs=8)
+    parser.add_argument("--_activate-current", nargs="+")
     args, rest = parser.parse_known_args(argv)
     selected_workers = (
         args._account_root,
@@ -5522,9 +5983,19 @@ def _main_hidden(argv: list[str]) -> int | None:
     if args._account_root is not None and not rest:
         return _accounting_worker_main(args._account_root)
     if args._account_recovery is not None and not rest:
-        return _accounting_worker_main(Path(args._account_recovery[0]), args._account_recovery[1])
+        if len(args._account_recovery) == 2:
+            return _accounting_worker_main(
+                Path(args._account_recovery[0]), args._account_recovery[1]
+            )
+        if len(args._account_recovery) != 4:
+            print(json.dumps({"error": "recovery accounting worker identity is incomplete"}))
+            return 1
+        operator, capture_id, report_path, profile = args._account_recovery
+        return _accounting_worker_main(
+            Path(operator), capture_id, report_path=Path(report_path), resource_profile=profile
+        )
     if args._account_historical_initial is not None and not rest:
-        operator, directory, report, capture_id, root_id, revision = (
+        operator, directory, report, capture_id, root_id, revision, profile = (
             args._account_historical_initial
         )
         return _accounting_worker_main(
@@ -5535,6 +6006,7 @@ def _main_hidden(argv: list[str]) -> int | None:
             report_path=Path(report),
             expected_root_id=root_id,
             expected_revision=revision,
+            resource_profile=profile,
         )
     if args._root_summary is not None and not rest:
         return _root_summary_worker_main(args._root_summary)
@@ -5546,7 +6018,7 @@ def _main_hidden(argv: list[str]) -> int | None:
             return _memory_sample_worker_main(0)
         return _memory_sample_worker_main(int(group))
     if args._refresh_worker is not None and not rest:
-        operator, report, metrics_path, notification_path, mode, capture_id, limits = (
+        operator, report, metrics_path, notification_path, mode, capture_id, limits, profile = (
             args._refresh_worker
         )
         return _refresh_worker_main(
@@ -5557,12 +6029,24 @@ def _main_hidden(argv: list[str]) -> int | None:
             mode,
             None if capture_id == "-" else capture_id,
             limits,
+            profile,
         )
     if args._activate_current is not None and not rest:
+        if len(args._activate_current) == 3:
+            return _activation_worker(
+                Path(args._activate_current[0]),
+                Path(args._activate_current[1]),
+                args._activate_current[2],
+            )
+        if len(args._activate_current) != 5:
+            print(json.dumps({"error": "activation worker session identity is incomplete"}))
+            return 1
         return _activation_worker(
             Path(args._activate_current[0]),
             Path(args._activate_current[1]),
             args._activate_current[2],
+            Path(args._activate_current[3]),
+            args._activate_current[4],
         )
     return None
 

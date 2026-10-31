@@ -201,7 +201,7 @@ def test_initial_24_hour_window_reaches_historical_child_duration(
 
     assert code == 1
     assert len(child_commands) == 1
-    allowance = json.loads(child_commands[0][-1])
+    allowance = json.loads(child_commands[0][-2])
     assert 14_400 < allowance["max-duration-seconds"] <= 86_400
     assert result["offline_historical_window"]["version"] == 2
     assert (

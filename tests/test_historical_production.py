@@ -1062,10 +1062,10 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
         stderr = paths["logs"] / f"{label}.stderr.log"
         stderr.touch()
         if label == "refresh":
-            assert command[-3] == "historical"
-            assert command[-2] == CAPTURE_ID
+            assert command[-4] == "historical"
+            assert command[-3] == CAPTURE_ID
             if has_offline_window:
-                limits = json.loads(command[-1])
+                limits = json.loads(command[-2])
                 assert 0 < limits["max-duration-seconds"] <= 3600
             value = {
                 "complete": True,
@@ -1086,7 +1086,7 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
             code = 0
         else:
             assert label == "activation"
-            assert command[-1] == f"historical:{RELEASE_ID}"
+            assert command[-3] == f"historical:{RELEASE_ID}"
             value = {
                 "state": "verified",
                 "capture_id": CAPTURE_ID,
@@ -1223,7 +1223,7 @@ def test_historical_refresh_worker_does_not_read_api_or_call_capture(
         {"version": 1, "root_id": logical_root},
     )
     report = tmp_path / "run.json"
-    report.write_text("{}")
+    report.write_text(json.dumps({"capture_id": CAPTURE_ID}))
     metrics = tmp_path / "metrics.json"
     notification = tmp_path / "capture-notification.json"
     limits = {

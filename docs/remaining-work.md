@@ -14,6 +14,7 @@ historical production database has been activated by this investigation.
 | Orphan recovery | An invalid successful source response can be adopted repeatedly, stranding its unfinished request. | Preflight permits retry of typed source-body failures while retaining raw evidence and failing closed on integrity, context and scope contradictions. |
 | Receipt ordering | Whole-second receipt text can sort after a chronologically newer fractional-second receipt. | Python, SQLite and SQL compare exact UTC instants while retaining original timestamp text; old hints and baseline projections cannot silently retain stale winners. |
 | Operational guidance | The performance guide still described the removed logical-compressor cutoff as current policy. | Guidance matches NORMAL/WARN/CRITICAL monitoring and the independent RSS guard. |
+| Protected index accounting | The historical benchmark counted only each parent index's `index.sqlite`, omitting recovery indexes, SQLite sidecars and other index metadata. | Sum logical `st_size` per regular-file path under immediate `tmp/parent-index-*` and `tmp/recovery-index` trees; exclude unrelated temporary trees and fail closed on symlinks, special files or an over-bound inventory. |
 
 The changes address these defects with targeted regressions. Final verification
 and representative recovery measurements remain separate acceptance gates.
@@ -21,6 +22,29 @@ Source-body errors are classified only at body-validation sites; general
 evidence-validation errors must never be suppressed to retry them as source errors.
 
 ## Production blockers
+
+The approved monitored historical attempt now permits an explicitly selected
+expanded profile: 128 GiB database and 192 GiB temporary ceilings, 112/168 GiB
+protective stops, and 96/144 GiB capacity-admission forecasts respectively.
+Root/aggregate limits remain 350/400 GiB and minimum SSD free space remains
+150 GiB. No new volumes or mounts are permitted. For this attempt only, the
+operator accepted monitored write overshoot instead of requiring a hard
+filesystem boundary. Genuine hard-enforcement work remains unresolved.
+
+The revised bounded investigation counted all 83,397 selected data receipts:
+79,762,323 observations (78,835,045 historical markets, 911,884 events and
+15,394 series). This establishes the saved population, not a finished warehouse.
+A broader 219,523-observation fixture passed native/reference schema and
+two-way row comparisons after correcting dbt spill configuration. Both loaders
+previously failed when the adapter reapplied temporary-directory settings after
+spill; those settings now use supported connection-time configuration.
+
+Admission remains withheld. The revised endpoint-weighted database scenario is
+52.64 GiB (63.16 GiB with a 20% sample-mix allowance), but a sampled-tail stress
+is 102.08 GiB, above the expanded 96 GiB admission threshold. These are scenarios,
+not formal upper bounds. End-of-phase temporary snapshots are not high-water
+measurements; full-scale spill and aggregate occupancy remain unresolved.
+No production processing attempt or new offline grant was started.
 
 The current sampled lossless layout is not admitted. The previous endpoint-weighted
 point forecasts were about 58.3 GiB of database and 91.2 GiB of temporary storage.
@@ -32,8 +56,8 @@ upper bounds. Smaller sampled databases do not establish full-scale feasibility.
 The shared APFS operator location has no validated write-enforcing boundary for
 aggregate logical file sizes. Polling, per-batch checks, spill limits, allocated-block
 quotas and per-file limits do not by themselves provide that guarantee. Storage
-provisioning requires an explicit operator decision and validation; unsupported
-configurations remain blocked rather than silently weakening the guarantee.
+provisioning is excluded from the approved attempt. The monitored exception
+does not establish a hard logical-byte or allocated-space guarantee.
 
 A fresh seven-observation dlt reproduction with a 1 MiB database allowance wrote
 1,847,296 bytes before reporting `database storage exhausted`; the same load

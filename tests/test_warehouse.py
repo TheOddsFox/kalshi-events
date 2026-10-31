@@ -282,6 +282,62 @@ def test_dbt_profile_sets_bounded_parallelism_and_memory(store, monkeypatch):
     output = seen["kalshi_events"]["outputs"]["local"]
     assert output["threads"] == 4
     assert output["settings"]["memory_limit"] == "4GB"
+    assert output["config_options"]["temp_directory"].endswith("/spill")
+
+
+def test_dbt_spill_limit_uses_remaining_temp_and_root_headroom(store, monkeypatch):
+    usage = {"temporary_bytes": 300, "retained_bytes": 700, "database_bytes": 0}
+    store.limits = Limits(max_temp_bytes=1_000, max_root_bytes=1_200)
+    monkeypatch.setattr(store, "usage", lambda: dict(usage))
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        profiles = Path(command[command.index("--profiles-dir") + 1]) / "profiles.yml"
+        seen.update(json.loads(profiles.read_text()))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(warehouse.subprocess, "run", fake_run)
+    warehouse.dbt(store, ["parse"])
+    output = seen["kalshi_events"]["outputs"]["local"]
+    assert output["config_options"]["max_temp_directory_size"] == "500B"
+
+
+def test_dbt_duckdb_spill_keeps_temp_directory_for_later_cursors(tmp_path):
+    from dbt.adapters.duckdb.credentials import DuckDBCredentials
+    from dbt.adapters.duckdb.environments.local import LocalEnvironment
+
+    spill_directory = tmp_path / "spill"
+    credentials = DuckDBCredentials(
+        path=str(tmp_path / "warehouse.duckdb"),
+        config_options={
+            "memory_limit": "128MB",
+            "threads": "1",
+            "temp_directory": str(spill_directory),
+            "max_temp_directory_size": "2GB",
+            "preserve_insertion_order": "false",
+        },
+        settings={},
+        keep_open=True,
+    )
+    environment = LocalEnvironment(credentials)
+    first = environment.handle()
+    try:
+        cursor = first.cursor()
+        cursor.execute(
+            "create temp table unsorted as "
+            "select i, repeat(md5(i::varchar), 8) payload from range(1000000) t(i)"
+        )
+        cursor.execute("create temp table sorted as select * from unsorted order by payload")
+        assert list(spill_directory.glob("*.tmp"))
+
+        second = environment.handle()
+        try:
+            assert second.cursor().execute("select 1").fetchone() == (1,)
+        finally:
+            second.close()
+    finally:
+        first.close()
+        environment.close()
 
 
 def test_combo_leg_with_missing_authoritative_event_remains_unresolved_in_warehouse(store):

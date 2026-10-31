@@ -18,8 +18,11 @@ def activate_current(
     production_directory: Path,
     *,
     expected_release_id: str | None = None,
+    expected_capture_id: str | None = None,
     standalone_verified: dict[str, Any] | None = None,
     catalogue_version: int = 2,
+    max_database_bytes: int = 64 * 1024**3,
+    max_temp_bytes: int = 64 * 1024**3,
     link_fn: Any = None,
     replace_fn: Any = None,
     sync_fn: Any = None,
@@ -63,8 +66,8 @@ def activate_current(
         max_decoded_response_bytes=768 * 1024**2,
         max_duration_seconds=48 * 3600,
         max_root_bytes=350 * 1024**3,
-        max_temp_bytes=64 * 1024**3,
-        max_database_bytes=64 * 1024**3,
+        max_temp_bytes=max_temp_bytes,
+        max_database_bytes=max_database_bytes,
     )
     store = Store(root, limits)
     if store.scope is not None:
@@ -77,6 +80,16 @@ def activate_current(
             capture_id = current.get("capture_id")
             if expected_release_id is not None and release_id != expected_release_id:
                 raise RuntimeError("current publication changed after standalone verification")
+            if expected_capture_id is not None:
+                if (
+                    catalogue_version != 3
+                    or not isinstance(expected_capture_id, str)
+                    or len(expected_capture_id) != 32
+                    or any(character not in "0123456789abcdef" for character in expected_capture_id)
+                ):
+                    raise RuntimeError("expected historical capture identity is invalid")
+                if capture_id != expected_capture_id:
+                    raise RuntimeError("current publication belongs to a different capture")
             manifest_body = regular_bytes(Path(current["output"]) / "manifest.json", 1024**2)
             manifest_sha256 = digest(manifest_body)
             if standalone_verified is None:
@@ -131,6 +144,8 @@ def activate_current(
             source_info = source.lstat()
             if not stat.S_ISREG(source_info.st_mode) or source.is_symlink():
                 raise RuntimeError("certified warehouse is not a regular file")
+            if source_info.st_size > limits.max_database_bytes:
+                raise RuntimeError("certified warehouse exceeds the selected database limit")
             source_checksum, _ = file_digest(source, limits.max_database_bytes)
             if source_checksum != checksum:
                 raise RuntimeError("certified warehouse changed before production linking")
