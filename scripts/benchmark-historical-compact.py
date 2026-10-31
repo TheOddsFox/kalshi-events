@@ -80,6 +80,10 @@ def _checkout() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+
 def _source_path(root: Path, relative: str) -> Path:
     from kalshi_events.common import CatalogueError, safe_path
 
@@ -1073,19 +1077,7 @@ def _worker(args: argparse.Namespace) -> int:
     from kalshi_events.common import Limits, Store, atomic_json, decode, regular_bytes
     from kalshi_events.normalize import DiskParentIndex
 
-    fixture_root = args.fixture_root.resolve()
-    report_path = args.worker_report.absolute()
-    data_root = (checkout / "data").resolve()
-    if (
-        not fixture_root.is_relative_to(data_root)
-        or not report_path.is_relative_to(data_root)
-        or fixture_root == report_path
-        or report_path.is_relative_to(fixture_root)
-        or any(path.is_symlink() for path in (report_path, *report_path.parents))
-    ):
-        raise RuntimeError(
-            "worker fixture and report must be separate paths beneath checkout data/"
-        )
+    fixture_root, report_path = _worker_paths(args.fixture_root, args.worker_report, checkout)
     state = decode(regular_bytes(fixture_root / "diagnostic-state.json", STATE_LIMIT_BYTES))
     task_indices = set(args.task_indices)
     store = Store(
@@ -1210,30 +1202,37 @@ def _worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_paths(fixture_root: Path, report_path: Path, checkout: Path) -> tuple[Path, Path]:
+    from kalshi_events.paths import persistent_path
+
+    fixture_root = persistent_path(fixture_root, checkout=checkout, label="worker fixture")
+    report_path = persistent_path(report_path, checkout=checkout, label="worker report")
+    if _paths_overlap(fixture_root, report_path):
+        raise ValueError("worker fixture and report must be separate paths beneath checkout data/")
+    return fixture_root, report_path
+
+
 def _benchmark(args: argparse.Namespace) -> int:
     checkout = _checkout()
     if str(checkout / "src") not in sys.path:
         sys.path.insert(0, str(checkout / "src"))
     from kalshi_events import capture
-    from kalshi_events.common import CatalogueError, atomic_json
+    from kalshi_events.common import CatalogueError, atomic_json, safe_path
+    from kalshi_events.paths import PathPolicyError, persistent_path
 
     started_utc = datetime.now(UTC).isoformat()
     started_monotonic = time.monotonic()
     deadline = started_monotonic + MAX_TOTAL_SECONDS
     checkout = _checkout()
-    source_root = args.operator_root.absolute()
-    output = args.output_dir.absolute()
-    data_root = (checkout / "data").resolve()
-    if not output.is_relative_to(data_root) or output == data_root:
-        raise CatalogueError("benchmark output must be a descendant of checkout data/")
-    if (
-        source_root == output
-        or source_root.is_relative_to(output)
-        or output.is_relative_to(source_root)
-    ):
+    source_root = safe_path(args.operator_root)
+    try:
+        output = persistent_path(args.output_dir, checkout=checkout, label="benchmark output")
+    except PathPolicyError as exc:
+        raise CatalogueError(str(exc)) from exc
+    if _paths_overlap(source_root, output):
         raise CatalogueError("benchmark output must be separate from the read-only operator root")
-    if output.exists() or any(path.is_symlink() for path in (output, *output.parents)):
-        raise CatalogueError("benchmark output must be a new path without symlink ancestors")
+    if output.exists():
+        raise CatalogueError("benchmark output must be a new path")
     output.mkdir(parents=True)
     report_path = output / "report.json"
     report: dict[str, Any] = {
@@ -1451,12 +1450,13 @@ def main() -> int:
     if args.worker:
         if args.fixture_root is None or args.worker_report is None:
             parser.error("worker mode requires fixture and report paths")
-        report_path = args.worker_report.absolute()
-        data_root = (_checkout() / "data").resolve()
-        if not report_path.is_relative_to(data_root) or any(
-            path.is_symlink() for path in (report_path, *report_path.parents)
-        ):
-            parser.error("worker report must be a new safe path beneath checkout data/")
+        try:
+            args.fixture_root, args.worker_report = _worker_paths(
+                args.fixture_root, args.worker_report, _checkout()
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        report_path = args.worker_report
         try:
             return _worker(args)
         except Exception as exc:
