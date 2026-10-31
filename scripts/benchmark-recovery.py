@@ -388,9 +388,17 @@ def _resume_worker(args: argparse.Namespace) -> int:
                 old_body_reads_before_first_attempt += 1
         return original_read_page(store, relative, *read_args, **read_kwargs)
 
-    def observed_commit(store, state, index, relative, request_id, identities):
+    def observed_commit(store, state, index, relative, request_id, identities, **commit_kwargs):
         was_new = relative not in getattr(state, "processed", set())
-        result = original_commit(store, state, index, relative, request_id, identities)
+        if "first_data_timing" in commit_kwargs:
+            parameters = inspect.signature(original_commit).parameters
+            if "first_data_timing" not in parameters and not any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+            ):
+                commit_kwargs.pop("first_data_timing")
+        result = original_commit(
+            store, state, index, relative, request_id, identities, **commit_kwargs
+        )
         if was_new and relative not in first_page:
             manifest = json.loads(store.path(relative).read_text(encoding="utf-8"))
             if manifest.get("endpoint") != capture.CUTOFF_ENDPOINT:

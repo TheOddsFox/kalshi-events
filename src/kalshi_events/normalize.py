@@ -12,6 +12,7 @@ from typing import Any
 from kalshi_events.common import (
     BudgetExceeded,
     CatalogueError,
+    InvalidSourcePayload,
     digest,
     durable_mkdir,
     json_bytes,
@@ -39,15 +40,22 @@ PARENT_INDEX_SCHEMA = """create table winners(kind text,ticker text,received tex
 
 def records(payload: Any, key: str, *, singular: bool = False) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
-        raise CatalogueError("source envelope must be an object")
+        raise InvalidSourcePayload("source envelope must be an object")
     value = payload.get(key)
     if singular:
         if not isinstance(value, dict):
-            raise CatalogueError(f"source envelope lacks {key} object")
+            raise InvalidSourcePayload(f"source envelope lacks {key} object")
         value = [value]
     if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
-        raise CatalogueError(f"source envelope lacks {key} object array")
+        raise InvalidSourcePayload(f"source envelope lacks {key} object array")
     return value
+
+
+def _source_ticker(value: Any) -> str:
+    try:
+        return ticker(value)
+    except CatalogueError as exc:
+        raise InvalidSourcePayload(str(exc)) from exc
 
 
 def observation(
@@ -73,25 +81,25 @@ def observation(
 def native_identity(kind: str, native: dict[str, Any]) -> tuple[str, Any]:
     """Validate native identity and relationship fields without serializing payloads."""
     identity = native.get("event_ticker") if kind == "events" else native.get("ticker")
-    identity = ticker(identity)
+    identity = _source_ticker(identity)
     parent = None
     if kind == "events":
         parent = native.get("series_ticker")
         if parent is not None and parent != "":
             if not isinstance(parent, str):
-                raise CatalogueError("malformed native event series ticker")
-            ticker(parent)
+                raise InvalidSourcePayload("malformed native event series ticker")
+            _source_ticker(parent)
     elif kind == "markets":
-        parent = ticker(native.get("event_ticker"))
+        parent = _source_ticker(native.get("event_ticker"))
         legs = native.get("mve_selected_legs", [])
         if not isinstance(legs, list) or any(not isinstance(leg, dict) for leg in legs):
-            raise CatalogueError("malformed native combo legs")
+            raise InvalidSourcePayload("malformed native combo legs")
         for leg in legs:
-            ticker(leg.get("event_ticker"))
-            ticker(leg.get("market_ticker"))
+            _source_ticker(leg.get("event_ticker"))
+            _source_ticker(leg.get("market_ticker"))
             side = leg.get("side")
             if not isinstance(side, str) or side not in ("yes", "no", "YES", "NO"):
-                raise CatalogueError("malformed native combo side")
+                raise InvalidSourcePayload("malformed native combo side")
     return identity, parent
 
 
@@ -173,7 +181,9 @@ class ParentIndex:
             identity, parent = native_identity(kind, native)
             if allowed_batch is not None:
                 if kind != "events" or identity not in allowed_batch:
-                    raise CatalogueError("event parent batch returned an unrequested identity")
+                    raise InvalidSourcePayload(
+                        "event parent batch returned an unrequested identity"
+                    )
                 candidate_key = (batch_id, generation)
                 candidates = self.parent_batch_candidates.setdefault(candidate_key, {})
                 candidate = (
@@ -240,7 +250,7 @@ class ParentIndex:
                 if "markets" in native:
                     for market in records(native, "markets"):
                         if market.get("event_ticker") != identity:
-                            raise CatalogueError("nested market parent contradicts event")
+                            raise InvalidSourcePayload("nested market parent contradicts event")
                         if scoped_series is not None and (
                             market.get("mve_collection_ticker") or market.get("mve_selected_legs")
                         ):
@@ -674,7 +684,7 @@ def observations(pages: Iterable[tuple[dict[str, Any], Any]]) -> Iterator[dict[s
             if kind == "events" and "markets" in native:
                 for n, market in enumerate(records(native, "markets")):
                     if market.get("event_ticker") != row["event_ticker"]:
-                        raise CatalogueError("nested market parent contradicts event")
+                        raise InvalidSourcePayload("nested market parent contradicts event")
                     yield {
                         "entity_kind": "markets",
                         **observation(

@@ -74,6 +74,10 @@ class CatalogueError(RuntimeError):
     """A failed invariant; no publication may be promoted."""
 
 
+class InvalidSourcePayload(CatalogueError):
+    """A semantically invalid source body that may be retried before adoption."""
+
+
 class BudgetExceeded(CatalogueError):
     """Requested work remains incomplete and can resume with a new allowance."""
 

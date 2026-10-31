@@ -29,6 +29,7 @@ from kalshi_events.common import (
     Budget,
     BudgetExceeded,
     CatalogueError,
+    InvalidSourcePayload,
     Store,
     decode,
     digest,
@@ -1636,7 +1637,7 @@ def _derive_page_change(
             for row in rows:
                 identity, parent_series = native_identity("events", row)
                 if identity not in allowed_parents:
-                    raise CatalogueError("event parent batch returned an unrequested ticker")
+                    raise InvalidSourcePayload("event parent batch returned an unrequested ticker")
                 if parent_batch == "ordinary" and (
                     row.get("mve_collection_ticker") or row.get("mve_selected_legs")
                 ):
@@ -1648,9 +1649,9 @@ def _derive_page_change(
         if batch is not None:
             allowed = set(batch)
             for row in rows:
-                value = ticker(row.get("ticker"))
+                value = native_identity("markets", row)[0]
                 if value not in allowed:
-                    raise CatalogueError("market batch returned an unrequested ticker")
+                    raise InvalidSourcePayload("market batch returned an unrequested ticker")
                 batch_found.add(value)
         if work["singular"]:
             key = "event_ticker" if work["kind"] == "events" else "ticker"
@@ -1662,14 +1663,14 @@ def _derive_page_change(
                 ]
             )
             if rows[0].get(key) != ticker_from_path_segment(work["endpoint"][len(prefix) :]):
-                raise CatalogueError("direct lookup returned a different native identity")
+                raise InvalidSourcePayload("direct lookup returned a different native identity")
             updated["done"] = True
         elif work["endpoint"] == "/series":
             updated["done"] = True
         else:
             cursor = payload.get("cursor")
             if not isinstance(cursor, str) or len(cursor) > 8192:
-                raise CatalogueError("missing or malformed pagination cursor")
+                raise InvalidSourcePayload("missing or malformed pagination cursor")
             known = seen.get(index, set())
             fingerprint = digest(cursor.encode()) if cursor else ""
             if cursor and (cursor == work["cursor"] or fingerprint in known):
@@ -1826,14 +1827,14 @@ def _validated_cutoff(payload: Any) -> dict[str, Any]:
         or not isinstance(payload.get("market_settled_ts"), str)
         or not isinstance(payload.get("trades_created_ts"), str)
     ):
-        raise CatalogueError("malformed historical cutoff response")
+        raise InvalidSourcePayload("malformed historical cutoff response")
     for key in ("market_settled_ts", "trades_created_ts"):
         try:
             instant = datetime.fromisoformat(payload[key].replace("Z", "+00:00"))
             if instant.utcoffset() != timedelta(0):
                 raise ValueError("cutoff must be UTC")
         except ValueError as exc:
-            raise CatalogueError("malformed UTC historical cutoff") from exc
+            raise InvalidSourcePayload("malformed UTC historical cutoff") from exc
     return dict(payload)
 
 
@@ -3167,6 +3168,7 @@ def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
         else {row["relative"] for row in page_receipts(store, state)}
     )
     recovered: dict[str, str] = {}
+    seen_cursors = getattr(state, "seen_cursors", state.get("seen_cursors", {}))
     for path in store.path("raw").glob("*/manifest.json"):
         relative = path.relative_to(store.root).as_posix()
         if relative in logged:
@@ -3202,6 +3204,20 @@ def _recover_receipts(store: Store, state: dict[str, Any]) -> dict[str, str]:
             or manifest.get("singular") != singular
         ):
             raise CatalogueError("uncommitted raw receipt contradicts request identity")
+        try:
+            checked_manifest, payload, _ = _read_page_change(
+                store,
+                state,
+                seen_cursors,
+                index,
+                relative,
+                context["request_id"],
+            )
+            ParentIndex().add_page(checked_manifest, payload)
+        except InvalidSourcePayload:
+            continue
+        if checked_manifest != manifest:
+            raise CatalogueError("uncommitted raw receipt changed during recovery")
         if context["request_id"] in recovered:
             raise CatalogueError("multiple completed raw receipts claim the same request identity")
         recovered[context["request_id"]] = relative

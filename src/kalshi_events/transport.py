@@ -25,6 +25,7 @@ from kalshi_events.common import (
     Budget,
     BudgetExceeded,
     CatalogueError,
+    InvalidSourcePayload,
     Store,
     decode,
     digest,
@@ -184,7 +185,13 @@ def read_page(
     if should_decode:
         metrics.add("raw_body_json_decodes")
     store.check_deadline()
-    payload = decode(decoded) if should_decode else None
+    if should_decode:
+        try:
+            payload = decode(decoded)
+        except CatalogueError as exc:
+            raise InvalidSourcePayload("invalid source JSON payload") from exc
+    else:
+        payload = None
     store.check_deadline()
     return manifest, payload
 
