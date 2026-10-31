@@ -17,6 +17,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -32,6 +33,19 @@ MAX_SAMPLE_ROWS = 1_000_000
 MAX_ARTIFACT_BYTES = 16 * 1024**3
 MAX_CHILD_SECONDS = 180
 MAX_TOTAL_SECONDS = 3600
+MAX_ADMISSION_CHILD_SECONDS = 20 * 60
+MAX_ADMISSION_TOTAL_SECONDS = 2 * 60 * 60
+MAX_ADMISSION_CHILDREN_SECONDS = 105 * 60
+ADMISSION_REPORT_RESERVE_SECONDS = 15 * 60
+ADMISSION_SAMPLE_TARGETS = (250_000, 1_000_000, 3_000_000)
+MAX_ADMISSION_PAGES = 4096
+MAX_ADMISSION_ENCODED_BYTES = 2 * 1024**3
+MAX_ADMISSION_GENERATED_BYTES = 16 * 1024**3
+ADMISSION_DATABASE_LIMIT_BYTES = 96 * 1024**3
+ADMISSION_TEMPORARY_LIMIT_BYTES = 144 * 1024**3
+ADMISSION_FREE_LIMIT_BYTES = 150 * 1024**3
+ADMISSION_WORK_SECONDS = 22 * 60 * 60
+ADMISSION_VERIFY_SECONDS = 2 * 60 * 60
 UNKNOWN_POPULATION_MULTIPLIER = 2.0
 RAW_ROOT_BASELINE_ASSUMPTION_BYTES = 35_000_000_000
 SAFE_CATEGORY_BYTES = 48 * 1024**3
@@ -41,17 +55,19 @@ AGGREGATE_LIMIT_BYTES = 400 * 1024**3
 MANIFEST_LIMIT_BYTES = 1024**2
 STATE_LIMIT_BYTES = 64 * 1024**2
 DEFAULT_CAPTURE_ID = "19caddd934f74d13ad3d585b915601c9"
+_ADMISSION_WORKER_PROGRESS: dict[str, Any] | None = None
 
 
 class ReadOnlyStore:
     """Small read-only adapter: Store() would reconcile the unrelated 270 GiB root."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, max_seconds: int = MAX_CHILD_SECONDS):
         from kalshi_events.common import safe_path
 
         self.root = safe_path(root)
         self.scope = None
         self.started = time.monotonic()
+        self.max_seconds = max_seconds
         self.limits = SimpleNamespace(
             max_root_bytes=MAX_CAPTURE_BYTES,
             max_response_bytes=384 * 1024**2,
@@ -72,8 +88,57 @@ class ReadOnlyStore:
     def check_deadline(self) -> None:
         from kalshi_events.common import BudgetExceeded
 
-        if time.monotonic() - self.started > MAX_CHILD_SECONDS:
-            raise BudgetExceeded("saved-receipt sampling exceeded its 180-second bound")
+        if time.monotonic() - self.started > self.max_seconds:
+            raise BudgetExceeded("saved-receipt sampling exceeded its configured deadline")
+
+
+def _admission_worker_deadline(value: Any, *, now: float | None = None) -> tuple[float, float]:
+    current = time.monotonic() if now is None else now
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not math.isfinite(current)
+    ):
+        raise ValueError("admission worker deadline must be a finite monotonic timestamp")
+    deadline = float(value)
+    remaining = deadline - current
+    if remaining <= 0 or remaining > MAX_ADMISSION_CHILD_SECONDS:
+        raise ValueError(
+            "admission worker deadline must be positive and no more than 20 minutes away"
+        )
+    return deadline, remaining
+
+
+def _admission_deadline_store_type(store_type: Any, budget_error: Any, deadline: float) -> Any:
+    class AdmissionDeadlineStore(store_type):
+        def __init__(self, *args: Any, **kwargs: Any):
+            self._admission_deadline = deadline
+            limits = kwargs.get("limits")
+            if limits is not None:
+                # Several storage helpers derive an absolute deadline from Store.started
+                # and Limits directly. Leave a small startup allowance so those helpers
+                # cannot outlive the supervisor's absolute deadline during Store setup.
+                remaining = deadline - time.monotonic() - 1.0
+                if remaining <= 0:
+                    raise budget_error("admission child deadline exhausted during Store setup")
+                kwargs["limits"] = replace(
+                    limits,
+                    max_duration_seconds=min(limits.max_duration_seconds, remaining),
+                )
+            super().__init__(*args, **kwargs)
+
+        @property
+        def remaining(self) -> float:
+            seconds = self._admission_deadline - time.monotonic()
+            if seconds <= 0:
+                raise budget_error("admission child deadline exhausted")
+            return seconds
+
+        def check_deadline(self) -> None:
+            _ = self.remaining
+
+    return AdmissionDeadlineStore
 
 
 def _checkout() -> Path:
@@ -96,7 +161,7 @@ def _source_path(root: Path, relative: str) -> Path:
     return path
 
 
-def _read_json(path: Path, limit: int) -> Any:
+def _read_regular_bytes(path: Path, limit: int) -> bytes:
     from kalshi_events.common import CatalogueError
 
     if path.is_symlink():
@@ -111,9 +176,13 @@ def _read_json(path: Path, limit: int) -> Any:
             raw = stream.read(limit + 1)
         if len(raw) > limit:
             raise CatalogueError("sample metadata grew beyond its byte bound")
-        return json.loads(raw.decode("utf-8"))
+        return raw
     finally:
         os.close(descriptor)
+
+
+def _read_json(path: Path, limit: int) -> Any:
+    return json.loads(_read_regular_bytes(path, limit).decode("utf-8"))
 
 
 def _capture_id(root: Path, requested: str | None) -> str:
@@ -150,7 +219,12 @@ def _check_capture_entry_count(entry_count: int) -> None:
         raise CatalogueError("capture has too many receipt entries for bounded sampling")
 
 
-def _page_metadata(source: ReadOnlyStore, row: dict[str, Any], order: int) -> dict[str, Any]:
+def _page_metadata(
+    source: ReadOnlyStore,
+    row: dict[str, Any],
+    order: int,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     from kalshi_events.common import CatalogueError
 
     relative = row.get("relative")
@@ -161,6 +235,15 @@ def _page_metadata(source: ReadOnlyStore, row: dict[str, Any], order: int) -> di
     manifest = _read_json(manifest_path, MANIFEST_LIMIT_BYTES)
     if not isinstance(manifest, dict):
         raise CatalogueError("receipt manifest is not an object")
+    if state is not None:
+        from kalshi_events import capture
+
+        if manifest.get("capture_id") != state.get(
+            "capture_id"
+        ) or not capture._receipt_matches_state_protocol(manifest, state):
+            raise CatalogueError("receipt metadata is not bound to the current capture protocol")
+        if capture._acquisition_protocol(state) == capture.CURRENT_ACQUISITION_PROTOCOL:
+            capture._validate_receipt_task_binding(manifest, state, row)
     body_path = receipt_directory / "body.bin"
     if body_path.is_symlink() or not body_path.is_file():
         raise CatalogueError("sample receipt body is missing or unsafe")
@@ -1092,24 +1175,113 @@ def _capacity_forecast(
 
 
 def _worker(args: argparse.Namespace) -> int:
+    global _ADMISSION_WORKER_PROGRESS
+
+    worker_entry_started = time.monotonic()
+    admission_worker = bool(getattr(args, "admission_worker", False))
+    effective_worker_deadline = None
+    admission_remaining_at_entry = None
+    if admission_worker:
+        effective_worker_deadline, admission_remaining_at_entry = _admission_worker_deadline(
+            getattr(args, "admission_deadline_monotonic", None), now=worker_entry_started
+        )
+        _ADMISSION_WORKER_PROGRESS = {
+            "phase": "worker_setup",
+            "source_capture_id": args.capture_id,
+            "target_observations": None,
+            "selected_data_receipts": None,
+            "selected_control_receipts": None,
+            "source_receipt_identities": None,
+            "native_observations_landed": None,
+            "native_landing_complete": False,
+            "verified_evidence_sha256": None,
+            "verified_evidence_count": None,
+            "export_current_relation": None,
+            "export_completed_relations": [],
+            "verification_complete": False,
+            "verification_peak_temporary_bytes": None,
+            "verification_peak_temporary_allocated_bytes": None,
+            "effective_deadline_kind": "absolute_monotonic_from_supervisor",
+            "effective_deadline_monotonic": effective_worker_deadline,
+            "effective_deadline_remaining_at_worker_entry_seconds": admission_remaining_at_entry,
+        }
+    else:
+        _ADMISSION_WORKER_PROGRESS = None
     checkout = _checkout()
     sys.path.insert(0, str(checkout / "src"))
     from kalshi_events import publish, warehouse
-    from kalshi_events.common import Limits, Store, atomic_json, decode, regular_bytes
+    from kalshi_events.common import (
+        BudgetExceeded,
+        Limits,
+        Store,
+        atomic_json,
+        decode,
+        interrupt_at_deadline,
+        regular_bytes,
+    )
     from kalshi_events.normalize import DiskParentIndex
 
     fixture_root, report_path = _worker_paths(args.fixture_root, args.worker_report, checkout)
-    state = decode(regular_bytes(fixture_root / "diagnostic-state.json", STATE_LIMIT_BYTES))
+    state_data = decode(regular_bytes(fixture_root / "diagnostic-state.json", STATE_LIMIT_BYTES))
+    diagnostic_marker = None
+    if admission_worker:
+        from kalshi_events.capture import JOURNAL_VERSION, _CaptureState
+
+        diagnostic_marker = decode(regular_bytes(fixture_root / ".diagnostic-sample.json", 1024**2))
+        page_rows = decode(
+            regular_bytes(fixture_root / "diagnostic-page-index.json", MAX_ARTIFACT_BYTES)
+        )
+        if (
+            not isinstance(diagnostic_marker, dict)
+            or diagnostic_marker.get("kind") != "historical-admission-subset"
+            or diagnostic_marker.get("source_capture_id") != args.capture_id
+            or diagnostic_marker.get("complete") is not False
+            or diagnostic_marker.get("certified") is not False
+            or diagnostic_marker.get("published") is not False
+            or not isinstance(page_rows, list)
+            or not page_rows
+            or (fixture_root / "captures").exists()
+            or (fixture_root / "genesis.json").exists()
+        ):
+            raise RuntimeError(
+                "admission worker requires an incomplete journal-free diagnostic fixture"
+            )
+        state = _CaptureState(state_data)
+        state["journal_version"] = JOURNAL_VERSION
+        state.page_rows = page_rows
+        if state.get("complete") is not False:
+            raise RuntimeError("admission fixture cannot represent a complete source capture")
+        if time.monotonic() >= effective_worker_deadline:
+            raise BudgetExceeded("admission deadline expired during fixture metadata setup")
+        assert _ADMISSION_WORKER_PROGRESS is not None
+        _ADMISSION_WORKER_PROGRESS.update(
+            phase="fixture_setup",
+            target_observations=diagnostic_marker.get("target_observations"),
+            selected_data_receipts=diagnostic_marker.get("selected_data_receipts"),
+            selected_control_receipts=diagnostic_marker.get("selected_control_receipts"),
+            source_receipt_identities=[
+                {key: row.get(key) for key in ("relative", "request_id")} for row in page_rows
+            ],
+        )
+    else:
+        state = state_data
     task_indices = set(args.task_indices)
-    store = Store(
+    child_seconds = MAX_ADMISSION_CHILD_SECONDS if admission_worker else MAX_CHILD_SECONDS
+    store_type = (
+        _admission_deadline_store_type(Store, BudgetExceeded, effective_worker_deadline)
+        if admission_worker
+        else Store
+    )
+    store = store_type(
         fixture_root,
-        Limits(
-            max_duration_seconds=MAX_CHILD_SECONDS,
+        limits=Limits(
+            max_duration_seconds=child_seconds,
             max_root_bytes=MAX_ARTIFACT_BYTES,
             max_temp_bytes=MAX_ARTIFACT_BYTES,
             max_database_bytes=MAX_ARTIFACT_BYTES,
         ),
     )
+    store.check_deadline()
     started = time.monotonic()
     cpu_started = time.process_time()
     phase_path = fixture_root / ".benchmark-phase"
@@ -1120,6 +1292,10 @@ def _worker(args: argparse.Namespace) -> int:
     directory.mkdir(parents=True)
     database = directory / "warehouse.duckdb"
     verified_pages: dict[str, str] = {}
+    if admission_worker:
+        assert _ADMISSION_WORKER_PROGRESS is not None
+        _ADMISSION_WORKER_PROGRESS["verified_evidence_sha256"] = verified_pages
+        _ADMISSION_WORKER_PROGRESS["phase"] = "build"
     index = DiskParentIndex(store, collect_winners=False)
     loader_started = time.monotonic()
     count = selected_loader(
@@ -1130,11 +1306,20 @@ def _worker(args: argparse.Namespace) -> int:
         parent_index=index,
         task_indices=task_indices,
     )
+    if admission_worker:
+        assert _ADMISSION_WORKER_PROGRESS is not None
+        _ADMISSION_WORKER_PROGRESS.update(
+            native_observations_landed=count,
+            native_landing_complete=True,
+            verified_evidence_count=len(verified_pages),
+            verified_evidence_sha256=dict(verified_pages),
+        )
     loader_seconds = time.monotonic() - loader_started
     database_relative = database.relative_to(store.root).as_posix()
     with (
         warehouse._duckdb_work_config(store, directory) as config,
         warehouse.duckdb.connect(str(database), config=config) as connection,
+        interrupt_at_deadline(store, connection.interrupt),
     ):
         warehouse._projection_membership(store, state, index, connection)
         warehouse._write_historical_coverage(connection, state)
@@ -1152,11 +1337,17 @@ def _worker(args: argparse.Namespace) -> int:
             "historical_compact": True,
         },
     )
+    if admission_worker:
+        assert _ADMISSION_WORKER_PROGRESS is not None
+        _ADMISSION_WORKER_PROGRESS["phase"] = "build_dbt"
     store.sync(directory.relative_to(store.root).as_posix())
     build_database_bytes = database.stat().st_size
+    build_database_allocated_bytes = database.stat().st_blocks * 512
     build_wal = database.with_name(database.name + ".wal")
     build_wal_bytes = build_wal.stat().st_size if build_wal.exists() else 0
+    build_wal_allocated_bytes = build_wal.stat().st_blocks * 512 if build_wal.exists() else 0
     parent_index_bytes = index.path.stat().st_size
+    parent_index_allocated_bytes = index.path.stat().st_blocks * 512
     build_phase_temporary_bytes = _tree_bytes(fixture_root / "tmp")[0]
     index.close()
     diagnostic_database = store.path(f"diagnostic-builds/{args.capture_id}/warehouse.duckdb")
@@ -1172,14 +1363,167 @@ def _worker(args: argparse.Namespace) -> int:
     phase_path.write_text("export", encoding="ascii")
     with publish._export_connection(store, database, export_dir) as connection:
         for name, table in publish.RELATIONS.items():
+            if admission_worker:
+                assert _ADMISSION_WORKER_PROGRESS is not None
+                _ADMISSION_WORKER_PROGRESS.update(
+                    phase="export",
+                    export_current_relation=name,
+                )
             destination = export_dir / f"{name}.parquet"
             connection.execute(
                 f"copy (select * from main.{table} order by {publish.ORDER_KEYS[name]}) "
                 "to ? (format parquet, compression zstd, compression_level 6)",
                 [str(destination)],
             )
+            if admission_worker:
+                assert _ADMISSION_WORKER_PROGRESS is not None
+                _ADMISSION_WORKER_PROGRESS["export_completed_relations"].append(name)
+                _ADMISSION_WORKER_PROGRESS["export_current_relation"] = None
         export_phase_temporary_bytes = _tree_bytes(fixture_root / "tmp")[0]
     store.sync("tmp/compact-exports")
+    verification = None
+    verification_seconds = 0.0
+    verification_spill_config = None
+    verification_phase_temporary_bytes = 0
+    if admission_worker:
+        assert _ADMISSION_WORKER_PROGRESS is not None
+        _ADMISSION_WORKER_PROGRESS.update(
+            phase="verification",
+            verification_complete=False,
+        )
+        verification_started = time.monotonic()
+        phase_path.write_text("verification", encoding="ascii")
+        expected_relations = {f"{name}.parquet" for name in publish.RELATIONS}
+        inventory = publish.inventory(export_dir, expected_relations, MAX_ARTIFACT_BYTES)
+        if set(inventory) != expected_relations:
+            raise RuntimeError("diagnostic Parquet inventory is incomplete")
+        relational = {}
+        verification_directory = store.path("tmp/verification")
+        verification_directory.mkdir(parents=True)
+        with warehouse._duckdb_work_config(store, verification_directory) as config:
+            verification_spill_config = {
+                "memory_limit": config["memory_limit"],
+                "threads": config["threads"],
+                "temp_directory": config["temp_directory"],
+                "max_temp_directory_size": config["max_temp_directory_size"],
+            }
+            with (
+                warehouse.duckdb.connect(
+                    str(database), config=config, read_only=True
+                ) as connection,
+                interrupt_at_deadline(store, connection.interrupt),
+            ):
+                observation_rows = connection.execute(
+                    "select count(*) from landing.observations"
+                ).fetchone()[0]
+                coverage_rows = connection.execute(
+                    "select * from main.catalogue_coverage"
+                ).fetchall()
+                if coverage_rows != [
+                    (
+                        "oddsfox.kalshi.historical.v1",
+                        "historical",
+                        ["events_combo", "markets_live", "markets_combo"],
+                        args.capture_id,
+                        False,
+                    )
+                ]:
+                    raise RuntimeError(
+                        "diagnostic historical coverage values do not match the fixture"
+                    )
+                actual_rows = connection.execute(
+                    "select count(*) from landing.observations"
+                ).fetchone()[0]
+                if actual_rows != count or observation_rows != count:
+                    raise RuntimeError(
+                        "diagnostic landing row count differs from normalized receipt rows"
+                    )
+                duplicate_entity_count = connection.execute(
+                    "select count(*) from (select entity_kind, entity_ticker "
+                    "from landing.observations group by entity_kind, entity_ticker "
+                    "having count(*) > 1)"
+                ).fetchone()[0]
+                for name, table in publish.RELATIONS.items():
+                    destination = export_dir / f"{name}.parquet"
+                    database_schema = connection.execute(
+                        f"describe select * from main.{table}"
+                    ).fetchall()
+                    parquet_schema = connection.execute(
+                        "describe select * from read_parquet(?)", [str(destination)]
+                    ).fetchall()
+                    if [(row[0], row[1]) for row in database_schema] != [
+                        (row[0], row[1]) for row in parquet_schema
+                    ]:
+                        raise RuntimeError(f"diagnostic Parquet schema differs for {name}")
+                    database_count = connection.execute(
+                        f"select count(*) from main.{table}"
+                    ).fetchone()[0]
+                    parquet_count = connection.execute(
+                        "select count(*) from read_parquet(?)", [str(destination)]
+                    ).fetchone()[0]
+                    if database_count != parquet_count:
+                        raise RuntimeError(f"diagnostic Parquet row count differs for {name}")
+                    keys = publish.ORDER_KEYS[name]
+                    first_db = connection.execute(
+                        f"select * from main.{table} order by {keys} limit 1"
+                    ).fetchall()
+                    first_file = connection.execute(
+                        f"select * from read_parquet(?) order by {keys} limit 1",
+                        [str(destination)],
+                    ).fetchall()
+                    last_db = connection.execute(
+                        f"select * from main.{table} order by {keys} desc limit 1"
+                    ).fetchall()
+                    last_file = connection.execute(
+                        f"select * from read_parquet(?) order by {keys} desc limit 1",
+                        [str(destination)],
+                    ).fetchall()
+                    if first_db != first_file or last_db != last_file:
+                        raise RuntimeError(f"diagnostic Parquet boundary rows differ for {name}")
+                    if connection.execute(
+                        f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
+                    ).fetchone():
+                        raise RuntimeError(f"diagnostic publication keys are not unique for {name}")
+                    relational[name] = {
+                        "rows": database_count,
+                        "schema": [(row[0], row[1]) for row in database_schema],
+                        "boundary_rows_compared": 2 if database_count else 0,
+                        "ordering_keys_unique": True,
+                        "sha256": inventory[f"{name}.parquet"]["sha256"],
+                        "bytes": inventory[f"{name}.parquet"]["size"],
+                    }
+        store.sync("tmp/verification")
+        verification_phase_temporary_bytes = _tree_bytes(fixture_root / "tmp")[0]
+        expected_page_rows = {row["relative"] for row in page_rows}
+        expected_evidence = {
+            path
+            for relative in expected_page_rows
+            for path in (
+                relative,
+                str(Path(relative).with_name("body.bin")),
+            )
+        }
+        verified_relatives = set(verified_pages)
+        if not expected_evidence.issubset(verified_relatives):
+            raise RuntimeError("diagnostic loader receipt verification is incomplete")
+        if len(verified_pages) != 2 * len(expected_page_rows):
+            raise RuntimeError("diagnostic loader verified unexpected receipt evidence")
+        verification_seconds = time.monotonic() - verification_started
+        verification = {
+            "complete": True,
+            "receipt_files_verified": len(verified_pages),
+            "receipt_count": len(expected_page_rows),
+            "landing_rows": count,
+            "landing_row_count_matches": True,
+            "historical_coverage_checked": True,
+            "relation_inventory_sha256": hashlib.sha256(
+                json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "relations": relational,
+            "standalone_release_verify_wrapper": "not_called_on_incomplete_subset",
+            "shared_hash_schema_coverage_and_bounded_sql": True,
+        }
+        _ADMISSION_WORKER_PROGRESS.update(verification_complete=True)
     phase_path.unlink(missing_ok=True)
     total_bytes, _ = _tree_bytes(fixture_root)
     export_bytes = sum(path.stat().st_size for path in export_dir.glob("*.parquet"))
@@ -1200,8 +1544,11 @@ def _worker(args: argparse.Namespace) -> int:
         "verified_evidence_sha256": verified,
         "database_bytes": database.stat().st_size,
         "build_database_bytes": build_database_bytes,
+        "build_database_allocated_bytes": build_database_allocated_bytes,
         "build_wal_bytes": build_wal_bytes,
+        "build_wal_allocated_bytes": build_wal_allocated_bytes,
         "parent_index_bytes": parent_index_bytes,
+        "parent_index_allocated_bytes": parent_index_allocated_bytes,
         "build_phase_temporary_bytes": build_phase_temporary_bytes,
         "export_phase_temporary_bytes": export_phase_temporary_bytes,
         "wal_bytes": database.with_name(database.name + ".wal").stat().st_size
@@ -1210,7 +1557,8 @@ def _worker(args: argparse.Namespace) -> int:
         "export_bytes": export_bytes,
         "export_files": sorted(path.name for path in export_dir.glob("*.parquet")),
         "fixture_and_artifact_bytes": total_bytes,
-        "elapsed_seconds": time.monotonic() - started,
+        "elapsed_seconds": time.monotonic()
+        - (worker_entry_started if admission_worker else started),
         "timing_interpretation": (
             "loader_seconds compares the selected landing paths; elapsed_seconds also includes "
             "the shared compact projection, dbt build and ZSTD level 6 diagnostic exports"
@@ -1219,6 +1567,51 @@ def _worker(args: argparse.Namespace) -> int:
         "peak_rss_bytes": int(rss),
         "database": str(database),
     }
+    if admission_worker:
+        report.update(
+            complete=False,
+            effective_deadline_kind="absolute_monotonic_from_supervisor",
+            effective_deadline_monotonic=effective_worker_deadline,
+            effective_deadline_remaining_at_worker_entry_seconds=admission_remaining_at_entry,
+            effective_store_limit_seconds=store.limits.max_duration_seconds,
+            deadline_remaining_at_report_seconds=max(
+                0.0, effective_worker_deadline - time.monotonic()
+            ),
+            verification=verification,
+            verification_seconds=verification_seconds,
+            verification_phase_temporary_bytes=verification_phase_temporary_bytes,
+            verification_spill_config=verification_spill_config,
+            database_allocated_bytes=database.stat().st_blocks * 512,
+            database_phase_bytes=database.stat().st_size
+            + (
+                database.with_name(database.name + ".wal").stat().st_size
+                if database.with_name(database.name + ".wal").exists()
+                else 0
+            ),
+            database_phase_allocated_bytes=database.stat().st_blocks * 512
+            + (
+                database.with_name(database.name + ".wal").stat().st_blocks * 512
+                if database.with_name(database.name + ".wal").exists()
+                else 0
+            ),
+            build_database_component_bytes=(
+                build_database_bytes + build_wal_bytes + parent_index_bytes
+            ),
+            build_database_allocated_component_bytes=(
+                build_database_allocated_bytes
+                + build_wal_allocated_bytes
+                + parent_index_allocated_bytes
+            ),
+            wal_allocated_bytes=(
+                database.with_name(database.name + ".wal").stat().st_blocks * 512
+                if database.with_name(database.name + ".wal").exists()
+                else 0
+            ),
+            spill_limit_enforced_by_store=True,
+            spill_directory_configured=verification_spill_config is not None,
+            spill_limit_bytes=store.limits.max_temp_bytes,
+            sample_duplicate_entities=duplicate_entity_count,
+        )
     atomic_json(report_path, report)
     return 0
 
@@ -1461,6 +1854,41 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-report", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--task-indices", type=int, nargs="*", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--admission-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--admission-deadline-monotonic",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--admission-check",
+        action="store_true",
+        help="run the bounded historical capacity admission diagnostic",
+    )
+    parser.add_argument(
+        "--population-report",
+        type=Path,
+        help="complete exact-count population report bound to the saved capture",
+    )
+    parser.add_argument(
+        "--receipt-index",
+        type=Path,
+        help="complete receipt metadata index bound by the population report",
+    )
+    parser.add_argument(
+        "--stride-report",
+        type=Path,
+        default=checkout
+        / "data/testing/expanded-historical-20261031/capacity/expanded-stride400-20261031T162718Z/report.json",
+        help="prior bound diagnostic report used only for combo and repeated-rule sample hints",
+    )
+    parser.add_argument(
+        "--old-stress-report",
+        type=Path,
+        default=checkout
+        / "data/testing/expanded-historical-20261031/capacity/capacity-summary-20261031T1703Z.json",
+        help="bound report containing the prior all-strata maximum stress scenario",
+    )
     parser.add_argument("--capture-id", default=DEFAULT_CAPTURE_ID)
     return parser
 
@@ -1469,6 +1897,12 @@ def main() -> int:
     parser = _parser()
     args = parser.parse_args()
     if args.worker:
+        if args.admission_check:
+            parser.error("--admission-check cannot be combined with hidden worker mode")
+        if args.admission_worker and args.admission_deadline_monotonic is None:
+            parser.error("admission worker mode requires the supervisor monotonic deadline")
+        if not args.admission_worker and args.admission_deadline_monotonic is not None:
+            parser.error("admission deadline is valid only in hidden admission-worker mode")
         if args.fixture_root is None or args.worker_report is None:
             parser.error("worker mode requires fixture and report paths")
         try:
@@ -1484,14 +1918,51 @@ def main() -> int:
             if args.worker_report is not None:
                 from kalshi_events.common import atomic_json
 
-                atomic_json(report_path, {"error": f"{type(exc).__name__}: {exc}"})
+                error = f"{type(exc).__name__}: {exc}"
+                if args.admission_worker:
+                    progress = dict(_ADMISSION_WORKER_PROGRESS or {})
+                    atomic_json(
+                        report_path,
+                        {
+                            "status": "failed_incomplete",
+                            "error": error,
+                            "worker_progress": progress,
+                            "observations": progress.get("native_observations_landed"),
+                            "verified_pages": progress.get("verified_evidence_count"),
+                            "complete": False,
+                            "certified": False,
+                            "published": False,
+                            "verification_complete": False,
+                            "verification_peak_temporary_bytes": progress.get(
+                                "verification_peak_temporary_bytes"
+                            ),
+                            "verification_peak_temporary_allocated_bytes": progress.get(
+                                "verification_peak_temporary_allocated_bytes"
+                            ),
+                        },
+                    )
+                else:
+                    atomic_json(report_path, {"error": error})
             return 2
     if args.output_dir is None:
-        args.output_dir = (
-            _checkout()
-            / "data/testing/historical-compact-20261030/runs"
-            / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        )
+        if args.admission_check:
+            args.output_dir = (
+                _checkout()
+                / "data/testing/expanded-historical-20261031/admission"
+                / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            )
+        else:
+            args.output_dir = (
+                _checkout()
+                / "data/testing/historical-compact-20261030/runs"
+                / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            )
+    if args.admission_check:
+        if args.population_report is None or args.receipt_index is None:
+            parser.error("--admission-check requires --population-report and --receipt-index")
+        from historical_admission import run as run_admission_check
+
+        return run_admission_check(args, sys.modules[__name__])
     return _benchmark(args)
 
 

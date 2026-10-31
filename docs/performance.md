@@ -607,3 +607,83 @@ remain unmeasured. Failed reports were preserved under ignored
 `data/testing/consolidation-20261031/recovery/`. No networking, production cleanup,
 new grant, publication or activation occurred. Historical production is still
 not admitted; see [remaining work](remaining-work.md).
+
+## Final historical admission check
+
+The explicit `--admission-check` mode of `scripts/benchmark-historical-compact.py`
+uses a hash-bound population report and receipt index from the completed census.
+It validates their current capture bindings and re-verifies each selected receipt.
+This admission run is restricted to the approved capture/root and its exact
+83,397 data receipts / 79,762,323 observations, including the endpoint totals.
+The report's own digest records provenance; those approved totals and current
+capture bindings establish the census trust boundary.
+It does not repeat the full-body census, acquire data, publish a subset or activate
+a database. Without this flag, the original comparison mode retains its limits.
+
+The admission session includes setup, native builds, exports, verification and
+reporting within two hours. Measurement children stop by minute 105, leaving
+15 minutes for the independent decision and report. Each child receives at most
+20 minutes and the smaller remaining allowance. Nested whole-receipt samples
+target 250,000, one million and three million observations, with aggregate bounds
+of 4,096 selected receipts, 2 GiB encoded input and 16 GiB generated artifacts.
+Selection records endpoint/generation, traversal position, payload-size and
+compression tails, and observed repeated-entity and combo characteristics.
+
+Record database plus WAL, indexes, spill, export and verification workspaces
+throughout their phases, including logical and allocated bytes and sample gaps.
+Observed peaks can miss short bursts; they are not hard quotas. A staged database
+counts as both database and temporary storage. Retained database and exports must
+coexist in export/verification forecasts even after the database leaves `tmp/`.
+Account for session artifacts outside the operator root and shared inodes using
+the production accounting rules. Do not repeatedly walk immutable receipts while
+sampling changing workspaces.
+
+The final ledger uses the exact saved population and source-byte weights, reports
+scale growth and a fixed 20% composition allowance, and preserves the earlier
+102.08 GiB sampled-tail stress. A forecast is not a guaranteed upper bound.
+Missing coverage, unexplained nonlinear growth, unmeasured spill/verification or
+uncertain accounting prevent admission. The reviewed forecast must fit 96 GiB
+database, 144 GiB temporary, 350 GiB root and 400 GiB aggregate, while preserving
+150 GiB free space and the intended processing/verification time allocation.
+
+If the result is not admitted, stop without production, another experiment or a
+limit increase. If admitted, the separately authorized single 24-hour offline
+attempt still requires fresh resource preflight, a verified frozen runtime and
+independent production verification followed by activation. Source delivery and
+the historical dataset's acceptance are reported separately; hard-quota and
+unrelated recovery-performance targets remain open.
+
+### Final admission session outcome — October 31
+
+The corrected diagnostic bound the existing census of 79,762,323 observations.
+Its first sample completed native loading, projections, dbt integrity checks,
+six relation exports and shared verification on 250,123 observations in
+91.77 seconds, including 4.55 seconds of verification. The database was
+162,541,568 bytes (155 MiB). Observed build temporary high-water was
+1,753,574,577 bytes (1.63 GiB), including 1,578,729,472 bytes (1.47 GiB) of
+spill. These peaks were sampled throughout the phase; they are substantially
+larger than its end-of-phase files.
+
+The one-million-observation target failed during export: DuckDB could not
+allocate another 512 KiB at its configured 4 GB managed-memory limit
+(3.7 GiB used). The worker reached export and left an uncertified 652,226,560-byte
+diagnostic database, plus series and event Parquet files; the markets export
+was not produced. The failed worker's exact landed count and phase peaks were
+not preserved by that measured revision and remain unavailable. Later reporting
+changes do not reconstruct those lost measurements. The three-million stage was
+not run. There is no completed multi-scale capacity forecast or admission.
+
+This is an engine memory-budget failure, not evidence that macOS ran out of
+physical RAM or that a filesystem quota was enforced. Preflight memory pressure
+was NORMAL; failure-time system pressure was not recorded. Do not extrapolate
+full-population capacity or completion time from the successful small sample.
+Production was not started, published or activated. No API requests occurred.
+
+The original check stopped before sampling because its guard incorrectly
+required the excluded full-catalogue capture to be complete. That guard was
+fixed without relaxing historical-task completion or identity/hash validation.
+The operator explicitly authorized one corrected retry within the original
+two-hour clock. It exited at 21:39:22 UTC, with the supervised process group
+absent; no further retry or limit change was made. Both reports, launch history,
+the memory error and partial diagnostic artifacts remain under ignored
+`data/testing/historical-final-admission-20261031/`.

@@ -23,6 +23,15 @@ evidence-validation errors must never be suppressed to retry them as source erro
 
 ## Production blockers
 
+The final corrected admission session on October 31 completed the
+250,123-observation sample but failed during the one-million-observation export
+at DuckDB's configured 4 GB managed-memory limit. The three-million stage did
+not run. Capacity remains **unmeasured at the required scales and not admitted**;
+the partial diagnostic warehouse is not production. The export memory failure
+must be resolved before the approved production configuration can be admitted.
+The measured revision lost the failed stage's in-memory resource peaks; they
+remain unknown. See the [actual session outcome](performance.md#final-admission-session-outcome--october-31).
+
 The approved monitored historical attempt now permits an explicitly selected
 expanded profile: 128 GiB database and 192 GiB temporary ceilings, 112/168 GiB
 protective stops, and 96/144 GiB capacity-admission forecasts respectively.
@@ -46,12 +55,12 @@ not formal upper bounds. End-of-phase temporary snapshots are not high-water
 measurements; full-scale spill and aggregate occupancy remain unresolved.
 No production processing attempt or new offline grant was started.
 
-The current sampled lossless layout is not admitted. The previous endpoint-weighted
-point forecasts were about 58.3 GiB of database and 91.2 GiB of temporary storage.
-They exceed the 48 GiB admission threshold protecting each 64 GiB category.
-Wide/high-entropy content, repeated entities, full-scale spill and a fresh root
-baseline still need representative evidence. Sensitivity scenarios are not formal
-upper bounds. Smaller sampled databases do not establish full-scale feasibility.
+The current sampled lossless layout is not admitted. The earlier 58.3 GiB database
+and 91.2 GiB temporary point forecasts were assessed against the superseded
+48 GiB admission thresholds. The current thresholds are 96/144 GiB; the latest
+102.08 GiB database stress and unresolved phase peaks still block launch.
+Sensitivity scenarios are not formal upper bounds. Smaller sampled databases do
+not establish full-scale feasibility.
 
 The shared APFS operator location has no validated write-enforcing boundary for
 aggregate logical file sizes. Polling, per-batch checks, spill limits, allocated-block
@@ -65,19 +74,31 @@ succeeded with a 16 MiB allowance. This confirms post-write detection on the
 current path, not enforcement. It does not establish a defect in the separate
 native historical loader's row semantics.
 
-The October 31 read-only root inventory found 24,463,120,641 bytes of raw evidence,
+The initial October 31 read-only root inventory found 24,463,120,641 bytes of raw evidence,
 152,398,958 bytes of capture metadata, and 356,812,974,170 bytes under temporary
 storage. Those temporary bytes include the failed database, loader Parquet, spill
-and indexes. No cleanup was performed. Do not use the older assumed 35 GB root
-baseline to admit a new run; cleanup and fresh accounting remain required.
+and indexes. Subsequent supported reconciliation and validated cleanup removed
+only abandoned historical staging, preserving forensic inventory and source
+evidence. Fresh post-cleanup Store usage was 34,202,192,658 retained bytes,
+including 9,586,671,984 temporary bytes, with zero database bytes. Do not reuse
+either dated inventory for launch; fresh accounting is required.
+
+The final focused admission check has one two-hour measurement allowance with
+native-only nested samples and a complete phase ledger. A failed or incomplete
+capacity result ends the attempt without production, additional experiments or
+automatic limit increases. The separate 24-hour production attempt remains
+unused and conditional on admission and fresh resource preflight. The one
+explicitly authorized corrected diagnostic retry has ended; no further
+measurement or production restart is authorized by that session.
 
 ## Acceptance still required
 
 - Representative warm, cold and hydration-only recovery comparisons, separating
   worker startup from supervisor accounting and preflight. The five-minute target
   is unproven until the complete path is measured.
-- Final-source verification, distribution checks, isolated installed-wheel checks,
-  and independent correctness, semantic-data and filesystem/security reviews.
+- Revision `9682d7c` passed 1,989 tests, distribution and installed-wheel checks,
+  plus independent reviews. New admission-tooling changes require their own
+  final-source verification and reviews.
 - One admitted saved-evidence-only historical attempt, then standalone release
   verification, atomic activation and fresh-process read-only database queries.
 

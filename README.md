@@ -455,6 +455,28 @@ The default historical completion profile keeps 64 GiB database and temporary ce
 
 One admitted offline attempt must preserve all cumulative acquisition accounting, use only saved evidence, and retain the 400 GiB session, 350 GiB root, 150 GiB free-space and existing memory safeguards. Reserve the final two hours of a 24-hour attempt for independent verification, activation and reporting. If the capacity forecast fails, do not launch or silently raise limits. Partial extraction is not a production publication.
 
+Use the explicit admission diagnostic with the previously verified census and its
+receipt index before considering another production attempt:
+
+```sh
+python scripts/benchmark-historical-compact.py \
+  --admission-check \
+  --operator-root ./data/kalshi-production/operator \
+  --capture-id 19caddd934f74d13ad3d585b915601c9 \
+  --population-report ./data/testing/expanded-historical-20261031/capacity/exact-count-scan-20261031T1635Z/progress.json \
+  --receipt-index ./data/testing/expanded-historical-20261031/capacity/exact-count-scan-20261031T1635Z/candidate-pages.json \
+  --output-dir ./data/testing/historical-final-admission-new
+```
+
+This manually invoked diagnostic has a two-hour total allowance, including setup
+and reporting. Its native-only nested samples target 250,000, one million and
+three million observations; each child has at most 20 minutes. Samples stay
+incomplete and unpublished. The report distinguishes observed storage peaks,
+forecasts and unresolved components. Unknown capacity or forecasts exceeding
+96 GiB database / 144 GiB temporary storage mean **do not launch**. Passing source
+tests or counting saved observations is not production acceptance. See
+[capacity validation](docs/performance.md#final-historical-admission-check).
+
 
 After final source verification and a passing capacity admission, reconcile an explicitly authorized stopped historical attempt first:
 
@@ -471,8 +493,9 @@ Reconciliation starts no worker and grants no processing time. After it succeeds
 python scripts/run-production.py \
   --directory ./data/kalshi-production \
   --historical --capture-id CAPTURE_ID \
-  --supersede-offline-window \
+  --historical-resource-profile expanded \
+  --renew-offline-window \
   --offline-duration-seconds 86280
 ```
 
-This grants at most 23 hours 58 minutes inside an outer 24-hour session, preserving startup/reporting headroom. It never resets acquisition consumption or automatically retries. The October 30 compression experiment did **not** pass capacity admission; do not run this command for that capture until the unresolved capacity gate is satisfied.
+This grants at most 23 hours 58 minutes inside an outer 24-hour session, preserving startup/reporting headroom. Renewal requires both saved clocks to have expired. It never resets acquisition consumption or automatically retries. The October 30 and October 31 compression experiments did **not** pass capacity admission; do not run this command for that capture until the unresolved capacity gate is satisfied.
