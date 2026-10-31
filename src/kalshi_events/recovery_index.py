@@ -14,7 +14,7 @@ from kalshi_events.common import CatalogueError, durable_mkdir, fsync_directory
 from kalshi_events.normalize import PARENT_INDEX_SCHEMA, DiskParentIndex
 
 RECOVERY_INDEX_SCHEMA = 1
-NORMALIZER_VERSION = 1
+NORMALIZER_VERSION = 2
 _DIRECTORY = "tmp/recovery-index"
 _META_SCHEMA = """create table recovery_meta(
     id integer primary key check(id=1),

@@ -12,6 +12,7 @@ historical production database has been activated by this investigation.
 | Recovery benchmark | Its commit observer rejects the current `first_data_timing` keyword. | The actual resume worker runs against current and reference capture APIs. |
 | Diagnostic paths | The historical benchmark creates output before rejecting an unsafe operator-root alias. | Invalid, overlapping and nested-checkout paths cause no output writes. |
 | Orphan recovery | An invalid successful source response can be adopted repeatedly, stranding its unfinished request. | Preflight permits retry of typed source-body failures while retaining raw evidence and failing closed on integrity, context and scope contradictions. |
+| Receipt ordering | Whole-second receipt text can sort after a chronologically newer fractional-second receipt. | Python, SQLite and SQL compare exact UTC instants while retaining original timestamp text; old hints and baseline projections cannot silently retain stale winners. |
 | Operational guidance | The performance guide still described the removed logical-compressor cutoff as current policy. | Guidance matches NORMAL/WARN/CRITICAL monitoring and the independent RSS guard. |
 
 The changes address these defects with targeted regressions. Final verification

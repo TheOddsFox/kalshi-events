@@ -16,6 +16,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
@@ -83,7 +84,28 @@ class BudgetExceeded(CatalogueError):
 
 
 def now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def timestamp_order_key(received_at: str, observation_id: str) -> tuple[int, str]:
+    """Order receipt timestamps as exact UTC microseconds, then observation ID."""
+    if not isinstance(received_at, str) or not isinstance(observation_id, str):
+        raise CatalogueError("receipt timestamp ordering requires strings")
+    if len(received_at) > 64:
+        raise CatalogueError("received_at is too long")
+    return _timestamp_microseconds(received_at), observation_id
+
+
+@lru_cache(maxsize=1024)
+def _timestamp_microseconds(received_at: str) -> int:
+    try:
+        timestamp = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise CatalogueError("received_at must include a UTC offset")
+        delta = timestamp.astimezone(UTC) - datetime(1970, 1, 1, tzinfo=UTC)
+    except (ValueError, OverflowError) as exc:
+        raise CatalogueError("received_at must be an ISO timestamp") from exc
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
 def json_bytes(value: Any) -> bytes:

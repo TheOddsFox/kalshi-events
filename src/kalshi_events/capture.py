@@ -41,6 +41,7 @@ from kalshi_events.common import (
     ticker,
     ticker_from_path_segment,
     ticker_path_segment,
+    timestamp_order_key,
     validate_series_scope,
 )
 from kalshi_events.normalize import DiskParentIndex, ParentIndex, native_identity, records
@@ -2157,7 +2158,9 @@ def _merge_parent_index(
         existing_candidates = target.parent_batch_candidates.setdefault(key, {})
         for identity, candidate in candidates.items():
             previous = existing_candidates.get(identity)
-            if previous is None or candidate[0][:2] > previous[0][:2]:
+            if previous is None or timestamp_order_key(*candidate[0][:2]) > timestamp_order_key(
+                *previous[0][:2]
+            ):
                 existing_candidates[identity] = candidate
     target.parent_batch_terminal.update(source.parent_batch_terminal)
     for scope, generations in source.scope_membership.items():

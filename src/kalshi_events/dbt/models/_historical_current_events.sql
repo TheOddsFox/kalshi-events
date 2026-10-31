@@ -10,7 +10,7 @@ latest_market_parents as (
     from {{ ref('observation_history') }}
     where entity_kind = 'markets' and source_kind = 'direct'
     qualify row_number() over (
-        partition by entity_ticker order by received_at desc, observation_id desc
+        partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
     ) = 1
 ),
 required as (
@@ -42,7 +42,7 @@ latest as (
     join eligible e on e.event_ticker = h.entity_ticker
     where h.entity_kind = 'events'
     qualify row_number() over (
-        partition by h.entity_ticker order by h.received_at desc, h.observation_id desc
+        partition by h.entity_ticker order by cast(h.received_at as timestamptz) desc, h.observation_id desc
     ) = 1
 )
 select * from latest

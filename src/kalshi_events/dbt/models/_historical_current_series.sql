@@ -32,7 +32,7 @@ latest as (
     join eligible e on e.series_ticker = h.entity_ticker
     where h.entity_kind = 'series'
     qualify row_number() over (
-        partition by h.entity_ticker order by h.received_at desc, h.observation_id desc
+        partition by h.entity_ticker order by cast(h.received_at as timestamptz) desc, h.observation_id desc
     ) = 1
 )
 select * from latest

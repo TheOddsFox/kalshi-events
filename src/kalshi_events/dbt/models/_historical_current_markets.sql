@@ -13,7 +13,7 @@ latest as (
     join eligible e on e.market_ticker = h.entity_ticker
     where h.entity_kind = 'markets' and h.source_kind = 'direct'
     qualify row_number() over (
-        partition by h.entity_ticker order by h.received_at desc, h.observation_id desc
+        partition by h.entity_ticker order by cast(h.received_at as timestamptz) desc, h.observation_id desc
     ) = 1
 )
 select m.entity_ticker as market_ticker, m.event_ticker, e.series_ticker,

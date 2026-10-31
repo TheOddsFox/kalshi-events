@@ -35,7 +35,7 @@ latest as (
       and h.entity_ticker in (select market_ticker from {{ source('landing', 'affected_markets') }})
     {% endif %}
     qualify row_number() over (
-        partition by h.entity_ticker order by h.received_at desc, h.observation_id desc
+        partition by h.entity_ticker order by cast(h.received_at as timestamptz) desc, h.observation_id desc
     ) = 1
 ),
 projected as (
@@ -64,7 +64,7 @@ select * from projected
 with latest as (
     select * from {{ ref('observation_history') }}
     where entity_kind = 'markets' and source_kind = 'direct'
-    qualify row_number() over (partition by entity_ticker order by received_at desc, observation_id desc) = 1
+    qualify row_number() over (partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc) = 1
 )
 select m.entity_ticker as market_ticker, m.event_ticker, e.series_ticker,
        (e.event_ticker is not null and s.series_ticker is not null) as usable,

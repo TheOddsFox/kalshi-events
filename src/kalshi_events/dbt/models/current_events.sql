@@ -17,7 +17,7 @@ latest_market_parents as (
     from {{ ref('observation_history') }}
     where entity_kind = 'markets' and source_kind = 'direct'
     qualify row_number() over (
-        partition by entity_ticker order by received_at desc, observation_id desc
+        partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
     ) = 1
 ),
 required as (
@@ -53,7 +53,7 @@ latest as (
       and h.entity_ticker in (select event_ticker from {{ source('landing', 'affected_events') }})
     {% endif %}
     qualify row_number() over (
-        partition by h.entity_ticker order by h.received_at desc, h.observation_id desc
+        partition by h.entity_ticker order by cast(h.received_at as timestamptz) desc, h.observation_id desc
     ) = 1
 )
 select event_ticker, series_ticker, observation_id, capture_id, received_at,
@@ -64,5 +64,5 @@ select entity_ticker as event_ticker, series_ticker, observation_id, capture_id,
        provider_updated_at, source_endpoint, payload_json
 from {{ ref('observation_history') }}
 where entity_kind = 'events'
-qualify row_number() over (partition by entity_ticker order by received_at desc, observation_id desc) = 1
+qualify row_number() over (partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc) = 1
 {% endif %}{% endif %}

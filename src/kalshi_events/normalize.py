@@ -18,19 +18,20 @@ from kalshi_events.common import (
     json_bytes,
     ticker,
     ticker_from_path_segment,
+    timestamp_order_key,
     validate_series_scope,
 )
 
 ENTITY_KEYS = {"series": "series_ticker", "events": "event_ticker", "markets": "market_ticker"}
 
-PARENT_INDEX_SCHEMA = """create table winners(kind text,ticker text,received text,observation_id text,parent text,
+PARENT_INDEX_SCHEMA = """create table winners(kind text,ticker text,received_key integer,received text,observation_id text,parent text,
        primary key(kind,ticker)) without rowid;
    create index winners_parent on winners(kind,parent);
    create table membership(scope text,generation integer,ticker text,
        primary key(scope,generation,ticker)) without rowid;
    create table lookups(kind text,ticker text,status integer,page_id text,request_id text,
        primary key(kind,ticker)) without rowid;
-   create table candidates(batch_id text,generation integer,ticker text,received text,
+   create table candidates(batch_id text,generation integer,ticker text,received_key integer,received text,
        observation_id text,parent text,page_id text,request_id text,
        primary key(batch_id,generation,ticker)) without rowid;
    create index candidates_ticker on candidates(ticker);
@@ -121,7 +122,9 @@ class ParentIndex:
     @staticmethod
     def _put(target: dict[str, tuple], identity: str, winner: tuple) -> None:
         previous = target.get(identity)
-        if previous is None or winner[:2] > previous[:2]:
+        if previous is None or timestamp_order_key(*winner[:2]) > timestamp_order_key(
+            *previous[:2]
+        ):
             target[identity] = winner
 
     def add_page(self, manifest: dict[str, Any], payload: Any) -> None:
@@ -196,7 +199,9 @@ class ParentIndex:
                     manifest["request_id"],
                 )
                 previous = candidates.get(identity)
-                if previous is None or candidate[0][:2] > previous[0][:2]:
+                if previous is None or timestamp_order_key(*candidate[0][:2]) > timestamp_order_key(
+                    *previous[0][:2]
+                ):
                     candidates[identity] = candidate
             if scoped_series is not None:
                 if kind == "series" and identity != scoped_series:
@@ -403,11 +408,19 @@ class DiskParentIndex:
                     if kind == "events" and not parent:
                         parent = None
                     self.db.execute(
-                        """insert into winners values(?,?,?,?,?) on conflict(kind,ticker) do update set
+                        """insert into winners values(?,?,?,?,?,?) on conflict(kind,ticker) do update set
+                           received_key=excluded.received_key,
                            received=excluded.received,observation_id=excluded.observation_id,parent=excluded.parent
-                           where (excluded.received,excluded.observation_id) >
-                                 (winners.received,winners.observation_id)""",
-                        [kind, identity, winner[0], winner[1], parent],
+                           where (excluded.received_key,excluded.observation_id) >
+                                 (winners.received_key,winners.observation_id)""",
+                        [
+                            kind,
+                            identity,
+                            timestamp_order_key(*winner[:2])[0],
+                            winner[0],
+                            winner[1],
+                            parent,
+                        ],
                     )
         for scope, generations in page.scope_membership.items():
             for generation, identities in generations.items():
@@ -424,15 +437,17 @@ class DiskParentIndex:
         for (batch_id, generation), candidates in page.parent_batch_candidates.items():
             for identity, (winner, page_id, request_id) in candidates.items():
                 self.db.execute(
-                    """insert into candidates values(?,?,?,?,?,?,?,?) on conflict(batch_id,generation,ticker)
+                    """insert into candidates values(?,?,?,?,?,?,?,?,?) on conflict(batch_id,generation,ticker)
                        do update set received=excluded.received,observation_id=excluded.observation_id,
-                       parent=excluded.parent,page_id=excluded.page_id,request_id=excluded.request_id
-                       where (excluded.received,excluded.observation_id) >
-                             (candidates.received,candidates.observation_id)""",
+                       received_key=excluded.received_key,parent=excluded.parent,page_id=excluded.page_id,
+                       request_id=excluded.request_id
+                       where (excluded.received_key,excluded.observation_id) >
+                             (candidates.received_key,candidates.observation_id)""",
                     [
                         batch_id,
                         generation,
                         identity,
+                        timestamp_order_key(*winner[:2])[0],
                         winner[0],
                         winner[1],
                         winner[2] or None,
@@ -705,7 +720,10 @@ def project_pages(
         if selected is None or row["entity_kind"] != "markets" or row["market_ticker"] in selected
     )
     unique = {row["observation_id"]: row for row in history}
-    history = sorted(unique.values(), key=lambda row: (row["received_at"], row["observation_id"]))
+    history = sorted(
+        unique.values(),
+        key=lambda row: timestamp_order_key(row["received_at"], row["observation_id"]),
+    )
     result: dict[str, list[dict[str, Any]]] = {kind: [] for kind in ENTITY_KEYS}
     for kind, key in ENTITY_KEYS.items():
         latest = {}

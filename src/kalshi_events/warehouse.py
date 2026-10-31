@@ -71,6 +71,8 @@ RELATIONS = {
 }
 DBT_MEMORY_LIMIT = "4GB"
 DBT_THREADS = 4
+ORDERING_POLICY = "received-at-utc-microseconds-v1"
+ORDERING_POLICY_FIELD = "warehouse_ordering_policy"
 _LANDING_COLUMNS = (
     "observation_id",
     "capture_id",
@@ -194,6 +196,101 @@ def _dbt_executable(python_executable: str) -> Path:
     return Path(python_executable).parent / "dbt"
 
 
+def _write_ordering_policy(store: Store, database: Path) -> None:
+    with (
+        _duckdb_work_config(store, database.parent) as config,
+        duckdb.connect(str(database), config=config) as connection,
+    ):
+        store.check_deadline()
+        try:
+            with interrupt_at_deadline(store, connection.interrupt):
+                connection.execute("create schema if not exists kalshi_private")
+                connection.execute("drop table if exists kalshi_private.ordering_policy")
+                connection.execute(
+                    "create table kalshi_private.ordering_policy(policy varchar not null)"
+                )
+                connection.execute(
+                    "insert into kalshi_private.ordering_policy values (?)", [ORDERING_POLICY]
+                )
+                connection.execute("checkpoint")
+        except duckdb.Error as exc:
+            try:
+                store.check_deadline()
+            except BudgetExceeded as budget:
+                raise budget from exc
+            raise
+        store.check_deadline()
+
+
+def _check_ordering_policy(store: Store, database: Path, receipt: dict[str, Any]) -> None:
+    has_receipt_marker = ORDERING_POLICY_FIELD in receipt
+    usage = store.usage()
+    spill_budget = min(
+        1024**2,
+        store.limits.max_temp_bytes - usage["temporary_bytes"],
+        store.limits.max_root_bytes - usage["retained_bytes"],
+    )
+    if spill_budget < 1:
+        raise BudgetExceeded("no bounded temporary storage is available for policy verification")
+    spill_relative = f"tmp/ordering-policy-{uuid.uuid4().hex}"
+    spill_directory = store.path(spill_relative)
+    store.reserve_storage(spill_budget)
+    try:
+        spill_directory.mkdir(parents=True)
+        with (
+            duckdb.connect(
+                str(database),
+                read_only=True,
+                config={
+                    "memory_limit": "64MB",
+                    "temp_directory": str(spill_directory),
+                    "max_temp_directory_size": f"{spill_budget}B",
+                },
+            ) as connection,
+            interrupt_at_deadline(store, connection.interrupt),
+        ):
+            try:
+                marker = connection.execute(
+                    "select table_type from information_schema.tables "
+                    "where table_schema='kalshi_private' and table_name='ordering_policy'"
+                ).fetchone()
+                if not has_receipt_marker:
+                    if marker is not None:
+                        raise CatalogueError(
+                            "build receipt and warehouse ordering policy markers differ"
+                        )
+                    return
+                if (
+                    receipt[ORDERING_POLICY_FIELD] != ORDERING_POLICY
+                    or marker is None
+                    or marker[0] != "BASE TABLE"
+                ):
+                    raise CatalogueError(
+                        "build receipt and warehouse ordering policy markers differ"
+                    )
+                rows = connection.execute(
+                    "select policy from kalshi_private.ordering_policy limit 2"
+                ).fetchall()
+                if rows != [(ORDERING_POLICY,)]:
+                    raise CatalogueError("warehouse ordering policy marker mismatch")
+            except duckdb.Error as exc:
+                try:
+                    store.check_deadline()
+                except BudgetExceeded as budget:
+                    raise budget from exc
+                raise
+        store.check_deadline()
+    except CatalogueError:
+        raise
+    except duckdb.Error as exc:
+        raise CatalogueError("warehouse ordering policy marker is invalid") from exc
+    finally:
+        if spill_directory.exists():
+            shutil.rmtree(spill_directory, ignore_errors=True)
+            store.sync("tmp")
+        store.release_storage(spill_budget)
+
+
 def _receipt_body_path(relative: str) -> str:
     return (PurePosixPath(relative).parent / "body.bin").as_posix()
 
@@ -248,6 +345,14 @@ def operation_context(store: Store):
     finally:
         context.closed = True
         context.captures.clear()
+
+
+def _invalidate_operation_certification(
+    store: Store, capture_id: str, catalogue_version: int, context: _OperationContext
+) -> None:
+    """Forget proof for a build that this writer operation is about to replace."""
+    _check_operation_context(store, context)
+    context.captures.pop((capture_id, catalogue_version), None)
 
 
 def _check_operation_context(store: Store, context: _OperationContext) -> None:
@@ -1583,7 +1688,7 @@ def _affected_keys(
             """select entity_ticker, series_ticker from landing.observations
                where entity_kind='events' and source_kind='direct'
                qualify row_number() over (
-                 partition by entity_ticker order by received_at desc, observation_id desc
+                 partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
                ) = 1"""
         ).fetchall()
     }
@@ -1629,7 +1734,7 @@ def _affected_keys(
             """select entity_ticker, event_ticker from landing.observations
                where entity_kind='markets' and source_kind='direct'
                qualify row_number() over (
-                 partition by entity_ticker order by received_at desc, observation_id desc
+                 partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
                ) = 1"""
         ).fetchall()
     }
@@ -1841,6 +1946,8 @@ def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
             database=f"{staging_relative}/warehouse.duckdb",
             artifacts=f"{staging_relative}/build-artifacts.json",
         )
+        database = staging / "warehouse.duckdb"
+        _write_ordering_policy(store, database)
         store.sync(staging_relative)
         operation_evidence = _operation_evidence(store, state, 1, verified_pages)
         receipt = {
@@ -1848,10 +1955,9 @@ def _build_locked(store: Store, capture_id: str) -> dict[str, Any]:
             "capture_id": capture_id,
             "built_at": now(),
             "scope": "catalogue",
+            ORDERING_POLICY_FIELD: ORDERING_POLICY,
             "evidence": operation_evidence.evidence,
-            "warehouse_sha256": file_digest(
-                staging / "warehouse.duckdb", store.limits.max_database_bytes
-            )[0],
+            "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
         }
         store.write(f"{staging_relative}/build.json", receipt)
@@ -2161,7 +2267,7 @@ def _parent_closure_is_fresh(
                    and entity_ticker in (select entity_ticker from landing.membership
                      where scope in ('markets_live','markets_combo','markets_history'))
                  qualify row_number() over(partition by entity_ticker
-                   order by received_at desc,observation_id desc)=1
+                   order by cast(received_at as timestamptz) desc,observation_id desc)=1
                )
                select 1 from market_winners m
                left join landing.membership e on e.entity_ticker=m.event_ticker
@@ -2186,7 +2292,7 @@ def _parent_closure_is_fresh(
                  where entity_kind='events' and source_kind='direct'
                    and entity_ticker in (select entity_ticker from active_events)
                  qualify row_number() over(partition by entity_ticker
-                   order by received_at desc,observation_id desc)=1
+                   order by cast(received_at as timestamptz) desc,observation_id desc)=1
                )
                select 1 from event_winners e
                left join landing.membership s on s.scope='series' and s.entity_ticker=e.series_ticker
@@ -2220,7 +2326,7 @@ def _parent_closure_is_fresh(
            where entity_kind='markets' and source_kind='direct'
              and entity_ticker in (select unnest(?))
            qualify row_number() over (
-             partition by entity_ticker order by received_at desc, observation_id desc
+             partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
            ) = 1""",
         [sorted(active_markets)],
     ).fetchall()
@@ -2244,7 +2350,7 @@ def _parent_closure_is_fresh(
            where entity_kind='events' and source_kind='direct'
              and entity_ticker in (select unnest(?))
            qualify row_number() over (
-             partition by entity_ticker order by received_at desc, observation_id desc
+             partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
            ) = 1""",
         [sorted(active_events)],
     ).fetchall()
@@ -2429,9 +2535,10 @@ def _full_v2_build(
                 **({"historical_compact": True} if historical else {}),
             },
         )
+        database = staging / "warehouse.duckdb"
+        _write_ordering_policy(store, database)
         store.sync(staging_relative)
         operation_evidence = _operation_evidence(store, state, catalogue_version, verified_pages)
-        database = staging / "warehouse.duckdb"
         fsync_file(database)
         fsync_directory(staging)
         receipt = {
@@ -2443,6 +2550,7 @@ def _full_v2_build(
             "capture_id": capture_id,
             "built_at": now(),
             **({} if historical else _build_scope_fields(state)),
+            ORDERING_POLICY_FIELD: ORDERING_POLICY,
             "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
@@ -2509,6 +2617,7 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
         pin["capture_id"],
         catalogue_version=pin["catalogue_version"],
     )
+    reproject_all = baseline_receipt.get(ORDERING_POLICY_FIELD) != ORDERING_POLICY
     staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
     durable_mkdir(staging.parent)
@@ -2546,8 +2655,9 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             )
             if state.get("scope") is not None:
                 _parent_closure_is_fresh(connection, state, index)
-            _affected_keys(connection, state, changes)
-            _delete_affected(connection)
+            if not reproject_all:
+                _affected_keys(connection, state, changes)
+                _delete_affected(connection)
         dbt(
             store,
             ["build"],
@@ -2555,14 +2665,15 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             artifacts=f"{staging_relative}/build-artifacts.json",
             variables={
                 "catalogue_version": 2,
-                "incremental_update": True,
+                "incremental_update": not reproject_all,
                 "current_capture_id": capture_id,
                 "delta_capture_id": capture_id,
             },
         )
+        database = staging / "warehouse.duckdb"
+        _write_ordering_policy(store, database)
         store.sync(staging_relative)
         operation_evidence = _operation_evidence(store, state, 2, verified_pages)
-        database = staging / "warehouse.duckdb"
         fsync_file(database)
         fsync_directory(staging)
         receipt = {
@@ -2571,6 +2682,7 @@ def _build_delta(store: Store, state: dict[str, Any]) -> dict[str, Any]:
             "capture_id": capture_id,
             "built_at": now(),
             **_build_scope_fields(state),
+            ORDERING_POLICY_FIELD: ORDERING_POLICY,
             "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
@@ -2706,6 +2818,7 @@ def certified(
     warehouse = directory_path / "warehouse.duckdb"
     if file_digest(warehouse, store.limits.max_database_bytes)[0] != receipt["warehouse_sha256"]:
         raise CatalogueError("warehouse changed after certified build")
+    _check_ordering_policy(store, warehouse, receipt)
     if catalogue_version == 3:
         _check_historical_coverage(warehouse, capture_id, state.get("complete") is True)
     artifacts = directory_path / "build-artifacts.json"

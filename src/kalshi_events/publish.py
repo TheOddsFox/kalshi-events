@@ -51,6 +51,7 @@ from kalshi_events.warehouse import (
     DBT_MEMORY_LIMIT,
     DBT_THREADS,
     RELATIONS,
+    _invalidate_operation_certification,
     build_directory,
     certified,
 )
@@ -517,23 +518,58 @@ def _publish(
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
     if catalogue_version == 2:
         from kalshi_events import incremental
+        from kalshi_events.warehouse import (
+            ORDERING_POLICY,
+            ORDERING_POLICY_FIELD,
+            build,
+            build_v2_full,
+        )
 
         if state.get("incremental") is True:
             incremental.verify_pin(store, state)
-            if not store.path(f"{build_directory(capture_id, 2)}/build.json").exists():
-                from kalshi_events.warehouse import build
-
+            if store.path(f"{build_directory(capture_id, 2)}/build.json").exists():
+                receipt = certified(store, capture_id, catalogue_version=2, _context=_context)
+                if receipt.get(ORDERING_POLICY_FIELD) != ORDERING_POLICY:
+                    _invalidate_operation_certification(store, capture_id, 2, _context)
+                    build(store, capture_id)
+            else:
                 build(store, capture_id)
         else:
-            from kalshi_events.warehouse import build_v2_full
-
-            if not store.path(f"{build_directory(capture_id, 2)}/build.json").exists():
+            build_path = store.path(f"{build_directory(capture_id, 2)}/build.json")
+            if build_path.exists():
+                receipt = certified(store, capture_id, catalogue_version=2, _context=_context)
+                if receipt.get(ORDERING_POLICY_FIELD) != ORDERING_POLICY:
+                    incremental.verify_full_rebase(store, state)
+                    _invalidate_operation_certification(store, capture_id, 2, _context)
+                    build_v2_full(store, capture_id, rebuild=True)
+            else:
                 build_v2_full(store, capture_id)
     elif catalogue_version == 3:
-        if not store.path(f"{build_directory(capture_id, 3)}/build.json").exists():
-            from kalshi_events.warehouse import build_historical
+        from kalshi_events.warehouse import (
+            ORDERING_POLICY,
+            ORDERING_POLICY_FIELD,
+            build_historical,
+        )
 
+        build_path = store.path(f"{build_directory(capture_id, 3)}/build.json")
+        if build_path.exists():
+            receipt = certified(store, capture_id, catalogue_version=3, _context=_context)
+            if receipt.get(ORDERING_POLICY_FIELD) != ORDERING_POLICY:
+                _invalidate_operation_certification(store, capture_id, 3, _context)
+                build_historical(store, capture_id, rebuild=True)
+        else:
             build_historical(store, capture_id)
+    elif catalogue_version == 1:
+        from kalshi_events.warehouse import ORDERING_POLICY, ORDERING_POLICY_FIELD
+
+        build_path = store.path(f"{build_directory(capture_id, 1)}/build.json")
+        if build_path.exists():
+            receipt = certified(store, capture_id, catalogue_version=1, _context=_context)
+            if receipt.get(ORDERING_POLICY_FIELD) != ORDERING_POLICY:
+                from kalshi_events.warehouse import build
+
+                _invalidate_operation_certification(store, capture_id, 1, _context)
+                build(store, capture_id)
     cutoffs: list[dict[str, Any]] = []
     rows = page_receipts(store, state)
     if catalogue_version == 3:

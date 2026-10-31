@@ -9,7 +9,7 @@ from conftest import FakeClient
 from recovery_fixtures import build_recovery_root
 
 from kalshi_events import capture, recovery_index
-from kalshi_events.common import CatalogueError, Store, json_bytes
+from kalshi_events.common import CatalogueError, Store, json_bytes, timestamp_order_key
 from kalshi_events.incremental import root_id
 from kalshi_events.recovery_index import RecoveryParentIndex, sealed_settings_sha256
 
@@ -204,14 +204,36 @@ def test_poisoned_parent_cache_rows_are_rebuilt_before_completion(tmp_path, monk
     )
     with store.writer_guard(), sqlite3.connect(cache_path) as db:
         db.executemany(
-            "insert into winners values(?,?,?,?,?)",
+            "insert into winners values(?,?,?,?,?,?)",
             [
-                ("series", poison[0], "2099-01-01T00:00:00Z", "poison-series", None),
-                ("events", poison[1], "2099-01-01T00:00:00Z", "poison-event", poison[0]),
-                ("markets", poison[2], "2099-01-01T00:00:00Z", "poison-market", poison[1]),
+                (
+                    "series",
+                    poison[0],
+                    timestamp_order_key("2099-01-01T00:00:00Z", "poison-series")[0],
+                    "2099-01-01T00:00:00Z",
+                    "poison-series",
+                    None,
+                ),
+                (
+                    "events",
+                    poison[1],
+                    timestamp_order_key("2099-01-01T00:00:00Z", "poison-event")[0],
+                    "2099-01-01T00:00:00Z",
+                    "poison-event",
+                    poison[0],
+                ),
+                (
+                    "markets",
+                    poison[2],
+                    timestamp_order_key("2099-01-01T00:00:00Z", "poison-market")[0],
+                    "2099-01-01T00:00:00Z",
+                    "poison-market",
+                    poison[1],
+                ),
                 (
                     "markets",
                     poison[4],
+                    timestamp_order_key("2099-01-01T00:00:00Z", "poison-market-lookup")[0],
                     "2099-01-01T00:00:00Z",
                     "poison-market-lookup",
                     poison[3],
@@ -397,8 +419,15 @@ def test_partial_recovery_merge_rolls_back_without_reissuing_committed_page(tmp_
         if not injected:
             injected = True
             index.db.execute(
-                "insert into winners values(?,?,?,?,?)",
-                ("events", "CACHE-PARTIAL-POISON", "2099", "partial", "SERIES"),
+                "insert into winners values(?,?,?,?,?,?)",
+                (
+                    "events",
+                    "CACHE-PARTIAL-POISON",
+                    timestamp_order_key("2099-01-01T00:00:00Z", "partial")[0],
+                    "2099-01-01T00:00:00Z",
+                    "partial",
+                    "SERIES",
+                ),
             )
             raise RuntimeError("simulated power loss before cache anchor binding")
 

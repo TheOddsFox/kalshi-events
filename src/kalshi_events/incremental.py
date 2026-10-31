@@ -27,6 +27,7 @@ from kalshi_events.common import (
     now,
     path_is_link,
     regular_bytes,
+    timestamp_order_key,
     validate_series_scope,
 )
 
@@ -310,10 +311,17 @@ def _baseline_data_impl(
                 "max_temp_directory_size": f"{spill_budget}B",
             },
         )
-        from kalshi_events.warehouse import RELATIONS, membership_fingerprint
+        from kalshi_events.warehouse import (
+            ORDERING_POLICY,
+            ORDERING_POLICY_FIELD,
+            RELATIONS,
+            membership_fingerprint,
+        )
 
-        warehouse_hash_fast_path = version == 2 and manifest.get("warehouse_sha256") == receipt.get(
-            "warehouse_sha256"
+        warehouse_hash_fast_path = (
+            version == 2
+            and receipt.get(ORDERING_POLICY_FIELD) == ORDERING_POLICY
+            and manifest.get("warehouse_sha256") == receipt.get("warehouse_sha256")
         )
         with interrupt_at_deadline(store, connection.interrupt):
             try:
@@ -427,7 +435,7 @@ def _baseline_snapshot(store: Store, pin: dict[str, Any]) -> dict[str, Any]:
                        from landing.observations
                        where entity_kind='markets' and source_kind='direct'
                        qualify row_number() over (
-                         partition by entity_ticker order by received_at desc, observation_id desc
+                         partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
                        ) = 1"""
                 ).fetchall()
             }
@@ -438,13 +446,15 @@ def _baseline_snapshot(store: Store, pin: dict[str, Any]) -> dict[str, Any]:
                        from landing.observations
                        where entity_kind='events' and source_kind='direct'
                        qualify row_number() over (
-                         partition by entity_ticker order by received_at desc, observation_id desc
+                         partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
                        ) = 1"""
                 ).fetchall()
             }
             return {"membership": result, "markets": markets, "events": events}
         if "observations" not in tables:
-            raise CatalogueError("legacy baseline lacks membership source evidence")
+            raise CatalogueError(
+                "legacy baseline lacks membership source evidence; publish a complete saved full capture with --catalogue-version 2"
+            )
         current_series = {
             row[0]
             for row in connection.execute(
@@ -500,7 +510,7 @@ def _baseline_snapshot(store: Store, pin: dict[str, Any]) -> dict[str, Any]:
                    from landing.observations
                    where entity_kind='markets' and source_kind='direct'
                    qualify row_number() over (
-                     partition by entity_ticker order by received_at desc, observation_id desc
+                     partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
                    ) = 1"""
             ).fetchall()
         }
@@ -511,7 +521,7 @@ def _baseline_snapshot(store: Store, pin: dict[str, Any]) -> dict[str, Any]:
                    from landing.observations
                    where entity_kind='events' and source_kind='direct'
                    qualify row_number() over (
-                     partition by entity_ticker order by received_at desc, observation_id desc
+                     partition by entity_ticker order by cast(received_at as timestamptz) desc, observation_id desc
                    ) = 1"""
             ).fetchall()
         }
@@ -599,7 +609,8 @@ def parent_lookup_tasks(
     }
     for market, winner in identities.markets.items():
         if market in market_members and (
-            market not in market_winners or winner[:2] > market_winners[market][:2]
+            market not in market_winners
+            or timestamp_order_key(*winner[:2]) > timestamp_order_key(*market_winners[market][:2])
         ):
             market_winners[market] = winner
     lookup_events = {
@@ -613,7 +624,8 @@ def parent_lookup_tasks(
     }
     for event, winner in effective_events.items():
         if event in active_events and (
-            event not in event_winners or winner[:2] > event_winners[event][:2]
+            event not in event_winners
+            or timestamp_order_key(*winner[:2]) > timestamp_order_key(*event_winners[event][:2])
         ):
             event_winners[event] = winner
     event_parents = {event: winner[2] for event, winner in event_winners.items()}
