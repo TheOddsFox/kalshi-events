@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from recovery_fixtures import build_recovery_root
@@ -121,6 +122,74 @@ def test_provenance_includes_runtime_files_fixture_sources_and_environment():
     assert "benchmark-recovery.py" in provenance["source_files_sha256"]
     assert "recovery_fixtures.py" in provenance["source_files_sha256"]
     assert provenance["python_executable"] == sys.executable
+
+
+@pytest.mark.parametrize(
+    ("supports_first_data_timing", "caller_passes_first_data_timing"),
+    [(False, False), (False, True), (True, True)],
+)
+def test_resume_worker_commit_wrapper_supports_current_and_legacy_signatures(
+    tmp_path, monkeypatch, supports_first_data_timing, caller_passes_first_data_timing
+):
+    benchmark = _benchmark_module()
+    capture_id = "a" * 32
+    root = tmp_path / "root"
+    Store(root)
+    (root / "captures" / capture_id).mkdir(parents=True)
+    result = tmp_path / "worker.json"
+    timing = capture._FirstDataTiming()
+    received_timing = []
+
+    if supports_first_data_timing:
+
+        def original_commit(
+            store, _state, _index, relative, _request_id, _identities, *, first_data_timing
+        ):
+            received_timing.append(first_data_timing)
+            first_data_timing.observe_page_commit("/events")
+            path = store.path(relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"endpoint":"/events"}', encoding="utf-8")
+
+    else:
+
+        def original_commit(store, _state, _index, relative, _request_id, _identities):
+            path = store.path(relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"endpoint":"/events"}', encoding="utf-8")
+
+    def fake_capture(store, *, resume, client_factory):
+        assert resume == capture_id
+        assert callable(client_factory)
+        state = SimpleNamespace(processed=set())
+        arguments = {"first_data_timing": timing} if caller_passes_first_data_timing else {}
+        capture._commit_page_v2(
+            store, state, 0, "raw/page/manifest.json", "request", None, **arguments
+        )
+        return {"complete": True}
+
+    monkeypatch.setattr(benchmark, "_worker_imports", lambda *_args: None)
+    monkeypatch.setattr(capture, "_commit_page_v2", original_commit)
+    monkeypatch.setattr(capture, "capture", fake_capture)
+    monkeypatch.setattr(capture, "MAX_CONCURRENT_REQUESTS", 1)
+    args = SimpleNamespace(
+        source_root=tmp_path,
+        fixture_root=tmp_path,
+        root=root,
+        result=result,
+        capture_id=capture_id,
+        complete=True,
+    )
+
+    assert benchmark._resume_worker(args) == 0
+
+    report = json.loads(result.read_text(encoding="utf-8"))
+    assert report["first_committed_new_page_elapsed_seconds"] is not None
+    if supports_first_data_timing:
+        assert received_timing == [timing]
+        assert timing._page_committed_at is not None
+    else:
+        assert received_timing == []
 
 
 def test_fixture_marker_size_is_bounded_before_json_parsing(tmp_path):

@@ -411,6 +411,28 @@ def test_pending_prune_finishes_before_an_obsolete_candidate_can_publish(
     _check_fresh(root, captures)
 
 
+@pytest.mark.parametrize("with_plan", [False, True])
+def test_retirement_metadata_cleanup_updates_store_accounting(tmp_path, with_plan):
+    root = tmp_path / "root"
+    store = Store(root)
+    with store.writer_guard():
+        if with_plan:
+            store.write("prune-plan.json", {"version": 1, "kind": "prune", "entries": []})
+        store.write_bytes("prune-progress.jsonl", b"" if with_plan else b"orphan progress\n")
+    before = store.usage()["retained_bytes"]
+    removed_bytes = sum(
+        store.path(name).stat().st_size
+        for name in ("prune-plan.json", "prune-progress.jsonl")
+        if store.path(name).exists()
+    )
+
+    incremental.finish_pending_retirement(store)
+
+    assert not store.path("prune-plan.json").exists()
+    assert not store.path("prune-progress.jsonl").exists()
+    assert store.usage()["retained_bytes"] == before - removed_bytes
+
+
 @pytest.mark.parametrize("operator_file", ["source", "target"])
 def test_malformed_prune_plan_cannot_delete_unknown_operator_files(recovery_root, operator_file):
     root, _ = recovery_root

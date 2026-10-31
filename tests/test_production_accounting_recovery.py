@@ -293,18 +293,18 @@ def test_reconcile_allows_new_lock_to_new_lock_only_with_complete_saved_metadata
 
 
 @pytest.mark.parametrize("saved_lock", ["legacy", "target"])
-@pytest.mark.parametrize("saved_hash", ["previous", "current"])
+@pytest.mark.parametrize("saved_hash", ["previous", "pre_payload", "current"])
 def test_reconcile_accepts_approved_saved_transport_hashes_with_current_source(
     production, workflow, monkeypatch, saved_lock, saved_hash
 ):
     stopped, report_path, report = _stopped_capture_with_unknown_accounting(production, workflow)
     if saved_lock == "target":
         report = _mark_target_runtime(production, report_path)
-    report["system"]["transport_sha256"] = (
-        production.PREVIOUS_RECONCILIATION_TRANSPORT_SHA256
-        if saved_hash == "previous"
-        else production.RECONCILIATION_TRANSPORT_SHA256
-    )
+    report["system"]["transport_sha256"] = {
+        "previous": production.PREVIOUS_RECONCILIATION_TRANSPORT_SHA256,
+        "pre_payload": production.PRE_PAYLOAD_RECONCILIATION_TRANSPORT_SHA256,
+        "current": production.RECONCILIATION_TRANSPORT_SHA256,
+    }[saved_hash]
     report_path.write_text(json.dumps(report))
     workflow.commands.clear()
     monkeypatch.setattr(production, "_package_versions", lambda: _target_versions())

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +21,21 @@ SPEC = importlib.util.spec_from_file_location("benchmark_historical_compact", SC
 assert SPEC is not None and SPEC.loader is not None
 benchmark = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(benchmark)
+
+
+def _checkout_with_data(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    (checkout / "data").mkdir(parents=True)
+    monkeypatch.setattr(benchmark, "_checkout", lambda: checkout)
+    return checkout
+
+
+def _benchmark_args(operator_root, output_dir):
+    return SimpleNamespace(
+        operator_root=operator_root,
+        output_dir=output_dir,
+        capture_id="a" * 32,
+    )
 
 
 def test_sample_selects_page_positions_and_size_tails_per_generation():
@@ -346,3 +363,92 @@ def test_help_does_not_start_sampling_or_create_an_output_directory(tmp_path):
     assert result.returncode == 0
     assert "read-only operator root" in result.stdout
     assert not list(tmp_path.iterdir())
+
+
+def test_benchmark_rejects_symlink_operator_root_before_creating_report(tmp_path, monkeypatch):
+    checkout = _checkout_with_data(tmp_path, monkeypatch)
+    output = checkout / "data/run"
+    operator_alias = tmp_path / "operator-alias"
+    operator_alias.symlink_to(output, target_is_directory=True)
+
+    with pytest.raises(CatalogueError, match="symlink"):
+        benchmark._benchmark(_benchmark_args(operator_alias, output))
+
+    assert not output.exists()
+
+
+def test_benchmark_rejects_canonical_operator_output_overlap_before_creating_report(
+    tmp_path, monkeypatch
+):
+    checkout = _checkout_with_data(tmp_path, monkeypatch)
+    operator_root = checkout / "data/operator"
+    operator_root.mkdir()
+    output = operator_root / "run"
+    aliased_operator_root = operator_root / "missing" / ".."
+
+    with pytest.raises(CatalogueError, match="separate from the read-only operator root"):
+        benchmark._benchmark(_benchmark_args(aliased_operator_root, output))
+
+    assert not output.exists()
+
+
+def test_benchmark_rejects_nested_git_output_before_creating_report(tmp_path, monkeypatch):
+    checkout = _checkout_with_data(tmp_path, monkeypatch)
+    nested = checkout / "data/nested-checkout"
+    (nested / ".git").mkdir(parents=True)
+    output = nested / "run"
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+
+    with pytest.raises(CatalogueError, match="nested Git checkout"):
+        benchmark._benchmark(_benchmark_args(operator_root, output))
+
+    assert not output.exists()
+
+
+def test_benchmark_still_rejects_an_existing_output_without_overwriting_it(tmp_path, monkeypatch):
+    checkout = _checkout_with_data(tmp_path, monkeypatch)
+    output = checkout / "data/existing"
+    output.mkdir()
+    report = output / "report.json"
+    report.write_text("keep", encoding="utf-8")
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+
+    with pytest.raises(CatalogueError, match="new path"):
+        benchmark._benchmark(_benchmark_args(operator_root, output))
+
+    assert report.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("report_inside_fixture", [False, True])
+def test_worker_rejects_unsafe_report_before_writing_error(
+    tmp_path, monkeypatch, report_inside_fixture
+):
+    checkout = _checkout_with_data(tmp_path, monkeypatch)
+    fixture = checkout / "data/fixture"
+    fixture.mkdir()
+    if report_inside_fixture:
+        report = fixture / "worker.json"
+    else:
+        nested = checkout / "data/nested-checkout"
+        (nested / ".git").mkdir(parents=True)
+        report = nested / "worker.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--worker",
+            "legacy",
+            "--fixture-root",
+            str(fixture),
+            "--worker-report",
+            str(report),
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        benchmark.main()
+
+    assert not report.exists()
