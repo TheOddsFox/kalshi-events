@@ -1075,7 +1075,7 @@ def _finish_retirement_plan(store: Store) -> None:
         if trash.exists() and any(trash.iterdir()):
             raise CatalogueError("unplanned prune-trash contents; refusing broad cleanup")
         if progress_path.exists():
-            progress_path.unlink()
+            store.remove("prune-progress.jsonl")
             fsync_directory(store.root)
         return
     plan_body = regular_bytes(plan_path, store.limits.max_root_bytes)
@@ -1393,9 +1393,9 @@ def _finish_retirement_plan(store: Store) -> None:
 
     for identity in sorted(retired_capture_ids):
         remove_capture_cache(store, identity)
-    plan_path.unlink()
+    store.remove("prune-plan.json")
     fsync_directory(store.root)
-    progress_path.unlink(missing_ok=True)
+    store.remove("prune-progress.jsonl")
     fsync_directory(store.root)
     for relative in (
         "captures",
