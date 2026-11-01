@@ -263,6 +263,14 @@ Production memory telemetry has an invocation-specific effective-policy version,
 
 Resource samples have a bounded 256-entry inline tail and aggregate counts/peaks; truncation preserves the previous report in run evidence. Resume records the previous stop separately before clearing the new attempt's error and recovery fields. Offline invocation request/download counts remain zero independently of conservative lifetime acquisition accounting. New progress phases and aggregate landing counters are operational diagnostics only and do not change command-result or release identities.
 
+Memory-sampler failures retain the stable primary stop category and a separate
+`memory_sample_error` diagnostic, limited to 512 characters with absolute paths
+redacted. Failed system probes retain their allowlisted probe name, status and
+bounded stderr. Validated resume preserves this detail in stop history before
+clearing it for the new attempt. Diagnostics do not authorize recovery or replace
+missing measurements with zero; the five-second sample bound and fail-closed
+pressure/RSS policy are unchanged.
+
 Abandoned historical staging is disposable only after replacement recovery and validation under the canonical writer lock. Cleanup is restricted to direct managed UUID staging names and rejects symlinks, cross-device entries, special files and multiply-linked regular files. It never prunes raw evidence, captures, public builds, replacement backups or recovery caches. Root/temporary/database quota checks run against the post-cleanup accounting. The independent 150 GiB minimum-free-space gate remains in force before processing; cleanup does not bypass it. This does not provide hard enforcement for every dlt write.
 
 Acquisition completion, operator publication and production activation are separate states. A failure before replacement preserves the prior production link. A failure after replacement can leave activation uncertain even when the new file is present; reports must not claim rollback. Recovery verifies actual database hashes and the expected publication instead of trusting a prior status string. `--activate-current` performs offline verification, completes the current verified publication's existing retention cleanup under the writer lock, and then activates it; it does not acquire, build or silently resume a capture.
@@ -344,3 +352,13 @@ remain accounting failures. This does not restart the processing child or extend
 its deadline.
 
 Stopped-worker reconciliation is explicit and historical-only. Preserve the saved failure and process evidence; validate root, boot, capture, locks and absence of the original owned processes before clearing stale process state. Group absence observed later does not establish that the supervisor previously reaped the child. A new offline grant preserves all old grants, consumed extensions and lifetime reserved-upper-bound accounting. No networking or automatic retry is permitted.
+
+Run reconciliation from the canonical verified checkout, using the tested
+interpreter. Its managed-runtime lookup is relative to the script's source
+checkout; invoking a copied script inside a frozen runtime does not relocate
+that lookup through the project-data environment setting. The exact memory
+snapshot-unavailable stop also supports a structured, zero-network evidence path
+bound to the saved UTC launch identity and report hashes. Original storage-stop
+evidence requirements remain unchanged. Distinct verified memory-stop attempts
+may append reconciliation records for the same session; exact events are
+idempotent and conflicting records for the same attempt are rejected.

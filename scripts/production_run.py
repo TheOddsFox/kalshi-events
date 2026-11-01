@@ -1530,7 +1530,9 @@ def _bounded_memory_diagnostic(value: Any) -> str:
         value = value.decode("utf-8", errors="replace")
     elif not isinstance(value, str):
         value = str(value)
-    value = re.sub(r"(?<![\w])/(?:[^\s,;\"']+)", "<path>", value)
+    value = re.sub(r"'(/[^']*)'", "<path>", value)
+    value = re.sub(r'"(/[^\"]*)"', "<path>", value)
+    value = re.sub(r"(?<![\w:/'\"])/(?!/)[\s\S]*", "<path>", value)
     value = "".join(char for char in value if char.isprintable() or char.isspace())
     return " ".join(value.split())[:512]
 
@@ -1593,15 +1595,16 @@ def _memory_sample_worker(group: int | None) -> dict[str, Any]:
 
     rss_bytes = footprint_bytes = None
     if group is not None:
+        command = ["ps", "-g", str(group), "-o", "pgid=,pid=,rss="]
         result = subprocess.run(
-            ["ps", "-g", str(group), "-o", "pgid=,pid=,rss="],
+            command,
             check=False,
             capture_output=True,
             text=True,
             timeout=1.0,
         )
         if result.returncode not in {0, 1}:
-            raise RunnerError("process-group memory sampling failed")
+            raise subprocess.CalledProcessError(result.returncode, command, stderr=result.stderr)
         rows = []
         for line in result.stdout.splitlines():
             fields = line.split()

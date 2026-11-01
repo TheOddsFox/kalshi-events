@@ -4,6 +4,29 @@ This inventory starts from revision `9f33ae8`. Code delivery, offline test resul
 capacity admission and production activation are separate outcomes. No complete
 historical production database has been activated by this investigation.
 
+## Current status — November 1
+
+The operator subsequently authorized a bounded, monitored full-scale attempt
+without a completed three-million-observation admission forecast. Native loading
+emitted all 79,762,323 saved observations and current selection completed, but
+the attempt stopped during dbt because memory telemetry became unavailable.
+Publication, standalone release verification and production activation did not
+complete. The original sampler sub-error was not retained; this does not prove
+an application memory leak or a storage-limit breach.
+
+The delivered fixes narrow historical relationship inputs, extract combo legs
+before lateral expansion, batch membership inserts through Arrow, and preserve
+bounded sampler diagnostics. Stopped-worker reconciliation has completed.
+Subsequent preflight failures occurred before cleanup or a new processing run;
+the remaining cleanup has passed read-only validation against the saved data.
+Any further continuation requires explicit authorization and remains bounded,
+never automatic.
+
+The scenarios and failed admission measurements below remain historical evidence.
+The later launch exception did not turn them into a passing forecast. Full-scale
+production capacity remains unproven until processing, independent verification
+and activation finish. Genuine filesystem-enforced quotas remain separate.
+
 ## Verified defects
 
 | Area | Failure | Required proof |

@@ -141,6 +141,77 @@ def test_memory_worker_reports_probe_family_status_and_bounded_sanitized_stderr(
     assert len(error) <= 512
 
 
+def test_memory_worker_reports_nonstandard_ps_failure_with_bounded_sanitized_stderr(
+    production, monkeypatch, capsys
+):
+    def run(command, **_kwargs):
+        if command == ["vm_stat"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command == ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]:
+            return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+        assert command == ["ps", "-g", "123", "-o", "pgid=,pid=,rss="]
+        return SimpleNamespace(
+            returncode=2,
+            stdout="",
+            stderr="permission denied: /private/tmp/secret " + "x" * 600,
+        )
+
+    monkeypatch.setattr(production.subprocess, "run", run)
+    monkeypatch.setattr(production, "_vm_stat_compressor_metrics", lambda _stdout: (0, 0))
+    monkeypatch.setattr(production, "_memory_pressure_name", lambda _level: "normal")
+    monkeypatch.setattr(
+        production.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(proc_pid_rusage=lambda *_args: 0),
+    )
+    monkeypatch.setattr(production, "_proc_pid_footprint", lambda *_args: 0)
+
+    assert production._memory_sample_worker_main(123) == 1
+
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("ps probe exited with status 2; stderr: permission denied: <path>")
+    assert "/private/tmp/secret" not in error
+    assert len(error) <= 512
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "'/Volumes/Mac SSD/oddsfox/kalshi-events/run.log'",
+        '"/Volumes/Mac SSD/oddsfox/kalshi-events/run.log"',
+        "/Volumes/Mac SSD/oddsfox/kalshi-events/run.log",
+    ],
+)
+def test_memory_worker_redacts_paths_with_spaces_and_bounds_diagnostic(production, path):
+    error = production._memory_worker_error(
+        subprocess.CalledProcessError(
+            2,
+            ["/usr/bin/ps"],
+            stderr=f"permission denied: {path} " + "x" * 600,
+        )
+    )
+
+    assert error.startswith("ps probe exited with status 2; stderr: permission denied: <path>")
+    assert all(part not in error for part in ("Volumes", "Mac SSD", "oddsfox", "kalshi-events"))
+    assert len(error) <= 512
+
+
+def test_memory_sample_error_keeps_cause_header_after_redacting_unquoted_path(production):
+    error = production.RunnerError(
+        "permission denied: /Volumes/Mac SSD/oddsfox/kalshi-events/run.log " + "x" * 600
+    )
+    error.__cause__ = OSError("probe failed")
+
+    diagnostic = production._memory_sample_error(error)
+
+    assert diagnostic.startswith("permission denied: <path>")
+    assert "(caused by OSError)" in diagnostic
+    assert all(
+        part not in diagnostic for part in ("Volumes", "Mac SSD", "oddsfox", "kalshi-events")
+    )
+    assert len(diagnostic) <= 512
+
+
 def test_sample_memory_keeps_sanitized_stderr_when_worker_json_is_malformed(
     production, monkeypatch
 ):
