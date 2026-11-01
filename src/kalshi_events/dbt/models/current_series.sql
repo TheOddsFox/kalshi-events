@@ -1,8 +1,8 @@
 {% if var('historical_compact', false) %}{{ config(materialized='view') }}
 select s.series_ticker, s.observation_id, s.capture_id, s.received_at,
        s.provider_updated_at, s.source_endpoint, h.payload_json
-from {{ ref('_historical_current_series') }} s
-join {{ ref('observation_history') }} h using (observation_id)
+from {{ ref('observation_history') }} h
+join {{ ref('_historical_current_series') }} s using (observation_id)
 {% else %}{% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
 {{ config(materialized='incremental', incremental_strategy='append') }}
 {% endif %}

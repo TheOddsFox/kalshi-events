@@ -697,16 +697,35 @@ the memory error and partial diagnostic artifacts remain under ignored
 ### Historical export memory candidate
 
 The retained diagnostic database's markets-export plan contains a hash join,
-wide JSON/decimal projection and blocking sort. The old failure report does not
-identify which operator made the last allocation. Historical publication and the
-compact benchmark now disable `preserve_insertion_order` on their disposable
-export connection, retaining explicit unique-key ordering and the existing
-4 GB/four-thread/spill limits. Other publication contracts retain their existing
-export configuration.
+wide JSON/decimal projection and blocking sort. The one-million-observation
+failure alone did not identify which operator made the last allocation.
+Historical publication disables `preserve_insertion_order` and
+`build_side_probe_side` only on its disposable export connection, retaining
+explicit unique-key ordering and the existing 4 GB/four-thread/spill limits.
+Fresh compact historical builds also put the narrow current-market relation on
+the hash join's build side before joining it to observation history. Historical
+relation COPYs retain the 16 MiB `ROW_GROUP_SIZE_BYTES` target. That is a soft
+writer target: oversized single rows remain valid, and it does not bound a hash
+join, projection or sort. The row-group limit alone still failed at markets
+COPY, but the narrow-join diagnostic exported 974,045 markets in 14.443 seconds
+at the same memory and thread limits. Its ordered output matched the original
+`current_markets` values in both `EXCEPT ALL` directions, with identical schema;
+the source database checksum was unchanged. Export and parity checks took 76.15
+seconds. Evidence is retained under
+`data/testing/historical-writer-cap-20261101/expanded-capacity/export-probe-narrow-join/`.
 
-DuckDB documents this setting as a possible reduction in large-write memory use;
-queries with `ORDER BY` retain their specified ordering. See
-[workload tuning](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads)
+This diagnostic did not produce a release or establish complete historical
+catalogue capacity. The three-million stage was not run, and the complete
+catalogue still needs fresh capacity evidence before production admission.
+Already-certified cached historical warehouses keep their stored view plans;
+they require an explicit rebuild to receive the new join order. Other
+publication contracts retain their existing export configuration.
+
+DuckDB documents ROW_GROUP_SIZE_BYTES as a target in its
+[COPY options](https://www.duckdb.org/docs/2.0/sql/statements/copy). Its workload
+tuning guide describes disabling insertion-order preservation as a possible
+large-write memory reduction; queries with `ORDER BY` retain their specified
+ordering. See [workload tuning](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads)
 and [order preservation](https://duckdb.org/docs/2.0/sql/dialect/order_preservation).
 Small-fixture parity is not evidence that the earlier one-million-observation
 export or the complete historical catalogue now fits. Fresh multi-scale capacity

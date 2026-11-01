@@ -84,20 +84,49 @@ def _assert_spill_removed(temporary: Path) -> None:
 
 def test_export_copy_keeps_all_parquet_fields_nullable_and_preserves_values(tmp_path):
     store, database, temporary = _export_source(tmp_path)
+    oversized_bytes = 16 * 1024 * 1024 + 1
+    with duckdb.connect(str(database)) as source:
+        source.execute("create table oversized_cases (order_key integer, payload varchar)")
+        source.execute("insert into oversized_cases values (1, repeat('x', ?))", [oversized_bytes])
+    store.sync(database.relative_to(store.root).as_posix())
+
     output = tmp_path / "parquet"
     output.mkdir()
-
+    edge_file = output / "edge-cases.parquet"
+    empty_file = output / "empty-cases.parquet"
+    oversized_file = output / "oversized-cases.parquet"
     with publish._export_connection(store, database, temporary) as connection:
-        edge_file = output / "edge-cases.parquet"
         connection.execute(
             "copy (select * from main.edge_cases order by order_key) to ? (format parquet)",
             [str(edge_file)],
         )
-        empty_file = output / "empty-cases.parquet"
         connection.execute(
             "copy (select * from main.empty_cases order by order_key) to ? (format parquet)",
             [str(empty_file)],
         )
+        connection.execute(
+            "copy (select * from main.oversized_cases order by order_key) to ? (format parquet)",
+            [str(oversized_file)],
+        )
+
+    historical_output = tmp_path / "historical-parquet"
+    historical_output.mkdir()
+    historical_edge_file = historical_output / "edge-cases.parquet"
+    historical_empty_file = historical_output / "empty-cases.parquet"
+    historical_oversized_file = historical_output / "oversized-cases.parquet"
+    with publish._export_connection(
+        store, database, temporary, historical_export=True
+    ) as connection:
+        for table, destination in (
+            ("edge_cases", historical_edge_file),
+            ("empty_cases", historical_empty_file),
+            ("oversized_cases", historical_oversized_file),
+        ):
+            connection.execute(
+                f"copy (select * from main.{table} order by order_key) to ? "
+                f"(format parquet, {publish.HISTORICAL_COPY_OPTIONS})",
+                [str(destination)],
+            )
 
     assert hashlib.sha256(edge_file.read_bytes()).hexdigest() == (
         "98900378306f7830f68c540703e92fe4818a70e45937e011231020e7055d4ae1"
@@ -116,7 +145,8 @@ def test_export_copy_keeps_all_parquet_fields_nullable_and_preserves_values(tmp_
     assert edge_schema.field("order_key").type == pa.int32()
     assert edge_schema.field("amount").type == pa.decimal128(38, 18)
     assert edge_schema.field("payload").type == pa.string()
-    assert pq.read_table(edge_file).to_pylist() == [
+    edge_rows = pq.read_table(edge_file).to_pylist()
+    assert edge_rows == [
         {
             "order_key": 1,
             "ddl_not_null": 10,
@@ -145,6 +175,23 @@ def test_export_copy_keeps_all_parquet_fields_nullable_and_preserves_values(tmp_
             "payload": "wide界🌉",
         },
     ]
+
+    historical_edge_schema = pq.read_schema(historical_edge_file)
+    assert historical_edge_schema == edge_schema
+    assert pq.read_table(historical_edge_file).to_pylist() == edge_rows
+    assert pq.read_schema(historical_empty_file) == pq.read_schema(empty_file)
+    assert pq.read_table(historical_empty_file).to_pylist() == pq.read_table(empty_file).to_pylist()
+    expected_oversized = [{"order_key": 1, "payload": "x" * oversized_bytes}]
+    assert pq.read_schema(historical_oversized_file) == pq.read_schema(oversized_file)
+    assert pq.read_table(oversized_file).to_pylist() == expected_oversized
+    assert pq.read_table(historical_oversized_file).to_pylist() == expected_oversized
+    for parquet_path in (historical_edge_file, historical_empty_file, historical_oversized_file):
+        parquet = pq.ParquetFile(parquet_path)
+        assert all(
+            parquet.metadata.row_group(row_group).column(column).compression == "ZSTD"
+            for row_group in range(parquet.metadata.num_row_groups)
+            for column in range(parquet.metadata.num_columns)
+        )
 
     empty_schema = pq.read_schema(empty_file)
     assert empty_schema.names == ["order_key", "amount", "payload"]
@@ -181,6 +228,9 @@ def test_export_keeps_existing_connections_and_source_unchanged(tmp_path, fail, 
             ):
                 assert connection.execute("select count(*) from main.edge_cases").fetchone() == (3,)
                 assert _preserve_insertion_order(connection) is (not historical_export)
+                assert (
+                    "build_side_probe_side" in _disabled_optimizers(connection)
+                ) is historical_export
                 assert _disabled_optimizers(source_reader) == source_optimizers
                 assert _disabled_optimizers(default_connection) == default_optimizers
                 raise RuntimeError("injected export failure")
@@ -190,6 +240,9 @@ def test_export_keeps_existing_connections_and_source_unchanged(tmp_path, fail, 
             ) as connection:
                 assert connection.execute("select count(*) from main.edge_cases").fetchone() == (3,)
                 assert _preserve_insertion_order(connection) is (not historical_export)
+                assert (
+                    "build_side_probe_side" in _disabled_optimizers(connection)
+                ) is historical_export
                 assert _disabled_optimizers(source_reader) == source_optimizers
                 assert _disabled_optimizers(default_connection) == default_optimizers
 
@@ -349,13 +402,25 @@ def test_failed_publication_keeps_current_pointer(catalogue, monkeypatch):  # no
     store, state, _release, _database, _market, _combo = catalogue
     pointer = store.path("current.json").read_bytes()
     export_flags = []
+    copied_queries = []
     original_export = publish._export_connection
 
     @contextmanager
     def record_export(*args, **kwargs):
         export_flags.append(kwargs.get("historical_export", False))
         with original_export(*args, **kwargs) as connection:
-            yield connection
+
+            class RecordingConnection:
+                def execute(self, query, parameters=None):
+                    if query.lstrip().lower().startswith("copy "):
+                        copied_queries.append(query)
+                    return (
+                        connection.execute(query, parameters)
+                        if parameters is not None
+                        else connection.execute(query)
+                    )
+
+            yield RecordingConnection()
 
     def fail_export_sync(_path):
         raise OSError("injected export sync failure")
@@ -367,5 +432,7 @@ def test_failed_publication_keeps_current_pointer(catalogue, monkeypatch):  # no
 
     assert store.path("current.json").read_bytes() == pointer
     assert export_flags == [False]
+    assert copied_queries
+    assert all("row_group_size_bytes" not in query.lower() for query in copied_queries)
     assert not list(store.path("tmp").glob("publish-*"))
     assert store._storage_reservations == 0

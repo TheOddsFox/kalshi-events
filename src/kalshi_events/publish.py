@@ -90,6 +90,7 @@ V2_LINEAGE_FIELDS = (
     "membership_sha256",
 )
 MAX_COVERAGE_BINDING_BYTES = 1024**2
+HISTORICAL_COPY_OPTIONS = "compression zstd, compression_level 6, row_group_size_bytes 16777216"
 
 
 @contextmanager
@@ -120,6 +121,7 @@ def _export_connection(
             "max_temp_directory_size": f"{spill_budget}B",
         }
         if historical_export:
+            config["disabled_optimizers"] += ",build_side_probe_side"
             config["preserve_insertion_order"] = "false"
         connection = duckdb.connect(":memory:", config=config)
         database_literal = str(database).replace("'", "''")
@@ -618,11 +620,11 @@ def _publish(
                     f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
                 ).fetchone():
                     raise CatalogueError(f"non-unique publication ordering key: {name}")
-                compression = (
-                    ", compression zstd, compression_level 6" if catalogue_version == 3 else ""
+                historical_options = (
+                    f", {HISTORICAL_COPY_OPTIONS}" if catalogue_version == 3 else ""
                 )
                 connection.execute(
-                    f"copy (select * from main.{table} order by {keys}) to ? (format parquet{compression})",
+                    f"copy (select * from main.{table} order by {keys}) to ? (format parquet{historical_options})",
                     [str(destination)],
                 )
         coverage_row = {

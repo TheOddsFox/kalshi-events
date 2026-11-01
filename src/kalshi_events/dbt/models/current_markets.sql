@@ -14,8 +14,8 @@ select m.market_ticker, m.event_ticker, m.series_ticker, m.usable,
        cast(json_extract_string(h.payload_json, '$.open_interest_fp') as decimal(38,18)) as open_interest_fp,
        cast(json_extract_string(h.payload_json, '$.settlement_value_dollars') as decimal(38,18)) as settlement_value_dollars,
        h.payload_json
-from {{ ref('_historical_current_markets') }} m
-join {{ ref('observation_history') }} h using (observation_id)
+from {{ ref('observation_history') }} h
+join {{ ref('_historical_current_markets') }} m using (observation_id)
 {% else %}{% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
 {{ config(materialized='incremental', incremental_strategy='append') }}
 {% endif %}

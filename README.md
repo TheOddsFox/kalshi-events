@@ -112,7 +112,8 @@ markets, including combos. `build` and `publish` automatically select the histor
 for a new sealed historical capture. The shared Arrow/dbt path preserves native payloads,
 exact decimals, provenance, observation history and deterministic exports. Missing parents
 and combo references remain visibly unresolved; no historical market is removed for that
-reason.
+reason. Historical DuckDB relation exports use Zstandard level 6 with a 16 MiB target row
+group. The target is soft; oversized rows remain valid and it does not cap query or sort memory.
 
 Historical builds use `builds-historical/`, publish `oddsfox.kalshi.historical.v1`, and promote
 `current-historical.json`. Their coverage binds included and omitted scopes, selected task

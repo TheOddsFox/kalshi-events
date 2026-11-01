@@ -1,8 +1,8 @@
 {% if var('historical_compact', false) %}{{ config(materialized='view') }}
 select e.event_ticker, e.series_ticker, e.observation_id, e.capture_id, e.received_at,
        e.provider_updated_at, e.source_endpoint, h.payload_json
-from {{ ref('_historical_current_events') }} e
-join {{ ref('observation_history') }} h using (observation_id)
+from {{ ref('observation_history') }} h
+join {{ ref('_historical_current_events') }} e using (observation_id)
 {% else %}{% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
 {{ config(materialized='incremental', incremental_strategy='append') }}
 {% endif %}

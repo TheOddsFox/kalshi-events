@@ -1374,7 +1374,7 @@ def _worker(args: argparse.Namespace) -> int:
             destination = export_dir / f"{name}.parquet"
             connection.execute(
                 f"copy (select * from main.{table} order by {publish.ORDER_KEYS[name]}) "
-                "to ? (format parquet, compression zstd, compression_level 6)",
+                f"to ? (format parquet, {publish.HISTORICAL_COPY_OPTIONS})",
                 [str(destination)],
             )
             if admission_worker:

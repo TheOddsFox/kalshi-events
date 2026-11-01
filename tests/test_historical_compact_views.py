@@ -256,6 +256,37 @@ def test_historical_compact_views_match_legacy_public_relations(tmp_path):
         ).fetchone() == ("VARCHAR",)
 
     shutil.rmtree(store.path("tmp"), ignore_errors=True)
+    export_temporary = store.path("tmp/export-plan")
+    export_temporary.mkdir(parents=True)
+    with publish._export_connection(
+        store, databases["compact"], export_temporary, historical_export=True
+    ) as connection:
+        plan = json.loads(
+            connection.execute(
+                "explain (format json) select * from main.current_markets order by market_ticker"
+            ).fetchone()[1]
+        )
+
+    def walk(node):
+        if isinstance(node, list):
+            for child in node:
+                yield from walk(child)
+            return
+        yield node
+        for child in node.get("children", []):
+            yield from walk(child)
+
+    observation_join = [
+        node
+        for node in walk(plan)
+        if node.get("name", "").upper() == "HASH_JOIN"
+        and "observation_id = observation_id" in str(node.get("extra_info", {}))
+    ]
+    assert len(observation_join) == 1
+    left, right = observation_join[0]["children"]
+    assert "_historical_current_markets" not in json.dumps(left)
+    assert "_historical_current_markets" in json.dumps(right)
+
     with (
         duckdb.connect(str(databases["legacy"]), read_only=True) as legacy,
         duckdb.connect(str(databases["compact"]), read_only=True) as compact,
@@ -330,7 +361,7 @@ def test_historical_publication_uses_zstd_level_six(tmp_path, monkeypatch):
 
     assert historical_export_flags == [True]
     assert len(copied_queries) == len(warehouse.RELATIONS)
-    assert all("compression zstd, compression_level 6" in query.lower() for query in copied_queries)
+    assert all(publish.HISTORICAL_COPY_OPTIONS in query.lower() for query in copied_queries)
     assert coverage_options == {"compression": "zstd", "compression_level": 6}
     directory = store.path(f"releases/{release['source_release_id']}")
     for name in release["files"]:

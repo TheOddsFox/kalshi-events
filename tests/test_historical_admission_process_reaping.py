@@ -357,7 +357,8 @@ def test_real_native_worker_supervisor_completes_all_four_row_phases(tmp_path):
     assert type(result["verification_peak_temporary_allocated_bytes"]) is int
 
 
-def test_in_process_native_worker_uses_historical_export_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("worker", ("native", "legacy"))
+def test_in_process_worker_uses_historical_export_config(tmp_path, monkeypatch, worker):
     from kalshi_events import publish
 
     checkout = tmp_path / "checkout"
@@ -366,6 +367,7 @@ def test_in_process_native_worker_uses_historical_export_config(tmp_path, monkey
     capture_id, task_indices = _write_four_row_worker_fixture(fixture_root)
     report_path = checkout / "data" / "worker-report.json"
     export_settings = []
+    copied_queries = []
     original_export = publish._export_connection
 
     @contextmanager
@@ -377,7 +379,18 @@ def test_in_process_native_worker_uses_historical_export_config(tmp_path, monkey
                     0
                 ]
             )
-            yield connection
+
+            class RecordingConnection:
+                def execute(self, query, parameters=None):
+                    if query.lstrip().lower().startswith("copy "):
+                        copied_queries.append(query)
+                    return (
+                        connection.execute(query, parameters)
+                        if parameters is not None
+                        else connection.execute(query)
+                    )
+
+            yield RecordingConnection()
 
     monkeypatch.setattr(benchmark, "_checkout", lambda: checkout)
     monkeypatch.setattr(publish, "_export_connection", record_export)
@@ -386,7 +399,7 @@ def test_in_process_native_worker_uses_historical_export_config(tmp_path, monkey
         SimpleNamespace(
             admission_worker=True,
             admission_deadline_monotonic=time.monotonic() + 20 * 60,
-            worker="native",
+            worker=worker,
             fixture_root=fixture_root,
             worker_report=report_path,
             capture_id=capture_id,
@@ -396,6 +409,8 @@ def test_in_process_native_worker_uses_historical_export_config(tmp_path, monkey
 
     assert result == 0
     assert export_settings == [False]
+    assert len(copied_queries) == len(publish.RELATIONS)
+    assert all(publish.HISTORICAL_COPY_OPTIONS in query.lower() for query in copied_queries)
     assert report_path.is_file()
 
 
