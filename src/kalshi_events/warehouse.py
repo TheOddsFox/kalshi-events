@@ -1564,15 +1564,35 @@ def _projection_membership(
                  scope varchar, entity_kind varchar, entity_ticker varchar)"""
         )
         connection.execute("delete from landing.membership")
-        batch = []
-        for scope, identity in index.stream_membership(state):
-            batch.append((scope, SCOPE_KIND[scope], identity))
-            if len(batch) == 4096:
-                connection.executemany("insert into landing.membership values (?,?,?)", batch)
-                batch.clear()
-                store.check_deadline()
-        if batch:
-            connection.executemany("insert into landing.membership values (?,?,?)", batch)
+        membership_schema = pa.schema(
+            [
+                pa.field("scope", pa.string()),
+                pa.field("entity_kind", pa.string()),
+                pa.field("entity_ticker", pa.string()),
+            ]
+        )
+        memberships = iter(index.stream_membership(state))
+        while batch := list(itertools.islice(memberships, _LANDING_BATCH_ROWS)):
+            table = pa.Table.from_arrays(
+                [
+                    pa.array([row[0] for row in batch], type=pa.string()),
+                    pa.array([SCOPE_KIND[row[0]] for row in batch], type=pa.string()),
+                    pa.array([row[1] for row in batch], type=pa.string()),
+                ],
+                schema=membership_schema,
+            )
+            registered = False
+            try:
+                connection.register("historical_membership_batch", table)
+                registered = True
+                connection.execute(
+                    "insert into landing.membership "
+                    "select scope, entity_kind, entity_ticker from historical_membership_batch"
+                )
+            finally:
+                if registered:
+                    connection.unregister("historical_membership_batch")
+            store.check_deadline()
         connection.execute(
             """create table if not exists landing.parent_eligibility (
                  capture_id varchar, entity_kind varchar, entity_ticker varchar,

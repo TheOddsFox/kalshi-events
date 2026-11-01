@@ -21,5 +21,5 @@ select m.entity_ticker as market_ticker, m.event_ticker, e.series_ticker,
        m.observation_id, m.capture_id, m.received_at, m.provider_updated_at,
        m.source_endpoint
 from latest m
-left join {{ ref('current_events') }} e on m.event_ticker = e.event_ticker
-left join {{ ref('current_series') }} s on e.series_ticker = s.series_ticker
+left join {{ ref('_historical_current_events') }} e on m.event_ticker = e.event_ticker
+left join {{ ref('_historical_current_series') }} s on e.series_ticker = s.series_ticker

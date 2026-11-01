@@ -7,7 +7,7 @@ with listed as (
 ),
 required as (
     select distinct e.series_ticker
-    from {{ ref('current_events') }} e
+    from {{ ref('_historical_current_events') }} e
     where e.series_ticker is not null
       and not exists (
           select 1 from listed l where l.series_ticker = e.series_ticker

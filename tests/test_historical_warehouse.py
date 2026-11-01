@@ -5,6 +5,7 @@ import os
 
 import conftest
 import duckdb
+import pyarrow as pa
 import pytest
 from conftest import COMBO, HISTORICAL, FakeClient
 
@@ -150,6 +151,81 @@ def test_historical_disk_index_keeps_membership_and_eligibility_without_winners(
         assert winners[0][3] == "HISTORY-SERIES"
     finally:
         full_index.close()
+
+
+def test_disk_projection_membership_registers_bounded_typed_arrow_batches(store):
+    state = {
+        "capture_id": "b" * 32,
+        "tasks": [acquisition.task("/events", "events")],
+        "task_scopes": {"0": "events_live"},
+    }
+    events = [{"event_ticker": f"E-{number:04d}", "series_ticker": None} for number in range(4100)]
+    index = normalize.DiskParentIndex(store, collect_winners=False)
+    try:
+        index.add_page(
+            {
+                "entity_kind": "events",
+                "endpoint": "/events",
+                "singular": False,
+                "status": 200,
+                "page_id": "1" * 32,
+                "request_id": "2" * 64,
+                "received_at": "2026-10-28T12:00:00Z",
+                "task_scope": "events_live",
+                "task_generation": 0,
+            },
+            {"events": events},
+        )
+
+        with duckdb.connect() as raw_connection:
+            raw_connection.execute("create schema landing")
+
+            class RecordingConnection:
+                def __init__(self, connection):
+                    self.connection = connection
+                    self.registered = []
+                    self.unregistered = []
+                    self.executemany_sql = []
+
+                def execute(self, query, parameters=None):
+                    return self.connection.execute(query, parameters)
+
+                def register(self, name, value):
+                    self.registered.append((name, value))
+                    return self.connection.register(name, value)
+
+                def unregister(self, name):
+                    self.unregistered.append(name)
+                    return self.connection.unregister(name)
+
+                def executemany(self, query, parameters):
+                    self.executemany_sql.append(query)
+                    return self.connection.executemany(query, parameters)
+
+            connection = RecordingConnection(raw_connection)
+            assert warehouse._projection_membership(store, state, index, connection) == ({}, {})
+
+            batches = [
+                batch
+                for name, batch in connection.registered
+                if name == "historical_membership_batch"
+            ]
+            assert [batch.num_rows for batch in batches] == [4096, 4]
+            assert all(
+                batch.schema.names == ["scope", "entity_kind", "entity_ticker"] for batch in batches
+            )
+            assert all(
+                all(field.type == pa.string() for field in batch.schema) for batch in batches
+            )
+            assert connection.unregistered == ["historical_membership_batch"] * 2
+            assert not any(
+                "landing.membership" in sql.lower() for sql in connection.executemany_sql
+            )
+            assert raw_connection.execute(
+                "select count(*), min(entity_kind), min(scope) from landing.membership"
+            ).fetchone() == (4100, "events", "events_live")
+    finally:
+        index.close()
 
 
 def test_historical_build_keeps_all_generations_combos_and_tie_winner(store, monkeypatch):

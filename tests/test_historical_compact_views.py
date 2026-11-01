@@ -4,9 +4,12 @@ import json
 import shutil
 from contextlib import contextmanager
 from decimal import Decimal
+from pathlib import Path
 
 import duckdb
+import jinja2
 import pyarrow.parquet as pq
+import pytest
 from conftest import FakeClient
 
 from kalshi_events import capture, publish, warehouse
@@ -14,6 +17,7 @@ from kalshi_events.common import Store
 
 CAPTURE_ID = "c" * 32
 _PUBLIC_RELATIONS = tuple(warehouse.RELATIONS.items())
+_MODELS = Path(__file__).parents[1] / "src/kalshi_events/dbt/models"
 
 
 def _market(title, event_ticker, *, last_price="0.1", legs=None):
@@ -49,9 +53,23 @@ def _landing_rows():
             "side": "no",
             "yes_settlement_value_dollars": "0.000000000000000002",
         },
+        {
+            "event_ticker": "E1",
+            "market_ticker": "M1",
+            "side": "yes",
+            "yes_settlement_value_dollars": "0.000000000000000001",
+        },
     ]
     records = [
-        ("1" * 32, "series", "S1", {"ticker": "S1", "title": "listed"}, None, "S1", "series"),
+        (
+            "1" * 32,
+            "series",
+            "S1",
+            {"ticker": "S1", "title": "listéd 🌍"},
+            None,
+            "S1",
+            "series",
+        ),
         (
             "2" * 32,
             "series",
@@ -65,7 +83,7 @@ def _landing_rows():
             "3" * 32,
             "events",
             "E1",
-            {"event_ticker": "E1", "series_ticker": "S1", "title": "listed event"},
+            {"event_ticker": "E1", "series_ticker": "S1", "title": "listed café 🌍"},
             "E1",
             "S1",
             "events_live",
@@ -215,6 +233,49 @@ def _rows(connection, table, ordering):
     return connection.execute(f"select * from main.{table} order by {ordering}").fetchall()
 
 
+def _historical_model_sql(name, *, compact=True):
+    template = jinja2.Environment().from_string((_MODELS / f"{name}.sql").read_text())
+    variables = {
+        "catalogue_version": 2,
+        "historical_compact": compact,
+        "incremental_update": False,
+        "current_capture_id": CAPTURE_ID,
+    }
+    return template.render(
+        config=lambda **kwargs: "",
+        ref=lambda relation: f"main.{relation}",
+        source=lambda schema, relation: f"{schema}.{relation}",
+        var=lambda key, default=None: variables.get(key, default),
+    )
+
+
+def _walk_plan(plan):
+    if isinstance(plan, list):
+        for node in plan:
+            yield from _walk_plan(node)
+        return
+    if not isinstance(plan, dict):
+        return
+    yield plan
+    for key in ("children", "operator"):
+        yield from _walk_plan(plan.get(key, []))
+
+
+def _scan_tables(plan):
+    tables = []
+    for node in _walk_plan(plan):
+        if node.get("name", node.get("operator_type", node.get("type"))) not in {
+            "SEQ_SCAN",
+            "TABLE_SCAN",
+        }:
+            continue
+        info = node.get("extra_info", node.get("extraInfo", {}))
+        table = info.get("Table", info.get("table")) if isinstance(info, dict) else None
+        if table is not None:
+            tables.append(str(table))
+    return tables
+
+
 def test_historical_compact_views_match_legacy_public_relations(tmp_path):
     store = Store(tmp_path / "root")
     databases = {}
@@ -254,6 +315,30 @@ def test_historical_compact_views_match_legacy_public_relations(tmp_path):
         assert compact.execute(
             "select typeof(payload_json) from landing.observations limit 1"
         ).fetchone() == ("VARCHAR",)
+
+        relationship_plan = json.loads(
+            compact.execute(
+                f"explain (format json) {_historical_model_sql('relationships')}"
+            ).fetchone()[1]
+        )
+        assert not any("landing.observations" in table for table in _scan_tables(relationship_plan))
+
+        combo_plan = json.loads(
+            compact.execute(
+                f"explain (format json) {_historical_model_sql('combo_legs')}"
+            ).fetchone()[1]
+        )
+        combo_scans = _scan_tables(combo_plan)
+        assert sum("landing.observations" in table for table in combo_scans) == 1
+        correlations = [
+            str(node.get("extra_info", {}).get("Conditions", ""))
+            for node in _walk_plan(combo_plan)
+            if "IS NOT DISTINCT FROM"
+            in str(node.get("extra_info", {}).get("Conditions", "")).upper()
+        ]
+        assert len(correlations) == 1
+        assert "selected_legs" in correlations[0]
+        assert "payload_json" not in correlations[0]
 
     shutil.rmtree(store.path("tmp"), ignore_errors=True)
     export_temporary = store.path("tmp/export-plan")
@@ -307,9 +392,24 @@ def test_historical_compact_views_match_legacy_public_relations(tmp_path):
             "12345678901234567890.123456789012345678"
         )
         assert markets["MISSING"]["usable"] is False
+        assert markets["MISSING"]["rules_secondary"] is None
+        assert (
+            "listed café 🌍"
+            in compact.execute(
+                "select payload_json from main.current_events where event_ticker = 'E1'"
+            ).fetchone()[0]
+        )
         assert compact.execute(
             "select resolved from main.combo_legs order by leg_index"
-        ).fetchall() == [(True,), (False,)]
+        ).fetchall() == [(True,), (False,), (True,)]
+        assert compact.execute(
+            "select combo_market_ticker, leg_index, event_ticker, market_ticker, side, "
+            "yes_settlement_value_dollars, resolved from main.combo_legs order by leg_index"
+        ).fetchall() == [
+            ("COMBO", 0, "E1", "M1", "yes", Decimal("0.000000000000000001"), True),
+            ("COMBO", 1, "NOEVENT", "ABSENT", "no", Decimal("0.000000000000000002"), False),
+            ("COMBO", 2, "E1", "M1", "yes", Decimal("0.000000000000000001"), True),
+        ]
         assert compact.execute(
             "select parent_ticker, child_ticker, resolved from main.relationships "
             "where child_kind = 'markets' order by child_ticker"
@@ -319,6 +419,69 @@ def test_historical_compact_views_match_legacy_public_relations(tmp_path):
             ("E2", "M2", True),
             ("NOEVENT", "MISSING", False),
         ]
+
+
+def test_compact_combo_legs_match_legacy_for_json_shapes_and_preserve_key_errors():
+    connection = duckdb.connect()
+    connection.execute(
+        "create table current_markets (market_ticker varchar, event_ticker varchar, payload_json varchar)"
+    )
+    connection.execute("create table current_events (event_ticker varchar)")
+    connection.execute(
+        "create table _historical_current_markets (market_ticker varchar, event_ticker varchar)"
+    )
+    connection.execute("create table _historical_current_events (event_ticker varchar)")
+    valid_leg = {
+        "event_ticker": "E1",
+        "market_ticker": "M1",
+        "side": "yes",
+        "yes_settlement_value_dollars": "0.000000000000000001",
+    }
+    legs = {
+        "COMBO": [valid_leg, {**valid_leg}, {**valid_leg}],
+        "MISSING": {"__missing__": True},
+        "EMPTY": [],
+        "NULL": None,
+        "SCALAR": 7,
+        "OBJECT": {str(number): {**valid_leg} for number in range(3)},
+        "MALFORMED": [None, {}, "text", 7, []],
+    }
+    rows = [
+        (
+            ticker,
+            "E1",
+            json.dumps(
+                {"mve_selected_legs": selected} if selected != {"__missing__": True} else {},
+                separators=(",", ":"),
+            ),
+        )
+        for ticker, selected in legs.items()
+    ]
+    rows.append(("M1", "E1", json.dumps({"ticker": "M1"})))
+    connection.executemany("insert into current_markets values (?, ?, ?)", rows)
+    connection.execute("insert into _historical_current_markets values ('M1', 'E1')")
+    connection.execute("insert into _historical_current_events values ('E1')")
+    connection.execute("insert into current_events values ('E1')")
+
+    def result(compact):
+        query = _historical_model_sql("combo_legs", compact=compact)
+        cursor = connection.execute(
+            f"select * from ({query}) combo_legs order by combo_market_ticker, leg_index"
+        )
+        schema = [(column[0], column[1]) for column in cursor.description]
+        return schema, cursor.fetchall()
+
+    assert result(compact=True) == result(compact=False)
+    assert len(result(compact=True)[1]) == 13
+
+    connection.execute(
+        "insert into current_markets values (?, ?, ?)",
+        ["BAD_KEY", "E1", '{"mve_selected_legs":{"not-an-index":{}}}'],
+    )
+    for compact in (False, True):
+        with pytest.raises(duckdb.ConversionException, match="not-an-index"):
+            connection.execute(_historical_model_sql("combo_legs", compact=compact)).fetchall()
+    connection.close()
 
 
 def test_historical_publication_uses_zstd_level_six(tmp_path, monkeypatch):

@@ -1295,7 +1295,12 @@ def _monitor(
                     stop_reason = "session or workflow deadline reached termination reserve"
                     terminate()
                     break
-                memory = _sample_memory(process.pid, timeout=timeout)
+                try:
+                    memory = _sample_memory(process.pid, timeout=timeout)
+                except (OSError, subprocess.SubprocessError, RunnerError) as exc:
+                    report["memory_sample_error"] = _memory_sample_error(exc)
+                    raise
+                report.pop("memory_sample_error", None)
                 if _child_time_remaining(deadline, wall_deadline_epoch) <= float(
                     _effective_limits()["terminate_seconds"]
                 ):
@@ -1518,6 +1523,46 @@ def _proc_pid_footprint(proc_pid_rusage: Any, pid: int) -> int | None:
     return footprints[1]
 
 
+def _bounded_memory_diagnostic(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    elif not isinstance(value, str):
+        value = str(value)
+    value = re.sub(r"(?<![\w])/(?:[^\s,;\"']+)", "<path>", value)
+    value = "".join(char for char in value if char.isprintable() or char.isspace())
+    return " ".join(value.split())[:512]
+
+
+def _memory_worker_error(exc: Exception) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        command = exc.cmd
+        executable = command[0] if isinstance(command, (list, tuple)) and command else command
+        family = Path(str(executable)).name
+        if family not in {"vm_stat", "sysctl", "ps"}:
+            family = "unknown"
+        message = f"{family} probe exited with status {exc.returncode}"
+        stderr = _bounded_memory_diagnostic(exc.stderr)
+        if stderr:
+            message += f"; stderr: {stderr}"
+        return _bounded_memory_diagnostic(message)
+    return _bounded_memory_diagnostic(str(exc)) or type(exc).__name__
+
+
+def _memory_sample_error(exc: BaseException) -> str:
+    message = _bounded_memory_diagnostic(str(exc)) or type(exc).__name__
+    causes = []
+    cause = exc.__cause__
+    while cause is not None and len(causes) < 3:
+        causes.append(type(cause).__name__)
+        cause = cause.__cause__
+    if causes:
+        suffix = " (caused by " + " -> ".join(causes) + ")"
+        message = message[: max(0, 512 - len(suffix))] + suffix
+    return _bounded_memory_diagnostic(message)
+
+
 def _memory_sample_worker(group: int | None) -> dict[str, Any]:
     if group is not None and (type(group) is not int or group <= 0):
         raise RunnerError("memory sampler process group is invalid")
@@ -1627,7 +1672,7 @@ def _sample_memory(group: int | None, *, timeout: float = 5.0) -> dict[str, Any]
         work_timeout = sample_deadline - time.monotonic() - cleanup_reserve
         if work_timeout <= 0:
             raise subprocess.TimeoutExpired(command, min(5.0, timeout))
-        stdout, _stderr = worker.communicate(timeout=work_timeout)
+        stdout, stderr = worker.communicate(timeout=work_timeout)
     except subprocess.TimeoutExpired as exc:
         _stop_memory_sample_worker(worker, sample_deadline)
         raise RunnerError("bounded memory sample worker timed out") from exc
@@ -1635,17 +1680,24 @@ def _sample_memory(group: int | None, *, timeout: float = 5.0) -> dict[str, Any]
         _stop_memory_sample_worker(worker, sample_deadline)
         raise
     sample_completed = time.monotonic()
+    stderr_detail = _bounded_memory_diagnostic(stderr)
     try:
         value = json.loads(stdout)
     except (TypeError, ValueError) as exc:
-        raise RunnerError("bounded memory sample returned malformed JSON") from exc
+        detail = "bounded memory sample returned malformed JSON"
+        if stderr_detail:
+            detail += f"; worker stderr: {stderr_detail}"
+        raise RunnerError(_bounded_memory_diagnostic(detail)) from exc
     if worker.returncode != 0 or not isinstance(value, dict):
         message = value.get("error") if isinstance(value, dict) else None
-        raise RunnerError(
-            f"bounded memory sample failed: {message}"
+        detail = (
+            f"bounded memory sample failed: {_bounded_memory_diagnostic(message)}"
             if isinstance(message, str)
             else "bounded memory sample failed"
         )
+        if stderr_detail:
+            detail += f"; worker stderr: {stderr_detail}"
+        raise RunnerError(_bounded_memory_diagnostic(detail))
     expected = {
         "child_process_group_rss_bytes",
         "system_compressed_bytes",
@@ -1701,7 +1753,7 @@ def _memory_sample_worker_main(group: int | None) -> int:
         print(json.dumps(_memory_sample_worker(group), sort_keys=True, allow_nan=False))
         return 0
     except Exception as exc:
-        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        print(json.dumps({"error": _memory_worker_error(exc)}, sort_keys=True))
         return 1
 
 
@@ -1767,6 +1819,7 @@ def _invoke(
         report["memory_preflight_error"] = str(exc)
         _atomic_report(report_path, report)
         return None, "memory metrics unavailable before supervised work", True
+    report.pop("memory_sample_error", None)
     report.pop("memory_preflight_error", None)
     _append_memory_preflight_sample(report, report_path, memory_preflight)
     if memory_preflight["system_memory_pressure"] != "normal":
@@ -3261,7 +3314,217 @@ def _stopped_worker_evidence(
     return evidence, evidence_path, evidence_raw
 
 
-def _append_stopped_worker_audit(operator: Path, record: dict[str, Any]) -> dict[str, Any]:
+def _stopped_memory_worker_evidence(
+    directory: Path, report_path: Path, report: dict[str, Any], capture_id: str
+) -> tuple[dict[str, Any], Path, bytes, bytes, str]:
+    from kalshi_events.common import regular_bytes, safe_path
+
+    stop_reason = "resource accounting failed: memory snapshot unavailable"
+    profile, sealed_report = _session_resource_profile(report_path, capture_id=capture_id)
+    if sealed_report != report:
+        raise RunnerError("stopped-worker session report changed during validation")
+    raw_report = regular_bytes(report_path, 16 * MIB)
+    try:
+        if json.loads(raw_report.decode("utf-8")) != report:
+            raise RunnerError("stopped-worker session report changed during validation")
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("stopped-worker session report is malformed") from exc
+
+    supervision = report.get("process_supervision")
+    group = report.get("active_process_group")
+    token = supervision.get("invocation_token") if isinstance(supervision, dict) else None
+    errors = supervision.get("termination_errors") if isinstance(supervision, dict) else None
+    group_absent = supervision.get("group_absent") if isinstance(supervision, dict) else None
+    leader_reaped = supervision.get("leader_reaped") if isinstance(supervision, dict) else None
+    if (
+        report.get("error") != stop_reason
+        or not isinstance(supervision, dict)
+        or supervision.get("primary_stop_reason") != stop_reason
+        or type(group) is not int
+        or group <= 1
+        or type(leader_reaped) is not bool
+        or leader_reaped is not True
+        or group_absent is not None
+        and type(group_absent) is not bool
+        or type(supervision.get("uncertain")) is not bool
+        or supervision["uncertain"] != (not leader_reaped or group_absent is None)
+        or supervision.get("termination_attempted") is not True
+        or not isinstance(errors, list)
+        or len(errors) > 256
+        or any(not isinstance(item, str) or len(item) > 512 for item in errors)
+        or group_absent is None
+        and not errors
+        or not isinstance(token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", token)
+        or report.get("storage_supervision_invocation") != token
+        or type(report.get("network_activity_this_invocation")) is not dict
+        or set(report["network_activity_this_invocation"])
+        != {"requests", "downloaded_bytes", "accounting_complete"}
+        or type(report["network_activity_this_invocation"].get("requests")) is not int
+        or report["network_activity_this_invocation"]["requests"] != 0
+        or type(report["network_activity_this_invocation"].get("downloaded_bytes")) is not int
+        or report["network_activity_this_invocation"]["downloaded_bytes"] != 0
+        or report["network_activity_this_invocation"].get("accounting_complete") is not True
+    ):
+        raise RunnerError("memory-stop termination evidence is invalid")
+
+    source_value = report.get("source_root")
+    if not isinstance(source_value, str):
+        raise RunnerError("memory-stop reconciliation has no saved source root")
+    try:
+        source_root = safe_path(Path(source_value))
+    except Exception as exc:
+        raise RunnerError("saved source root is unsafe") from exc
+    runtime_root = (SOURCE_ROOT / "data" / "runtime").resolve()
+    if (
+        not source_root.is_dir()
+        or source_root.name != "source"
+        or source_root.parent.parent != runtime_root
+    ):
+        raise RunnerError("saved source root is outside the managed runtime layout")
+    launch_path = source_root.parent / "latest-launch.json"
+    try:
+        launch_stat = launch_path.lstat()
+    except OSError as exc:
+        raise RunnerError("saved source runtime has no latest-launch record") from exc
+    import stat
+
+    if not stat.S_ISREG(launch_stat.st_mode) or launch_stat.st_nlink != 1:
+        raise RunnerError("latest-launch record is unsafe")
+    launch_raw = regular_bytes(launch_path, MIB)
+    try:
+        launch = json.loads(launch_raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("latest-launch record is malformed") from exc
+    if not isinstance(launch, dict):
+        raise RunnerError("latest-launch record is malformed")
+
+    launch_pid = launch.get("pid")
+    launch_pgid = launch.get("pgid")
+    command = launch.get("command")
+    launch_revision = launch.get("revision")
+    if (
+        launch.get("session") != str(report_path)
+        or launch.get("capture_id") != capture_id
+        or launch.get("root_id") != report.get("root_id")
+        or launch_revision != report.get("revision")
+        or not isinstance(launch_revision, str)
+        or not REVISION.fullmatch(launch_revision)
+        or type(launch_pid) is not int
+        or launch_pid <= 1
+        or type(launch_pgid) is not int
+        or launch_pgid != launch_pid
+        or launch.get("offline_only") is not True
+        or launch.get("automatic_retry") is not False
+        or not isinstance(command, list)
+        or len(command) < 2
+        or any(not isinstance(item, str) for item in command)
+        or command.count("--historical") != 1
+        or command.count("--capture-id") != 1
+        or command.count("--directory") != 1
+    ):
+        raise RunnerError("latest-launch identity does not match the stopped capture")
+    try:
+        capture_index = command.index("--capture-id")
+        directory_index = command.index("--directory")
+        command_capture = command[capture_index + 1]
+        command_directory = Path(command[directory_index + 1]).absolute()
+        command_script = safe_path(Path(command[1]))
+        latest_session = safe_path(Path(launch["session"]))
+    except (ValueError, IndexError, KeyError, OSError, TypeError) as exc:
+        raise RunnerError("latest-launch command is incomplete or unsafe") from exc
+    if (
+        command_capture != capture_id
+        or command_directory != directory.absolute()
+        or not command_script.is_file()
+        or not command_script.is_relative_to(source_root)
+        or latest_session != report_path
+    ):
+        raise RunnerError("latest-launch command does not match this session")
+
+    identity = launch.get("process_identity_utc")
+    identity_match = (
+        re.fullmatch(
+            r"(\d+)\s+(\d+)\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+            r"(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})\s+(.+)",
+            identity.strip(),
+        )
+        if isinstance(identity, str) and len(identity) <= 8192
+        else None
+    )
+    launched_at_value = launch.get("launched_at_utc")
+    try:
+        launched_at = datetime.fromisoformat(launched_at_value)
+        if not isinstance(launched_at_value, str):
+            raise ValueError("launch timestamp is not text")
+        identity_started = datetime(
+            int(identity_match.group(7)),
+            {
+                month: index
+                for index, month in enumerate(
+                    (
+                        "Jan",
+                        "Feb",
+                        "Mar",
+                        "Apr",
+                        "May",
+                        "Jun",
+                        "Jul",
+                        "Aug",
+                        "Sep",
+                        "Oct",
+                        "Nov",
+                        "Dec",
+                    ),
+                    start=1,
+                )
+            }[identity_match.group(4)],
+            int(identity_match.group(5)),
+            *map(int, identity_match.group(6).split(":")),
+            tzinfo=UTC,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RunnerError("latest-launch UTC process identity is malformed") from exc
+    if (
+        identity_match is None
+        or identity_match.group(1) != str(launch_pid)
+        or identity_match.group(2) != str(launch_pgid)
+        or identity_match.group(3)
+        != ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[identity_started.weekday()]
+        or identity_match.group(8) != " ".join(command)
+        or launched_at.tzinfo is None
+        or launched_at.utcoffset() != timedelta(0)
+        or int(identity_started.timestamp()) != int(launched_at.timestamp())
+    ):
+        raise RunnerError("latest-launch UTC process identity does not match its command")
+
+    if "process_identity" in launch:
+        legacy_identity = launch["process_identity"]
+        if not isinstance(legacy_identity, str) or legacy_identity.split(maxsplit=2)[:2] != [
+            str(launch_pid),
+            str(launch_pgid),
+        ]:
+            raise RunnerError("legacy latest-launch process identity conflicts with UTC identity")
+    if "started_at" in launch:
+        try:
+            legacy_started = datetime.fromisoformat(launch["started_at"])
+        except (TypeError, ValueError) as exc:
+            raise RunnerError(
+                "legacy latest-launch start time conflicts with UTC identity"
+            ) from exc
+        if (
+            legacy_started.tzinfo is None
+            or legacy_started.utcoffset() != timedelta(0)
+            or int(legacy_started.timestamp()) != int(launched_at.timestamp())
+        ):
+            raise RunnerError("legacy latest-launch start time conflicts with UTC identity")
+    return launch, launch_path, launch_raw, raw_report, token
+
+
+def _append_stopped_worker_audit(
+    operator: Path, record: dict[str, Any], *, allow_distinct_attempts: bool = False
+) -> dict[str, Any]:
     from kalshi_events.common import fsync_directory
 
     path = operator / "stopped-worker-reconciliation.jsonl"
@@ -3297,9 +3560,22 @@ def _append_stopped_worker_audit(operator: Path, record: dict[str, Any]) -> dict
                     raise RunnerError("stopped-worker audit event conflicts with its prior record")
                 return entry
             if entry.get("session_id") == record["session_id"]:
-                raise RunnerError(
-                    "this stopped session already has a different reconciliation audit"
+                if allow_distinct_attempts and (
+                    type(entry.get("supervisor_pid")) is not int
+                    or type(entry.get("stale_process_group")) is not int
+                ):
+                    raise RunnerError("stopped-worker audit launch identity is malformed")
+                same_attempt = (
+                    entry.get("supervisor_pid") == record.get("supervisor_pid")
+                    and entry.get("stale_process_group") == record.get("stale_process_group")
+                ) or (
+                    isinstance(record.get("invocation_token"), str)
+                    and entry.get("invocation_token") == record["invocation_token"]
                 )
+                if not allow_distinct_attempts or same_attempt:
+                    raise RunnerError(
+                        "this stopped session already has a different reconciliation audit"
+                    )
         body = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
         remaining = memoryview(body)
         while remaining:
@@ -3359,36 +3635,86 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
         )
         if window.get("root_id") != root_id or _owner_root_id(directory) != root_id:
             raise RunnerError("stopped session root identity does not match its owner marker")
-        evidence, evidence_path, evidence_raw = _stopped_worker_evidence(
-            directory, report_path, report, capture_id
+        memory_stop = (
+            report.get("error") == "resource accounting failed: memory snapshot unavailable"
         )
-        supervisor_pid = evidence["supervisor_pid"]
-        if (
-            type(supervisor_pid) is not int
-            or supervisor_pid <= 1
-            or _pid_exists(group)
-            or _process_group_exists(group)
-            or _pid_exists(supervisor_pid)
-            or _process_group_exists(supervisor_pid)
-        ):
-            raise RunnerError("stopped worker or original supervisor is still alive or ambiguous")
-        raw_report = regular_bytes(report_path, 16 * MIB)
-        report_hash = hashlib.sha256(raw_report).hexdigest()
-        evidence_hash = hashlib.sha256(evidence_raw).hexdigest()
-        event_identity = {
-            "capture_id": capture_id,
-            "session_id": report.get("session_id"),
-            "root_id": root_id,
-            "stale_process_group": group,
-            "supervisor_pid": supervisor_pid,
-            "boot_stamp": report["boot_stamp"],
-            "revision": report.get("revision"),
-            "report_sha256": report_hash,
-            "evidence_path": str(evidence_path),
-            "evidence_sha256": evidence_hash,
-            "evidence_report_preimage_sha256": evidence["session_before_sha256"],
-            "primary_stop_reason": report.get("error"),
-        }
+        if memory_stop:
+            launch, launch_path, evidence_raw, raw_report, token = _stopped_memory_worker_evidence(
+                directory, report_path, report, capture_id
+            )
+            supervisor_pid = launch["pid"]
+            supervisor_pgid = launch["pgid"]
+            worker_pid = worker_pgid = group
+
+            def require_memory_processes_absent():
+                for pid, pgid in ((supervisor_pid, supervisor_pgid), (worker_pid, worker_pgid)):
+                    try:
+                        if _pid_exists(pid) or _process_group_exists(pgid):
+                            raise RunnerError(
+                                "stopped worker or original supervisor is still alive or ambiguous"
+                            )
+                    except OSError as exc:
+                        raise RunnerError(
+                            "stopped worker or original supervisor identity could not be verified"
+                        ) from exc
+
+            require_memory_processes_absent()
+            launch_hash = hashlib.sha256(evidence_raw).hexdigest()
+            report_hash = hashlib.sha256(raw_report).hexdigest()
+            evidence_path = launch_path
+            evidence_hash = launch_hash
+            session_before_hash = report_hash
+            event_identity = {
+                "capture_id": capture_id,
+                "session_id": report.get("session_id"),
+                "root_id": root_id,
+                "stale_process_group": group,
+                "worker_pid": worker_pid,
+                "worker_pgid": worker_pgid,
+                "supervisor_pid": supervisor_pid,
+                "supervisor_pgid": supervisor_pgid,
+                "invocation_token": token,
+                "boot_stamp": report["boot_stamp"],
+                "revision": report.get("revision"),
+                "report_sha256": report_hash,
+                "launch_path": str(launch_path),
+                "launch_sha256": launch_hash,
+                "primary_stop_reason": report.get("error"),
+            }
+        else:
+            evidence, evidence_path, evidence_raw = _stopped_worker_evidence(
+                directory, report_path, report, capture_id
+            )
+            supervisor_pid = evidence["supervisor_pid"]
+            if (
+                type(supervisor_pid) is not int
+                or supervisor_pid <= 1
+                or _pid_exists(group)
+                or _process_group_exists(group)
+                or _pid_exists(supervisor_pid)
+                or _process_group_exists(supervisor_pid)
+            ):
+                raise RunnerError(
+                    "stopped worker or original supervisor is still alive or ambiguous"
+                )
+            raw_report = regular_bytes(report_path, 16 * MIB)
+            report_hash = hashlib.sha256(raw_report).hexdigest()
+            evidence_hash = hashlib.sha256(evidence_raw).hexdigest()
+            session_before_hash = evidence["session_before_sha256"]
+            event_identity = {
+                "capture_id": capture_id,
+                "session_id": report.get("session_id"),
+                "root_id": root_id,
+                "stale_process_group": group,
+                "supervisor_pid": supervisor_pid,
+                "boot_stamp": report["boot_stamp"],
+                "revision": report.get("revision"),
+                "report_sha256": report_hash,
+                "evidence_path": str(evidence_path),
+                "evidence_sha256": evidence_hash,
+                "evidence_report_preimage_sha256": evidence["session_before_sha256"],
+                "primary_stop_reason": report.get("error"),
+            }
         event_id = hashlib.sha256(
             json.dumps(event_identity, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -3406,14 +3732,32 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
                 capture_id,
                 writer_lock_identity=writer_identity,
             )
-            if (
+            if memory_stop:
+                current_launch, _current_launch_path, current_launch_raw, current_report_raw, _ = (
+                    _stopped_memory_worker_evidence(directory, report_path, report, capture_id)
+                )
+                if current_launch_raw != evidence_raw or current_report_raw != raw_report:
+                    raise RunnerError(
+                        "stopped-worker launch or report changed during reconciliation"
+                    )
+                if (current_launch["pid"], current_launch["pgid"]) != (
+                    supervisor_pid,
+                    supervisor_pgid,
+                ):
+                    raise RunnerError(
+                        "stopped-worker launch identity changed during reconciliation"
+                    )
+                require_memory_processes_absent()
+            elif (
                 _pid_exists(group)
                 or _process_group_exists(group)
                 or _pid_exists(supervisor_pid)
                 or _process_group_exists(supervisor_pid)
             ):
                 raise RunnerError("stopped worker or original supervisor reappeared")
-            audit = _append_stopped_worker_audit(operator, audit)
+            audit = _append_stopped_worker_audit(
+                operator, audit, allow_distinct_attempts=memory_stop
+            )
             report["active_process_group"] = None
             report["stopped_worker_reconciliation"] = {
                 "event_id": event_id,
@@ -3423,8 +3767,17 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
                 "supervisor_pid": supervisor_pid,
                 "primary_stop_reason": report.get("error"),
                 "termination_evidence_sha256": evidence_hash,
-                "session_before_sha256": evidence["session_before_sha256"],
+                "session_before_sha256": session_before_hash,
             }
+            if memory_stop:
+                report["stopped_worker_reconciliation"].update(
+                    {
+                        "reconciliation_kind": "memory_snapshot_unavailable",
+                        "invocation_token": token,
+                        "launch_sha256": launch_hash,
+                        "report_sha256": report_hash,
+                    }
+                )
             _atomic_report(report_path, report)
         return report
 
@@ -5602,12 +5955,15 @@ def _load_resume(
             "last_observed_epoch": report.get("last_observed_epoch"),
             "resource_peaks": prior_resource_peaks,
         }
+        if isinstance(report.get("memory_sample_error"), str):
+            previous_stop["memory_sample_error"] = report["memory_sample_error"]
         history = report.get("stop_history", [])
         if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
             raise RunnerError("session stop history is invalid")
         history.append(previous_stop)
         report["stop_history"] = history[-64:]
         report["previous_stop"] = previous_stop
+    report.pop("memory_sample_error", None)
     report["error"] = None
     report["recovery"] = None
     # Keep an offline grant in the durable stopped state until the first processing child
