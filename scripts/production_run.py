@@ -2497,6 +2497,29 @@ def _bounded_tree_bytes(
 def _live_workspace_snapshot(
     operator: Path, directory: Path, capture_id: str, expected_root_id: str
 ) -> dict[str, Any]:
+    for attempt in range(3):
+        try:
+            return _live_workspace_snapshot_once(operator, directory, capture_id, expected_root_id)
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+        except RunnerError as exc:
+            cause = exc.__cause__
+            seen = {id(exc)}
+            while cause is not None and id(cause) not in seen:
+                if isinstance(cause, FileNotFoundError):
+                    break
+                seen.add(id(cause))
+                cause = cause.__cause__
+            else:
+                raise
+            if attempt == 2:
+                raise
+
+
+def _live_workspace_snapshot_once(
+    operator: Path, directory: Path, capture_id: str, expected_root_id: str
+) -> dict[str, Any]:
     """Account only declared mutable workspaces and promotion destinations."""
     import stat
 

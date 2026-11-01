@@ -449,9 +449,19 @@ Fresh historical builds use native Arrow-to-DuckDB inserts instead of dlt merge 
 
 New historical Parquet exports use Zstandard level 6. Their schemas, values and deterministic row order are preserved; compressed file checksums and release IDs change. Existing releases and other catalogue/metadata/series export settings remain unchanged. Raw receipt bytes are never repacked.
 
+Historical export uses a disposable DuckDB connection with
+`preserve_insertion_order=false` and an explicit unique-key `ORDER BY` for every
+relation. This permits DuckDB to avoid preserving intermediate insertion order
+while retaining sorted output, the 4 GB memory setting and four threads.
+Capacity admission must still demonstrate that the complete export fits.
+
 The production runner supports `--reconcile-stopped-worker` only for an exact historical capture. Use it to validate a stopped worker's absence under the supervisor and writer locks before clearing a stale process marker; never edit session fields by hand. A live, reused or ambiguous process identity blocks recovery. Primary stop reasons and uncertain shutdown outcomes remain in history.
 
 The default historical completion profile keeps 64 GiB database and temporary ceilings with 56 GiB cooperative stop thresholds. An explicit `--historical-resource-profile expanded` transition for a stopped historical capture raises those limits to 128 GiB database and 192 GiB temporary. Its report records 96/144 GiB forecast-admission thresholds; runtime baseline checks and stop thresholds are 112/168 GiB. The selected profile and prior limits are retained in append-only session history. Active measurements include database, WAL and spill, not just output after a load returns. Sampling and cooperative checks can overshoot; they do not provide filesystem-enforced quotas (WORK-42 remains open). A staged database counts toward both database and temporary usage.
+
+Live storage monitoring permits at most three complete snapshot attempts when a
+temporary file disappears during normal cleanup. Each attempt restarts accounting;
+persistent churn and unsafe or unavailable telemetry still stop processing.
 
 One admitted offline attempt must preserve all cumulative acquisition accounting, use only saved evidence, and retain the 400 GiB session, 350 GiB root, 150 GiB free-space and existing memory safeguards. Reserve the final two hours of a 24-hour attempt for independent verification, activation and reporting. If the capacity forecast fails, do not launch or silently raise limits. Partial extraction is not a production publication.
 

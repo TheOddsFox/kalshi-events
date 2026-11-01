@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -354,6 +355,48 @@ def test_real_native_worker_supervisor_completes_all_four_row_phases(tmp_path):
     }
     assert type(result["verification_peak_temporary_bytes"]) is int
     assert type(result["verification_peak_temporary_allocated_bytes"]) is int
+
+
+def test_in_process_native_worker_uses_historical_export_config(tmp_path, monkeypatch):
+    from kalshi_events import publish
+
+    checkout = tmp_path / "checkout"
+    fixture_root = checkout / "data" / "fixture"
+    fixture_root.parent.mkdir(parents=True)
+    capture_id, task_indices = _write_four_row_worker_fixture(fixture_root)
+    report_path = checkout / "data" / "worker-report.json"
+    export_settings = []
+    original_export = publish._export_connection
+
+    @contextmanager
+    def record_export(*args, **kwargs):
+        assert kwargs.get("historical_export") is True
+        with original_export(*args, **kwargs) as connection:
+            export_settings.append(
+                connection.execute("select current_setting('preserve_insertion_order')").fetchone()[
+                    0
+                ]
+            )
+            yield connection
+
+    monkeypatch.setattr(benchmark, "_checkout", lambda: checkout)
+    monkeypatch.setattr(publish, "_export_connection", record_export)
+    monkeypatch.setattr(benchmark, "_ADMISSION_WORKER_PROGRESS", None)
+    result = benchmark._worker(
+        SimpleNamespace(
+            admission_worker=True,
+            admission_deadline_monotonic=time.monotonic() + 20 * 60,
+            worker="native",
+            fixture_root=fixture_root,
+            worker_report=report_path,
+            capture_id=capture_id,
+            task_indices=task_indices,
+        )
+    )
+
+    assert result == 0
+    assert export_settings == [False]
+    assert report_path.is_file()
 
 
 def test_supervisor_build_database_high_water_includes_coexisting_wal_and_index(tmp_path):

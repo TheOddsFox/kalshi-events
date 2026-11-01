@@ -296,10 +296,12 @@ def test_historical_publication_uses_zstd_level_six(tmp_path, monkeypatch):
     warehouse.build_historical(store, state["capture_id"])
 
     copied_queries = []
+    historical_export_flags = []
     original_export = publish._export_connection
 
     @contextmanager
     def record_export(*args, **kwargs):
+        historical_export_flags.append(kwargs.get("historical_export", False))
         with original_export(*args, **kwargs) as connection:
 
             class RecordingConnection:
@@ -326,6 +328,7 @@ def test_historical_publication_uses_zstd_level_six(tmp_path, monkeypatch):
     monkeypatch.setattr(pq, "write_table", record_coverage)
     release = publish.publish(store, state["capture_id"], catalogue_version=3)
 
+    assert historical_export_flags == [True]
     assert len(copied_queries) == len(warehouse.RELATIONS)
     assert all("compression zstd, compression_level 6" in query.lower() for query in copied_queries)
     assert coverage_options == {"compression": "zstd", "compression_level": 6}

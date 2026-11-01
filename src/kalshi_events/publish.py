@@ -93,7 +93,9 @@ MAX_COVERAGE_BINDING_BYTES = 1024**2
 
 
 @contextmanager
-def _export_connection(store: Store, database: Path, temporary: Path) -> Any:
+def _export_connection(
+    store: Store, database: Path, temporary: Path, *, historical_export: bool = False
+) -> Any:
     relative_temporary = temporary.relative_to(store.root).as_posix()
     usage = store.usage()
     spill_budget = min(
@@ -109,17 +111,17 @@ def _export_connection(store: Store, database: Path, temporary: Path) -> Any:
     try:
         spill_directory.mkdir()
         store.check_deadline()
-        connection = duckdb.connect(
-            ":memory:",
-            config={
-                # DuckDB 2.x inference otherwise changes the public Parquet nullability schema.
-                "disabled_optimizers": "statistics_propagation",
-                "memory_limit": DBT_MEMORY_LIMIT,
-                "threads": str(DBT_THREADS),
-                "temp_directory": str(spill_directory),
-                "max_temp_directory_size": f"{spill_budget}B",
-            },
-        )
+        config = {
+            # DuckDB 2.x inference otherwise changes the public Parquet nullability schema.
+            "disabled_optimizers": "statistics_propagation",
+            "memory_limit": DBT_MEMORY_LIMIT,
+            "threads": str(DBT_THREADS),
+            "temp_directory": str(spill_directory),
+            "max_temp_directory_size": f"{spill_budget}B",
+        }
+        if historical_export:
+            config["preserve_insertion_order"] = "false"
+        connection = duckdb.connect(":memory:", config=config)
         database_literal = str(database).replace("'", "''")
         try:
             with interrupt_at_deadline(store, connection.interrupt):
@@ -601,7 +603,12 @@ def _publish(
     temporary.mkdir()
     fsync_directory(temporary.parent)
     try:
-        with _export_connection(store, warehouse, temporary) as connection, metrics.phase("export"):
+        with (
+            _export_connection(
+                store, warehouse, temporary, historical_export=catalogue_version == 3
+            ) as connection,
+            metrics.phase("export"),
+        ):
             for name, table in RELATIONS.items():
                 store.check_deadline()
                 destination = temporary / (name + ".parquet")

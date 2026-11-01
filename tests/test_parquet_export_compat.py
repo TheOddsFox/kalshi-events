@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -73,6 +74,10 @@ def _disabled_optimizers(connection):
     return connection.execute("select current_setting('disabled_optimizers')").fetchone()[0]
 
 
+def _preserve_insertion_order(connection):
+    return connection.execute("select current_setting('preserve_insertion_order')").fetchone()[0]
+
+
 def _assert_spill_removed(temporary: Path) -> None:
     assert not (temporary / "duckdb-spill").exists()
 
@@ -94,6 +99,9 @@ def test_export_copy_keeps_all_parquet_fields_nullable_and_preserves_values(tmp_
             [str(empty_file)],
         )
 
+    assert hashlib.sha256(edge_file.read_bytes()).hexdigest() == (
+        "98900378306f7830f68c540703e92fe4818a70e45937e011231020e7055d4ae1"
+    )
     edge_schema = pq.read_schema(edge_file)
     assert edge_schema.names == [
         "order_key",
@@ -150,7 +158,8 @@ def test_export_copy_keeps_all_parquet_fields_nullable_and_preserves_values(tmp_
 
 
 @pytest.mark.parametrize("fail", [False, True], ids=["success", "injected-failure"])
-def test_export_keeps_existing_connections_and_source_unchanged(tmp_path, fail):
+@pytest.mark.parametrize("historical_export", [False, True], ids=["default", "historical"])
+def test_export_keeps_existing_connections_and_source_unchanged(tmp_path, fail, historical_export):
     store, database, temporary = _export_source(tmp_path)
     source_bytes = database.read_bytes()
     source_hash = hashlib.sha256(source_bytes).hexdigest()
@@ -159,20 +168,28 @@ def test_export_keeps_existing_connections_and_source_unchanged(tmp_path, fail):
     default_connection = duckdb.connect()
     source_optimizers = _disabled_optimizers(source_reader)
     default_optimizers = _disabled_optimizers(default_connection)
+    default_insertion_order = _preserve_insertion_order(default_connection)
     source_constraints = _constraints(source_reader)
+    export_options = {"historical_export": True} if historical_export else {}
     try:
         if fail:
             with (
                 pytest.raises(RuntimeError, match="injected export failure"),
-                publish._export_connection(store, database, temporary) as connection,
+                publish._export_connection(
+                    store, database, temporary, **export_options
+                ) as connection,
             ):
                 assert connection.execute("select count(*) from main.edge_cases").fetchone() == (3,)
+                assert _preserve_insertion_order(connection) is (not historical_export)
                 assert _disabled_optimizers(source_reader) == source_optimizers
                 assert _disabled_optimizers(default_connection) == default_optimizers
                 raise RuntimeError("injected export failure")
         else:
-            with publish._export_connection(store, database, temporary) as connection:
+            with publish._export_connection(
+                store, database, temporary, **export_options
+            ) as connection:
                 assert connection.execute("select count(*) from main.edge_cases").fetchone() == (3,)
+                assert _preserve_insertion_order(connection) is (not historical_export)
                 assert _disabled_optimizers(source_reader) == source_optimizers
                 assert _disabled_optimizers(default_connection) == default_optimizers
 
@@ -180,6 +197,8 @@ def test_export_keeps_existing_connections_and_source_unchanged(tmp_path, fail):
         assert default_connection.execute("select 1").fetchone() == (1,)
         assert _disabled_optimizers(source_reader) == source_optimizers
         assert _disabled_optimizers(default_connection) == default_optimizers
+        assert _preserve_insertion_order(source_reader) is default_insertion_order
+        assert _preserve_insertion_order(default_connection) is default_insertion_order
         assert _constraints(source_reader) == source_constraints
         assert database.read_bytes() == source_bytes
         assert hashlib.sha256(database.read_bytes()).hexdigest() == source_hash
@@ -190,6 +209,29 @@ def test_export_keeps_existing_connections_and_source_unchanged(tmp_path, fail):
     finally:
         source_reader.close()
         default_connection.close()
+
+
+def test_historical_export_sorts_composite_keys_with_insertion_order_disabled(tmp_path):
+    store, database, temporary = _export_source(tmp_path)
+    output = tmp_path / "composite.parquet"
+
+    with publish._export_connection(
+        store, database, temporary, historical_export=True
+    ) as connection:
+        connection.execute(
+            "copy (select * from (values ('z', 'b'), ('a', 'c'), ('a', 'a')) "
+            "as rows(parent_key, child_key) order by parent_key, child_key) "
+            "to ? (format parquet)",
+            [str(output)],
+        )
+
+    assert pq.read_table(output).to_pylist() == [
+        {"parent_key": "a", "child_key": "a"},
+        {"parent_key": "a", "child_key": "c"},
+        {"parent_key": "z", "child_key": "b"},
+    ]
+    assert store._storage_reservations == 0
+    _assert_spill_removed(temporary)
 
 
 def test_export_deadline_is_checked_before_attach(tmp_path):
@@ -306,14 +348,24 @@ def test_export_sql_failure_cleans_spill_and_reservation(tmp_path):
 def test_failed_publication_keeps_current_pointer(catalogue, monkeypatch):  # noqa: F811
     store, state, _release, _database, _market, _combo = catalogue
     pointer = store.path("current.json").read_bytes()
+    export_flags = []
+    original_export = publish._export_connection
+
+    @contextmanager
+    def record_export(*args, **kwargs):
+        export_flags.append(kwargs.get("historical_export", False))
+        with original_export(*args, **kwargs) as connection:
+            yield connection
 
     def fail_export_sync(_path):
         raise OSError("injected export sync failure")
 
+    monkeypatch.setattr(publish, "_export_connection", record_export)
     monkeypatch.setattr(publish, "fsync_file", fail_export_sync)
     with pytest.raises(OSError, match="export sync failure"):
         publish.publish(store, state["capture_id"])
 
     assert store.path("current.json").read_bytes() == pointer
+    assert export_flags == [False]
     assert not list(store.path("tmp").glob("publish-*"))
     assert store._storage_reservations == 0

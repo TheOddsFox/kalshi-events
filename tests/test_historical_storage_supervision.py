@@ -228,6 +228,174 @@ def test_live_storage_fails_closed_on_unknown_or_symlink_tmp_entries(production,
         production._live_external_files(external, directory=directory)
 
 
+def _nested_missing_file_runner_error(production, message="entry disappeared"):
+    try:
+        raise FileNotFoundError(message)
+    except FileNotFoundError as missing:
+        try:
+            raise production.RunnerError("inner inventory failure") from missing
+        except production.RunnerError as inner:
+            try:
+                raise production.RunnerError("outer inventory failure") from inner
+            except production.RunnerError as outer:
+                return outer
+
+
+@pytest.mark.parametrize("failure", ["raw", "wrapped"])
+def test_live_workspace_snapshot_retries_only_disappearing_files(production, monkeypatch, failure):
+    calls = []
+    expected = {"complete": True}
+
+    def inventory(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            if failure == "raw":
+                raise FileNotFoundError("entry disappeared")
+            raise _nested_missing_file_runner_error(production)
+        return expected
+
+    monkeypatch.setattr(production, "_live_workspace_snapshot_once", inventory)
+    result = production._live_workspace_snapshot(
+        Path("operator"), Path("production"), "a" * 32, "b" * 32
+    )
+    assert result is expected
+    assert len(calls) == 2
+
+
+def test_live_workspace_snapshot_reraises_last_transient_error_after_three_attempts(
+    production, monkeypatch
+):
+    errors = [_nested_missing_file_runner_error(production, str(index)) for index in range(3)]
+    calls = 0
+
+    def inventory(*_args):
+        nonlocal calls
+        error = errors[calls]
+        calls += 1
+        raise error
+
+    monkeypatch.setattr(production, "_live_workspace_snapshot_once", inventory)
+    with pytest.raises(production.RunnerError) as raised:
+        production._live_workspace_snapshot(
+            Path("operator"), Path("production"), "a" * 32, "b" * 32
+        )
+    assert raised.value is errors[-1]
+    assert calls == 3
+
+
+@pytest.mark.parametrize(
+    ("error_kind", "message"),
+    [
+        ("permission", "permission denied"),
+        ("runner", "unknown live temporary workspace"),
+        ("runner", "live storage workspace is unsafe: dbt-entry"),
+        ("runner", "live storage workspace crossed filesystems"),
+        ("runner", "inventory failed for an unknown reason"),
+    ],
+    ids=["permission", "unknown-namespace", "symlink", "device", "opaque-runner-error"],
+)
+def test_live_workspace_snapshot_does_not_retry_non_transient_errors(
+    production, monkeypatch, error_kind, message
+):
+    error = (
+        PermissionError(message) if error_kind == "permission" else production.RunnerError(message)
+    )
+    calls = 0
+
+    def inventory(*_args):
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr(production, "_live_workspace_snapshot_once", inventory)
+    with pytest.raises(type(error)) as raised:
+        production._live_workspace_snapshot(
+            Path("operator"), Path("production"), "a" * 32, "b" * 32
+        )
+    assert raised.value is error
+    assert calls == 1
+
+
+def test_live_storage_retries_direntry_disappearance_without_stopping(
+    production, monkeypatch, tmp_path
+):
+    directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
+        tmp_path, production
+    )
+    state = production._begin_storage_supervision(directory, operator, report, progress, external)
+    workspace = operator / "tmp" / f"dbt-{'c' * 32}"
+    workspace.mkdir(parents=True)
+    first = workspace / "a.bin"
+    disappearing = workspace / "b.bin"
+    first.write_bytes(b"first inventory entry")
+    disappearing.write_bytes(b"second inventory entry")
+
+    control = production._live_workspace_snapshot(
+        operator, directory, report["capture_id"], report["root_id"]
+    )
+    assert control["logical_bytes"] == first.stat().st_size + disappearing.stat().st_size
+    assert (
+        control["allocated_bytes"] == (first.stat().st_blocks + disappearing.stat().st_blocks) * 512
+    )
+    assert control["allocated_inodes"] == {
+        (first.stat().st_dev, first.stat().st_ino),
+        (disappearing.stat().st_dev, disappearing.stat().st_ino),
+    }
+
+    real_scandir = production.os.scandir
+    scan_attempts = 0
+    removed = False
+
+    class DeletingEntry:
+        def __init__(self, entry):
+            self.entry = entry
+
+        @property
+        def name(self):
+            return self.entry.name
+
+        @property
+        def path(self):
+            return self.entry.path
+
+        def stat(self, *, follow_symlinks=True):
+            nonlocal removed
+            if self.name == disappearing.name and not removed:
+                removed = True
+                Path(self.path).unlink()
+            return self.entry.stat(follow_symlinks=follow_symlinks)
+
+    class ScandirProxy:
+        def __init__(self, path):
+            self.scan = real_scandir(path)
+
+        def __enter__(self):
+            entries = sorted(self.scan.__enter__(), key=lambda entry: entry.name)
+            return iter(DeletingEntry(entry) for entry in entries)
+
+        def __exit__(self, *args):
+            return self.scan.__exit__(*args)
+
+    def scandir(path):
+        nonlocal scan_attempts
+        if Path(path) == workspace:
+            scan_attempts += 1
+            return ScandirProxy(path)
+        return real_scandir(path)
+
+    monkeypatch.setattr(production.os, "scandir", scandir)
+    reason = production._sample_live_storage(directory, operator, report, state, progress, external)
+
+    assert removed
+    assert scan_attempts == 2
+    assert reason is None
+    assert disappearing.exists() is False
+    assert state["current"]["operator_temporary_bytes"] == first.stat().st_size
+    assert (
+        state["current"]["operator_live_workspace_allocated_bytes"] == first.stat().st_blocks * 512
+    )
+
+
 def test_live_inventory_counts_operator_atomic_pointer_temp(production, tmp_path):
     directory, operator, *_rest = _workspace(tmp_path, production)
     pointer = operator / "current-historical.json"

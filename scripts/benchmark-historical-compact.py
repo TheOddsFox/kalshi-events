@@ -1361,7 +1361,9 @@ def _worker(args: argparse.Namespace) -> int:
     export_dir = store.path("tmp/compact-exports")
     export_dir.mkdir(parents=True)
     phase_path.write_text("export", encoding="ascii")
-    with publish._export_connection(store, database, export_dir) as connection:
+    with publish._export_connection(
+        store, database, export_dir, historical_export=True
+    ) as connection:
         for name, table in publish.RELATIONS.items():
             if admission_worker:
                 assert _ADMISSION_WORKER_PROGRESS is not None

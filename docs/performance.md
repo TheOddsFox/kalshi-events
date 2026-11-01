@@ -693,3 +693,26 @@ two-hour clock. It exited at 21:39:22 UTC, with the supervised process group
 absent; no further retry or limit change was made. Both reports, launch history,
 the memory error and partial diagnostic artifacts remain under ignored
 `data/testing/historical-final-admission-20261031/`.
+
+### Historical export memory candidate
+
+The retained diagnostic database's markets-export plan contains a hash join,
+wide JSON/decimal projection and blocking sort. The old failure report does not
+identify which operator made the last allocation. Historical publication and the
+compact benchmark now disable `preserve_insertion_order` on their disposable
+export connection, retaining explicit unique-key ordering and the existing
+4 GB/four-thread/spill limits. Other publication contracts retain their existing
+export configuration.
+
+DuckDB documents this setting as a possible reduction in large-write memory use;
+queries with `ORDER BY` retain their specified ordering. See
+[workload tuning](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads)
+and [order preservation](https://duckdb.org/docs/2.0/sql/dialect/order_preservation).
+Small-fixture parity is not evidence that the earlier one-million-observation
+export or the complete historical catalogue now fits. Fresh multi-scale capacity
+measurements and independent review remain required before production admission.
+
+The production live-storage sampler also permits three whole-snapshot attempts
+for file disappearance during normal dbt cleanup. Failed attempts contribute no
+partial byte totals or inode state. Other filesystem/identity failures and
+persistent churn still stop supervision; actual sampling gaps remain observable.
