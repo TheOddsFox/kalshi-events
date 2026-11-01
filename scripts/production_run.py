@@ -2551,6 +2551,12 @@ def _live_workspace_snapshot_once(
                     stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
                 ):
                     raise RunnerError("operator root contains an unsafe live entry")
+                if entry.name == "writer.lock" and (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_dev != root_info.st_dev
+                    or info.st_nlink != 1
+                ):
+                    raise RunnerError("operator root writer lock is missing or unsafe")
                 operator_entries[entry.name] = [
                     info.st_dev,
                     info.st_ino,
@@ -2563,6 +2569,14 @@ def _live_workspace_snapshot_once(
         raise RunnerError("operator root could not be inventoried") from exc
     if len(operator_entries) > int(_effective_limits()["storage_inventory_entries"]):
         raise RunnerError("operator root exceeded its direct-entry bound")
+    writer_lock = operator_entries.get("writer.lock")
+    if writer_lock is None:
+        raise RunnerError("operator root writer lock is missing or unsafe")
+    logical += writer_lock[3]
+    lock_inode = (writer_lock[0], writer_lock[1])
+    if lock_inode not in allocated_inodes:
+        allocated += writer_lock[5] * 512
+        allocated_inodes.add(lock_inode)
     pointer_entry = operator_entries.get("current-historical.json")
     if pointer_entry is not None:
         logical += pointer_entry[3]
@@ -2951,6 +2965,14 @@ def _sample_live_storage(
         if _ATOMIC_TEMP_NAME.fullmatch(name)
     }
     for name in set(baseline_entries) & set(current_entries) - mutable_entries:
+        if name == "writer.lock":
+            previous = baseline_entries[name]
+            current = current_entries[name]
+            unchanged_size = current[3] == previous[3] and current[5] == previous[5]
+            filelock_truncated = current[3] == 0 and current[5] <= previous[5]
+            if current[:3] != previous[:3] or not (unchanged_size or filelock_truncated):
+                raise RunnerError("canonical writer lock changed unsafely during live work")
+            continue
         if baseline_entries[name] != current_entries[name]:
             raise RunnerError(f"non-workspace operator entry changed during live work: {name}")
     current_external = _live_external_files(

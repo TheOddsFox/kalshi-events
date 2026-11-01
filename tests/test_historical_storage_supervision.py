@@ -43,6 +43,7 @@ def _workspace(tmp_path: Path, production, *, external_size: int = 0):
         json.dumps({"owner": "oddsfox.kalshi.events.v1", "storage_version": 5}),
         encoding="utf-8",
     )
+    (operator / "writer.lock").write_bytes(b"")
     production._atomic_report(
         directory / production.OWNER_MARKER, {"version": 1, "root_id": root_id}
     )
@@ -120,6 +121,85 @@ def test_live_storage_stops_on_temporary_burst_above_category_threshold(producti
         stream.truncate(int(production.RUN_LIMITS["storage_temporary_stop_bytes"]) + 1)
     reason = production._sample_live_storage(directory, operator, report, state, progress, external)
     assert reason == "live temporary storage reached the 56 GiB stop threshold"
+
+
+def test_live_storage_accounts_filelock_metadata_mutation(production, tmp_path):
+    directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
+        tmp_path, production
+    )
+    lock_path = operator / "writer.lock"
+    lock_path.write_bytes(b"existing lock bytes")
+    lock_before = lock_path.stat()
+    report["storage"]["operator_retained_bytes"] = lock_before.st_size
+    report["storage"]["aggregate_estimate_bytes"] = lock_before.st_size
+
+    state = production._begin_storage_supervision(directory, operator, report, progress, external)
+    baseline = state["baseline"]["workspace"]
+    assert baseline["logical_bytes"] == lock_before.st_size
+    assert baseline["allocated_bytes"] == lock_before.st_blocks * 512
+    assert (lock_before.st_dev, lock_before.st_ino) in baseline["allocated_inodes"]
+
+    with common.Store(operator).lock():
+        pass
+
+    lock_after = lock_path.stat()
+    assert (lock_after.st_dev, lock_after.st_ino) == (lock_before.st_dev, lock_before.st_ino)
+    assert lock_after.st_size == 0
+    assert lock_after.st_mtime_ns != lock_before.st_mtime_ns
+    assert (
+        production._sample_live_storage(directory, operator, report, state, progress, external)
+        is None
+    )
+    assert state["current"]["operator_retained_bytes"] == 0
+    assert state["current"]["operator_live_workspace_allocated_bytes"] == (
+        lock_after.st_blocks * 512
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "operator root writer lock is missing or unsafe"),
+        ("symlink", "operator root contains an unsafe live entry"),
+        ("hardlink", "operator root writer lock is missing or unsafe"),
+        ("replacement-same-mode", "canonical writer lock changed unsafely"),
+        ("replacement-different-mode", "canonical writer lock changed unsafely"),
+        ("growth", "canonical writer lock changed unsafely"),
+        ("immutable-entry", "non-workspace operator entry changed during live work: root.json"),
+    ],
+)
+def test_live_storage_rejects_unsafe_writer_lock_changes(production, tmp_path, mutation, message):
+    directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
+        tmp_path, production
+    )
+    state = production._begin_storage_supervision(directory, operator, report, progress, external)
+    lock_path = operator / "writer.lock"
+    if mutation == "missing":
+        lock_path.unlink()
+    elif mutation == "symlink":
+        lock_path.unlink()
+        target = tmp_path / "lock-target"
+        target.write_bytes(b"")
+        lock_path.symlink_to(target)
+    elif mutation == "hardlink":
+        target = tmp_path / "lock-target"
+        target.write_bytes(b"")
+        lock_path.unlink()
+        lock_path.hardlink_to(target)
+    elif mutation.startswith("replacement-"):
+        replacement = tmp_path / "replacement-lock"
+        replacement.write_bytes(b"")
+        if mutation == "replacement-different-mode":
+            replacement.chmod(0o600)
+        replacement.replace(lock_path)
+    elif mutation == "growth":
+        with lock_path.open("ab") as stream:
+            stream.write(b"unsafe growth")
+    else:
+        (operator / "root.json").write_text("changed", encoding="utf-8")
+
+    with pytest.raises(production.RunnerError, match=message):
+        production._sample_live_storage(directory, operator, report, state, progress, external)
 
 
 @pytest.mark.parametrize(
@@ -340,6 +420,10 @@ def test_live_storage_retries_direntry_disappearance_without_stopping(
     assert control["allocated_inodes"] == {
         (first.stat().st_dev, first.stat().st_ino),
         (disappearing.stat().st_dev, disappearing.stat().st_ino),
+        (
+            (operator / "writer.lock").stat().st_dev,
+            (operator / "writer.lock").stat().st_ino,
+        ),
     }
 
     real_scandir = production.os.scandir
