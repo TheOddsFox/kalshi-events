@@ -783,6 +783,55 @@ def test_expanded_activation_binds_report_to_exact_current_capture(
     )
 
 
+def test_activation_worker_passes_remaining_deadline_and_build_census(
+    production, tmp_path, monkeypatch, capsys
+):
+    from kalshi_events.common import digest
+
+    directory, report_path, report, capture_id, _root_id = _resume_report_fixture(
+        production, tmp_path, monkeypatch, mode="historical"
+    )
+    operator = directory / "operator"
+    operator.mkdir()
+    production._bind_report_resource_profile(report, "expanded", transition=True)
+    report_path.write_text(json.dumps(report))
+    release_id = "d" * 64
+    release_directory = operator / "releases" / release_id
+    release_directory.mkdir(parents=True)
+    manifest = {
+        "contract": "oddsfox.kalshi.historical.v1",
+        "source_release_id": release_id,
+        "capture_id": capture_id,
+    }
+    manifest_bytes = json.dumps(manifest).encode()
+    (release_directory / "manifest.json").write_bytes(manifest_bytes)
+    (operator / "current-historical.json").write_text(
+        json.dumps({"manifest_sha256": digest(manifest_bytes), "source_release_id": release_id})
+    )
+    build_directory = operator / "builds-historical" / capture_id
+    build_directory.mkdir(parents=True)
+    (build_directory / "build.json").write_text(json.dumps({"observation_count": 17}))
+    called = {}
+    monkeypatch.setattr(
+        production,
+        "activate_current",
+        lambda *_args, **kwargs: called.update(kwargs) or {"state": "verified"},
+    )
+    monkeypatch.setattr(
+        production, "_monitor_deadline", lambda *_args, **_kwargs: time.monotonic() + 123
+    )
+    assert (
+        production._activation_worker(
+            operator, directory, f"historical:{release_id}", report_path, "expanded"
+        )
+        == 0
+    )
+    assert 117 < called["max_duration_seconds"] <= 118
+    assert called["expected_observations"] == 17
+    assert called["expected_capture_id"] == capture_id
+    assert json.loads(capsys.readouterr().out)["state"] == "verified"
+
+
 @pytest.mark.parametrize(
     ("full", "capture_id", "activate", "historical"),
     [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -40,6 +41,7 @@ def run(
     rate_policy: str | None = None,
     on_capture_id: Callable[[str], None] | None = None,
     historical: bool = False,
+    resume_historical_stage: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Run refresh while the caller holds the canonical root writer lock."""
     result = result_template()
@@ -48,6 +50,13 @@ def run(
     try:
         if full and capture_id is not None:
             raise CatalogueError("--full and --capture-id cannot be used together")
+        if resume_historical_stage is not None:
+            if not historical or full or capture_id is None or store.scope is not None:
+                raise CatalogueError("stage resume requires an exact offline historical capture")
+            if not isinstance(resume_historical_stage, str) or not re.fullmatch(
+                r"build-historical-[0-9a-f]{32}", resume_historical_stage
+            ):
+                raise CatalogueError("invalid historical resume stage identity")
         if historical and store.scope is not None:
             raise CatalogueError("historical catalogue mode cannot use a series root")
         if historical and not full and capture_id is None:
@@ -132,6 +141,11 @@ def run(
             store,
             result["capture_id"],
             catalogue_version=HISTORICAL_VERSION if historical_output else 2,
+            **(
+                {"resume_historical_stage": resume_historical_stage}
+                if resume_historical_stage is not None
+                else {}
+            ),
         )
         result["output"] = published.get("output")
         result["source_release_id"] = published.get("source_release_id")

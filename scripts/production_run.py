@@ -120,6 +120,12 @@ MAX_LEGACY_OFFLINE_HISTORICAL_SECONDS = 4 * 3600
 MAX_OFFLINE_HISTORICAL_SECONDS = 24 * 3600
 CAPTURE_ID = re.compile(r"[0-9a-f]{32}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
+HISTORICAL_STAGE = re.compile(r"build-historical-[0-9a-f]{32}\Z")
+PROCESS_IDENTITY_UTC = re.compile(
+    r"(\d+)\s+(\d+)\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})\s+(.+)"
+)
 REPORT_NAME = "session.json"
 OWNER_MARKER = ".production-root.json"
 RESOURCE_SAMPLE_LIMIT = 256
@@ -194,6 +200,496 @@ class BudgetStop(RunnerError):
 
 class RunnerInterrupted(RunnerError):
     """The operator requested a clean stop while a supervised stage was running."""
+
+
+def _validate_historical_stage(value: Any) -> str:
+    if not isinstance(value, str) or not HISTORICAL_STAGE.fullmatch(value):
+        raise RunnerError("historical stage must be a full build-historical stage basename")
+    return value
+
+
+def _record_historical_invocation(
+    report: dict[str, Any], stage: str | None, *, revision: str
+) -> None:
+    report["resume_historical_stage"] = stage
+    if stage is not None:
+        _validate_historical_stage(stage)
+    history = report.setdefault("historical_invocations", [])
+    if (
+        not isinstance(history, list)
+        or len(history) >= 64
+        or any(
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "invocation_id",
+                "started_at",
+                "mode",
+                "capture_id",
+                "root_id",
+                "revision",
+                "boot_stamp",
+                "supervisor_pid",
+                "supervisor_pgid",
+                "resume_historical_stage",
+            }
+            or not isinstance(item.get("invocation_id"), str)
+            or not CAPTURE_ID.fullmatch(item["invocation_id"])
+            or not isinstance(item.get("started_at"), str)
+            or item.get("mode") != "historical"
+            or item.get("capture_id") != report.get("capture_id")
+            or item.get("root_id") != report.get("root_id")
+            or not isinstance(item.get("revision"), str)
+            or not REVISION.fullmatch(item["revision"])
+            or item.get("boot_stamp") != report.get("boot_stamp")
+            or type(item.get("supervisor_pid")) is not int
+            or item["supervisor_pid"] <= 1
+            or type(item.get("supervisor_pgid")) is not int
+            or item["supervisor_pgid"] <= 1
+            or item.get("resume_historical_stage") is not None
+            and (
+                not isinstance(item["resume_historical_stage"], str)
+                or not HISTORICAL_STAGE.fullmatch(item["resume_historical_stage"])
+            )
+            for item in history
+        )
+    ):
+        raise RunnerError("historical invocation history is invalid or full")
+    invocation_id = uuid.uuid4().hex
+    history.append(
+        {
+            "invocation_id": invocation_id,
+            "started_at": _utc(),
+            "mode": "historical",
+            "capture_id": report.get("capture_id"),
+            "root_id": report.get("root_id"),
+            "revision": revision,
+            "boot_stamp": report.get("boot_stamp"),
+            "supervisor_pid": os.getpid(),
+            "supervisor_pgid": os.getpgrp(),
+            "resume_historical_stage": stage,
+        }
+    )
+    report["active_invocation_id"] = invocation_id
+
+
+def _session_historical_stage(report: dict[str, Any], mode: str) -> str | None:
+    stage = report.get("resume_historical_stage")
+    if stage is None:
+        return None
+    _validate_historical_stage(stage)
+    history = report.get("historical_invocations")
+    latest = history[-1] if isinstance(history, list) and history else None
+    if (
+        mode != "historical"
+        or not isinstance(history, list)
+        or len(history) > 64
+        or not isinstance(latest, dict)
+        or set(latest)
+        != {
+            "invocation_id",
+            "started_at",
+            "mode",
+            "capture_id",
+            "root_id",
+            "revision",
+            "boot_stamp",
+            "supervisor_pid",
+            "supervisor_pgid",
+            "resume_historical_stage",
+        }
+        or not isinstance(latest.get("invocation_id"), str)
+        or not CAPTURE_ID.fullmatch(latest["invocation_id"])
+        or report.get("active_invocation_id") != latest["invocation_id"]
+        or not isinstance(latest.get("started_at"), str)
+        or latest.get("mode") != "historical"
+        or latest.get("capture_id") != report.get("capture_id")
+        or latest.get("root_id") != report.get("root_id")
+        or latest.get("revision") != report.get("revision")
+        or latest.get("boot_stamp") != report.get("boot_stamp")
+        or type(latest.get("supervisor_pid")) is not int
+        or latest["supervisor_pid"] <= 1
+        or type(latest.get("supervisor_pgid")) is not int
+        or latest["supervisor_pgid"] <= 1
+        or latest.get("resume_historical_stage") != stage
+    ):
+        raise RunnerError("historical stage selection is not sealed to this invocation")
+    return stage
+
+
+def _validate_launch_process_identity(
+    launch: dict[str, Any], command: list[str], pid: int, pgid: int
+) -> str:
+    identity = launch.get("process_identity_utc")
+    identity_match = (
+        PROCESS_IDENTITY_UTC.fullmatch(identity.strip())
+        if isinstance(identity, str) and len(identity) <= 8192
+        else None
+    )
+    launched_at_value = launch.get("launched_at_utc")
+    try:
+        launched_at = datetime.fromisoformat(launched_at_value)
+        identity_started = datetime(
+            int(identity_match.group(7)),
+            {
+                month: index
+                for index, month in enumerate(
+                    (
+                        "Jan",
+                        "Feb",
+                        "Mar",
+                        "Apr",
+                        "May",
+                        "Jun",
+                        "Jul",
+                        "Aug",
+                        "Sep",
+                        "Oct",
+                        "Nov",
+                        "Dec",
+                    ),
+                    start=1,
+                )
+            }[identity_match.group(4)],
+            int(identity_match.group(5)),
+            *map(int, identity_match.group(6).split(":")),
+            tzinfo=UTC,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RunnerError("latest-launch UTC process identity is malformed") from exc
+    if (
+        identity_match is None
+        or identity_match.group(1) != str(pid)
+        or identity_match.group(2) != str(pgid)
+        or identity_match.group(3)
+        != ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[identity_started.weekday()]
+        or identity_match.group(8).strip() != " ".join(command)
+        or not isinstance(launched_at_value, str)
+        or launched_at.tzinfo is None
+        or launched_at.utcoffset() != timedelta(0)
+        or int(identity_started.timestamp()) != int(launched_at.timestamp())
+    ):
+        raise RunnerError("latest-launch UTC process identity does not match its command")
+    return identity
+
+
+def _validate_current_processing_launch(
+    launch_path: Path,
+    report_path: Path,
+    report: dict[str, Any],
+    launch: dict[str, Any],
+    command: list[str],
+    capture_id: str,
+    pid: int,
+    pgid: int,
+) -> tuple[Path, bytes, str]:
+    from kalshi_events.common import regular_bytes
+
+    current_revision = _revision()
+    processing_revision = launch.get("processing_revision")
+    reconciliation_source = launch.get("reconciliation_code_source")
+    if (
+        not isinstance(processing_revision, str)
+        or not REVISION.fullmatch(processing_revision)
+        or processing_revision != report.get("revision")
+        or not isinstance(launch.get("revision"), str)
+        or not REVISION.fullmatch(launch["revision"])
+        or not isinstance(reconciliation_source, dict)
+        or reconciliation_source.get("revision") != launch.get("revision")
+        or report.get("boot_stamp") != _boot_stamp()
+        or launch.get("session") != str(report_path)
+        or launch.get("capture_id") != capture_id
+        or launch.get("root_id") != report.get("root_id")
+        or launch.get("pid") != pid
+        or launch.get("pgid") != pgid
+        or launch.get("state") != "launched"
+        or launch.get("offline_only") is not True
+        or launch.get("automatic_retry") is not False
+        or command.count("--historical") != 1
+        or command.count("--capture-id") != 1
+        or command.count("--directory") != 1
+    ):
+        raise RunnerError("current processing revision is not bound to this stopped session")
+    history = report.get("historical_invocations")
+    if history is not None:
+        latest = history[-1] if isinstance(history, list) and history else None
+        if (
+            not isinstance(history, list)
+            or len(history) > 64
+            or not isinstance(latest, dict)
+            or latest.get("invocation_id") != report.get("active_invocation_id")
+            or latest.get("mode") != "historical"
+            or latest.get("capture_id") != capture_id
+            or latest.get("root_id") != report.get("root_id")
+            or latest.get("revision") != processing_revision
+            or latest.get("boot_stamp") != report.get("boot_stamp")
+            or latest.get("supervisor_pid") != pid
+            or latest.get("supervisor_pgid") != pgid
+        ):
+            raise RunnerError(
+                "current processing launch differs from its immutable invocation record"
+            )
+
+    _validate_launch_process_identity(launch, command, pid, pgid)
+    checks_path = launch_path.with_name("launch-checks.json")
+    try:
+        checks_stat = checks_path.lstat()
+    except OSError as exc:
+        raise RunnerError("current launch checks are missing") from exc
+    import stat
+
+    if not stat.S_ISREG(checks_stat.st_mode) or checks_stat.st_nlink != 1:
+        raise RunnerError("current launch checks are unsafe")
+    checks_raw = regular_bytes(checks_path, MIB)
+    try:
+        checks = json.loads(checks_raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("current launch checks are malformed") from exc
+    if (
+        not isinstance(checks, dict)
+        or set(checks)
+        != {
+            "checked_at_utc",
+            "fresh_processing_cutoff_and_active_end_enforced",
+            "original_grant_and_reconciliation_history_preserved",
+            "new_window",
+        }
+        or checks.get("fresh_processing_cutoff_and_active_end_enforced") is not True
+        or checks.get("original_grant_and_reconciliation_history_preserved") is not True
+        or checks.get("new_window") != report.get("offline_historical_window")
+    ):
+        raise RunnerError("current launch checks do not bind the saved offline window")
+    try:
+        checked_at_value = checks["checked_at_utc"]
+        checked_at = datetime.fromisoformat(
+            checked_at_value.replace("Z", "+00:00") if isinstance(checked_at_value, str) else ""
+        )
+        launched_at = datetime.fromisoformat(launch.get("launched_at_utc", ""))
+    except (TypeError, ValueError) as exc:
+        raise RunnerError("current launch-check timestamp is invalid") from exc
+    window = checks["new_window"]
+    epoch_fields = (
+        "started_epoch",
+        "deadline_epoch",
+    )
+    monotonic_fields = ("started_monotonic", "deadline_monotonic")
+    for field in (*epoch_fields, *monotonic_fields):
+        value = window.get(field) if isinstance(window, dict) else None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise RunnerError("current launch window has invalid clock values")
+    launch_clocks = (
+        "started_epoch",
+        "processing_deadline_epoch",
+        "active_end_epoch",
+        "outer_deadline_epoch",
+        "launched_monotonic",
+        "processing_deadline_monotonic",
+        "active_end_monotonic",
+        "outer_deadline_monotonic",
+    )
+    for field in launch_clocks:
+        value = launch.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise RunnerError("current launch has invalid processing clock values")
+    checked_epoch = checked_at.timestamp()
+    if (
+        checked_at.tzinfo is None
+        or checked_at.utcoffset() != timedelta(0)
+        or launched_at.tzinfo is None
+        or launched_at.utcoffset() != timedelta(0)
+        or checked_epoch < launched_at.timestamp()
+        or checked_epoch < float(window["started_epoch"])
+        or checked_epoch > float(window["deadline_epoch"])
+        or time.time() < checked_epoch
+        or launch["processing_deadline_epoch"] > window["deadline_epoch"]
+        or launch["active_end_epoch"] < window["deadline_epoch"]
+        or launch["outer_deadline_epoch"] < launch["active_end_epoch"]
+        or launch["processing_deadline_monotonic"] > window["deadline_monotonic"]
+        or launch["active_end_monotonic"] < window["deadline_monotonic"]
+        or launch["outer_deadline_monotonic"] < launch["active_end_monotonic"]
+    ):
+        raise RunnerError("current launch clocks do not preserve the checked offline deadline")
+    return checks_path, checks_raw, current_revision
+
+
+def _temporary_storage_stop_evidence(
+    report: dict[str, Any],
+    capture_id: str,
+    original_group: Any,
+    *,
+    revision_source: str,
+    derive: bool,
+) -> dict[str, Any]:
+    profile = report.get("resource_profile", "default")
+    limits = _limits_from_report(report, profile)
+    current = report.get("storage_supervision", {}).get("current")
+    threshold = int(limits["storage_temporary_stop_bytes"])
+    inclusive = bool(limits["storage_temporary_stop_inclusive"])
+    observed = current.get("operator_temporary_bytes") if isinstance(current, dict) else None
+    if type(original_group) is not int or original_group <= 1 or type(observed) is not int:
+        raise RunnerError("temporary storage stop evidence has invalid group or observation")
+    reached = observed >= threshold if inclusive else observed > threshold
+    if not reached or report.get("error") != (
+        f"live temporary storage reached the {threshold // GIB} GiB stop threshold"
+    ):
+        raise RunnerError("temporary storage stop does not match the sealed stop threshold")
+    invocation_id = report.get("active_invocation_id")
+    if invocation_id is None:
+        invocation_id = report.get("storage_supervision_invocation")
+    if not isinstance(invocation_id, str) or not CAPTURE_ID.fullmatch(invocation_id):
+        raise RunnerError("temporary storage stop has no exact invocation identity")
+    evidence = report.get("storage_safety_stop")
+    if derive:
+        evidence = {
+            "version": 1,
+            "mode": "historical",
+            "category": "temporary",
+            "invocation_id": invocation_id,
+            "capture_id": capture_id,
+            "root_id": report.get("root_id"),
+            "revision": report.get("revision"),
+            "revision_source": revision_source,
+            "observed_bytes": observed,
+            "threshold_bytes": threshold,
+            "threshold_inclusive": inclusive,
+            "original_process_group": original_group,
+        }
+    process = report.get("process_supervision")
+    errors = process.get("termination_errors") if isinstance(process, dict) else None
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence)
+        != {
+            "version",
+            "mode",
+            "category",
+            "invocation_id",
+            "capture_id",
+            "root_id",
+            "revision",
+            "revision_source",
+            "observed_bytes",
+            "threshold_bytes",
+            "threshold_inclusive",
+            "original_process_group",
+        }
+        or type(evidence.get("version")) is not int
+        or evidence["version"] != 1
+        or evidence.get("mode") != "historical"
+        or evidence.get("category") != "temporary"
+        or evidence.get("invocation_id") != invocation_id
+        or evidence.get("capture_id") != capture_id
+        or evidence.get("root_id") != report.get("root_id")
+        or evidence.get("revision") != report.get("revision")
+        or evidence.get("revision_source") not in {"session.revision", "processing_revision"}
+        or evidence.get("observed_bytes") != observed
+        or evidence.get("threshold_bytes") != threshold
+        or evidence.get("threshold_inclusive") is not inclusive
+        or evidence.get("original_process_group") != original_group
+        or not isinstance(process, dict)
+        or process.get("primary_stop_reason") != report.get("error")
+        or process.get("termination_attempted") is not True
+        or process.get("leader_reaped") is not True
+        or process.get("invocation_token") != report.get("storage_supervision_invocation")
+        or process.get("group_absent") is not None
+        and type(process.get("group_absent")) is not bool
+        or type(process.get("uncertain")) is not bool
+        or process.get("uncertain") != (process.get("group_absent") is None)
+        or not isinstance(errors, list)
+        or len(errors) > 256
+        or any(not isinstance(item, str) or len(item) > 512 for item in errors)
+        or report.get("network_activity_this_invocation")
+        != {"requests": 0, "downloaded_bytes": 0, "accounting_complete": True}
+    ):
+        raise RunnerError("temporary storage stop evidence is invalid")
+    return dict(evidence)
+
+
+def _original_supervisor_absent(pid: int, process_identity: str) -> bool:
+    if not _pid_exists(pid):
+        return True
+    command = ["ps", "-p", str(pid), "-o", "pid=,pgid=,lstart=,command="]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerError("original supervisor identity could not be verified") from exc
+    rows = [line for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode not in {0, 1} or len(rows) > 1 or (result.returncode == 0) != bool(rows):
+        raise RunnerError("original supervisor identity query is malformed")
+    if not rows:
+        if _pid_exists(pid):
+            raise RunnerError(
+                "saved original supervisor PID is present but identity is inaccessible"
+            )
+        return True
+    expected = PROCESS_IDENTITY_UTC.fullmatch(process_identity.strip())
+    actual = PROCESS_IDENTITY_UTC.fullmatch(rows[0].strip())
+    if expected is None or actual is None or actual.group(1) != str(pid):
+        raise RunnerError("original supervisor process identity is malformed")
+    return actual.group(1, 4, 5, 6, 7) != expected.group(1, 4, 5, 6, 7)
+
+
+def _require_stopped_storage_processes_absent(
+    worker_group: int,
+    supervisor_pid: int,
+    supervisor_pgid: int,
+    process_identity: str,
+    *,
+    allow_pid_reuse: bool,
+) -> None:
+    try:
+        worker_group_exists = _process_group_exists(worker_group)
+    except OSError as exc:
+        raise RunnerError("stopped worker process-group absence could not be verified") from exc
+    if worker_group_exists:
+        raise RunnerError("stopped worker process group is still live or ambiguous")
+    if _pid_exists(worker_group):
+        if not allow_pid_reuse:
+            raise RunnerError("stopped worker PID is still live or ambiguous")
+        try:
+            current_group = os.getpgid(worker_group)
+        except ProcessLookupError:
+            if _pid_exists(worker_group):
+                raise RunnerError("stopped worker PID reuse could not be verified") from None
+        except OSError as exc:
+            raise RunnerError("stopped worker PID reuse could not be verified") from exc
+        else:
+            if current_group == worker_group:
+                raise RunnerError("stopped worker process group reappeared")
+    try:
+        supervisor_group_exists = _process_group_exists(supervisor_pgid)
+    except OSError as exc:
+        raise RunnerError(
+            "original supervisor process-group absence could not be verified"
+        ) from exc
+    if supervisor_group_exists:
+        raise RunnerError("original supervisor process group is still live or ambiguous")
+    if not _original_supervisor_absent(supervisor_pid, process_identity):
+        raise RunnerError("original supervisor process is still live or ambiguous")
+    try:
+        group_reappeared = _process_group_exists(worker_group) or _process_group_exists(
+            supervisor_pgid
+        )
+    except OSError as exc:
+        raise RunnerError(
+            "process-group absence could not be confirmed under the writer lock"
+        ) from exc
+    if group_reappeared:
+        raise RunnerError("stopped worker or original supervisor reappeared during reconciliation")
 
 
 def _effective_limits() -> dict[str, int | float | str | bool]:
@@ -2160,6 +2656,7 @@ def _validate_initial_historical_accounting_session(
         or os.getpgrp() != os.getpid()
     ):
         raise RunnerError("initial historical accounting session binding changed")
+    _session_historical_stage(report, "historical")
     if "offline_historical_window" in report:
         _validate_offline_historical_window(
             report,
@@ -2236,6 +2733,40 @@ def _read_accounting_worker(
             max_database_bytes=int(_effective_limits()["database_bytes"]),
         ),
     )
+    if cleanup_historical_stages and expected_directory is not None:
+        from production_activation import (
+            _activation_temporary_names,
+            recover_activation_temporaries,
+        )
+
+        if _activation_temporary_names(expected_directory):
+            assert report_path is not None
+            assert expected_capture_id is not None
+            assert expected_root_id is not None
+            assert expected_revision is not None
+            with store.lock():
+                _validate_initial_historical_accounting_session(
+                    root,
+                    expected_directory,
+                    report_path,
+                    expected_capture_id,
+                    expected_root_id,
+                    expected_revision,
+                )
+                pointer = _strict_json(root / "current-historical.json")
+                release_id = pointer.get("source_release_id") if pointer else None
+                if not isinstance(release_id, str) or not re.fullmatch(r"[0-9a-f]{64}", release_id):
+                    raise RunnerError("stale activation links have no current historical release")
+            recover_activation_temporaries(
+                root,
+                expected_directory,
+                expected_release_id=release_id,
+                expected_capture_id=expected_capture_id,
+                catalogue_version=3,
+                max_database_bytes=store.limits.max_database_bytes,
+                max_temp_bytes=store.limits.max_temp_bytes,
+                max_duration_seconds=store.remaining,
+            )
     with store.lock():
         capture_state = None
         if expected_capture_id is not None:
@@ -2259,7 +2790,7 @@ def _read_accounting_worker(
             assert report_path is not None
             assert expected_root_id is not None
             assert expected_revision is not None
-            _validate_initial_historical_accounting_session(
+            session = _validate_initial_historical_accounting_session(
                 root,
                 expected_directory,
                 report_path,
@@ -2274,7 +2805,12 @@ def _read_accounting_worker(
             cleanup = getattr(warehouse, "recover_and_cleanup_abandoned_historical_stages", None)
             if not callable(cleanup):
                 raise RunnerError("historical stage recovery helper is unavailable")
-            cleanup(store, expected_capture_id)
+            preserve_stage = session.get("resume_historical_stage") if session else None
+            if preserve_stage is not None:
+                _validate_historical_stage(preserve_stage)
+                cleanup(store, expected_capture_id, preserve_stage=preserve_stage)
+            else:
+                cleanup(store, expected_capture_id)
         attempts = downloaded_or_reserved = 0
         accounting_complete = True
         unfinished = []
@@ -2424,6 +2960,8 @@ def activate_current(
     catalogue_version: int = 2,
     max_database_bytes: int = 64 * GIB,
     max_temp_bytes: int = 64 * GIB,
+    max_duration_seconds: float | None = None,
+    expected_observations: int | None = None,
     link_fn: Any = None,
     replace_fn: Any = None,
     sync_fn: Any = None,
@@ -2440,6 +2978,8 @@ def activate_current(
         catalogue_version=catalogue_version,
         max_database_bytes=max_database_bytes,
         max_temp_bytes=max_temp_bytes,
+        max_duration_seconds=max_duration_seconds,
+        expected_observations=expected_observations,
         link_fn=link_fn,
         replace_fn=replace_fn,
         sync_fn=sync_fn,
@@ -2491,6 +3031,7 @@ _LIVE_TMP_NAMES = (
     re.compile(r"dbt-[0-9a-f]{32}\Z"),
     re.compile(r"load-[0-9a-f]{32}\Z"),
     re.compile(r"baseline-verify-[0-9a-f]{32}\Z"),
+    re.compile(r"activation-readback-[0-9a-f]{32}\Z"),
     re.compile(r"database-copy-[0-9a-f]{32}\Z"),
     re.compile(r"build-[0-9a-f]{32}\Z"),
     re.compile(r"build-v2-[0-9a-f]{32}\Z"),
@@ -2857,6 +3398,37 @@ def _storage_stop_reached(observed: int, category: str) -> bool:
     return observed > threshold
 
 
+def _record_temporary_storage_stop(report: dict[str, Any], observed: int) -> None:
+    invocation_id = report.get("active_invocation_id")
+    group = report.get("active_process_group")
+    if invocation_id is None:
+        return
+    if (
+        not isinstance(invocation_id, str)
+        or not CAPTURE_ID.fullmatch(invocation_id)
+        or type(group) is not int
+        or group <= 1
+        or not isinstance(report.get("revision"), str)
+        or not REVISION.fullmatch(report["revision"])
+    ):
+        raise RunnerError("temporary storage stop lacks its sealed invocation identity")
+    limits = _effective_limits()
+    report["storage_safety_stop"] = {
+        "version": 1,
+        "mode": "historical",
+        "category": "temporary",
+        "invocation_id": invocation_id,
+        "capture_id": report.get("capture_id"),
+        "root_id": report.get("root_id"),
+        "revision": report["revision"],
+        "revision_source": "session.revision",
+        "observed_bytes": observed,
+        "threshold_bytes": int(limits["storage_temporary_stop_bytes"]),
+        "threshold_inclusive": bool(limits["storage_temporary_stop_inclusive"]),
+        "original_process_group": group,
+    }
+
+
 def _begin_storage_supervision(
     directory: Path,
     operator: Path,
@@ -3083,6 +3655,7 @@ def _sample_live_storage(
         return f"live database storage reached the {database_stop // GIB} GiB stop threshold"
     temporary_stop = int(_effective_limits()["storage_temporary_stop_bytes"])
     if _storage_stop_reached(current["operator_temporary_bytes"], "temporary"):
+        _record_temporary_storage_stop(report, current["operator_temporary_bytes"])
         return f"live temporary storage reached the {temporary_stop // GIB} GiB stop threshold"
     if current["operator_retained_bytes"] > int(_effective_limits()["root_bytes"]):
         return "live operator root storage allowance was exceeded"
@@ -3171,7 +3744,7 @@ def _operator_writer_lock(operator: Path):
 
 def _stopped_worker_evidence(
     directory: Path, report_path: Path, report: dict[str, Any], capture_id: str
-) -> tuple[dict[str, Any], Path, bytes]:
+) -> tuple[dict[str, Any], Path, bytes, Path, bytes, Path | None, bytes | None]:
     from kalshi_events.common import regular_bytes, safe_path
 
     profile, sealed_report = _session_resource_profile(report_path, capture_id=capture_id)
@@ -3216,7 +3789,6 @@ def _stopped_worker_evidence(
     if (
         launch.get("session") != str(report_path)
         or launch_capture != capture_id
-        or launch_revision != report.get("revision")
         or not isinstance(launch_revision, str)
         or not REVISION.fullmatch(launch_revision)
         or isinstance(launch_pid, bool)
@@ -3232,6 +3804,27 @@ def _stopped_worker_evidence(
         or "--historical" not in command
     ):
         raise RunnerError("latest-launch identity does not match the stopped capture")
+    launch_checks_path: Path | None = None
+    launch_checks_raw: bytes | None = None
+    reconciliation_runtime_revision: str | None = None
+    if launch_revision == report.get("revision"):
+        revision_source = "session.revision"
+    else:
+        (
+            launch_checks_path,
+            launch_checks_raw,
+            reconciliation_runtime_revision,
+        ) = _validate_current_processing_launch(
+            launch_path,
+            report_path,
+            report,
+            launch,
+            command,
+            capture_id,
+            launch_pid,
+            launch_pgid,
+        )
+        revision_source = "processing_revision"
     try:
         capture_index = command.index("--capture-id")
         directory_index = command.index("--directory")
@@ -3249,12 +3842,17 @@ def _stopped_worker_evidence(
         or latest_session != report_path
     ):
         raise RunnerError("latest-launch command does not match this session")
-    process_identity = launch.get("process_identity")
-    if not isinstance(process_identity, str) or process_identity.split(maxsplit=2)[:2] != [
-        str(launch_pid),
-        str(launch_pgid),
-    ]:
-        raise RunnerError("latest-launch process identity is ambiguous")
+    process_identity_utc = launch.get("process_identity_utc")
+    if process_identity_utc is not None:
+        _validate_launch_process_identity(launch, command, launch_pid, launch_pgid)
+    else:
+        process_identity = launch.get("process_identity")
+        if (
+            revision_source == "processing_revision"
+            or not isinstance(process_identity, str)
+            or process_identity.split(maxsplit=2)[:2] != [str(launch_pid), str(launch_pgid)]
+        ):
+            raise RunnerError("latest-launch process identity is ambiguous")
     stdout_path = launch.get("stdout")
     if not isinstance(stdout_path, str):
         raise RunnerError("latest-launch stdout path is missing")
@@ -3265,56 +3863,93 @@ def _stopped_worker_evidence(
         raise RunnerError("latest-launch stdout path is unsafe") from exc
     if not stat.S_ISREG(stdout_info.st_mode) or stdout.parent.parent != source_root.parent:
         raise RunnerError("latest-launch stdout path is outside its managed run")
-    evidence_path = stdout.parent / "storage-safety-stop.json"
-    try:
-        evidence_info = evidence_path.lstat()
-    except OSError as exc:
-        raise RunnerError("stopped-worker evidence is missing") from exc
-    if not stat.S_ISREG(evidence_info.st_mode) or evidence_info.st_nlink != 1:
-        raise RunnerError("stopped-worker evidence is unsafe")
-    evidence_raw = regular_bytes(evidence_path, MIB)
-    try:
-        evidence = json.loads(evidence_raw.decode("utf-8"))
-    except (UnicodeError, ValueError) as exc:
-        raise RunnerError("stopped-worker evidence is malformed") from exc
-    if not isinstance(evidence, dict):
-        raise RunnerError("stopped-worker evidence is malformed")
-    started_at = launch.get("started_at")
-    process_started_at = evidence.get("supervisor_process_started_utc")
-    try:
-        launch_started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
-        evidence_started = datetime.fromisoformat(str(process_started_at).replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise RunnerError("stopped-worker process start identity is invalid") from exc
     original_group = report.get("active_process_group")
-    activity = evidence.get("network_activity_this_invocation")
-    if (
-        launch_started.tzinfo is None
-        or evidence_started.tzinfo is None
-        or int(launch_started.timestamp()) != int(evidence_started.timestamp())
-        or evidence.get("capture_id") != capture_id
-        or evidence.get("revision") != report.get("revision")
-        or evidence.get("old_active_child_group") != original_group
-        or evidence.get("supervisor_pid") != launch_pid
-        or evidence.get("signal") != "SIGTERM to exact original supervisor only"
-        or evidence.get("original_pids_absent") is not True
-        or evidence.get("owned_group_members") != []
-        or evidence.get("production_exists") is not False
-        or evidence.get("automatic_retry") is not False
-        or evidence.get("session_phase") != "stopped"
-        or evidence.get("session_error") != report.get("error")
-        or evidence.get("database_limit_bytes") != database_limit
-        or type(evidence.get("observed_database_bytes")) is not int
-        or evidence["observed_database_bytes"] <= database_limit
-        or not isinstance(activity, dict)
-        or activity.get("requests") != 0
-        or activity.get("downloaded_bytes") != 0
-        or activity.get("accounting_complete") is not True
-        or not isinstance(evidence.get("session_before_sha256"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", evidence["session_before_sha256"])
-    ):
-        raise RunnerError("stopped-worker evidence identity or stop condition is invalid")
-    return evidence, evidence_path, evidence_raw
+    typed_stop = report.get("storage_safety_stop")
+    derived_temporary_stop = typed_stop is None and revision_source == "processing_revision"
+    if typed_stop is not None or derived_temporary_stop:
+        evidence = _temporary_storage_stop_evidence(
+            report,
+            capture_id,
+            original_group,
+            revision_source=revision_source,
+            derive=derived_temporary_stop,
+        )
+        evidence_path = report_path
+        evidence_raw = (
+            json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        ).encode()
+    else:
+        evidence_path = stdout.parent / "storage-safety-stop.json"
+        try:
+            evidence_info = evidence_path.lstat()
+        except OSError as exc:
+            raise RunnerError("stopped-worker evidence is missing") from exc
+        if not stat.S_ISREG(evidence_info.st_mode) or evidence_info.st_nlink != 1:
+            raise RunnerError("stopped-worker evidence is unsafe")
+        evidence_raw = regular_bytes(evidence_path, MIB)
+        try:
+            evidence = json.loads(evidence_raw.decode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise RunnerError("stopped-worker evidence is malformed") from exc
+        if not isinstance(evidence, dict):
+            raise RunnerError("stopped-worker evidence is malformed")
+        started_at = launch.get("started_at")
+        process_started_at = evidence.get("supervisor_process_started_utc")
+        try:
+            launch_started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+            evidence_started = datetime.fromisoformat(
+                str(process_started_at).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise RunnerError("stopped-worker process start identity is invalid") from exc
+        activity = evidence.get("network_activity_this_invocation")
+        if (
+            launch_started.tzinfo is None
+            or evidence_started.tzinfo is None
+            or int(launch_started.timestamp()) != int(evidence_started.timestamp())
+            or evidence.get("capture_id") != capture_id
+            or evidence.get("revision") != report.get("revision")
+            or evidence.get("old_active_child_group") != original_group
+            or evidence.get("supervisor_pid") != launch_pid
+            or evidence.get("signal") != "SIGTERM to exact original supervisor only"
+            or evidence.get("original_pids_absent") is not True
+            or evidence.get("owned_group_members") != []
+            or evidence.get("production_exists") is not False
+            or evidence.get("automatic_retry") is not False
+            or evidence.get("session_phase") != "stopped"
+            or evidence.get("session_error") != report.get("error")
+            or evidence.get("database_limit_bytes") != database_limit
+            or type(evidence.get("observed_database_bytes")) is not int
+            or evidence["observed_database_bytes"] <= database_limit
+            or not isinstance(activity, dict)
+            or activity.get("requests") != 0
+            or activity.get("downloaded_bytes") != 0
+            or activity.get("accounting_complete") is not True
+            or not isinstance(evidence.get("session_before_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence["session_before_sha256"])
+        ):
+            raise RunnerError("stopped-worker evidence identity or stop condition is invalid")
+    evidence["launch_revision_source"] = revision_source
+    evidence["processing_revision"] = (
+        launch.get("processing_revision") if revision_source == "processing_revision" else None
+    )
+    evidence["supervisor_pid"] = launch_pid
+    evidence["supervisor_pgid"] = launch_pgid
+    evidence["original_process_group"] = original_group
+    evidence["process_identity_utc"] = process_identity_utc
+    evidence["reconciliation_runtime_revision"] = reconciliation_runtime_revision
+    raw_launch_after = regular_bytes(launch_path, MIB)
+    if raw_launch_after != launch_raw:
+        raise RunnerError("latest-launch changed during stopped-worker validation")
+    return (
+        evidence,
+        evidence_path,
+        evidence_raw,
+        launch_path,
+        launch_raw,
+        launch_checks_path,
+        launch_checks_raw,
+    )
 
 
 def _stopped_memory_worker_evidence(
@@ -3447,12 +4082,7 @@ def _stopped_memory_worker_evidence(
 
     identity = launch.get("process_identity_utc")
     identity_match = (
-        re.fullmatch(
-            r"(\d+)\s+(\d+)\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
-            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
-            r"(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})\s+(.+)",
-            identity.strip(),
-        )
+        PROCESS_IDENTITY_UTC.fullmatch(identity.strip())
         if isinstance(identity, str) and len(identity) <= 8192
         else None
     )
@@ -3685,39 +4315,113 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
                 "primary_stop_reason": report.get("error"),
             }
         else:
-            evidence, evidence_path, evidence_raw = _stopped_worker_evidence(
-                directory, report_path, report, capture_id
-            )
+            (
+                evidence,
+                evidence_path,
+                evidence_raw,
+                launch_path,
+                launch_raw,
+                launch_checks_path,
+                launch_checks_raw,
+            ) = _stopped_worker_evidence(directory, report_path, report, capture_id)
             supervisor_pid = evidence["supervisor_pid"]
+            supervisor_pgid = evidence["supervisor_pgid"]
+            process_identity = evidence.get("process_identity_utc")
+            typed_temporary_stop = evidence.get("category") == "temporary"
             if (
                 type(supervisor_pid) is not int
                 or supervisor_pid <= 1
-                or _pid_exists(group)
-                or _process_group_exists(group)
-                or _pid_exists(supervisor_pid)
-                or _process_group_exists(supervisor_pid)
+                or type(supervisor_pgid) is not int
+                or supervisor_pgid <= 1
             ):
-                raise RunnerError(
-                    "stopped worker or original supervisor is still alive or ambiguous"
-                )
+                raise RunnerError("stopped-worker launch identity is invalid")
+            if typed_temporary_stop and report.get("storage_safety_stop") is None:
+                report["storage_safety_stop"] = {
+                    key: evidence[key]
+                    for key in (
+                        "version",
+                        "mode",
+                        "category",
+                        "invocation_id",
+                        "capture_id",
+                        "root_id",
+                        "revision",
+                        "revision_source",
+                        "observed_bytes",
+                        "threshold_bytes",
+                        "threshold_inclusive",
+                        "original_process_group",
+                    )
+                }
+                _atomic_report(report_path, report)
+
+            def require_storage_processes_absent():
+                if report.get("boot_stamp") != _boot_stamp():
+                    raise RunnerError("saved original boot identity changed during reconciliation")
+                if typed_temporary_stop and isinstance(process_identity, str):
+                    _require_stopped_storage_processes_absent(
+                        group,
+                        supervisor_pid,
+                        supervisor_pgid,
+                        process_identity,
+                        allow_pid_reuse=True,
+                    )
+                elif (
+                    _pid_exists(group)
+                    or _process_group_exists(group)
+                    or _pid_exists(supervisor_pid)
+                    or _process_group_exists(supervisor_pgid)
+                ):
+                    raise RunnerError(
+                        "stopped worker or original supervisor is still alive or ambiguous"
+                    )
+
+            require_storage_processes_absent()
             raw_report = regular_bytes(report_path, 16 * MIB)
             report_hash = hashlib.sha256(raw_report).hexdigest()
             evidence_hash = hashlib.sha256(evidence_raw).hexdigest()
-            session_before_hash = evidence["session_before_sha256"]
+            session_before_hash = evidence.get("session_before_sha256", report_hash)
             event_identity = {
                 "capture_id": capture_id,
                 "session_id": report.get("session_id"),
                 "root_id": root_id,
                 "stale_process_group": group,
                 "supervisor_pid": supervisor_pid,
+                "supervisor_pgid": supervisor_pgid,
                 "boot_stamp": report["boot_stamp"],
                 "revision": report.get("revision"),
+                "launch_revision_source": evidence["launch_revision_source"],
+                "processing_revision": evidence.get("processing_revision"),
+                "reconciliation_runtime_revision": evidence.get("reconciliation_runtime_revision"),
                 "report_sha256": report_hash,
                 "evidence_path": str(evidence_path),
                 "evidence_sha256": evidence_hash,
-                "evidence_report_preimage_sha256": evidence["session_before_sha256"],
+                "launch_path": str(launch_path),
+                "launch_sha256": hashlib.sha256(launch_raw).hexdigest(),
+                "launch_checks_path": (
+                    str(launch_checks_path) if launch_checks_path is not None else None
+                ),
+                "launch_checks_sha256": (
+                    hashlib.sha256(launch_checks_raw).hexdigest()
+                    if launch_checks_raw is not None
+                    else None
+                ),
                 "primary_stop_reason": report.get("error"),
             }
+            if typed_temporary_stop:
+                event_identity["reconciliation_kind"] = "temporary_storage_stop"
+                event_identity["storage_stop_evidence"] = {
+                    key: evidence[key]
+                    for key in (
+                        "mode",
+                        "category",
+                        "revision_source",
+                        "threshold_bytes",
+                        "threshold_inclusive",
+                        "observed_bytes",
+                        "original_process_group",
+                    )
+                }
         event_id = hashlib.sha256(
             json.dumps(event_identity, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -3751,13 +4455,32 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
                         "stopped-worker launch identity changed during reconciliation"
                     )
                 require_memory_processes_absent()
-            elif (
-                _pid_exists(group)
-                or _process_group_exists(group)
-                or _pid_exists(supervisor_pid)
-                or _process_group_exists(supervisor_pid)
-            ):
-                raise RunnerError("stopped worker or original supervisor reappeared")
+            else:
+                (
+                    current_evidence,
+                    current_evidence_path,
+                    current_evidence_raw,
+                    current_launch_path,
+                    current_launch_raw,
+                    current_checks_path,
+                    current_checks_raw,
+                ) = _stopped_worker_evidence(directory, report_path, report, capture_id)
+                current_report_raw = regular_bytes(report_path, 16 * MIB)
+                if (
+                    current_evidence_path != evidence_path
+                    or current_evidence_raw != evidence_raw
+                    or current_launch_path != launch_path
+                    or current_launch_raw != launch_raw
+                    or current_checks_path != launch_checks_path
+                    or current_checks_raw != launch_checks_raw
+                    or current_report_raw != raw_report
+                    or current_evidence.get("supervisor_pid") != supervisor_pid
+                    or current_evidence.get("supervisor_pgid") != supervisor_pgid
+                    or current_evidence.get("reconciliation_runtime_revision")
+                    != evidence.get("reconciliation_runtime_revision")
+                ):
+                    raise RunnerError("stopped-worker inputs changed during reconciliation")
+                require_storage_processes_absent()
             audit = _append_stopped_worker_audit(
                 operator, audit, allow_distinct_attempts=memory_stop
             )
@@ -3772,6 +4495,28 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
                 "termination_evidence_sha256": evidence_hash,
                 "session_before_sha256": session_before_hash,
             }
+            if not memory_stop:
+                report["stopped_worker_reconciliation"].update(
+                    {
+                        "launch_revision_source": evidence.get("launch_revision_source"),
+                        "processing_revision": evidence.get("processing_revision"),
+                        "reconciliation_runtime_revision": evidence.get(
+                            "reconciliation_runtime_revision"
+                        ),
+                        "launch_sha256": event_identity["launch_sha256"],
+                    }
+                )
+                if launch_checks_path is not None:
+                    report["stopped_worker_reconciliation"]["launch_checks_sha256"] = (
+                        event_identity["launch_checks_sha256"]
+                    )
+                if typed_temporary_stop:
+                    report["stopped_worker_reconciliation"].update(
+                        {
+                            "reconciliation_kind": "temporary_storage_stop",
+                            "storage_stop_evidence": event_identity["storage_stop_evidence"],
+                        }
+                    )
             if memory_stop:
                 report["stopped_worker_reconciliation"].update(
                     {
@@ -4456,6 +5201,7 @@ def run_production(
     recovery_volume_uuid: str | None = None,
     reconcile_stopped_worker: bool = False,
     resource_profile: str | None = None,
+    resume_historical_stage: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded catalogue refresh/resume or verify-and-activate a publication."""
     preflight_started = time.monotonic()
@@ -4469,6 +5215,10 @@ def run_production(
         supersede_offline_window=supersede_offline_window,
         resource_profile=resource_profile,
     )
+    if resume_historical_stage is not None:
+        _validate_historical_stage(resume_historical_stage)
+        if mode != "historical":
+            raise RunnerError("--resume-historical-stage requires --historical --capture-id")
     if reconcile_stopped_worker:
         if (
             mode != "historical"
@@ -4578,6 +5328,15 @@ def run_production(
                 "accounting_complete": True,
             }
         report["revision"] = _revision()
+        if mode == "historical":
+            _record_historical_invocation(
+                report,
+                resume_historical_stage,
+                revision=report["revision"],
+            )
+        else:
+            report["resume_historical_stage"] = None
+            report.pop("active_invocation_id", None)
         report["source_root"] = str(SOURCE_ROOT)
         prior_volume_uuid = report.get("system", {}).get("filesystem_volume_uuid")
         report["system"] = _system_info(directory)
@@ -5320,6 +6079,25 @@ def _activation_worker(
             if session_report is not None
             else _limits_for_profile(profile)
         )
+        remaining = None
+        if session_report is not None:
+            if "offline_historical_window" in session_report:
+                window = _validate_offline_historical_window(
+                    session_report, str(session_report.get("capture_id"))
+                )
+                remaining = min(
+                    float(window["deadline_epoch"]) - time.time(),
+                    float(window["deadline_monotonic"]) - time.monotonic(),
+                    float(window["started_monotonic"])
+                    + float(limits["active_cutoff_seconds"])
+                    - time.monotonic(),
+                )
+            else:
+                remaining = _monitor_deadline(session_report, workflow=False) - time.monotonic()
+            remaining -= float(limits["terminate_seconds"])
+            if remaining <= 0:
+                raise BudgetStop("no activation time remains in the approved session")
+        expected_observations = None
         if catalogue_version == 3:
             current = _strict_json(operator / "current-historical.json")
             if current is None or current.get("source_release_id") != release_id:
@@ -5350,6 +6128,11 @@ def _activation_worker(
                 raise RunnerError(
                     "expanded activation release does not match its stopped session capture"
                 )
+            build = _strict_json(operator / "builds-historical" / current_capture / "build.json")
+            if build is not None and "observation_count" in build:
+                expected_observations = build["observation_count"]
+                if type(expected_observations) is not int or expected_observations < 0:
+                    raise RunnerError("historical build observation count is invalid")
             if profile == "default":
                 source = operator / "builds-historical" / current_capture / "warehouse.duckdb"
                 try:
@@ -5378,6 +6161,8 @@ def _activation_worker(
             catalogue_version=catalogue_version,
             max_database_bytes=int(limits["database_bytes"]),
             max_temp_bytes=int(limits["temporary_bytes"]),
+            max_duration_seconds=remaining,
+            expected_observations=expected_observations,
         )
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return 0
@@ -5408,6 +6193,10 @@ def main(argv: list[str] | None = None) -> int:
         "--historical-resource-profile",
         choices=tuple(RESOURCE_PROFILES),
         help="select the sealed storage policy for offline historical completion",
+    )
+    parser.add_argument(
+        "--resume-historical-stage",
+        help="resume the exact saved build-historical stage for this capture",
     )
     parser.add_argument(
         "--offline-duration-seconds",
@@ -5462,6 +6251,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     except RunnerError as exc:
         parser.error(str(exc))
+    if args.resume_historical_stage is not None:
+        try:
+            _validate_historical_stage(args.resume_historical_stage)
+        except RunnerError as exc:
+            parser.error(str(exc))
+        if not args.historical or not args.capture_id:
+            parser.error("--resume-historical-stage requires --historical --capture-id")
     if args.reconcile_accounting and (not args.capture_id or args.historical):
         parser.error("--reconcile-accounting requires a network --capture-id resume")
     if args.reconcile_stopped_worker and (
@@ -5509,6 +6305,7 @@ def main(argv: list[str] | None = None) -> int:
                 recovery_volume_uuid=args.recovery_volume_uuid,
                 reconcile_stopped_worker=args.reconcile_stopped_worker,
                 resource_profile=args.historical_resource_profile,
+                resume_historical_stage=args.resume_historical_stage,
             )
     except (BudgetStop, RunnerInterrupted) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
@@ -5958,6 +6755,8 @@ def _load_resume(
             "last_observed_epoch": report.get("last_observed_epoch"),
             "resource_peaks": prior_resource_peaks,
         }
+        if isinstance(report.get("storage_safety_stop"), dict):
+            previous_stop["storage_safety_stop"] = report["storage_safety_stop"]
         if isinstance(report.get("memory_sample_error"), str):
             previous_stop["memory_sample_error"] = report["memory_sample_error"]
         history = report.get("stop_history", [])
@@ -5967,6 +6766,7 @@ def _load_resume(
         report["stop_history"] = history[-64:]
         report["previous_stop"] = previous_stop
     report.pop("memory_sample_error", None)
+    report.pop("storage_safety_stop", None)
     report["error"] = None
     report["recovery"] = None
     # Keep an offline grant in the durable stopped state until the first processing child
@@ -6234,6 +7034,7 @@ def _refresh_worker_main(
         return 1
     token = None
     try:
+        resume_stage = _session_historical_stage(report, mode)
         profile, _ = _session_resource_profile(
             report_path, expected_profile, capture_id if mode != "full" else None
         )
@@ -6288,6 +7089,11 @@ def _refresh_worker_main(
                         historical=mode == "historical",
                         compression=compression,
                         rate_policy=rate_policy,
+                        **(
+                            {"resume_historical_stage": resume_stage}
+                            if resume_stage is not None
+                            else {}
+                        ),
                         on_capture_id=(
                             None
                             if mode == "historical"

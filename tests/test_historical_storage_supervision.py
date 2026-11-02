@@ -123,6 +123,21 @@ def test_live_storage_stops_on_temporary_burst_above_category_threshold(producti
     assert reason == "live temporary storage reached the 56 GiB stop threshold"
 
 
+def test_activation_readback_spill_is_a_registered_accounted_workspace(production, tmp_path):
+    directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
+        tmp_path, production
+    )
+    state = production._begin_storage_supervision(directory, operator, report, progress, external)
+    spill = operator / "tmp" / f"activation-readback-{'c' * 32}" / "spill.tmp"
+    spill.parent.mkdir(parents=True)
+    spill.write_bytes(b"x" * 4096)
+    assert (
+        production._sample_live_storage(directory, operator, report, state, progress, external)
+        is None
+    )
+    assert state["current"]["operator_temporary_bytes"] == 4096
+
+
 def test_live_storage_accounts_filelock_metadata_mutation(production, tmp_path):
     directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
         tmp_path, production
@@ -531,8 +546,8 @@ def test_initial_historical_preflight_finishes_validated_retirement_before_stora
     production, monkeypatch, tmp_path
 ):
     events = []
-    root = tmp_path / "operator"
-    root.mkdir()
+    root = tmp_path / "production" / "operator"
+    root.mkdir(parents=True)
     (root / "raw").mkdir()
     capture_id = "a" * 32
     root_id = "b" * 32

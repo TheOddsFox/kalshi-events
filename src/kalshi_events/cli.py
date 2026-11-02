@@ -118,6 +118,7 @@ def parser() -> argparse.ArgumentParser:
         if name == "refresh":
             command.add_argument("--full", action="store_true")
             command.add_argument("--capture-id")
+            command.add_argument("--resume-historical-stage")
             command.add_argument("--compression", choices=("identity", "gzip"), default=None)
             command.add_argument(
                 "--rate-policy", choices=("fixed", "decrease-on-429"), default=None
@@ -502,6 +503,14 @@ def _refresh_main(args: argparse.Namespace) -> int:
     try:
         if args.full and args.capture_id is not None:
             raise CatalogueError("--full and --capture-id cannot be used together")
+        resume_stage = getattr(args, "resume_historical_stage", None)
+        if resume_stage is not None and (
+            series_command
+            or not getattr(args, "historical", False)
+            or args.full
+            or args.capture_id is None
+        ):
+            raise CatalogueError("--resume-historical-stage requires --historical --capture-id")
         limits = Limits(**{field: getattr(args, field) for field in Limits.__dataclass_fields__})
         checkout = _checkout_root()
         root = _operator_root(args.root, checkout=checkout)
@@ -544,6 +553,11 @@ def _refresh_main(args: argparse.Namespace) -> int:
                     compression=args.compression,
                     rate_policy=args.rate_policy,
                     **({"historical": True} if getattr(args, "historical", False) else {}),
+                    **(
+                        {"resume_historical_stage": resume_stage}
+                        if resume_stage is not None
+                        else {}
+                    ),
                 )
                 if series_command:
                     result["series_scope"] = store.scope
