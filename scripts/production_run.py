@@ -520,6 +520,139 @@ def _validate_current_processing_launch(
     return checks_path, checks_raw, current_revision
 
 
+def _validate_inherited_launch_stdout(
+    *,
+    launch_path: Path,
+    launch: dict[str, Any],
+    report: dict[str, Any],
+    capture_id: str,
+    processing_revision: str,
+    stdout: Path,
+    stdout_info: os.stat_result,
+    runtime_root: Path,
+) -> None:
+    import stat
+
+    from kalshi_events.common import regular_bytes, safe_path
+
+    runtime_root = safe_path(runtime_root)
+    current_runtime = launch_path.parent
+    authorization = launch.get("continuation_authorization")
+    if not isinstance(authorization, dict):
+        raise RunnerError("inherited stdout has no continuation archive binding")
+    approval_id = authorization.get("approval_id")
+    if not isinstance(approval_id, str) or not re.fullmatch(r"[0-9a-f]{32}", approval_id):
+        raise RunnerError("inherited stdout continuation archive identity is invalid")
+
+    archive_root = current_runtime / "continuation-archives"
+    archive_directory = archive_root / approval_id
+    failed_path = archive_directory / "failed-latest-launch.json"
+    approval_path = archive_directory / "approval.json"
+    if authorization.get("failed_latch_archive") != str(failed_path) or authorization.get(
+        "approval_archive"
+    ) != str(approval_path):
+        raise RunnerError("inherited stdout archive paths are outside the current runtime")
+
+    try:
+        runtime_info = runtime_root.lstat()
+        current_info = current_runtime.lstat()
+        archive_root_info = archive_root.lstat()
+        archive_info = archive_directory.lstat()
+    except OSError as exc:
+        raise RunnerError("inherited stdout continuation archive is missing or unsafe") from exc
+    if (
+        not stat.S_ISDIR(runtime_info.st_mode)
+        or not stat.S_ISDIR(current_info.st_mode)
+        or not stat.S_ISDIR(archive_root_info.st_mode)
+        or not stat.S_ISDIR(archive_info.st_mode)
+        or current_info.st_dev != runtime_info.st_dev
+        or archive_root_info.st_dev != runtime_info.st_dev
+        or archive_info.st_dev != runtime_info.st_dev
+        or current_info.st_uid != os.geteuid()
+        or archive_root_info.st_uid != os.geteuid()
+        or archive_info.st_uid != os.geteuid()
+        or stat.S_IMODE(archive_root_info.st_mode) & 0o077
+        or stat.S_IMODE(archive_info.st_mode) & 0o077
+    ):
+        raise RunnerError("inherited stdout continuation archive directory is unsafe")
+
+    def read_archive(path: Path, digest_value: Any) -> tuple[dict[str, Any], str]:
+        if not isinstance(digest_value, str) or not re.fullmatch(r"[0-9a-f]{64}", digest_value):
+            raise RunnerError("inherited stdout archive checksum is malformed")
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise RunnerError("inherited stdout archive file is missing or unsafe") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_dev != runtime_info.st_dev
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise RunnerError("inherited stdout archive file is unsafe")
+        raw = regular_bytes(path, MIB)
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != digest_value:
+            raise RunnerError("inherited stdout archive checksum does not match")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise RunnerError("inherited stdout archive JSON is malformed") from exc
+        if not isinstance(value, dict):
+            raise RunnerError("inherited stdout archive JSON is malformed")
+        return value, digest
+
+    failed, failed_digest = read_archive(failed_path, authorization.get("failed_latch_sha256"))
+    approval, _ = read_archive(approval_path, authorization.get("approval_sha256"))
+    old_revision = launch.get("revision")
+    if (
+        not isinstance(old_revision, str)
+        or not REVISION.fullmatch(old_revision)
+        or failed.get("state") != "preflight_or_launch_failed"
+        or failed.get("session") != launch.get("session")
+        or failed.get("capture_id") != capture_id
+        or failed.get("root_id") != report.get("root_id")
+        or failed.get("revision") != old_revision
+        or failed.get("stdout") != launch.get("stdout")
+        or launch.get("stdout") != str(stdout)
+        or failed.get("offline_only") is not True
+        or failed.get("automatic_retry") is not False
+        or approval.get("approval_id") != approval_id
+        or approval.get("action") != "continue_reconciled_cleanup_once"
+        or approval.get("capture_id") != capture_id
+        or approval.get("root_id") != report.get("root_id")
+        or approval.get("revision") != processing_revision
+        or approval.get("failed_launch_sha256") != failed_digest
+    ):
+        raise RunnerError("inherited stdout does not match its approved failed launch")
+
+    try:
+        relative_stdout = stdout.relative_to(runtime_root)
+        runtime_entry = runtime_root / relative_stdout.parts[0]
+        run_directory = runtime_entry / relative_stdout.parts[1]
+        runtime_entry_info = runtime_entry.lstat()
+        run_info = run_directory.lstat()
+    except (OSError, ValueError, IndexError) as exc:
+        raise RunnerError("inherited stdout is outside managed runtime logs") from exc
+    if (
+        len(relative_stdout.parts) != 3
+        or relative_stdout.name != "stdout.log"
+        or not relative_stdout.parts[1].startswith("run-")
+        or stdout.parent != run_directory
+        or stdout.parent.parent != runtime_entry
+        or runtime_entry.parent != runtime_root
+        or stdout.parent.parent == current_runtime
+        or not stat.S_ISDIR(runtime_entry_info.st_mode)
+        or not stat.S_ISDIR(run_info.st_mode)
+        or runtime_entry_info.st_dev != runtime_info.st_dev
+        or run_info.st_dev != runtime_info.st_dev
+        or stdout_info.st_dev != runtime_info.st_dev
+        or stdout_info.st_nlink != 1
+    ):
+        raise RunnerError("inherited stdout is not a same-device managed runtime log")
+
+
 def _temporary_storage_stop_evidence(
     report: dict[str, Any],
     capture_id: str,
@@ -3861,8 +3994,21 @@ def _stopped_worker_evidence(
         stdout_info = stdout.lstat()
     except OSError as exc:
         raise RunnerError("latest-launch stdout path is unsafe") from exc
-    if not stat.S_ISREG(stdout_info.st_mode) or stdout.parent.parent != source_root.parent:
-        raise RunnerError("latest-launch stdout path is outside its managed run")
+    if not stat.S_ISREG(stdout_info.st_mode):
+        raise RunnerError("latest-launch stdout is unsafe")
+    if stdout.parent.parent != source_root.parent:
+        if revision_source != "processing_revision":
+            raise RunnerError("latest-launch stdout path is outside its managed run")
+        _validate_inherited_launch_stdout(
+            launch_path=launch_path,
+            launch=launch,
+            report=report,
+            capture_id=capture_id,
+            processing_revision=launch.get("processing_revision"),
+            stdout=stdout,
+            stdout_info=stdout_info,
+            runtime_root=runtime_root,
+        )
     original_group = report.get("active_process_group")
     typed_stop = report.get("storage_safety_stop")
     derived_temporary_stop = typed_stop is None and revision_source == "processing_revision"

@@ -390,6 +390,14 @@ its deadline.
 
 Stopped-worker reconciliation is explicit and historical-only. Preserve the saved failure and process evidence; validate root, boot, capture, locks and absence of the original owned processes before clearing stale process state. Group absence observed later does not establish that the supervisor previously reaped the child. A new offline grant preserves all old grants, consumed extensions and lifetime reserved-upper-bound accounting. No networking or automatic retry is permitted.
 
+For a verified legacy continuation, an inherited stdout log in an earlier
+managed runtime is accepted only when its exact path is bound by the private,
+checksummed failed-launch and approval archives for the same capture, root and
+processing revision. Ordinary launches retain the current-runtime restriction.
+Preserve the producer's timezone when reconciling older sessions: their saved
+boot stamp includes local display text. UTC process-identity queries must scope
+their timezone override to that query.
+
 Run reconciliation from the canonical verified checkout, using the tested
 interpreter. Its managed-runtime lookup is relative to the script's source
 checkout; invoking a copied script inside a frozen runtime does not relocate

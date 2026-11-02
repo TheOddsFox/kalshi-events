@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import sys
@@ -425,6 +426,77 @@ def _current_temporary_stop(tmp_path, production, monkeypatch):
     return directory, operator, report_path, report, group, pid, launch
 
 
+def _bind_inherited_stdout(tmp_path, report_path, report, launch):
+    runtime_directory = Path(report["source_root"]).parent
+    runtime_root = runtime_directory.parent
+    run_set = runtime_root / "previous-projection-run"
+    run_directory = run_set / "run-20261102T082419Z-01234567"
+    run_directory.mkdir(parents=True, mode=0o700)
+    run_set.chmod(0o700)
+    stdout = run_directory / "stdout.log"
+    stdout.write_bytes(b"inherited historical runner log\n")
+
+    approval_id = "9" * 32
+    archive_directory = runtime_directory / "continuation-archives" / approval_id
+    archive_directory.mkdir(parents=True, mode=0o700)
+    archive_directory.parent.chmod(0o700)
+    archive_directory.chmod(0o700)
+    failed_path = archive_directory / "failed-latest-launch.json"
+    approval_path = archive_directory / "approval.json"
+    failed = {
+        "state": "preflight_or_launch_failed",
+        "session": str(report_path),
+        "capture_id": report["capture_id"],
+        "root_id": report["root_id"],
+        "revision": launch["revision"],
+        "stdout": str(stdout),
+        "offline_only": True,
+        "automatic_retry": False,
+    }
+
+    def archive_json(path, value):
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        return hashlib.sha256(raw).hexdigest()
+
+    failed_sha = archive_json(failed_path, failed)
+    approval = {
+        "approval_id": approval_id,
+        "action": "continue_reconciled_cleanup_once",
+        "capture_id": report["capture_id"],
+        "root_id": report["root_id"],
+        "revision": launch["processing_revision"],
+        "failed_launch_sha256": failed_sha,
+    }
+    approval_sha = archive_json(approval_path, approval)
+    launch["stdout"] = str(stdout)
+    launch["continuation_authorization"] = {
+        "approval_id": approval_id,
+        "failed_latch_archive": str(failed_path),
+        "failed_latch_sha256": failed_sha,
+        "approval_archive": str(approval_path),
+        "approval_sha256": approval_sha,
+    }
+    source_runtime = runtime_directory
+    (source_runtime / "latest-launch.json").write_text(json.dumps(launch), encoding="utf-8")
+    return stdout, failed_path, approval_path, failed, approval
+
+
+def _rewrite_inherited_archive_bindings(launch, failed_path, approval_path, failed, approval):
+    auth = launch["continuation_authorization"]
+    failed_raw = (json.dumps(failed, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    failed_path.write_bytes(failed_raw)
+    failed_path.chmod(0o600)
+    failed_sha = hashlib.sha256(failed_raw).hexdigest()
+    approval["failed_launch_sha256"] = failed_sha
+    approval_raw = (json.dumps(approval, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    approval_path.write_bytes(approval_raw)
+    approval_path.chmod(0o600)
+    auth["failed_latch_sha256"] = failed_sha
+    auth["approval_sha256"] = hashlib.sha256(approval_raw).hexdigest()
+
+
 def test_current_processing_revision_reconciles_typed_temp_stop_and_keeps_evidence(
     production, tmp_path, monkeypatch
 ):
@@ -491,6 +563,87 @@ def test_old_processing_revision_binds_under_new_reconciler_and_tampering_fails(
     (source_runtime / "latest-launch.json").write_text(json.dumps(launch), encoding="utf-8")
     with pytest.raises(production.RunnerError, match="not bound to this stopped session"):
         production._stopped_worker_evidence(directory, report_path, report, CAPTURE_ID)
+
+
+def test_current_processing_revision_accepts_checksummed_inherited_managed_stdout(
+    production, tmp_path, monkeypatch
+):
+    directory, _operator, report_path, report, _group, _pid, launch = _current_temporary_stop(
+        tmp_path, production, monkeypatch
+    )
+    stdout, _failed_path, _approval_path, _failed, _approval = _bind_inherited_stdout(
+        tmp_path, report_path, report, launch
+    )
+    monkeypatch.setattr(production, "_revision", lambda: RECONCILIATION_REVISION)
+
+    evidence, *_ = production._stopped_worker_evidence(directory, report_path, report, CAPTURE_ID)
+
+    assert evidence["launch_revision_source"] == "processing_revision"
+    assert Path(launch["stdout"]) == stdout
+
+
+@pytest.mark.parametrize("field", ("root_id", "capture_id"))
+def test_inherited_stdout_rejects_wrong_archived_capture_or_root(
+    production, tmp_path, monkeypatch, field
+):
+    directory, _operator, report_path, report, _group, _pid, launch = _current_temporary_stop(
+        tmp_path, production, monkeypatch
+    )
+    _, failed_path, approval_path, failed, approval = _bind_inherited_stdout(
+        tmp_path, report_path, report, launch
+    )
+    failed[field] = "f" * 32
+    _rewrite_inherited_archive_bindings(launch, failed_path, approval_path, failed, approval)
+    source_runtime = Path(report["source_root"]).parent
+    (source_runtime / "latest-launch.json").write_text(json.dumps(launch), encoding="utf-8")
+    monkeypatch.setattr(production, "_revision", lambda: RECONCILIATION_REVISION)
+
+    with pytest.raises(production.RunnerError, match="approved failed launch"):
+        production._stopped_worker_evidence(directory, report_path, report, CAPTURE_ID)
+
+
+def test_inherited_stdout_rejects_tampered_archive_hash_and_unrelated_log(
+    production, tmp_path, monkeypatch
+):
+    directory, _operator, report_path, report, _group, _pid, launch = _current_temporary_stop(
+        tmp_path, production, monkeypatch
+    )
+    stdout, failed_path, approval_path, failed, approval = _bind_inherited_stdout(
+        tmp_path, report_path, report, launch
+    )
+    failed_path.write_bytes(failed_path.read_bytes() + b"tampered\n")
+    source_runtime = Path(report["source_root"]).parent
+    (source_runtime / "latest-launch.json").write_text(json.dumps(launch), encoding="utf-8")
+    monkeypatch.setattr(production, "_revision", lambda: RECONCILIATION_REVISION)
+
+    with pytest.raises(production.RunnerError, match="archive checksum"):
+        production._stopped_worker_evidence(directory, report_path, report, CAPTURE_ID)
+
+    _rewrite_inherited_archive_bindings(launch, failed_path, approval_path, failed, approval)
+    unrelated = stdout.parent.parent / "unrelated.log"
+    unrelated.write_bytes(b"not the archived run stdout\n")
+    launch["stdout"] = str(unrelated)
+    (source_runtime / "latest-launch.json").write_text(json.dumps(launch), encoding="utf-8")
+    with pytest.raises(production.RunnerError, match="approved failed launch"):
+        production._stopped_worker_evidence(directory, report_path, report, CAPTURE_ID)
+
+
+def test_session_revision_keeps_the_normal_stdout_parent_restriction(
+    production, tmp_path, monkeypatch
+):
+    directory, _operator, report_path, report, _group, _pid, launch = _current_temporary_stop(
+        tmp_path, production, monkeypatch
+    )
+    stdout, _failed_path, _approval_path, _failed, _approval = _bind_inherited_stdout(
+        tmp_path, report_path, report, launch
+    )
+    launch["revision"] = report["revision"]
+    source_runtime = Path(report["source_root"]).parent
+    (source_runtime / "latest-launch.json").write_text(json.dumps(launch), encoding="utf-8")
+
+    with pytest.raises(production.RunnerError, match="stdout path is outside its managed run"):
+        production._stopped_worker_evidence(directory, report_path, report, CAPTURE_ID)
+    assert stdout.is_file()
 
 
 def test_temporary_stop_evidence_survives_eprem_process_group_probe(
