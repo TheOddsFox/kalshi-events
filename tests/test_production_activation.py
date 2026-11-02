@@ -160,7 +160,7 @@ def test_expanded_activation_accepts_a_mocked_sparse_warehouse_over_64_gib(
     )
 
     assert result["state"] == "verified"
-    assert observed_limits == [128 * 1024**3, 128 * 1024**3]
+    assert observed_limits == [128 * 1024**3] * 4
 
 
 def test_historical_activation_only_rejects_over_default_database_limit(
