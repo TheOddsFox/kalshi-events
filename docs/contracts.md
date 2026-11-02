@@ -404,6 +404,6 @@ checkout; invoking a copied script inside a frozen runtime does not relocate
 that lookup through the project-data environment setting. The exact memory
 snapshot-unavailable stop also supports a structured, zero-network evidence path
 bound to the saved UTC launch identity and report hashes. Original storage-stop
-evidence requirements remain unchanged. Distinct verified memory-stop attempts
+evidence requirements remain unchanged. Distinct verified memory-stop and typed temporary-storage-stop attempts
 may append reconciliation records for the same session; exact events are
 idempotent and conflicting records for the same attempt are rejected.

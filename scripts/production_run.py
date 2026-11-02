@@ -4628,7 +4628,7 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
                     raise RunnerError("stopped-worker inputs changed during reconciliation")
                 require_storage_processes_absent()
             audit = _append_stopped_worker_audit(
-                operator, audit, allow_distinct_attempts=memory_stop
+                operator, audit, allow_distinct_attempts=memory_stop or typed_temporary_stop
             )
             report["active_process_group"] = None
             report["stopped_worker_reconciliation"] = {

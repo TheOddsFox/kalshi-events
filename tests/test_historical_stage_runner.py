@@ -545,6 +545,89 @@ def test_current_processing_revision_reconciles_typed_temp_stop_and_keeps_eviden
     )
 
 
+def _seed_prior_reconciliation_audit(
+    operator: Path,
+    report: dict,
+    *,
+    supervisor_pid: int,
+    supervisor_pgid: int | None,
+    stale_process_group: int,
+) -> dict:
+    entry = {
+        "version": 1,
+        "event_id": hashlib.sha256(
+            f"prior-{supervisor_pid}-{stale_process_group}".encode()
+        ).hexdigest(),
+        "reconciled_at": "2026-11-01T12:00:00+00:00",
+        "session_id": report["session_id"],
+        "capture_id": report["capture_id"],
+        "root_id": report["root_id"],
+        "supervisor_pid": supervisor_pid,
+        "stale_process_group": stale_process_group,
+    }
+    if supervisor_pgid is not None:
+        entry["supervisor_pgid"] = supervisor_pgid
+    path = operator / "stopped-worker-reconciliation.jsonl"
+    path.write_text(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+    path.chmod(0o600)
+    return entry
+
+
+def test_temporary_stop_appends_new_owned_attempt_and_preserves_prior_audit(
+    production, tmp_path, monkeypatch
+):
+    directory, operator, report_path, report, group, pid, _launch = _current_temporary_stop(
+        tmp_path, production, monkeypatch
+    )
+    prior = _seed_prior_reconciliation_audit(
+        operator,
+        report,
+        supervisor_pid=pid + 10,
+        supervisor_pgid=None,
+        stale_process_group=group + 10,
+    )
+    monkeypatch.setattr(production, "_revision", lambda: RECONCILIATION_REVISION)
+    monkeypatch.setattr(production, "_pid_exists", lambda _pid: False)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+
+    result = production._reconcile_stopped_worker(directory, CAPTURE_ID)
+
+    entries = [
+        json.loads(line)
+        for line in (operator / "stopped-worker-reconciliation.jsonl").read_text().splitlines()
+    ]
+    assert result["active_process_group"] is None
+    assert len(entries) == 2
+    assert entries[0] == prior
+    assert entries[1]["supervisor_pid"] == pid
+    assert entries[1]["stale_process_group"] == group
+    assert production._strict_json(report_path)["active_process_group"] is None
+
+
+def test_temporary_stop_rejects_conflicting_audit_for_same_attempt(
+    production, tmp_path, monkeypatch
+):
+    directory, operator, _report_path, report, group, pid, _launch = _current_temporary_stop(
+        tmp_path, production, monkeypatch
+    )
+    _seed_prior_reconciliation_audit(
+        operator,
+        report,
+        supervisor_pid=pid,
+        supervisor_pgid=pid,
+        stale_process_group=group,
+    )
+    monkeypatch.setattr(production, "_revision", lambda: RECONCILIATION_REVISION)
+    monkeypatch.setattr(production, "_pid_exists", lambda _pid: False)
+    monkeypatch.setattr(production, "_process_group_exists", lambda _group: False)
+
+    with pytest.raises(production.RunnerError, match="different reconciliation audit"):
+        production._reconcile_stopped_worker(directory, CAPTURE_ID)
+
+    entries = (operator / "stopped-worker-reconciliation.jsonl").read_text().splitlines()
+    assert len(entries) == 1
+
+
 def test_old_processing_revision_binds_under_new_reconciler_and_tampering_fails(
     production, tmp_path, monkeypatch
 ):

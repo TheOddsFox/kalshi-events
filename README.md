@@ -489,7 +489,7 @@ tests or counting saved observations is not production acceptance. See
 [capacity validation](docs/performance.md#final-historical-admission-check).
 
 
-The operator approved one saved-stage continuation; it has not started and is not a capacity-admission or completion result. After source verification, reconcile the stopped worker first:
+A saved-stage continuation requires explicit operator approval and is not a capacity-admission or completion result. After source verification, reconcile the stopped worker first:
 
 ```sh
 python scripts/run-production.py \
@@ -498,7 +498,7 @@ python scripts/run-production.py \
   --reconcile-stopped-worker
 ```
 
-Reconciliation starts no worker and grants no processing time. After it succeeds, a staged continuation must name the exact stopped historical stage basename from the report. The all-zero stage below is a placeholder, not a stage to use; replace both placeholders only after reviewing the saved report and verified source. A single 24-hour outer offline attempt is approved but has not started:
+Reconciliation starts no worker and grants no processing time. After it succeeds, a staged continuation must name the exact stopped historical stage basename from the report. The all-zero stage below is a placeholder, not a stage to use; replace both placeholders only after reviewing the saved report and verified source. The example below uses a 24-hour outer offline allowance. Its clock starts before preflight; a failed preflight does not reset it, and another attempt requires explicit authorization:
 
 ```sh
 python scripts/run-production.py \
