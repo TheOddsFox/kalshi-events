@@ -36,6 +36,39 @@ OVERLAP = timedelta(minutes=5)
 SERIES_CONTRACT = "oddsfox.kalshi.series.v1"
 CATALOGUE_V2_CONTRACT = "oddsfox.kalshi.catalogue.v2"
 HISTORICAL_CONTRACT = "oddsfox.kalshi.historical.v1"
+MAX_RETIREMENT_PLAN_BYTES = 128 * 1024**2
+MAX_RETIREMENT_ENTRIES = 250_000
+MAX_RETIREMENT_PROGRESS_LINE_BYTES = 64 * 1024
+
+
+def _retirement_progress_lines(store: Store, path: Path) -> Iterator[bytes]:
+    if not path.is_file() or path.stat().st_size > min(
+        store.limits.max_root_bytes, 4 * MAX_RETIREMENT_PLAN_BYTES
+    ):
+        raise CatalogueError("retirement progress exceeds its metadata bound")
+    committed = 0
+    with path.open("r+b") as stream:
+        while line := stream.readline(MAX_RETIREMENT_PROGRESS_LINE_BYTES + 1):
+            store.check_deadline()
+            if len(line) > MAX_RETIREMENT_PROGRESS_LINE_BYTES:
+                raise CatalogueError("retirement progress record exceeds its metadata bound")
+            if not line.endswith(b"\n"):
+                stream.truncate(committed)
+                stream.flush()
+                os.fsync(stream.fileno())
+                store.sync("prune-progress.jsonl")
+                return
+            yield line
+            committed += len(line)
+
+
+def _write_retirement_plan(store: Store, plan: dict[str, Any]) -> None:
+    if len(plan["entries"]) > MAX_RETIREMENT_ENTRIES:
+        raise CatalogueError("retirement plan exceeds its entry bound")
+    body = json_bytes(plan)
+    if len(body) > MAX_RETIREMENT_PLAN_BYTES:
+        raise CatalogueError("retirement plan exceeds its metadata bound")
+    store.write_bytes("prune-plan.json", body)
 
 
 def pointer_profile(store: Store) -> tuple[str, int, str]:
@@ -1073,7 +1106,16 @@ def _validate_retirement_artifact(store: Store, path: Path, root: str, identity:
     )
     if actual != identity:
         raise CatalogueError("retirement artifact identity mismatch")
-    return value.get("capture_id") if root == "raw" else identity
+    if root == "raw":
+        capture_id = value.get("capture_id")
+        if (
+            not isinstance(capture_id, str)
+            or len(capture_id) != 32
+            or any(character not in "0123456789abcdef" for character in capture_id)
+        ):
+            raise CatalogueError("raw retirement source lacks a capture identity")
+        return capture_id
+    return identity
 
 
 def _finish_retirement_plan(store: Store) -> None:
@@ -1090,7 +1132,9 @@ def _finish_retirement_plan(store: Store) -> None:
             store.remove("prune-progress.jsonl")
             fsync_directory(store.root)
         return
-    plan_body = regular_bytes(plan_path, store.limits.max_root_bytes)
+    plan_body = regular_bytes(
+        plan_path, min(store.limits.max_root_bytes, MAX_RETIREMENT_PLAN_BYTES)
+    )
     plan = decode(plan_body)
     if (
         not isinstance(plan, dict)
@@ -1103,7 +1147,11 @@ def _finish_retirement_plan(store: Store) -> None:
     ):
         raise CatalogueError("invalid durable prune plan")
     entries = plan["entries"]
-    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+    if (
+        not isinstance(entries, list)
+        or len(entries) > MAX_RETIREMENT_ENTRIES
+        or any(not isinstance(entry, dict) for entry in entries)
+    ):
         raise CatalogueError("invalid durable prune plan entries")
     if plan.get("kind") == "discard" and (
         not isinstance(plan.get("capture_id"), str)
@@ -1134,17 +1182,7 @@ def _finish_retirement_plan(store: Store) -> None:
     plan_sha256 = hashlib.sha256(plan_body).hexdigest()
     progress: dict[int, dict[str, Any]] = {}
     if progress_path.exists():
-        progress_body = regular_bytes(progress_path, store.limits.max_root_bytes)
-        lines = progress_body.splitlines(keepends=True)
-        if lines and not lines[-1].endswith(b"\n"):
-            committed = b"".join(lines[:-1])
-            with progress_path.open("r+b") as stream:
-                stream.truncate(len(committed))
-                stream.flush()
-                os.fsync(stream.fileno())
-            store.sync("prune-progress.jsonl")
-            lines = lines[:-1]
-        for index, line in enumerate(lines):
+        for index, line in enumerate(_retirement_progress_lines(store, progress_path)):
             record = decode(line)
             if (
                 not isinstance(record, dict)
@@ -1327,15 +1365,27 @@ def _finish_retirement_plan(store: Store) -> None:
         target = store.path(entry["target"])
         root, identity = Path(entry["source"]).parts
         started = index in progress
+        capture_id = None
         if source.exists():
-            _validate_retirement_artifact(store, source, root, identity)
+            capture_id = _validate_retirement_artifact(store, source, root, identity)
             if target.exists():
                 raise CatalogueError("prune plan source and tombstone both exist")
         elif target.exists():
             if not started or path_is_link(target) or not target.is_dir():
                 raise CatalogueError("untracked prune tombstone; refusing cleanup")
+            if root == "raw" and (target / "manifest.json").exists():
+                capture_id = _validate_retirement_artifact(store, target, root, identity)
         elif not started:
             raise CatalogueError("untracked missing prune source; refusing cleanup")
+        if root == "raw" and started:
+            recorded_capture = progress[index].get("capture_id")
+            if (
+                not isinstance(recorded_capture, str)
+                or len(recorded_capture) != 32
+                or any(character not in "0123456789abcdef" for character in recorded_capture)
+                or (capture_id is not None and recorded_capture != capture_id)
+            ):
+                raise CatalogueError("raw retirement progress lacks a matching capture identity")
 
     if path_is_link(trash) or (trash.exists() and not trash.is_dir()):
         raise CatalogueError("prune-trash is not a canonical directory")
@@ -1586,6 +1636,13 @@ def _prune_locked(
             if baseline_started is not None:
                 full_cutoffs.append(baseline_started)
 
+    # Targeted evidence never enters catalogue retirement selection.
+    targeted = {
+        identity
+        for identity, capture_state in capture_states.items()
+        if capture_state.get("selected") is not None
+    }
+    keep_captures.update(targeted)
     raw_dirs: set[Path] = set()
     raw_root = store.path("raw")
     verified_raw_owners = {
@@ -1601,20 +1658,8 @@ def _prune_locked(
             identity = manifest.get("capture_id")
         if identity in capture_states and identity not in keep_captures:
             raw_dirs.add(manifest_path.parent)
-
-    # Targeted metadata evidence is outside catalogue retention, even if an
-    # older publication predates that targeted capture.
-    targeted = {
-        identity
-        for identity, capture_state in capture_states.items()
-        if capture_state.get("selected") is not None
-    }
-    keep_captures.update(targeted)
-    raw_dirs = {
-        path
-        for path in raw_dirs
-        if decode(regular_bytes(path / "manifest.json", 1024**2)).get("capture_id") not in targeted
-    }
+            if len(raw_dirs) > MAX_RETIREMENT_ENTRIES:
+                raise CatalogueError("retirement selection exceeds its entry bound")
 
     remove: list[Path] = []
     for identity in sorted(capture_states):
@@ -1672,6 +1717,8 @@ def _prune_locked(
     for path in remove:
         if not path.exists():
             continue
+        if len(entries) >= MAX_RETIREMENT_ENTRIES:
+            raise CatalogueError("retirement plan exceeds its entry bound")
         relative = path.relative_to(store.root).as_posix()
         entries.append(
             {
@@ -1688,7 +1735,7 @@ def _prune_locked(
         return removed_captures
     # No cached proof is used after retention has selected the complete removal set.
     context.captures.clear()
-    store.write("prune-plan.json", {"version": 1, "kind": "prune", "entries": entries})
+    _write_retirement_plan(store, {"version": 1, "kind": "prune", "entries": entries})
     fsync_directory(store.root)
     _finish_retirement_plan(store)
     # This capture remains reachable from the publication after the retirement
@@ -1780,14 +1827,16 @@ def _discard_locked(store: Store, capture_id: str) -> dict[str, Any]:
     for path in paths:
         if not path.exists():
             continue
+        if len(entries) >= MAX_RETIREMENT_ENTRIES:
+            raise CatalogueError("retirement plan exceeds its entry bound")
         entries.append(
             {
                 "source": path.relative_to(store.root).as_posix(),
                 "target": f"prune-trash/{uuid.uuid4().hex}-{path.parent.name}-{path.name}",
             }
         )
-    store.write(
-        "prune-plan.json",
+    _write_retirement_plan(
+        store,
         {"version": 1, "kind": "discard", "capture_id": capture_id, "entries": entries},
     )
     fsync_directory(store.root)
