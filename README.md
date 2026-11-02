@@ -489,7 +489,7 @@ tests or counting saved observations is not production acceptance. See
 [capacity validation](docs/performance.md#final-historical-admission-check).
 
 
-After final source verification and a passing capacity admission, reconcile an explicitly authorized stopped historical attempt first:
+The operator approved one saved-stage continuation; it has not started and is not a capacity-admission or completion result. After source verification, reconcile the stopped worker first:
 
 ```sh
 python scripts/run-production.py \
@@ -498,15 +498,16 @@ python scripts/run-production.py \
   --reconcile-stopped-worker
 ```
 
-Reconciliation starts no worker and grants no processing time. After it succeeds, start the separately authorized bounded resume:
+Reconciliation starts no worker and grants no processing time. After it succeeds, a staged continuation must name the exact stopped historical stage basename from the report. The all-zero stage below is a placeholder, not a stage to use; replace both placeholders only after reviewing the saved report and verified source. A single 24-hour outer offline attempt is approved but has not started:
 
 ```sh
 python scripts/run-production.py \
   --directory ./data/kalshi-production \
   --historical --capture-id CAPTURE_ID \
+  --resume-historical-stage build-historical-00000000000000000000000000000000 \
   --historical-resource-profile expanded \
   --renew-offline-window \
   --offline-duration-seconds 86280
 ```
 
-This grants at most 23 hours 58 minutes inside an outer 24-hour session, preserving startup/reporting headroom. Renewal requires both saved clocks to have expired. It never resets acquisition consumption or automatically retries. The October 30 and October 31 compression experiments did **not** pass capacity admission; do not run this command for that capture until the unresolved capacity gate is satisfied.
+Renewal requires the prior offline window to have expired on both clocks. If the operator explicitly authorizes replacing an unexpired window, use `--supersede-offline-window` instead; the old window and supersession remain in audit history. Neither option can be combined with `--reconcile-stopped-worker`; run reconciliation separately first. The requested 86,280 seconds leaves two minutes before the outer deadline. Renewal does not reset acquisition totals or limits and does not retry automatically. A stage resume is bound to the exact capture and historical mode, verifies the existing database and WAL in an isolated copy against fresh saved-receipt results, and does not fall back to loading a new stage. It preserves the source stage until verified adoption is durable. This is an offline build continuation, not a production acceptance claim. The October 30 and October 31 capacity experiments did **not** pass admission; see the dated correction and current stopped-session evidence in [performance guidance](docs/performance.md#stopped-historical-stage-and-continuation-correction-2026-11-02).

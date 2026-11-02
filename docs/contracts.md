@@ -337,13 +337,50 @@ Native loading uses the existing bounded Arrow batches, a fresh database and nat
 
 Historical observation history and current public relations may be views sharing canonical payload storage. Narrow current selections preserve received_at DESC, observation_id DESC, membership, parent eligibility, combo ordering and exact DECIMAL(38,18) conversions. Fresh compact historical builds join observation history to the narrow current relations in that order; already-certified cached warehouses retain their stored views and require an explicit rebuild to use the new plan. Read-only consumers require no application UDF, external dataset or extension. New historical exports use lossless Zstandard level 6; DuckDB relation COPYs also target 16 MiB row groups. This is a soft target, so an oversized single row remains valid. Changed physical bytes legitimately derive new checksums and release IDs. This is the historical exception to earlier unchanged-writer-settings guarantees.
 
-The historical export connection disables `preserve_insertion_order`; each relation
-still uses explicit, unique publication ordering keys. The setting is confined to
-the disposable read-only export instance, preserving warehouse settings and other
-contracts' export configuration. Memory, threads, spill reservations and deadlines
-retain their existing bounds.
+The disposable historical export connection disables insertion-order preservation
+while it writes bounded sorted Parquet runs. Runs use at most 4,096 rows or 8 MiB
+of UTF-8 values per batch and merge with at most eight open readers. Ordering uses
+the relation's exact global unique keys, UTF-8 bytes for strings and nulls last.
+The final DuckDB `COPY` uses one thread and preserves the sorted reader order, with
+Zstandard level 6 and a 16 MiB target row group. Output schema is checked against
+the warehouse relation. Sorted runs and checkpoints are private resumable work,
+not release certification; a current publication may skip a redundant
+export only when its capture, metadata, coverage and export-policy bindings still
+match exactly. Other contracts' export configuration is unchanged.
+The source DuckDB reader fetches up to 4,096 rows before byte splitting, so its
+input buffer can exceed 8 MiB for wide rows. The batch target does not bound total
+process memory; the existing pressure and RSS guards still apply.
 
-Storage monitoring uses verified baseline accounting plus measured mutable workspaces. Database and WAL bytes count together; a database under tmp also consumes temporary allowance. Under the default profile, database and temporary limits are each 64 GiB with 56 GiB cooperative stop thresholds. An explicitly selected offline historical `expanded` profile uses a 128 GiB database limit and 192 GiB temporary limit. Its report records 96/144 GiB forecast-admission thresholds; runtime baseline checks and stop thresholds are 112/168 GiB. Append-only report history seals monitoring policy version 1, including cooperative enforcement and acknowledged overshoot. Samples run once per second; they can overshoot and are not hard quotas. Per-batch checks and DuckDB's spill-only `max_temp_directory_size` do not provide aggregate hard enforcement. Record actual sample gaps and overshoot; missing or unsafe accounting fails closed. WORK-42 remains separate.
+An explicit `--resume-historical-stage build-historical-<32 lowercase hex>` is
+valid only with `--historical --capture-id ID` for the exact saved capture. It
+never resumes acquisition or silently creates a replacement stage. The runner
+copies the named stage's existing database and any WAL into an isolated candidate,
+then compares all 13 logical landing columns with a freshly verified receipt
+stream in windows bounded to 4,096 rows and 8 MiB of UTF-8 values. It also
+rechecks historical scope, membership and parent-eligibility output. Candidate
+proofs bind the capture, saved evidence, stage and code; they are private recovery
+hints, not certification. Only invalid historical models and their dependents
+are rebuilt, followed by the full data-integrity test selection. The original
+stage remains available until the replacement build is adopted durably. A failed
+comparison cannot authorize reloading from scratch through this option.
+
+Historical combo projection uses bounded Arrow batches of up to 4,096 rows or
+8 MiB of encoded ticker/JSON values. JSON leg parsing and a narrow resolution
+join against selected historical market and event identities preserve exact
+leg values and unresolved status without materializing wide source relations.
+Only ticker and selected-leg JSON are first streamed to an accounted transient
+Parquet spool inside the stage; it is removed after consumption. Appends
+checkpoint after 64 MiB of logical input or 30 seconds between batches. The final
+set-based resolution update remains one transaction and is separately monitored.
+
+Before production promotion, activation creates a temporary hard link to the
+certified warehouse and performs a deadline-bounded readback with 4 GB DuckDB
+memory and four threads. It checks relation row counts, representative rows and
+historical coverage before atomic replacement. Stale temporary links are removed
+only when their identity and bytes exactly match the currently certified
+warehouse; ambiguous files are preserved and block cleanup.
+
+Storage monitoring uses verified baseline accounting plus measured mutable workspaces. Database and WAL bytes count together; a database under tmp also consumes temporary allowance, so these categories overlap and their totals must not be treated as disjoint. Under the default profile, database and temporary limits are each 64 GiB with 56 GiB cooperative stop thresholds. An explicitly selected offline historical `expanded` profile uses a 128 GiB database limit and 192 GiB temporary limit. Its report records 96/144 GiB forecast-admission thresholds; runtime baseline checks and stop thresholds are 112/168 GiB. Root remains 350 GiB, aggregate 400 GiB, and minimum free space 150 GiB. Append-only report history seals monitoring policy version 1, including cooperative enforcement and acknowledged overshoot. Samples run once per second; they can overshoot and are not hard quotas. Per-batch checks and DuckDB's spill-only `max_temp_directory_size` do not provide aggregate hard enforcement. Record actual sample gaps and overshoot; missing or unsafe accounting fails closed. WORK-42 remains separate.
 
 A live-workspace inventory retries a disappearing file at most three complete
 attempts, discarding partial counters and inode bookkeeping before each retry.
