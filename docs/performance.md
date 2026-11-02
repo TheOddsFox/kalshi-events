@@ -735,3 +735,29 @@ The production live-storage sampler also permits three whole-snapshot attempts
 for file disappearance during normal dbt cleanup. Failed attempts contribute no
 partial byte totals or inode state. Other filesystem/identity failures and
 persistent churn still stop supervision; actual sampling gaps remain observable.
+
+## Stopped historical stage and continuation correction (2026-11-02)
+
+The frozen capacity baseline remains revision `6784e79` and 79,762,323 landed
+observations. The saved historical build stopped in dbt at 11:58 UTC on
+November 2. Its temporary-usage sample was 168.1338 GiB. The database plus WAL
+were about 29.98 GiB. A separate inventory found 35 abandoned dbt spill files
+totaling 132,400,349,184 bytes (about 123.307 GiB). This is separate from the
+previously completed cleanup of 97 files totaling 99.31 GiB in an older
+workspace; that cleanup is not evidence about, or a reason to repeat cleanup
+on, this stopped stage.
+
+The bounded continuation path can explicitly reuse the exact stopped stage.
+It verifies a copied database and WAL against fresh receipt-derived landing
+rows, scope membership and parent eligibility, then validates and selectively
+rebuilds historical models. Combo projection uses 4,096-row/8 MiB Arrow batches.
+Historical exports use bounded sorted runs and an eight-reader merge before a
+one-thread ordered DuckDB Parquet `COPY`. These are source-level safeguards,
+not full-scale measurements, a speedup claim or production acceptance.
+
+A new offline window was approved for this saved-evidence continuation but had
+not started as of this correction. Production remains stopped: no API requests
+were made, and there is no accepted release or production activation. The
+continuation still requires independent verification and explicit activation;
+none of the earlier failed capacity measurements are superseded by the new code
+or authorization.
