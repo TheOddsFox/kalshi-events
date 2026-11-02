@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -16,7 +17,225 @@ from pathlib import Path
 from typing import Any
 
 _ACTIVATION_TEMP_NAME = re.compile(r"\.production\.duckdb\.[0-9a-f]{32}\.tmp\Z")
+_ACTIVATION_AUDIT_NAME = re.compile(r"activation-audit-([0-9a-f]{64})\.json\Z")
+_ACTIVATION_AUDIT_FIELDS = {
+    "version",
+    "session_id",
+    "capture_id",
+    "root_id",
+    "capture_state_sha256",
+    "receipt_index_sha256",
+    "population_report_sha256",
+    "observations_by_endpoint",
+    "exact_observations",
+    "sample_strategy",
+}
+_MAX_ACTIVATION_AUDIT_BYTES = 64 * 1024
+_MAX_ACTIVATION_SESSION_REPORT_BYTES = 16 * 1024**2
+_ENDPOINT_SEGMENT = re.compile(r"(?:[A-Za-z0-9._()~ -]|%[0-9A-F]{2})+\Z")
 _MAX_PRODUCTION_DIRECTORY_ENTRIES = 50_000
+
+
+def _canonical_endpoint(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith("/") or value.endswith("/"):
+        return False
+    parts = value[1:].split("/")
+    return bool(parts) and all(
+        part not in {"", ".", ".."}
+        and not part.endswith(" ")
+        and _ENDPOINT_SEGMENT.fullmatch(part) is not None
+        for part in parts
+    )
+
+
+def _check_activation_audit_owner_mode(
+    info: os.stat_result, *, path: Path, immutable: bool = False
+) -> None:
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid != os.geteuid() or mode & 0o022 or immutable and mode & 0o222:
+        raise RuntimeError(f"activation audit path ownership or mode is unsafe: {path.name}")
+
+
+def _activation_audit_payload(
+    directory: Path,
+    binding: dict[str, Any],
+    *,
+    expected_session_id: str | None = None,
+) -> dict[str, Any]:
+    """Read the session-local immutable artifact bound by its report and digest."""
+    from kalshi_events.common import regular_bytes
+
+    if not isinstance(binding, dict):
+        raise RuntimeError("activation audit binding must be an object")
+    binding_fields = {"relative_path", "sha256"}
+    if frozenset(binding) not in {
+        frozenset(binding_fields),
+        frozenset(_ACTIVATION_AUDIT_FIELDS | binding_fields),
+    }:
+        raise RuntimeError("activation audit binding has an invalid schema")
+    relative_path = binding.get("relative_path")
+    checksum = binding.get("sha256")
+    session_id = expected_session_id or binding.get("session_id")
+    if (
+        not isinstance(session_id, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", session_id)
+        or not isinstance(relative_path, str)
+        or not isinstance(checksum, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+    ):
+        raise RuntimeError("activation audit binding identity is invalid")
+    filename = _ACTIVATION_AUDIT_NAME.fullmatch(relative_path)
+    if filename is None or filename.group(1) != checksum:
+        raise RuntimeError("activation audit path does not bind its exact digest")
+
+    runs = directory / "runs"
+    session_directory = runs / session_id
+    path = session_directory / relative_path
+    for candidate in (directory, runs, session_directory):
+        info = candidate.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or candidate.is_symlink()
+            or info.st_dev != directory.stat().st_dev
+        ):
+            raise RuntimeError("activation audit is outside a safe session directory")
+        _check_activation_audit_owner_mode(info, path=candidate)
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or path.is_symlink()
+        or info.st_nlink != 1
+        or info.st_dev != directory.stat().st_dev
+        or info.st_size > _MAX_ACTIVATION_AUDIT_BYTES
+    ):
+        raise RuntimeError("activation audit file is unsafe or exceeds its bound")
+    _check_activation_audit_owner_mode(info, path=path, immutable=True)
+    raw = regular_bytes(path, _MAX_ACTIVATION_AUDIT_BYTES)
+    if hashlib.sha256(raw).hexdigest() != checksum:
+        raise RuntimeError("activation audit file digest differs from its session binding")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON field")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    try:
+        artifact = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError("activation audit JSON is invalid") from exc
+    if not isinstance(artifact, dict) or set(artifact) != _ACTIVATION_AUDIT_FIELDS:
+        raise RuntimeError("activation audit artifact has an invalid schema")
+
+    def hex_value(value: Any, length: int) -> bool:
+        return isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None
+
+    observations = artifact.get("observations_by_endpoint")
+    exact = artifact.get("exact_observations")
+    if (
+        type(artifact.get("version")) is not int
+        or artifact["version"] != 1
+        or not hex_value(artifact.get("session_id"), 32)
+        or artifact["session_id"] != session_id
+        or not hex_value(artifact.get("capture_id"), 32)
+        or not hex_value(artifact.get("root_id"), 32)
+        or not hex_value(artifact.get("capture_state_sha256"), 64)
+        or not hex_value(artifact.get("receipt_index_sha256"), 64)
+        or not hex_value(artifact.get("population_report_sha256"), 64)
+        or not isinstance(observations, dict)
+        or not observations
+        or any(
+            not _canonical_endpoint(endpoint)
+            or type(count) is not int
+            or count < 0
+            or count > 2**63 - 1
+            for endpoint, count in observations.items()
+        )
+        or type(exact) is not int
+        or exact < 0
+        or exact > 2**63 - 1
+        or sum(observations.values()) != exact
+        or artifact.get("sample_strategy") != "verified-parquet-keyed-v1"
+    ):
+        raise RuntimeError("activation audit artifact values are invalid")
+
+    if set(binding) == _ACTIVATION_AUDIT_FIELDS | binding_fields:
+        expected = {key: binding[key] for key in _ACTIVATION_AUDIT_FIELDS}
+        if expected != artifact:
+            raise RuntimeError("activation audit artifact changed after session binding")
+
+    report_path = session_directory / "session.json"
+    report_info = report_path.lstat()
+    if (
+        not stat.S_ISREG(report_info.st_mode)
+        or report_path.is_symlink()
+        or report_info.st_nlink != 1
+        or report_info.st_dev != directory.stat().st_dev
+        or report_info.st_size > _MAX_ACTIVATION_SESSION_REPORT_BYTES
+    ):
+        raise RuntimeError("activation session report is unsafe or exceeds its bound")
+    _check_activation_audit_owner_mode(report_info, path=report_path)
+    report_raw = regular_bytes(report_path, _MAX_ACTIVATION_SESSION_REPORT_BYTES)
+    try:
+        report = json.loads(
+            report_raw.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError("activation session report JSON is invalid") from exc
+    if (
+        not isinstance(report, dict)
+        or report.get("session_id") != session_id
+        or report.get("capture_id") != artifact["capture_id"]
+        or report.get("root_id") != artifact["root_id"]
+        or not isinstance(report.get("activation_audit"), dict)
+        or set(report["activation_audit"]) != binding_fields
+        or report["activation_audit"].get("relative_path") != relative_path
+        or report["activation_audit"].get("sha256") != checksum
+    ):
+        raise RuntimeError("activation session report no longer binds this audit artifact")
+    return {**artifact, "relative_path": relative_path, "sha256": checksum}
+
+
+def _validate_audit_current_capture(
+    audit: dict[str, Any],
+    store: Any,
+    state: dict[str, Any],
+    current: dict[str, Any],
+    capture_id: str,
+) -> None:
+    from kalshi_events.common import decode, regular_bytes
+
+    root_record = decode(regular_bytes(store.path("root-id.json"), 1024**2))
+    root_id = root_record.get("root_id") if isinstance(root_record, dict) else None
+    state_sha256 = getattr(state, "verified_snapshot_sha256", None)
+    state_capture_id = state.get("capture_id")
+    state_root_id = state.get("root_id")
+    if (
+        not isinstance(root_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", root_id) is None
+        or audit.get("root_id") != root_id
+        or current.get("root_id") != root_id
+        or state_root_id is not None
+        and state_root_id != root_id
+        or state_capture_id != capture_id
+        or current.get("capture_id") != capture_id
+        or audit.get("capture_id") != capture_id
+        or not isinstance(state_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", state_sha256) is None
+        or audit.get("capture_state_sha256") != state_sha256
+    ):
+        raise RuntimeError("activation audit does not bind the current capture state and root")
 
 
 def _activation_temporary_names(directory: Path) -> list[Path]:
@@ -208,6 +427,7 @@ def activate_current(
     max_temp_bytes: int = 64 * 1024**3,
     max_duration_seconds: float | None = None,
     expected_observations: int | None = None,
+    activation_audit: dict[str, Any] | None = None,
     link_fn: Any = None,
     replace_fn: Any = None,
     sync_fn: Any = None,
@@ -255,6 +475,13 @@ def activate_current(
         or expected_observations < 0
     ):
         raise RuntimeError("expected historical observation count is invalid")
+    verified_audit = None
+    if activation_audit is not None:
+        if catalogue_version != 3:
+            raise RuntimeError("activation audit only supports historical catalogue releases")
+        verified_audit = _activation_audit_payload(directory, activation_audit)
+        if expected_capture_id != verified_audit["capture_id"]:
+            raise RuntimeError("activation audit capture differs from the expected capture")
     alias = directory / "production.duckdb"
     if alias.is_symlink():
         raise RuntimeError("production database path cannot be a symlink")
@@ -322,6 +549,8 @@ def activate_current(
                 ):
                     pass
             state = capture.read_capture(store, capture_id)
+            if verified_audit is not None:
+                _validate_audit_current_capture(verified_audit, store, state, current, capture_id)
             source = store.path(
                 f"{warehouse.build_directory(capture_id, catalogue_version)}/warehouse.duckdb"
             )
@@ -395,10 +624,13 @@ def activate_current(
                         "temporary production link differs from the certified warehouse"
                     )
                 relation_map = dict(warehouse.RELATIONS)
+                audit_enabled = verified_audit is not None
                 query = """
 import duckdb, json, sys
-database, spill, spill_bytes, version, relation_map_json = sys.argv[1:]
+from pathlib import Path
+database, spill, spill_bytes, version, relation_map_json, release_directory, audit_enabled = sys.argv[1:]
 relation_map = json.loads(relation_map_json)
+audit_enabled = audit_enabled == "1"
 config = {
     "memory_limit": "4GB",
     "threads": "4",
@@ -412,16 +644,136 @@ try:
         result["relation_rows"][name] = connection.execute(
             f"select count(*) from main.{table}"
         ).fetchone()[0]
-    samples = {
-        "series": "select series_ticker, observation_id, capture_id, received_at, source_endpoint, sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.current_series limit 1",
-        "events": "select event_ticker, series_ticker, observation_id, capture_id, received_at, source_endpoint, sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.current_events limit 1",
-        "markets": "select market_ticker, event_ticker, series_ticker, usable, observation_id, capture_id, received_at, source_endpoint, cast(last_price_dollars as varchar), cast(volume_fp as varchar), cast(open_interest_fp as varchar), sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.current_markets limit 1",
-        "observation_history": "select observation_id, capture_id, entity_kind, entity_ticker, received_at, source_endpoint, source_kind, sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.observation_history limit 1",
-        "combo_legs": "select combo_market_ticker, leg_index, event_ticker, market_ticker, side, cast(yes_settlement_value_dollars as varchar), sha256(cast(payload_json as varchar)) from main.combo_legs limit 1",
-        "relationships": "select parent_kind, parent_ticker, child_kind, child_ticker, resolved from main.relationships limit 1",
+    sample_specs = {
+        "series": (
+            ["series_ticker"],
+            "series_ticker, observation_id, capture_id, received_at, source_endpoint, "
+            "sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256)",
+        ),
+        "events": (
+            ["event_ticker"],
+            "event_ticker, series_ticker, observation_id, capture_id, received_at, "
+            "source_endpoint, sha256(cast(payload_json as varchar)), "
+            "substr(cast(payload_json as varchar), 1, 256)",
+        ),
+        "markets": (
+            ["market_ticker"],
+            "market_ticker, event_ticker, series_ticker, usable, observation_id, "
+            "capture_id, received_at, source_endpoint, cast(last_price_dollars as varchar), "
+            "cast(volume_fp as varchar), cast(open_interest_fp as varchar), "
+            "sha256(cast(payload_json as varchar)), "
+            "substr(cast(payload_json as varchar), 1, 256)",
+        ),
+        "observation_history": (
+            ["observation_id"],
+            "observation_id, capture_id, entity_kind, entity_ticker, received_at, "
+            "source_endpoint, source_kind, sha256(cast(payload_json as varchar)), "
+            "substr(cast(payload_json as varchar), 1, 256)",
+        ),
+        "combo_legs": (
+            ["combo_market_ticker", "leg_index"],
+            "combo_market_ticker, leg_index, event_ticker, market_ticker, side, "
+            "cast(yes_settlement_value_dollars as varchar), "
+            "sha256(cast(payload_json as varchar))",
+        ),
+        "relationships": (
+            ["parent_kind", "parent_ticker", "child_kind", "child_ticker"],
+            "parent_kind, parent_ticker, child_kind, child_ticker, resolved",
+        ),
     }
-    for name, sql in samples.items():
-        result["samples"][name] = connection.execute(sql).fetchone()
+    if not audit_enabled:
+        legacy_samples = {
+            "series": "select series_ticker, observation_id, capture_id, received_at, source_endpoint, sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.current_series limit 1",
+            "events": "select event_ticker, series_ticker, observation_id, capture_id, received_at, source_endpoint, sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.current_events limit 1",
+            "markets": "select market_ticker, event_ticker, series_ticker, usable, observation_id, capture_id, received_at, source_endpoint, cast(last_price_dollars as varchar), cast(volume_fp as varchar), cast(open_interest_fp as varchar), sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.current_markets limit 1",
+            "observation_history": "select observation_id, capture_id, entity_kind, entity_ticker, received_at, source_endpoint, source_kind, sha256(cast(payload_json as varchar)), substr(cast(payload_json as varchar), 1, 256) from main.observation_history limit 1",
+            "combo_legs": "select combo_market_ticker, leg_index, event_ticker, market_ticker, side, cast(yes_settlement_value_dollars as varchar), sha256(cast(payload_json as varchar)) from main.combo_legs limit 1",
+            "relationships": "select parent_kind, parent_ticker, child_kind, child_ticker, resolved from main.relationships limit 1",
+        }
+        for name, sql in legacy_samples.items():
+            result["samples"][name] = connection.execute(sql).fetchone()
+    else:
+        endpoint_rows = connection.execute(
+            "select source_endpoint, count(*) from main.observation_history "
+            "group by source_endpoint order by source_endpoint"
+        ).fetchall()
+        result["observations_by_endpoint"] = endpoint_rows
+        result["sample_audit"] = {}
+    for name, (keys, projection) in (sample_specs.items() if audit_enabled else ()):
+        parquet_path = str(Path(release_directory) / (name + ".parquet"))
+        key_names = ", ".join(keys)
+        order_keys = ", ".join(f"{key} asc nulls last" for key in keys)
+        decimal_filters = {
+            "markets": [
+                "last_price_dollars is not null and volume_fp is not null "
+                "and open_interest_fp is not null",
+                "last_price_dollars is not null or volume_fp is not null "
+                "or open_interest_fp is not null",
+            ],
+            "combo_legs": ["yes_settlement_value_dollars is not null"],
+        }
+        key_row = None
+        where_terms = decimal_filters.get(name, [])
+        for condition in [*where_terms, None]:
+            where = "" if condition is None else f" where {condition}"
+            key_row = connection.execute(
+                f"select {key_names} from read_parquet(?){where} "
+                f"order by {order_keys} limit 1",
+                [parquet_path],
+            ).fetchone()
+            if key_row is not None:
+                break
+        if key_row is None:
+            result["samples"][name] = None
+            sample_audit = {"matched": True, "key": None}
+            if name == "markets":
+                sample_audit.update({"decimal_fields_sampled": [], "decimal_sample_absent": True})
+            elif name == "combo_legs":
+                sample_audit.update({"decimal_fields_sampled": [], "decimal_sample_absent": True})
+            result["sample_audit"][name] = sample_audit
+            continue
+        key_values = list(key_row)
+        predicates = " and ".join(f"{key} is not distinct from ?" for key in keys)
+        result["samples"][name] = connection.execute(
+            f"select {projection} from main.{relation_map[name]} where {predicates}",
+            key_values,
+        ).fetchone()
+        if audit_enabled:
+            expected = connection.execute(
+                f"select {projection} from read_parquet(?) where {predicates}",
+                [parquet_path, *key_values],
+            ).fetchone()
+            actual = result["samples"][name]
+            result["sample_audit"][name] = {
+                "matched": expected == actual,
+                "key": key_values,
+            }
+            if name == "markets":
+                decimal_fields = [
+                    field
+                    for field, index in zip(
+                        ["last_price_dollars", "volume_fp", "open_interest_fp"],
+                        (8, 9, 10),
+                        strict=True,
+                    )
+                    if expected[index] is not None
+                ]
+                result["sample_audit"][name].update(
+                    {
+                        "decimal_fields_sampled": decimal_fields,
+                        "decimal_sample_absent": not decimal_fields,
+                    }
+                )
+            elif name == "combo_legs":
+                decimal_fields = (
+                    ["yes_settlement_value_dollars"] if expected[5] is not None else []
+                )
+                result["sample_audit"][name].update(
+                    {
+                        "decimal_fields_sampled": decimal_fields,
+                        "decimal_sample_absent": not decimal_fields,
+                    }
+                )
     if version == "3":
         row = connection.execute(
             "select historical_contract, scope, omitted_scopes, source_capture_id, source_capture_complete from main.catalogue_coverage"
@@ -444,6 +796,8 @@ finally:
                         str(spill_budget),
                         str(catalogue_version),
                         json.dumps(relation_map),
+                        str(Path(current["output"])),
+                        "1" if audit_enabled else "0",
                     ],
                     check=True,
                     capture_output=True,
@@ -481,6 +835,105 @@ finally:
                     raise RuntimeError(
                         "production DuckDB public readback missed a representative relation row"
                     )
+                activation_audit_result = None
+                if verified_audit is not None:
+                    raw_endpoint_rows = readback_data.get("observations_by_endpoint")
+                    if not isinstance(raw_endpoint_rows, list):
+                        raise RuntimeError("production endpoint census is missing")
+                    endpoint_counts: dict[str, int] = {}
+                    for row in raw_endpoint_rows:
+                        if (
+                            not isinstance(row, list)
+                            or len(row) != 2
+                            or not isinstance(row[0], str)
+                            or not _canonical_endpoint(row[0])
+                            or type(row[1]) is not int
+                            or row[1] < 0
+                            or row[0] in endpoint_counts
+                        ):
+                            raise RuntimeError("production endpoint census is malformed")
+                        endpoint_counts[row[0]] = row[1]
+                    expected_endpoint_counts = verified_audit["observations_by_endpoint"]
+                    if (
+                        set(endpoint_counts) - set(expected_endpoint_counts)
+                        or any(
+                            endpoint_counts.get(endpoint, 0) != expected_count
+                            for endpoint, expected_count in expected_endpoint_counts.items()
+                        )
+                        or sum(endpoint_counts.values()) != verified_audit["exact_observations"]
+                        or verified_audit["exact_observations"] != counts["observation_history"]
+                    ):
+                        raise RuntimeError(
+                            "production endpoint census differs from the verified population audit"
+                        )
+                    sample_audit = readback_data.get("sample_audit")
+                    if not isinstance(sample_audit, dict) or set(sample_audit) != set(relation_map):
+                        raise RuntimeError(
+                            "production keyed sample differs from its verified Parquet row"
+                        )
+                    decimal_columns = {
+                        "markets": [
+                            "last_price_dollars",
+                            "volume_fp",
+                            "open_interest_fp",
+                        ],
+                        "combo_legs": ["yes_settlement_value_dollars"],
+                    }
+                    decimal_samples = {}
+                    for name in relation_map:
+                        sample = sample_audit[name]
+                        expected_fields = decimal_columns.get(name)
+                        expected_keys = {"matched", "key"}
+                        if expected_fields is not None:
+                            expected_keys |= {
+                                "decimal_fields_sampled",
+                                "decimal_sample_absent",
+                            }
+                        key = sample.get("key") if isinstance(sample, dict) else None
+                        if (
+                            not isinstance(sample, dict)
+                            or set(sample) != expected_keys
+                            or sample.get("matched") is not True
+                            or (counts[name] == 0 and key is not None)
+                            or (counts[name] > 0 and not isinstance(key, list))
+                        ):
+                            raise RuntimeError(
+                                "production keyed sample differs from its verified Parquet row"
+                            )
+                        if expected_fields is not None:
+                            sampled_fields = sample.get("decimal_fields_sampled")
+                            decimal_absent = sample.get("decimal_sample_absent")
+                            if (
+                                not isinstance(sampled_fields, list)
+                                or any(field not in expected_fields for field in sampled_fields)
+                                or len(sampled_fields) != len(set(sampled_fields))
+                                or sampled_fields
+                                != [field for field in expected_fields if field in sampled_fields]
+                                or type(decimal_absent) is not bool
+                                or decimal_absent != (not sampled_fields)
+                            ):
+                                raise RuntimeError(
+                                    "production decimal sample evidence is malformed"
+                                )
+                            decimal_samples[name] = {
+                                "decimal_fields_sampled": sampled_fields,
+                                "decimal_sample_absent": decimal_absent,
+                            }
+                    activation_audit_result = {
+                        "state": "verified",
+                        "sha256": verified_audit["sha256"],
+                        "capture_state_sha256": verified_audit["capture_state_sha256"],
+                        "receipt_index_sha256": verified_audit["receipt_index_sha256"],
+                        "population_report_sha256": verified_audit["population_report_sha256"],
+                        "sample_strategy": verified_audit["sample_strategy"],
+                        "sample_matches": {name: True for name in sorted(relation_map)},
+                        "decimal_samples": decimal_samples,
+                        "observations_by_endpoint": {
+                            endpoint: expected_endpoint_counts[endpoint]
+                            for endpoint in sorted(expected_endpoint_counts)
+                        },
+                        "exact_observations": verified_audit["exact_observations"],
+                    }
                 readback_coverage = readback_data.get("catalogue_coverage")
                 if catalogue_version == 3:
                     expected_omitted = json.loads(current["omitted_scopes_json"])
@@ -574,6 +1027,12 @@ finally:
                     alias.exists() and not stat.S_ISREG(alias.lstat().st_mode)
                 ):
                     raise RuntimeError("production database path changed during retention cleanup")
+                if verified_audit is not None:
+                    latest_audit = _activation_audit_payload(directory, verified_audit)
+                    latest_state = capture.read_capture(store, capture_id)
+                    _validate_audit_current_capture(
+                        latest_audit, store, latest_state, rechecked, capture_id
+                    )
                 replace_fn(temporary, alias)
                 sync_fn(directory)
             finally:
@@ -629,4 +1088,9 @@ finally:
                 },
                 "atomic_snapshot": False,
                 "recovered_activation_temporaries": recovered_temporaries,
+                **(
+                    {"activation_audit": activation_audit_result}
+                    if activation_audit_result is not None
+                    else {}
+                ),
             }

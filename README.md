@@ -331,6 +331,8 @@ connection = duckdb.connect(
 
 An existing reader retains its opened snapshot. DuckDB can reuse that database for additional connections to the same path in the same process: close every connection to the path before reopening, or use a fresh process to see the activated generation. A writable consumer can damage the shared certified file. Keep the hard link outside `operator/`, retain evidence and recovery pins, and never edit warehouse files. The entry point survives pruning of its original pathname, but does not pin the older raw-evidence closure.
 
+A controlled historical continuation can bind a checksummed source-census audit to its saved session. Before replacing the production link, activation checks that census against the warehouse and compares deterministic payload, provenance and decimal samples with the verified Parquet release. Preserve that session's audit artifact with its report; a missing or changed artifact stops activation.
+
 Publication and production activation are separate results. Failures before activation replacement preserve the previous production database. A failure after replacement can leave the new file present with activation still uncertain; the report does not imply rollback. Offline activation finishes the existing verified publication's pending retention cleanup before replacing the entry point. An ordinary resume retains the effective approved deadline and subtracts previously accounted requests/downloads. Only the explicitly invoked one-time `--extend-session` flow grants a new 48-hour window; cumulative resource ceilings remain unchanged. Expired or uncertain acquisition accounting does not authorize more networking. Review the external report and use its exact recovery command. Existing catalogue commands do not update `production.duckdb`; explicitly use `--activate-current` after a later manual publication. Stop the supervisor with SIGTERM or Ctrl-C so it can terminate and reap its workers; do not use SIGKILL for an orderly stop. See the [production contract](docs/contracts.md#production-database-entry-point) and [acceptance guidance](docs/performance.md#supervised-production-acceptance).
 
 ## Complete ordinary-series ingestion
@@ -450,11 +452,23 @@ Fresh historical builds use native Arrow-to-DuckDB inserts instead of dlt merge 
 
 New historical Parquet exports use Zstandard level 6. Their schemas, values and deterministic row order are preserved; compressed file checksums and release IDs change. Existing releases and other catalogue/metadata/series export settings remain unchanged. Raw receipt bytes are never repacked.
 
-Historical export uses a disposable DuckDB connection with
-`preserve_insertion_order=false` and an explicit unique-key `ORDER BY` for every
-relation. This permits DuckDB to avoid preserving intermediate insertion order
-while retaining sorted output, the 4 GB memory setting and four threads.
-Capacity admission must still demonstrate that the complete export fits.
+Historical export materializes one public relation at a time into an owned,
+Zstandard-compressed temporary DuckDB table, keeping the certified warehouse
+read-only. It sizes physical row windows before fetching payloads into Arrow;
+multi-row windows contain at most 4,096 rows and 8 MiB of logical Arrow data.
+A single oversized row remains valid. Sorted runs are merged with at most eight
+readers, each reading one bounded row group at a time, before the final
+one-thread ordered Parquet `COPY`. Public schemas, values and unique-key order
+are preserved. The 8 MiB target does not bound total process RSS.
+
+The scratch database and WAL count toward database, temporary and root usage
+while sorted runs accumulate. Its ownership marker binds the relation, schema
+and private export checkpoint identity. Interrupted scratch input is discarded
+under the writer lock after its ownership and safe file inventory are validated;
+sealed matching runs and completed exports remain reusable. The native engine
+retains its 4 GB managed-memory setting and four threads. These safeguards add
+temporary I/O and storage; representative measurements and the unchanged
+production resource stops still govern a saved-stage continuation.
 
 The production runner supports `--reconcile-stopped-worker` only for an exact historical capture. Use it to validate a stopped worker's absence under the supervisor and writer locks before clearing a stale process marker; never edit session fields by hand. A live, reused or ambiguous process identity blocks recovery. Primary stop reasons and uncertain shutdown outcomes remain in history.
 

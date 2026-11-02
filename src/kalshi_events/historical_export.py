@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import stat
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from kalshi_events import metrics
 from kalshi_events.common import (
+    BudgetExceeded,
     CatalogueError,
     Store,
     decode,
@@ -29,17 +32,30 @@ from kalshi_events.common import (
     file_digest,
     fsync_directory,
     fsync_file,
+    interrupt_at_deadline,
     json_bytes,
     regular_bytes,
 )
 
 POLICY = "historical-arrow-external-merge-v1"
+_INPUT_READER_STRATEGY = "owned-duckdb-scratch-byte-windows-v1"
 COPY_OPTIONS = "compression zstd, compression_level 6, row_group_size_bytes 16777216"
 _BATCH_ROWS = 4096
 _BATCH_BYTES = 8 * 1024 * 1024
 _MERGE_FAN_IN = 8
 _MAX_SCHEMA_BYTES = 16 * 1024 * 1024
+_INPUT_WRITE_RESERVE = 8 * 1024 * 1024
+_INPUT_TABLE = "export_input"
+_WRITE_TEMP = re.compile(r"\.write-[a-z0-9_]{8}\Z")
 _RELATION = re.compile(r"[a-z][a-z0-9_]*\Z")
+_SCALAR_SQL_TYPE = re.compile(
+    r"(?:BOOLEAN|TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UHUGEINT|UTINYINT|USMALLINT|"
+    r"UINTEGER|UBIGINT|FLOAT|REAL|DOUBLE|DECIMAL\(\s*\d+\s*,\s*\d+\s*\)|"
+    r"NUMERIC\(\s*\d+\s*,\s*\d+\s*\)|DATE|TIME(?:_S|_MS|_US|_NS)?(?: WITH TIME ZONE)?|"
+    r"TIMESTAMP(?:_S|_MS|_US|_NS)?(?: WITH TIME ZONE)?|VARCHAR|TEXT|STRING|JSON|BLOB|"
+    r"UUID|INTERVAL)\Z",
+    re.IGNORECASE,
+)
 _GENERATION = re.compile(r"gen-[0-9]{8}\Z")
 _RUN = re.compile(r"run-[0-9]{8}\.parquet\Z")
 _OUTPUT = re.compile(r"[a-z][a-z0-9_]*\.parquet(?:\.partial)?\Z")
@@ -62,6 +78,7 @@ def binding(
         "order_keys": order_keys,
         "writer_policy": {
             "name": POLICY,
+            "input_reader_strategy": _INPUT_READER_STRATEGY,
             "copy_options": COPY_OPTIONS,
             "run_compression": "zstd-6",
             "batch_rows": _BATCH_ROWS,
@@ -76,17 +93,36 @@ def binding(
     return checksum, f"tmp/publish-{checksum[:32]}"
 
 
-def prepare(store: Store, relative: str) -> Path:
+def prepare(
+    store: Store,
+    relative: str,
+    *,
+    binding_sha256: str | None = None,
+    tables: dict[str, str] | None = None,
+) -> Path:
     if not re.fullmatch(r"tmp/publish-[0-9a-f]{32}", relative):
         raise CatalogueError("invalid historical export work directory")
+    if (binding_sha256 is None) != (tables is None):
+        raise CatalogueError("historical export input cleanup identity is incomplete")
+    if binding_sha256 is not None and (
+        not _hex(binding_sha256, 64)
+        or any(
+            _RELATION.fullmatch(name) is None or _RELATION.fullmatch(table) is None
+            for name, table in (tables or {}).items()
+        )
+    ):
+        raise CatalogueError("historical export input cleanup identity is invalid")
     root = store.path(relative)
     if root.exists():
         _validate_work_tree(store, root)
+        _discard_interrupted_marker_temps(store, root)
+        if binding_sha256 is not None:
+            _discard_stale_inputs(store, root, binding_sha256, tables or {})
     else:
         durable_mkdir(root.parent)
         root.mkdir()
         fsync_directory(root.parent)
-    for name in ("output", "runs", "checkpoints", "schemas"):
+    for name in ("output", "runs", "checkpoints", "schemas", "inputs"):
         child = root / name
         if not child.exists():
             child.mkdir()
@@ -113,9 +149,19 @@ def export_relation(
 
     root = store.path(work_relative)
     _assert_directory(store, root)
+    _discard_stale_inputs(store, root, binding_sha256, {name: table})
     schema = _reference_schema(store, connection, root, name, table)
     key_indices, key_types = _ordering_columns(schema, keys)
     schema_sha256 = digest(schema.serialize().to_pybytes())
+    _validate_prefetch_schema(schema)
+    _discard_input(
+        store,
+        work_relative,
+        name,
+        binding_sha256,
+        table,
+        schema_sha256,
+    )
     checkpoint_relative = f"{work_relative}/checkpoints/{name}.json"
     checkpoint_path = store.path(checkpoint_relative)
     output_relative = f"{work_relative}/output/{name}.parquet"
@@ -130,6 +176,7 @@ def export_relation(
             and checkpoint.get("schema_sha256") == schema_sha256
             and _valid_completed_export(store, output_path, checkpoint, schema)
         ):
+            _input_prefetch_metrics(checkpoint)
             _remove_relation_runs(store, work_relative, name)
             return checkpoint
         _remove_owned_file(store, output_path)
@@ -165,20 +212,72 @@ def export_relation(
     if generation is None:
         _remove_relation_runs(store, work_relative, name)
         run_directory.mkdir(exist_ok=True)
-        generation = _spool_runs(
+        input_database = _materialize_input(
             store,
             connection,
-            run_directory,
+            work_relative,
+            binding_sha256,
+            name,
             table,
             schema,
-            key_indices,
+            schema_sha256,
         )
+        try:
+            input_connection = duckdb.connect(
+                str(input_database),
+                read_only=True,
+                config={
+                    "threads": "4",
+                    "memory_limit": "4GB",
+                    "disabled_optimizers": "statistics_propagation,build_side_probe_side",
+                    "preserve_insertion_order": "false",
+                },
+            )
+            try:
+                with interrupt_at_deadline(store, input_connection.interrupt):
+                    input_schema = _reference_schema(
+                        store,
+                        input_connection,
+                        store.path(work_relative),
+                        name,
+                        _INPUT_TABLE,
+                        schema_name=f"{name}_input",
+                    )
+                    if not input_schema.equals(schema, check_metadata=True):
+                        raise CatalogueError("historical input changed the reference schema")
+                    generation = _spool_runs(
+                        store,
+                        input_connection,
+                        run_directory,
+                        _INPUT_TABLE,
+                        schema,
+                        key_indices,
+                        f"{work_relative}/inputs/{name}",
+                    )
+            finally:
+                input_connection.close()
+        except duckdb.InterruptException as exc:
+            try:
+                store.check_deadline()
+            except BudgetExceeded as deadline:
+                raise deadline from exc
+            raise CatalogueError("historical input read was interrupted") from exc
+        except duckdb.Error as exc:
+            raise CatalogueError("could not read the owned historical input snapshot") from exc
         checkpoint = {
             **expected_state,
             **generation,
             "generation": 0,
         }
         store.write(checkpoint_relative, checkpoint)
+        _discard_input(
+            store,
+            work_relative,
+            name,
+            binding_sha256,
+            table,
+            schema_sha256,
+        )
 
     while checkpoint["run_count"] > _MERGE_FAN_IN:
         next_generation = checkpoint["generation"] + 1
@@ -209,6 +308,7 @@ def export_relation(
     rows = pq.ParquetFile(output_path).metadata.num_rows
     result = {
         **expected_state,
+        **_input_prefetch_metrics(checkpoint),
         "complete": True,
         "output_sha256": checksum,
         "output_size": size,
@@ -241,13 +341,19 @@ def _reference_schema(
     root: Path,
     name: str,
     table: str,
+    *,
+    schema_name: str | None = None,
 ) -> pa.Schema:
-    relative = f"{root.relative_to(store.root).as_posix()}/schemas/{name}.parquet"
+    schema_name = name if schema_name is None else schema_name
+    if _RELATION.fullmatch(schema_name) is None:
+        raise CatalogueError("invalid historical schema artifact name")
+    relative = f"{root.relative_to(store.root).as_posix()}/schemas/{schema_name}.parquet"
     path = store.path(relative)
     partial = store.path(relative + ".partial")
     _remove_owned_file(store, path)
     _remove_owned_file(store, partial)
     store.reserve_storage(_MAX_SCHEMA_BYTES)
+    complete = False
     try:
         connection.execute(
             f"copy (select * from main.{table} limit 0) to ? (format parquet, {COPY_OPTIONS})",
@@ -260,13 +366,15 @@ def _reference_schema(
         schema = pq.read_schema(path)
         if len(schema) > 256 or len(schema.serialize().to_pybytes()) > _MAX_SCHEMA_BYTES:
             raise CatalogueError("historical relation schema exceeds its bounded limit")
+        complete = True
         return schema
     except duckdb.Error as exc:
         raise CatalogueError("could not read historical relation schema") from exc
     finally:
         try:
             _remove_owned_file(store, partial)
-            _remove_owned_file(store, path)
+            if not complete:
+                _remove_owned_file(store, path)
         finally:
             store.release_storage(_MAX_SCHEMA_BYTES)
 
@@ -281,7 +389,7 @@ def _ordering_columns(
         if index < 0:
             raise CatalogueError(f"historical ordering key is missing: {name}")
         data_type = schema.field(index).type
-        storage = data_type.storage_type if isinstance(data_type, pa.ExtensionType) else data_type
+        storage = _storage_type(data_type)
         if not (
             pa.types.is_string(storage)
             or pa.types.is_large_string(storage)
@@ -295,6 +403,19 @@ def _ordering_columns(
 
 def _checkpoint_matches(checkpoint: dict[str, Any], expected: dict[str, Any]) -> bool:
     return all(checkpoint.get(key) == value for key, value in expected.items())
+
+
+def _input_prefetch_metrics(checkpoint: dict[str, Any]) -> dict[str, int]:
+    names = (
+        "input_arrow_peak_bytes",
+        "input_arrow_peak_rows",
+        "input_max_singleton_bytes",
+        "input_singleton_peak_bytes",
+    )
+    result = {name: checkpoint.get(name) for name in names}
+    if any(type(value) is not int or value < 0 for value in result.values()):
+        raise CatalogueError("historical input prefetch metrics are missing or invalid")
+    return result
 
 
 def _read_checkpoint(store: Store, path: Path) -> dict[str, Any] | None:
@@ -335,6 +456,509 @@ def _valid_completed_export(
         return False
 
 
+def _storage_type(data_type: pa.DataType) -> pa.DataType:
+    return data_type.storage_type if isinstance(data_type, pa.BaseExtensionType) else data_type
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _validate_prefetch_schema(schema: pa.Schema) -> None:
+    if (
+        not schema.names
+        or len(set(schema.names)) != len(schema.names)
+        or any(name.lower() == "rowid" for name in schema.names)
+    ):
+        raise CatalogueError("historical relation has an unsupported Arrow schema")
+    for field in schema:
+        data_type = _storage_type(field.type)
+        if (
+            pa.types.is_string(data_type)
+            or pa.types.is_large_string(data_type)
+            or pa.types.is_binary(data_type)
+            or pa.types.is_large_binary(data_type)
+            or pa.types.is_fixed_size_binary(data_type)
+        ):
+            continue
+        try:
+            _ = data_type.bit_width
+        except (AttributeError, ValueError):
+            raise CatalogueError(
+                f"unsupported historical relation field type: {field.name}"
+            ) from None
+
+
+def _input_directory(store: Store, work_relative: str, relation: str) -> Path:
+    return store.path(f"{work_relative}/inputs/{relation}")
+
+
+def _input_marker(
+    binding_sha256: str,
+    relation: str,
+    table: str,
+    schema_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "binding_sha256": binding_sha256,
+        "relation": relation,
+        "table": table,
+        "schema_sha256": schema_sha256,
+    }
+
+
+def _validate_input_tree(
+    store: Store,
+    path: Path,
+    relation: str,
+    binding_sha256: str | None = None,
+    table: str | None = None,
+    schema_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    if _RELATION.fullmatch(relation) is None or path.name != relation:
+        raise CatalogueError("historical input relation directory is invalid")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    _assert_directory(store, path)
+    entries = {child.name: child for child in path.iterdir()}
+    if set(entries) - {
+        "owner.json",
+        "input.duckdb",
+        "input.duckdb.wal",
+    } and not _interrupted_owner_write(store, entries):
+        raise CatalogueError("historical input contains an unexpected file")
+    owner = entries.get("owner.json")
+    if owner is None:
+        if entries:
+            if _interrupted_owner_write(store, entries):
+                return None
+            raise CatalogueError("historical input data has no valid owner marker")
+        return None
+    _assert_regular(store, owner)
+    try:
+        marker = decode(regular_bytes(owner, 1024))
+    except Exception as exc:
+        raise CatalogueError("historical input owner marker is invalid") from exc
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != {"version", "binding_sha256", "relation", "table", "schema_sha256"}
+        or type(marker.get("version")) is not int
+        or marker["version"] != 1
+        or not _hex(marker.get("binding_sha256"), 64)
+        or marker.get("relation") != relation
+        or not isinstance(marker.get("table"), str)
+        or _RELATION.fullmatch(marker["table"]) is None
+        or not _hex(marker.get("schema_sha256"), 64)
+    ):
+        raise CatalogueError("historical input owner marker is invalid")
+    if any(
+        expected is not None and marker[key] != expected
+        for key, expected in (
+            ("binding_sha256", binding_sha256),
+            ("table", table),
+            ("schema_sha256", schema_sha256),
+        )
+    ):
+        raise CatalogueError("historical input owner binding changed")
+    for name, child in entries.items():
+        if name == "owner.json":
+            _assert_regular(store, child)
+        else:
+            _assert_owned_input_data_file(store, child)
+    return marker
+
+
+def _interrupted_owner_write(store: Store, entries: dict[str, Path]) -> bool:
+    if len(entries) != 1:
+        return False
+    name, path = next(iter(entries.items()))
+    if _WRITE_TEMP.fullmatch(name) is None:
+        return False
+    _assert_regular(store, path)
+    if path.stat().st_size > 1024:
+        raise CatalogueError("interrupted historical input marker is oversized")
+    return True
+
+
+def _discard_interrupted_marker_temps(store: Store, root: Path) -> None:
+    inputs = root / "inputs"
+    if not inputs.exists():
+        return
+    _assert_directory(store, inputs)
+    changed = False
+    for path in list(inputs.iterdir()):
+        _validate_input_tree(store, path, path.name)
+        entries = list(path.iterdir())
+        if not entries:
+            path.rmdir()
+            fsync_directory(inputs)
+            changed = True
+        elif _interrupted_owner_write(store, {entry.name: entry for entry in entries}):
+            entries[0].unlink()
+            fsync_directory(path)
+            path.rmdir()
+            fsync_directory(inputs)
+            changed = True
+    if changed:
+        store.sync(f"{root.relative_to(store.root).as_posix()}/inputs")
+
+
+def _durable_schema_digest(store: Store, root: Path, relation: str) -> str:
+    path = store.path(f"{root.relative_to(store.root).as_posix()}/schemas/{relation}.parquet")
+    _assert_regular(store, path)
+    if path.stat().st_size > _MAX_SCHEMA_BYTES:
+        raise CatalogueError("historical reference schema exceeds its bounded limit")
+    try:
+        schema = pq.read_schema(path)
+    except (OSError, pa.ArrowException, ValueError) as exc:
+        raise CatalogueError("historical reference schema is invalid") from exc
+    serialized = schema.serialize().to_pybytes()
+    if len(schema) > 256 or len(serialized) > _MAX_SCHEMA_BYTES:
+        raise CatalogueError("historical reference schema exceeds its bounded limit")
+    return digest(serialized)
+
+
+def _discard_stale_inputs(
+    store: Store,
+    root: Path,
+    binding_sha256: str,
+    tables: dict[str, str],
+) -> None:
+    if not _hex(binding_sha256, 64):
+        raise CatalogueError("historical input binding is invalid")
+    _discard_interrupted_marker_temps(store, root)
+    inputs = root / "inputs"
+    if not inputs.exists():
+        return
+    _assert_directory(store, inputs)
+    for path in list(inputs.iterdir()):
+        relation = path.name
+        marker = _validate_input_tree(store, path, relation)
+        if marker is None:
+            continue
+        if relation not in tables:
+            raise CatalogueError("historical input relation has no caller identity")
+        table = tables[relation]
+        if _RELATION.fullmatch(table) is None:
+            raise CatalogueError("historical input table identity is invalid")
+        schema_sha256 = _durable_schema_digest(store, root, relation)
+        _discard_input(
+            store,
+            root.relative_to(store.root).as_posix(),
+            relation,
+            binding_sha256,
+            table,
+            schema_sha256,
+        )
+
+
+def _discard_input(
+    store: Store,
+    work_relative: str,
+    relation: str,
+    binding_sha256: str,
+    table: str,
+    schema_sha256: str,
+) -> None:
+    relative = f"{work_relative}/inputs/{relation}"
+    path = _input_directory(store, work_relative, relation)
+    marker = _validate_input_tree(store, path, relation, binding_sha256, table, schema_sha256)
+    if marker is None and not path.exists():
+        return
+    for name in ("input.duckdb.wal", "input.duckdb"):
+        _remove_owned_input_file(store, path / name)
+    _remove_owned_file(store, path / "owner.json")
+    path.rmdir()
+    fsync_directory(path.parent)
+    store.sync(relative)
+
+
+def _input_snapshot_size(store: Store, directory: Path) -> int:
+    for _attempt in range(3):
+        try:
+            with os.scandir(directory) as scan:
+                names = {entry.name for entry in scan}
+            if names - {"owner.json", "input.duckdb", "input.duckdb.wal"}:
+                raise CatalogueError("historical input contains an unexpected file")
+            total = 0
+            for name in sorted(names & {"input.duckdb", "input.duckdb.wal"}):
+                path = directory / name
+                info = path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_dev != store.root.stat().st_dev
+                    or info.st_nlink != 1
+                    or info.st_size > store.limits.max_root_bytes
+                ):
+                    raise CatalogueError("historical input file is unsafe or oversized")
+                total += info.st_size
+            with os.scandir(directory) as scan:
+                current_names = {entry.name for entry in scan}
+            if names == current_names:
+                return total
+        except FileNotFoundError:
+            continue
+    raise CatalogueError("historical input changed during storage sampling")
+
+
+def _assert_owned_input_data_file(store: Store, path: Path) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise CatalogueError("historical input file is missing or unsafe") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_dev != store.root.stat().st_dev
+        or info.st_nlink != 1
+    ):
+        raise CatalogueError("historical input file is unsafe")
+
+
+def _remove_owned_input_file(store: Store, path: Path) -> None:
+    if not path.exists():
+        return
+    _assert_owned_input_data_file(store, path)
+    path.unlink()
+    fsync_directory(path.parent)
+    store.sync(path.relative_to(store.root).as_posix())
+
+
+def _check_input_storage(store: Store, directory: Path) -> int:
+    size = _input_snapshot_size(store, directory)
+    usage = store.check_storage(size)
+    if usage["database_bytes"] + size > store.limits.max_database_bytes:
+        raise BudgetExceeded("historical input exceeds the database storage allowance")
+    return size
+
+
+def _materialize_input(
+    store: Store,
+    source_connection: duckdb.DuckDBPyConnection,
+    work_relative: str,
+    binding_sha256: str,
+    name: str,
+    table: str,
+    schema: pa.Schema,
+    schema_sha256: str,
+) -> Path:
+    relative = f"{work_relative}/inputs/{name}"
+    directory = _input_directory(store, work_relative, name)
+    durable_mkdir(directory)
+    fsync_directory(directory.parent)
+    marker = _input_marker(binding_sha256, name, table, schema_sha256)
+    store.check_storage()
+    store.write_bytes(f"{relative}/owner.json", json_bytes(marker))
+    store.sync(relative)
+    input_database = directory / "input.duckdb"
+
+    description = source_connection.execute(f"describe select * from main.{table}").fetchall()
+    if [row[0] for row in description] != schema.names:
+        raise CatalogueError("historical input schema changed before materialization")
+    columns = []
+    for field, row in zip(schema, description, strict=True):
+        sql_type = str(row[1])
+        if _SCALAR_SQL_TYPE.fullmatch(sql_type) is None:
+            raise CatalogueError(f"unsupported historical input type: {field.name}")
+        compression = (
+            " USING COMPRESSION 'zstd'"
+            if sql_type.upper()
+            in {
+                "VARCHAR",
+                "TEXT",
+                "STRING",
+                "JSON",
+                "BLOB",
+            }
+            else ""
+        )
+        not_null = " NOT NULL" if row[2] == "NO" else ""
+        columns.append(f"{_quote_identifier(field.name)} {sql_type}{compression}{not_null}")
+
+    store.reserve_storage(_INPUT_WRITE_RESERVE)
+    attached = False
+    detached = False
+    operation_error: BaseException | None = None
+    sampler_error: list[BaseException] = []
+    input_peak = [0]
+    stop = threading.Event()
+    try:
+        usage = store.usage()
+        if usage["database_bytes"] + _INPUT_WRITE_RESERVE > store.limits.max_database_bytes:
+            raise BudgetExceeded("not enough database storage is available for historical input")
+        store.check_deadline()
+        input_literal = "'" + str(input_database).replace("'", "''") + "'"
+        with interrupt_at_deadline(store, source_connection.interrupt):
+            source_connection.execute(f"ATTACH {input_literal} AS historical_input")
+            attached = True
+
+            def monitor_storage() -> None:
+                while not stop.wait(1.0):
+                    try:
+                        store.check_deadline()
+                        input_peak[0] = max(input_peak[0], _check_input_storage(store, directory))
+                    except Exception as exc:
+                        sampler_error.append(exc)
+                        with contextlib.suppress(duckdb.Error):
+                            source_connection.interrupt()
+                        return
+
+            monitor = threading.Thread(target=monitor_storage, daemon=True)
+            try:
+                monitor.start()
+                source_connection.execute(
+                    f"CREATE TABLE historical_input.main.{_INPUT_TABLE} ({', '.join(columns)})"
+                )
+                source_connection.execute(
+                    f"INSERT INTO historical_input.main.{_INPUT_TABLE} SELECT * FROM main.{table}"
+                )
+                input_peak[0] = max(input_peak[0], _check_input_storage(store, directory))
+                source_connection.execute("CHECKPOINT historical_input")
+                input_peak[0] = max(input_peak[0], _check_input_storage(store, directory))
+            except BaseException as exc:
+                operation_error = exc
+            finally:
+                stop.set()
+                if monitor.ident is not None:
+                    monitor.join()
+            if operation_error is None:
+                source_connection.execute("DETACH historical_input")
+                attached = False
+                detached = True
+    except BaseException as exc:
+        if operation_error is None:
+            operation_error = exc
+    finally:
+        if attached:
+            try:
+                source_connection.execute("DETACH historical_input")
+                attached = False
+                detached = True
+            except duckdb.Error:
+                pass
+        store.release_storage(_INPUT_WRITE_RESERVE)
+
+    accounting_error: BaseException | None = None
+    if detached:
+        try:
+            store.sync(relative)
+            store.check_storage()
+        except BaseException as exc:
+            accounting_error = exc
+    metrics.peak("historical_input_database_peak_bytes", input_peak[0])
+    if sampler_error:
+        raise sampler_error[0] from operation_error
+    if operation_error is not None:
+        if isinstance(operation_error, duckdb.InterruptException):
+            try:
+                store.check_deadline()
+            except BudgetExceeded as exc:
+                raise exc from operation_error
+            if accounting_error is not None:
+                raise accounting_error from operation_error
+            raise CatalogueError(
+                "historical input materialization was interrupted"
+            ) from operation_error
+        if isinstance(operation_error, duckdb.Error):
+            raise CatalogueError("could not materialize historical input") from operation_error
+        raise operation_error.with_traceback(operation_error.__traceback__)
+    if accounting_error is not None:
+        raise accounting_error
+    if not detached:
+        raise CatalogueError("historical input database was not detached")
+    store.check_deadline()
+    return input_database
+
+
+def _prefetch_windows(
+    connection: duckdb.DuckDBPyConnection, table: str, schema: pa.Schema
+) -> Iterator[tuple[int, int, int]]:
+    query = _input_row_size_query(table, schema)
+    count, minimum, maximum = connection.execute(
+        f"select count(*), min(rowid), max(rowid) from main.{table}"
+    ).fetchone()
+    if count == 0:
+        if minimum is not None or maximum is not None:
+            raise CatalogueError("historical input row positions are invalid")
+        return
+    if minimum != 0 or maximum != count - 1:
+        raise CatalogueError("historical input row positions are not dense")
+
+    start = 0
+    while start < count:
+        block_end = min(count, start + _BATCH_ROWS)
+        metadata = connection.execute(query, [start, block_end]).fetchall()
+        if len(metadata) != block_end - start:
+            raise CatalogueError("historical input row sizing has a gap")
+        window_start = start
+        window_rows = 0
+        window_bytes = 0
+        for expected_rowid, (rowid, size) in enumerate(metadata, start=start):
+            if (
+                rowid != expected_rowid
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 1
+            ):
+                raise CatalogueError("historical input row sizing is invalid")
+            if window_rows and (window_rows >= _BATCH_ROWS or window_bytes + size > _BATCH_BYTES):
+                yield window_start, window_rows, window_bytes
+                window_start = rowid
+                window_rows = 0
+                window_bytes = 0
+            if not window_rows and size > _BATCH_BYTES:
+                yield rowid, 1, size
+                window_start = rowid + 1
+                continue
+            window_rows += 1
+            window_bytes += size
+        if window_rows:
+            yield window_start, window_rows, window_bytes
+        start = block_end
+
+
+def _input_row_size_query(table: str, schema: pa.Schema) -> str:
+    if _RELATION.fullmatch(table) is None:
+        raise CatalogueError("invalid historical input table")
+    terms = ["8"]
+    for field in schema:
+        data_type = _storage_type(field.type)
+        identifier = _quote_identifier(field.name)
+        if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
+            terms.append(f"strlen(coalesce(cast({identifier} as varchar), '')) + 9")
+        elif (
+            pa.types.is_binary(data_type)
+            or pa.types.is_large_binary(data_type)
+            or pa.types.is_fixed_size_binary(data_type)
+        ):
+            terms.append(f"coalesce(octet_length({identifier}), 0) + 9")
+        else:
+            try:
+                width = (data_type.bit_width + 7) // 8
+            except (AttributeError, ValueError):
+                raise CatalogueError(f"unsupported historical input type: {field.name}") from None
+            terms.append(str(width + 1))
+    row_bytes = " + ".join(f"({term})" for term in terms)
+    return (
+        f"select rowid, {row_bytes} as row_bytes from main.{table} "
+        "where rowid >= ? and rowid < ? order by rowid"
+    )
+
+
+def _read_input_window(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    start_rowid: int,
+    row_count: int,
+) -> Any:
+    return connection.sql(
+        f"select * from main.{table} where rowid >= ? and rowid < ? order by rowid",
+        params=[start_rowid, start_rowid + row_count],
+    ).to_arrow_reader(row_count)
+
+
 def _spool_runs(
     store: Store,
     connection: duckdb.DuckDBPyConnection,
@@ -342,6 +966,7 @@ def _spool_runs(
     table: str,
     schema: pa.Schema,
     key_indices: tuple[int, ...],
+    input_relative: str,
 ) -> dict[str, Any]:
     generation = run_directory / "gen-00000000"
     if generation.exists():
@@ -355,79 +980,107 @@ def _spool_runs(
     run_count = 0
     row_count = 0
     run_bytes = 0
-    # shortcut: DuckDB caps this Arrow reader by rows, not bytes. Split each
-    # fetched batch to 8 MiB runs immediately, but a wide 4096-row fetch (or a
-    # single row) can exceed that target while it is being read. If production
-    # row widths make this peak unsafe, replace the reader with byte-aware row
-    # windows; the run and merge buffers are byte-bounded below.
-    reader = connection.table(f"main.{table}").to_arrow_reader(_BATCH_ROWS)
+    arrow_peak_bytes = 0
+    arrow_peak_rows = 0
+    max_singleton_bytes = 0
+    singleton_peak_bytes = 0
     try:
         with manifest_partial.open("wb") as manifest:
-            for batch in reader:
+            for window_start, window_rows, estimated_bytes in _prefetch_windows(
+                connection, table, schema
+            ):
                 store.check_deadline()
-                converted = pa.Table.from_batches([batch]).cast(schema)
-                for piece in _byte_bounded_batches(
-                    converted.to_batches(max_chunksize=_BATCH_ROWS)[0]
-                ):
-                    table_piece = pa.Table.from_batches([piece])
-                    sort_columns = []
-                    sort_names = []
-                    for index in key_indices:
-                        field = schema.field(index)
-                        column = table_piece.column(index)
-                        data_type = (
-                            field.type.storage_type
-                            if isinstance(field.type, pa.ExtensionType)
-                            else field.type
-                        )
-                        if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
-                            column = pc.cast(column, pa.binary())
-                        sort_columns.append(column)
-                        sort_names.append(field.name)
-                    sort_table = pa.Table.from_arrays(sort_columns, names=sort_names)
-                    indices = pc.sort_indices(
-                        sort_table,
-                        sort_keys=[(name, "ascending") for name in sort_names],
-                        null_placement="at_end",
-                    )
-                    sorted_piece = table_piece.take(indices)
-                    name = f"run-{run_count:08d}.parquet"
-                    path = generation / (name + ".partial")
-                    final_path = generation / name
-                    estimate = max(1024 * 1024, sorted_piece.nbytes * 2)
-                    store.reserve_storage(estimate)
-                    try:
-                        pq.write_table(
-                            sorted_piece,
-                            path,
-                            compression="zstd",
-                            compression_level=6,
-                            row_group_size=_BATCH_ROWS,
-                        )
-                        fsync_file(path)
-                        os.replace(path, final_path)
-                        fsync_directory(generation)
-                        relative = final_path.relative_to(store.root).as_posix()
-                        store.sync_file(relative)
-                    finally:
-                        store.release_storage(estimate)
-                    checksum, size = file_digest(final_path, store.limits.max_root_bytes)
-                    count = pq.ParquetFile(final_path).metadata.num_rows
-                    entry = {"name": name, "sha256": checksum, "size": size, "rows": count}
-                    encoded = json_bytes(entry)
-                    store.reserve_storage(len(encoded))
-                    try:
-                        manifest.write(encoded)
-                        manifest.flush()
-                        manifest_hash.update(encoded)
-                        manifest_size += len(encoded)
-                        store.sync_file(manifest_partial.relative_to(store.root).as_posix())
-                    finally:
-                        store.release_storage(len(encoded))
-                    run_count += 1
-                    row_count += count
-                    run_bytes += size
-        reader.close()
+                if window_rows == 1:
+                    max_singleton_bytes = max(max_singleton_bytes, estimated_bytes)
+                    metrics.peak("historical_input_singleton_bytes", estimated_bytes)
+                reader = _read_input_window(connection, table, window_start, window_rows)
+                fetched_rows = 0
+                try:
+                    for batch in reader:
+                        store.check_deadline()
+                        fetched_rows += batch.num_rows
+                        arrow_peak_bytes = max(arrow_peak_bytes, batch.nbytes)
+                        arrow_peak_rows = max(arrow_peak_rows, batch.num_rows)
+                        if batch.num_rows == 1:
+                            singleton_peak_bytes = max(singleton_peak_bytes, batch.nbytes)
+                            metrics.peak("historical_input_singleton_arrow_bytes", batch.nbytes)
+                        if batch.num_rows > window_rows or (
+                            batch.num_rows > 1 and batch.nbytes > _BATCH_BYTES
+                        ):
+                            raise CatalogueError("historical input exceeded its Arrow window")
+                        metrics.peak("historical_input_arrow_bytes", batch.nbytes)
+                        metrics.peak("historical_input_arrow_rows", batch.num_rows)
+                        converted = pa.Table.from_batches([batch]).cast(schema)
+                        for piece in _byte_bounded_batches(
+                            converted.to_batches(max_chunksize=_BATCH_ROWS)[0]
+                        ):
+                            table_piece = pa.Table.from_batches([piece])
+                            sort_columns = []
+                            sort_names = []
+                            for index in key_indices:
+                                field = schema.field(index)
+                                column = table_piece.column(index)
+                                data_type = _storage_type(field.type)
+                                if pa.types.is_string(data_type) or pa.types.is_large_string(
+                                    data_type
+                                ):
+                                    column = pc.cast(column, pa.binary())
+                                sort_columns.append(column)
+                                sort_names.append(field.name)
+                            sort_table = pa.Table.from_arrays(sort_columns, names=sort_names)
+                            indices = pc.sort_indices(
+                                sort_table,
+                                sort_keys=[(name, "ascending") for name in sort_names],
+                                null_placement="at_end",
+                            )
+                            sorted_piece = table_piece.take(indices)
+                            name = f"run-{run_count:08d}.parquet"
+                            path = generation / (name + ".partial")
+                            final_path = generation / name
+                            estimate = max(1024 * 1024, sorted_piece.nbytes * 2)
+                            store.reserve_storage(estimate)
+                            try:
+                                pq.write_table(
+                                    sorted_piece,
+                                    path,
+                                    compression="zstd",
+                                    compression_level=6,
+                                    row_group_size=_BATCH_ROWS,
+                                )
+                                fsync_file(path)
+                                os.replace(path, final_path)
+                                fsync_directory(generation)
+                                relative = final_path.relative_to(store.root).as_posix()
+                                store.sync_file(relative)
+                            finally:
+                                store.release_storage(estimate)
+                            checksum, size = file_digest(final_path, store.limits.max_root_bytes)
+                            count = pq.ParquetFile(final_path).metadata.num_rows
+                            entry = {
+                                "name": name,
+                                "sha256": checksum,
+                                "size": size,
+                                "rows": count,
+                            }
+                            encoded = json_bytes(entry)
+                            store.reserve_storage(len(encoded))
+                            try:
+                                manifest.write(encoded)
+                                manifest.flush()
+                                manifest_hash.update(encoded)
+                                manifest_size += len(encoded)
+                                store.sync_file(manifest_partial.relative_to(store.root).as_posix())
+                            finally:
+                                store.release_storage(len(encoded))
+                            run_count += 1
+                            row_count += count
+                            run_bytes += size
+                finally:
+                    reader.close()
+                if fetched_rows != window_rows:
+                    raise CatalogueError("historical input payload window has a gap")
+                store.sync(input_relative)
+                store.check_storage()
         fsync_file(manifest_partial)
         os.replace(manifest_partial, manifest_path)
         fsync_directory(generation)
@@ -435,7 +1088,6 @@ def _spool_runs(
         store.sync(manifest_partial.relative_to(store.root).as_posix())
         store.sync_file(manifest_relative)
     except BaseException:
-        reader.close()
         raise
     if row_count == 0:
         # An empty relation still has one schema-bearing run for DuckDB COPY.
@@ -472,6 +1124,10 @@ def _spool_runs(
         "run_count": run_count,
         "row_count": row_count,
         "run_bytes": run_bytes,
+        "input_arrow_peak_bytes": arrow_peak_bytes,
+        "input_arrow_peak_rows": arrow_peak_rows,
+        "input_max_singleton_bytes": max_singleton_bytes,
+        "input_singleton_peak_bytes": singleton_peak_bytes,
     }
 
 
@@ -679,21 +1335,32 @@ class _Stream:
         self.parquet = pq.ParquetFile(path)
         if not self.parquet.schema_arrow.equals(schema, check_metadata=True):
             raise CatalogueError("historical sorted run schema changed")
-        # Runs are written to the byte target, apart from a single oversized row.
-        self.batches = iter(self.parquet.iter_batches(batch_size=_BATCH_ROWS, use_threads=False))
+        self.row_group = 0
+        self.batches = iter(())
         self.batch: pa.RecordBatch | None = None
         self.batch_id = 0
         self.position = 0
 
     def next_batch(self) -> pa.RecordBatch | None:
-        try:
-            self.batch = next(self.batches)
-        except StopIteration:
-            self.batch = None
-            return None
-        self.batch_id += 1
-        self.position = 0
-        return self.batch
+        while True:
+            try:
+                self.batch = next(self.batches)
+            except StopIteration:
+                if self.row_group >= self.parquet.metadata.num_row_groups:
+                    self.batch = None
+                    return None
+                self.batches = iter(
+                    self.parquet.iter_batches(
+                        batch_size=_BATCH_ROWS,
+                        row_groups=[self.row_group],
+                        use_threads=False,
+                    )
+                )
+                self.row_group += 1
+                continue
+            self.batch_id += 1
+            self.position = 0
+            return self.batch
 
 
 def _key(
@@ -732,6 +1399,7 @@ def _merge_batches(
     last_key = None
     out_rows = 0
     out_bytes = 0
+    validity_bytes_per_row = len(schema)
 
     def push(stream_index: int) -> None:
         stream = streams[stream_index]
@@ -749,7 +1417,8 @@ def _merge_batches(
         key, stream_index, position, batch_id = heap[0]
         source_id = (stream_index, batch_id)
         batch = source_batches[source_id]
-        row_bytes = batch.slice(position, 1).nbytes
+        # Arrow take may allocate one validity byte per selected row and schema field.
+        row_bytes = batch.slice(position, 1).nbytes + validity_bytes_per_row
         if out_rows and (out_rows >= _BATCH_ROWS or out_bytes + row_bytes > _BATCH_BYTES):
             if store is not None:
                 store.check_deadline()
@@ -998,7 +1667,7 @@ def _validate_owned_tree(store: Store, path: Path) -> None:
 
 def _validate_work_tree(store: Store, root: Path) -> None:
     _assert_directory(store, root)
-    allowed = {"output", "runs", "checkpoints", "schemas", "duckdb-spill"}
+    allowed = {"output", "runs", "checkpoints", "schemas", "inputs", "duckdb-spill"}
     for child in root.iterdir():
         if child.name not in allowed or child.is_symlink() or not child.is_dir():
             raise CatalogueError("historical export work tree contains an unexpected entry")
@@ -1035,9 +1704,13 @@ def _validate_work_tree(store: Store, root: Path) -> None:
                                 "historical export run contains an unexpected file"
                             )
                         _assert_regular(store, entry)
+        elif child.name == "inputs":
+            for relation in child.iterdir():
+                if _RELATION.fullmatch(relation.name) is None or relation.is_symlink():
+                    raise CatalogueError("historical input inventory is unsafe")
+                _validate_input_tree(store, relation, relation.name)
         else:
             _validate_safe_tree(store, child)
-    store.check_storage()
 
 
 def _validate_safe_tree(store: Store, path: Path) -> None:

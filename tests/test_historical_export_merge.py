@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import shutil
+from decimal import Decimal
 
 import duckdb
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from test_historical_compact_views import CAPTURE_ID, _seed_warehouse
@@ -110,6 +112,130 @@ def test_external_merge_preserves_reference_schema_and_binary_nulls_last_order(
         assert values[2]["note"] is None
     finally:
         connection.close()
+
+
+def test_merge_stream_never_coalesces_adjacent_row_groups(tmp_path, monkeypatch):
+    monkeypatch.setattr(historical_export, "_BATCH_ROWS", 4096)
+    schema = pa.schema([("ticker", pa.string()), ("ordinal", pa.int64())])
+    path = tmp_path / "multiple-row-groups.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "ticker": ["a", "b", "c", "d", "e", "f"],
+                "ordinal": list(range(6)),
+            },
+            schema=schema,
+        ),
+        path,
+        row_group_size=2,
+    )
+
+    stream = historical_export._Stream(path, schema)
+    try:
+        batches = []
+        while (batch := stream.next_batch()) is not None:
+            batches.append(batch.num_rows)
+        assert batches == [2, 2, 2]
+    finally:
+        stream.parquet.close()
+
+
+def test_merge_byte_bound_accounts_for_arrow_take_validity_buffers(tmp_path, monkeypatch):
+    schema = pa.schema(
+        [
+            ("ticker", pa.string()),
+            ("ordinal", pa.int64()),
+            ("payload_json", pa.string()),
+            *((f"text_{index:02}", pa.string()) for index in range(20)),
+            ("enabled", pa.bool_()),
+            ("nullable_count", pa.int64()),
+            ("settlement", pa.decimal128(12, 2)),
+        ]
+    )
+
+    def row(ticker, ordinal, text):
+        values = {
+            "ticker": ticker,
+            "ordinal": ordinal,
+            "payload_json": '{"valid":true}',
+            "enabled": True,
+            "nullable_count": None,
+            "settlement": Decimal("1.25"),
+        }
+        values.update({f"text_{index:02}": text for index in range(20)})
+        return values
+
+    rows = [row("a", 0, "value"), row("b", 1, "value")]
+    rows.extend(row(chr(ord("c") + index), index + 2, "") for index in range(6))
+    paths = []
+    source_batches = []
+    for index, values in enumerate(rows):
+        path = tmp_path / f"validity-run-{index}.parquet"
+        pq.write_table(pa.Table.from_pylist([values], schema=schema), path)
+        paths.append(path)
+        source_batches.append(pq.ParquetFile(path).read_row_group(0).to_batches()[0])
+
+    # The old estimate counted the narrow source rows but missed the validity
+    # bitmaps Arrow allocates when it gathers their non-null columns.
+    old_estimate = sum(batch.slice(0, 1).nbytes for batch in source_batches[:2])
+    candidate = (
+        pa.concat_tables([pa.Table.from_batches([batch]) for batch in source_batches[:2]])
+        .take(pa.array([0, 1], type=pa.int64()))
+        .to_batches()[0]
+    )
+    assert candidate.nbytes > old_estimate
+    monkeypatch.setattr(historical_export, "_BATCH_BYTES", old_estimate)
+
+    batches = list(
+        historical_export._merge_batches(
+            paths,
+            schema,
+            (0, 1),
+            (pa.string(), pa.int64()),
+        )
+    )
+
+    assert any(batch.num_rows > 1 for batch in batches)
+    assert all(batch.nbytes <= old_estimate or batch.num_rows == 1 for batch in batches)
+    assert all(batch.schema.equals(schema, check_metadata=True) for batch in batches)
+    assert pa.Table.from_batches(batches, schema=schema).to_pylist() == rows
+
+
+def test_eight_merge_heads_preserve_order_with_oversized_rows_and_multiple_groups(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(historical_export, "_BATCH_ROWS", 4096)
+    monkeypatch.setattr(historical_export, "_BATCH_BYTES", 64)
+    schema = pa.schema([("ticker", pa.string()), ("ordinal", pa.int64()), ("note", pa.string())])
+    paths = []
+    for index in range(historical_export._MERGE_FAN_IN):
+        path = tmp_path / f"run-{index}.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "ticker": [f"key-{index:02d}", f"key-{index + 8:02d}"],
+                    "ordinal": [index, index + 8],
+                    "note": ["x" * 128, "y" * 128],
+                },
+                schema=schema,
+            ),
+            path,
+            row_group_size=1,
+        )
+        paths.append(path)
+
+    batches = list(
+        historical_export._merge_batches(
+            paths,
+            schema,
+            (0, 1),
+            (pa.string(), pa.int64()),
+        )
+    )
+    assert [batch.column(1).to_pylist() for batch in batches] == [[i] for i in range(16)]
+    assert all(
+        batch.num_rows == 1 and batch.nbytes > historical_export._BATCH_BYTES for batch in batches
+    )
 
 
 def test_external_merge_uses_multiple_bounded_passes_and_reuses_sealed_export(

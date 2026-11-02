@@ -3095,6 +3095,7 @@ def activate_current(
     max_temp_bytes: int = 64 * GIB,
     max_duration_seconds: float | None = None,
     expected_observations: int | None = None,
+    activation_audit: dict[str, Any] | None = None,
     link_fn: Any = None,
     replace_fn: Any = None,
     sync_fn: Any = None,
@@ -3113,6 +3114,7 @@ def activate_current(
         max_temp_bytes=max_temp_bytes,
         max_duration_seconds=max_duration_seconds,
         expected_observations=expected_observations,
+        activation_audit=activation_audit,
         link_fn=link_fn,
         replace_fn=replace_fn,
         sync_fn=sync_fn,
@@ -6244,6 +6246,7 @@ def _activation_worker(
             if remaining <= 0:
                 raise BudgetStop("no activation time remains in the approved session")
         expected_observations = None
+        activation_audit = None
         if catalogue_version == 3:
             current = _strict_json(operator / "current-historical.json")
             if current is None or current.get("source_release_id") != release_id:
@@ -6266,6 +6269,35 @@ def _activation_worker(
                     "historical activation pointer does not bind a valid release manifest"
                 )
             current_capture = manifest["capture_id"]
+            if session_report is not None and "activation_audit" in session_report:
+                if report_path is None:
+                    raise RunnerError("activation audit requires its session report path")
+                session_id = session_report.get("session_id")
+                if (
+                    not isinstance(session_id, str)
+                    or not CAPTURE_ID.fullmatch(session_id)
+                    or report_path != directory / "runs" / session_id / REPORT_NAME
+                ):
+                    raise RunnerError("activation audit session path is invalid")
+                from production_activation import _activation_audit_payload
+
+                activation_audit = _activation_audit_payload(
+                    directory,
+                    session_report["activation_audit"],
+                    expected_session_id=session_id,
+                )
+                report_root_id = session_report.get("root_id")
+                if (
+                    session_report.get("capture_id") != current_capture
+                    or not isinstance(report_root_id, str)
+                    or not CAPTURE_ID.fullmatch(report_root_id)
+                    or activation_audit.get("capture_id") != current_capture
+                    or activation_audit.get("root_id") != report_root_id
+                    or activation_audit.get("root_id") != manifest.get("root_id")
+                ):
+                    raise RunnerError(
+                        "activation audit does not match the current session and release"
+                    )
             if profile == "expanded" and (
                 session_report is None
                 or session_report.get("mode") not in {"full", "resume", "historical"}
@@ -6301,7 +6333,8 @@ def _activation_worker(
             expected_release_id=release_id,
             expected_capture_id=(
                 str(session_report["capture_id"])
-                if profile == "expanded" and session_report is not None
+                if (profile == "expanded" or activation_audit is not None)
+                and session_report is not None
                 else None
             ),
             catalogue_version=catalogue_version,
@@ -6309,6 +6342,7 @@ def _activation_worker(
             max_temp_bytes=int(limits["temporary_bytes"]),
             max_duration_seconds=remaining,
             expected_observations=expected_observations,
+            activation_audit=activation_audit,
         )
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return 0

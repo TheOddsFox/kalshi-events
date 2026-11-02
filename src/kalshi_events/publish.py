@@ -789,7 +789,12 @@ def _publish(
                 )
             return {**existing_current, "pruned_captures": pruned}
         if store.path(temporary_relative).exists():
-            historical_export.prepare(store, temporary_relative)
+            historical_export.prepare(
+                store,
+                temporary_relative,
+                binding_sha256=historical_binding_sha256,
+                tables=RELATIONS,
+            )
             recovered_historical = _recover_historical_release(
                 store,
                 temporary_relative,
@@ -799,7 +804,12 @@ def _publish(
                 coverage_row,
             )
         if recovered_historical is None:
-            temporary = historical_export.prepare(store, temporary_relative)
+            temporary = historical_export.prepare(
+                store,
+                temporary_relative,
+                binding_sha256=historical_binding_sha256,
+                tables=RELATIONS,
+            )
         else:
             temporary = store.path(temporary_relative)
         output_directory = temporary / "output"

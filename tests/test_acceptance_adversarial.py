@@ -80,7 +80,10 @@ def test_metadata_preserves_native_lifecycle_and_settlement_strings(store, tmp_p
 
 @pytest.mark.parametrize("failure", ["repeated", "invalidated"])
 def test_cursor_failure_stays_incomplete_and_cannot_export(store, tmp_path, failure):
+    event_request_cursors = []
+
     def events(params):
+        event_request_cursors.append(params.get("cursor"))
         if failure == "invalidated" and params.get("cursor"):
             return 410, {"message": "cursor expired"}
         return 200, {"events": [EVENTS[0]], "cursor": "next"}
@@ -92,7 +95,45 @@ def test_cursor_failure_stays_incomplete_and_cannot_export(store, tmp_path, fail
     capture_id = next(store.path("captures").iterdir()).name
     state = acquisition.read_capture(store, capture_id)
     assert not state["complete"]
-    assert sum(1 for _ in acquisition.capture_pages(store, state)) >= 4
+    pages = list(acquisition.capture_pages(store, state))
+    event_pages = [
+        (manifest, payload) for manifest, payload in pages if manifest["endpoint"] == "/events"
+    ]
+    assert event_pages
+    assert all(manifest["task_scope"] == "events_live" for manifest, _ in event_pages)
+    successful_event_pages = []
+    invalidated_event_pages = []
+    for manifest, payload in event_pages:
+        if manifest["status"] == 200:
+            assert payload == {"cursor": "next", "events": [EVENTS[0]]}
+            successful_event_pages.append(manifest)
+        elif manifest["status"] == 410:
+            assert payload is None
+            invalidated_event_pages.append(manifest)
+        else:
+            pytest.fail(f"unexpected durable event response status: {manifest['status']}")
+
+    event_task = next(task for task in state["tasks"] if task["endpoint"] == "/events")
+    assert event_task["kind"] == "events"
+    assert event_task["cursor"] == "next"
+    assert event_task["done"] is False
+    if failure == "repeated":
+        assert state["error"] == "pagination cursor repeated without completion"
+        assert event_task["restarts"] == 0
+        assert event_request_cursors == [None, "next"]
+        assert successful_event_pages
+        assert successful_event_pages[0]["params"].get("cursor") is None
+        assert not invalidated_event_pages
+    else:
+        assert state["error"] == "pagination cursor repeatedly invalidated"
+        assert event_task["restarts"] > 0
+        assert successful_event_pages
+        assert invalidated_event_pages
+        assert len(invalidated_event_pages) == event_task["restarts"]
+        assert event_request_cursors == [None, "next"] * (event_task["restarts"] + 1)
+        assert all(
+            manifest["params"].get("cursor") == "next" for manifest in invalidated_event_pages
+        )
     with pytest.raises(CatalogueError, match="incomplete"):
         export(store, ["MARKET"], tmp_path / "metadata", capture_id=capture_id)
     assert not (tmp_path / "metadata").exists()
