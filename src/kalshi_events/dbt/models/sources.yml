@@ -6,6 +6,7 @@ sources:
       - name: observations
       - name: membership
       - name: parent_eligibility
+      - name: combo_legs_canonical
       - name: affected_series
       - name: affected_events
       - name: affected_markets

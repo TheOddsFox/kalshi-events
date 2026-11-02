@@ -1,3 +1,9 @@
+{% if var('historical_combo_prepared', false) %}
+{{ config(materialized='view') }}
+select combo_market_ticker, leg_index, event_ticker, market_ticker, side,
+       yes_settlement_value_dollars, resolved, payload_json
+from {{ source('landing', 'combo_legs_canonical') }}
+{% else %}
 {% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
 {{ config(materialized='incremental', incremental_strategy='append') }}
 {% endif %}
@@ -25,4 +31,5 @@ left join {{ ref('_historical_current_events' if var('historical_compact', false
   on json_extract_string(leg.value, '$.event_ticker') = native_event.event_ticker
 {% if var('catalogue_version', 1) == 2 and var('incremental_update', false) %}
 where m.market_ticker in (select market_ticker from {{ source('landing', 'affected_markets') }})
+{% endif %}
 {% endif %}
