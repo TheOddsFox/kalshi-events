@@ -17,7 +17,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from kalshi_events import metrics
+from kalshi_events import historical_export, metrics
 from kalshi_events.capture import (
     _complete_capture,
     latest_catalogue_capture,
@@ -70,6 +70,7 @@ HISTORICAL_COVERAGE_FIELDS = (
     "warehouse_sha256",
 )
 HISTORICAL_OMITTED_SCOPES = ["events_combo", "markets_live", "markets_combo"]
+HISTORICAL_COPY_OPTIONS = historical_export.COPY_OPTIONS
 FILES = {name + ".parquet" for name in (*RELATIONS, "coverage")}
 ORDER_KEYS = {
     "series": "series_ticker",
@@ -90,7 +91,7 @@ V2_LINEAGE_FIELDS = (
     "membership_sha256",
 )
 MAX_COVERAGE_BINDING_BYTES = 1024**2
-HISTORICAL_COPY_OPTIONS = "compression zstd, compression_level 6, row_group_size_bytes 16777216"
+HISTORICAL_SPILL_BUDGET = 1024**3
 
 
 @contextmanager
@@ -98,11 +99,15 @@ def _export_connection(
     store: Store, database: Path, temporary: Path, *, historical_export: bool = False
 ) -> Any:
     relative_temporary = temporary.relative_to(store.root).as_posix()
+    relative_spill = f"{relative_temporary}/duckdb-spill"
     usage = store.usage()
     spill_budget = min(
         store.limits.max_temp_bytes - usage["temporary_bytes"],
         store.limits.max_root_bytes - usage["retained_bytes"],
     )
+    if historical_export:
+        # Keep most free capacity available for the merge runs and final output.
+        spill_budget = min(spill_budget // 4, HISTORICAL_SPILL_BUDGET)
     if spill_budget < 1:
         raise BudgetExceeded("no bounded temporary storage is available for publication export")
     store.reserve_storage(spill_budget)
@@ -110,6 +115,9 @@ def _export_connection(
     spill_directory = temporary / "duckdb-spill"
     connection = None
     try:
+        if spill_directory.exists():
+            shutil.rmtree(spill_directory)
+            store.sync(relative_spill)
         spill_directory.mkdir()
         store.check_deadline()
         config = {
@@ -143,7 +151,7 @@ def _export_connection(
                     shutil.rmtree(spill_directory)
             finally:
                 try:
-                    store.sync(relative_temporary)
+                    store.sync(relative_spill)
                 finally:
                     store.release_storage(spill_budget)
 
@@ -279,6 +287,7 @@ def _validate_historical_manifest(manifest: dict[str, Any]) -> None:
         or not _hex_id(manifest.get("root_id"), 32)
         or not _hex_id(manifest.get("warehouse_sha256"), 64)
         or type(manifest.get("source_capture_complete")) is not bool
+        or manifest.get("historical_export_policy") not in (None, historical_export.POLICY)
     ):
         raise CatalogueError("invalid historical release provenance")
     decoded: dict[str, Any] = {}
@@ -466,14 +475,113 @@ def _historical_release_fields(
     }
 
 
+def _historical_coverage_matches(directory: Path, coverage_row: dict[str, Any]) -> bool:
+    try:
+        parquet = pq.ParquetFile(
+            directory / "coverage.parquet",
+            thrift_string_size_limit=MAX_COVERAGE_BINDING_BYTES,
+            thrift_container_size_limit=10_000,
+        )
+        return parquet.metadata.num_rows == 1 and parquet.read().to_pylist() == [coverage_row]
+    except Exception:
+        return False
+
+
+def _current_historical_reuse(
+    store: Store,
+    capture_id: str,
+    release_metadata: dict[str, Any],
+    coverage_row: dict[str, Any],
+    binding_sha256: str,
+) -> dict[str, Any] | None:
+    if not store.path("current-historical.json").exists():
+        return None
+    candidate = current(store, catalogue_version=3)
+    if (
+        candidate.get("capture_id") != capture_id
+        or any(candidate.get(name) != value for name, value in release_metadata.items())
+        or not _historical_coverage_matches(Path(candidate["output"]), coverage_row)
+    ):
+        return None
+    if candidate.get("historical_export_policy") == historical_export.POLICY:
+        return candidate
+    try:
+        pointer = decode(regular_bytes(store.path("current-historical.json"), 1024**2))
+    except CatalogueError:
+        return None
+    if (
+        candidate.get("historical_export_policy") is None
+        and isinstance(pointer, dict)
+        and pointer.get("historical_export_binding_sha256") == binding_sha256
+    ):
+        return candidate
+    return None
+
+
+def _recover_historical_release(
+    store: Store,
+    work_relative: str,
+    binding_sha256: str,
+    capture_id: str,
+    release_metadata: dict[str, Any],
+    coverage_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    marker_path = store.path(f"{work_relative}/checkpoints/publication.json")
+    if not marker_path.exists():
+        return None
+    try:
+        marker = decode(regular_bytes(marker_path, 1024**2))
+    except CatalogueError:
+        return None
+    if (
+        not isinstance(marker, dict)
+        or marker.get("binding_sha256") != binding_sha256
+        or not _hex_id(marker.get("release_id"), 64)
+    ):
+        return None
+    release_id = marker["release_id"]
+    destination = store.path(f"releases/{release_id}")
+    if not destination.exists():
+        return None
+    try:
+        manifest = verify_release(destination, store.limits.max_root_bytes)
+    except CatalogueError:
+        return None
+    if (
+        digest(regular_bytes(destination / "manifest.json", 1024**2))
+        != marker.get("manifest_sha256")
+        or manifest != marker.get("manifest")
+        or manifest.get("source_release_id") != release_id
+        or manifest.get("capture_id") != capture_id
+        or manifest.get("historical_export_policy") != historical_export.POLICY
+        or any(manifest.get(name) != value for name, value in release_metadata.items())
+        or not _historical_coverage_matches(destination, coverage_row)
+    ):
+        return None
+    return {"output": str(destination), **manifest}
+
+
 def publish(
-    store: Store, capture_id: str | None = None, *, catalogue_version: int = 1
+    store: Store,
+    capture_id: str | None = None,
+    *,
+    catalogue_version: int = 1,
+    resume_historical_stage: str | None = None,
 ) -> dict[str, Any]:
     if isinstance(catalogue_version, bool) or catalogue_version not in (1, 2, 3):
         raise CatalogueError("catalogue version must be 1, 2, or 3")
     _profile(store, catalogue_version)
+    if resume_historical_stage is not None and catalogue_version != 3:
+        raise CatalogueError("historical stage resume requires catalogue version 3")
     with store.writer_guard():
-        return _publish(store, capture_id, catalogue_version)
+        if resume_historical_stage is None:
+            return _publish(store, capture_id, catalogue_version)
+        return _publish(
+            store,
+            capture_id,
+            catalogue_version,
+            resume_historical_stage=resume_historical_stage,
+        )
 
 
 def _publish(
@@ -482,14 +590,31 @@ def _publish(
     catalogue_version: int,
     *,
     _context: Any = None,
+    resume_historical_stage: str | None = None,
 ) -> dict[str, Any]:
     from kalshi_events.warehouse import operation_context
 
     if not store.writer_locked_by_current_thread:
         with store.writer_guard(), operation_context(store) as context:
+            if resume_historical_stage is not None:
+                return _publish(
+                    store,
+                    capture_id,
+                    catalogue_version,
+                    _context=context,
+                    resume_historical_stage=resume_historical_stage,
+                )
             return _publish(store, capture_id, catalogue_version, _context=context)
     if _context is None:
         with operation_context(store) as context:
+            if resume_historical_stage is not None:
+                return _publish(
+                    store,
+                    capture_id,
+                    catalogue_version,
+                    _context=context,
+                    resume_historical_stage=resume_historical_stage,
+                )
             return _publish(store, capture_id, catalogue_version, _context=context)
     store.require_writable()
     from kalshi_events import incremental
@@ -557,12 +682,28 @@ def _publish(
 
         build_path = store.path(f"{build_directory(capture_id, 3)}/build.json")
         if build_path.exists():
-            receipt = certified(store, capture_id, catalogue_version=3, _context=_context)
-            if receipt.get(ORDERING_POLICY_FIELD) != ORDERING_POLICY:
+            if resume_historical_stage is not None:
                 _invalidate_operation_certification(store, capture_id, 3, _context)
-                build_historical(store, capture_id, rebuild=True)
+                build_historical(
+                    store,
+                    capture_id,
+                    rebuild=True,
+                    resume_historical_stage=resume_historical_stage,
+                )
+            else:
+                receipt = certified(store, capture_id, catalogue_version=3, _context=_context)
+                if receipt.get(ORDERING_POLICY_FIELD) != ORDERING_POLICY:
+                    _invalidate_operation_certification(store, capture_id, 3, _context)
+                    build_historical(store, capture_id, rebuild=True)
         else:
-            build_historical(store, capture_id)
+            if resume_historical_stage is None:
+                build_historical(store, capture_id)
+            else:
+                build_historical(
+                    store,
+                    capture_id,
+                    resume_historical_stage=resume_historical_stage,
+                )
     elif catalogue_version == 1:
         from kalshi_events.warehouse import ORDERING_POLICY, ORDERING_POLICY_FIELD
 
@@ -598,107 +739,195 @@ def _publish(
     if receipt["scope"] != expected_build_scope:
         raise CatalogueError("targeted captures cannot promote the catalogue pointer")
     store.check_deadline()
-    warehouse = store.path(f"{build_directory(capture_id, catalogue_version)}/warehouse.duckdb")
-    temporary_relative = f"tmp/publish-{uuid.uuid4().hex}"
-    temporary = store.path(temporary_relative)
-    durable_mkdir(temporary.parent)
-    temporary.mkdir()
-    fsync_directory(temporary.parent)
-    try:
-        with (
-            _export_connection(
-                store, warehouse, temporary, historical_export=catalogue_version == 3
-            ) as connection,
-            metrics.phase("export"),
-        ):
-            for name, table in RELATIONS.items():
-                store.check_deadline()
-                destination = temporary / (name + ".parquet")
-                # DuckDB's path parameter keeps the operator path out of SQL syntax.
-                keys = ORDER_KEYS[name]
-                if connection.execute(
-                    f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
-                ).fetchone():
-                    raise CatalogueError(f"non-unique publication ordering key: {name}")
-                historical_options = (
-                    f", {HISTORICAL_COPY_OPTIONS}" if catalogue_version == 3 else ""
-                )
-                connection.execute(
-                    f"copy (select * from main.{table} order by {keys}) to ? (format parquet{historical_options})",
-                    [str(destination)],
-                )
-        coverage_row = {
-            "capture_id": state["capture_id"],
-            "coverage_scope": expected_build_scope,
-            "started_at": state["started_at"],
-            "completed_at": state["completed_at"],
-            "atomic_snapshot": False,
-            "traversals_json": json_bytes(state["tasks"]).decode().strip(),
-            "cutoff_json": json_bytes(cutoffs).decode().strip(),
-        }
-        release_metadata = {}
-        if catalogue_version == 2:
-            from kalshi_events import incremental
+    coverage_row = {
+        "capture_id": state["capture_id"],
+        "coverage_scope": expected_build_scope,
+        "started_at": state["started_at"],
+        "completed_at": state["completed_at"],
+        "atomic_snapshot": False,
+        "traversals_json": json_bytes(state["tasks"]).decode().strip(),
+        "cutoff_json": json_bytes(cutoffs).decode().strip(),
+    }
+    release_metadata = {}
+    if catalogue_version == 2:
+        release_metadata = incremental.release_fields(store, state)
+        coverage_row.update(
+            {key: value for key, value in release_metadata.items() if key != "series_scope"}
+        )
+    elif catalogue_version == 3:
+        release_metadata = _historical_release_fields(store, state, receipt)
+        coverage_row.update(release_metadata)
 
-            release_metadata = incremental.release_fields(store, state)
-            coverage_row.update(
-                {key: value for key, value in release_metadata.items() if key != "series_scope"}
-            )
-        elif catalogue_version == 3:
-            release_metadata = _historical_release_fields(store, state, receipt)
-            coverage_row.update(release_metadata)
-        coverage = [coverage_row]
-        store.check_deadline()
-        coverage_options = (
-            {"compression": "zstd", "compression_level": 6} if catalogue_version == 3 else {}
+    warehouse = store.path(f"{build_directory(capture_id, catalogue_version)}/warehouse.duckdb")
+    historical_binding_sha256 = None
+    recovered_historical = None
+    if catalogue_version == 3:
+        historical_binding_sha256, temporary_relative = historical_export.binding(
+            capture_id,
+            receipt["warehouse_sha256"],
+            receipt["evidence"],
+            release_metadata,
+            coverage_row,
+            ORDER_KEYS,
         )
-        pq.write_table(
-            pa.Table.from_pylist(coverage), temporary / "coverage.parquet", **coverage_options
+        existing_current = _current_historical_reuse(
+            store,
+            capture_id,
+            release_metadata,
+            coverage_row,
+            historical_binding_sha256,
         )
-        for name in FILES:
-            fsync_file(temporary / name)
-        fsync_directory(temporary)
-        store.sync(temporary_relative)
-        store.check_storage()
-        evidence = inventory(temporary, FILES, store.limits.max_root_bytes)
-        release_id = digest(json_bytes(evidence).rstrip(b"\n"))
-        manifest = {
-            "contract": _profile(store, catalogue_version)[1],
-            "source_release_id": release_id,
-            "capture_id": state["capture_id"],
-            "received_at": now(),
-            "coverage_scope": "series" if store.scope is not None else "catalogue",
-            "files": evidence,
-        }
-        manifest.update(release_metadata)
-        if store.scope is not None:
-            manifest["series_scope"] = dict(store.scope)
-        if catalogue_version == 2:
-            manifest["warehouse_sha256"] = receipt["warehouse_sha256"]
-        atomic_json(temporary / "manifest.json", manifest)
-        fsync_directory(temporary)
-        verify_release(temporary, store.limits.max_root_bytes)
-        destination = store.path(f"releases/{release_id}")
-        durable_mkdir(destination.parent)
-        fsync_directory(destination.parent.parent)
-        if destination.exists():
-            existing = verify_release(destination, store.limits.max_root_bytes)
-            if (
-                existing.get("contract") != manifest["contract"]
-                or existing.get("capture_id") != capture_id
-                or any(existing.get(name) != value for name, value in release_metadata.items())
-            ):
-                raise CatalogueError(
-                    "release identity collides with different publication metadata"
+        if existing_current is not None:
+            historical_export.remove_work(store, temporary_relative)
+            with metrics.phase("pruning"):
+                pruned = incremental.prune(
+                    store,
+                    state,
+                    existing_current["source_release_id"],
+                    catalogue_version,
+                    _context=_context,
                 )
-            for name in FILES | {"manifest.json"}:
-                fsync_file(destination / name)
-            fsync_directory(destination)
-            if catalogue_version == 2:
-                manifest = existing
+            return {**existing_current, "pruned_captures": pruned}
+        if store.path(temporary_relative).exists():
+            historical_export.prepare(store, temporary_relative)
+            recovered_historical = _recover_historical_release(
+                store,
+                temporary_relative,
+                historical_binding_sha256,
+                capture_id,
+                release_metadata,
+                coverage_row,
+            )
+        if recovered_historical is None:
+            temporary = historical_export.prepare(store, temporary_relative)
         else:
-            os.rename(temporary, destination)
+            temporary = store.path(temporary_relative)
+        output_directory = temporary / "output"
+    else:
+        temporary_relative = f"tmp/publish-{uuid.uuid4().hex}"
+        temporary = store.path(temporary_relative)
+        durable_mkdir(temporary.parent)
+        temporary.mkdir()
         fsync_directory(temporary.parent)
+        output_directory = temporary
+    publication_succeeded = False
+    legacy_export_binding_proof = False
+    try:
+        if recovered_historical is not None:
+            manifest = {
+                key: value for key, value in recovered_historical.items() if key != "output"
+            }
+            release_id = manifest["source_release_id"]
+            destination = Path(recovered_historical["output"])
+        elif catalogue_version == 3:
+            with metrics.phase("export"):
+                for name, table in RELATIONS.items():
+                    store.check_deadline()
+                    with _export_connection(
+                        store, warehouse, temporary, historical_export=True
+                    ) as connection:
+                        historical_export.export_relation(
+                            store,
+                            connection,
+                            work_relative=temporary_relative,
+                            binding_sha256=historical_binding_sha256,
+                            name=name,
+                            table=table,
+                            keys=tuple(ORDER_KEYS[name].split(", ")),
+                        )
+        else:
+            with _export_connection(store, warehouse, temporary) as connection:
+                for name, table in RELATIONS.items():
+                    store.check_deadline()
+                    destination = output_directory / (name + ".parquet")
+                    keys = ORDER_KEYS[name]
+                    if connection.execute(
+                        f"select 1 from main.{table} group by {keys} having count(*) > 1 limit 1"
+                    ).fetchone():
+                        raise CatalogueError(f"non-unique publication ordering key: {name}")
+                    connection.execute(
+                        f"copy (select * from main.{table} order by {keys}) to ? (format parquet)",
+                        [str(destination)],
+                    )
+
+        if recovered_historical is None:
+            coverage = [coverage_row]
+            store.check_deadline()
+            coverage_options = (
+                {"compression": "zstd", "compression_level": 6} if catalogue_version == 3 else {}
+            )
+            pq.write_table(
+                pa.Table.from_pylist(coverage),
+                output_directory / "coverage.parquet",
+                **coverage_options,
+            )
+            for name in FILES:
+                fsync_file(output_directory / name)
+            fsync_directory(output_directory)
+            store.sync(temporary_relative)
+            store.check_storage()
+            evidence = inventory(output_directory, FILES, store.limits.max_root_bytes)
+            release_id = digest(json_bytes(evidence).rstrip(b"\n"))
+            manifest = {
+                "contract": _profile(store, catalogue_version)[1],
+                "source_release_id": release_id,
+                "capture_id": state["capture_id"],
+                "received_at": now(),
+                "coverage_scope": "series" if store.scope is not None else "catalogue",
+                "files": evidence,
+            }
+            manifest.update(release_metadata)
+            if catalogue_version == 3:
+                manifest["historical_export_policy"] = historical_export.POLICY
+            if store.scope is not None:
+                manifest["series_scope"] = dict(store.scope)
+            if catalogue_version == 2:
+                manifest["warehouse_sha256"] = receipt["warehouse_sha256"]
+            atomic_json(output_directory / "manifest.json", manifest)
+            fsync_directory(output_directory)
+            verify_release(output_directory, store.limits.max_root_bytes)
+            if catalogue_version == 3:
+                manifest_bytes = regular_bytes(output_directory / "manifest.json", 1024**2)
+                store.write(
+                    f"{temporary_relative}/checkpoints/publication.json",
+                    {
+                        "binding_sha256": historical_binding_sha256,
+                        "release_id": release_id,
+                        "manifest_sha256": digest(manifest_bytes),
+                        "manifest": manifest,
+                    },
+                )
+            destination = store.path(f"releases/{release_id}")
+            durable_mkdir(destination.parent)
+            fsync_directory(destination.parent.parent)
+            if destination.exists():
+                existing = verify_release(destination, store.limits.max_root_bytes)
+                if (
+                    existing.get("contract") != manifest["contract"]
+                    or existing.get("capture_id") != capture_id
+                    or any(existing.get(name) != value for name, value in release_metadata.items())
+                ):
+                    raise CatalogueError(
+                        "release identity collides with different publication metadata"
+                    )
+                if catalogue_version == 3 and existing.get("historical_export_policy") is None:
+                    if existing.get("files") != evidence or not _historical_coverage_matches(
+                        destination, coverage_row
+                    ):
+                        raise CatalogueError(
+                            "legacy historical release does not match the fresh export"
+                        )
+                    legacy_export_binding_proof = True
+                for name in FILES | {"manifest.json"}:
+                    fsync_file(destination / name)
+                fsync_directory(destination)
+                if catalogue_version in {2, 3}:
+                    manifest = existing
+            elif catalogue_version == 3:
+                os.rename(output_directory, destination)
+            else:
+                os.rename(temporary, destination)
+        fsync_directory(temporary if catalogue_version == 3 else temporary.parent)
         fsync_directory(destination.parent)
         store.sync(temporary_relative)
         store.sync(f"releases/{release_id}")
@@ -714,6 +943,15 @@ def _publish(
                 and all(
                     existing_current.get(name) == value for name, value in release_metadata.items()
                 )
+                and (
+                    catalogue_version != 3
+                    or (
+                        existing_current.get("historical_export_policy") == historical_export.POLICY
+                        and _historical_coverage_matches(
+                            Path(existing_current["output"]), coverage_row
+                        )
+                    )
+                )
             )
         if catalogue_version == 2 and not already_current and state.get("incremental") is True:
             from kalshi_events import incremental
@@ -725,13 +963,13 @@ def _publish(
             incremental.verify_full_rebase(store, state)
         with metrics.phase("promotion"):
             if not already_current:
-                store.write(
-                    pointer_name,
-                    {
-                        "source_release_id": release_id,
-                        "manifest_sha256": digest(regular_bytes(destination / "manifest.json")),
-                    },
-                )
+                pointer = {
+                    "source_release_id": release_id,
+                    "manifest_sha256": digest(regular_bytes(destination / "manifest.json")),
+                }
+                if legacy_export_binding_proof:
+                    pointer["historical_export_binding_sha256"] = historical_binding_sha256
+                store.write(pointer_name, pointer)
             # Pruning runs only after the promoted pointer re-verifies end to end.
             promoted = (
                 current(store)
@@ -753,11 +991,18 @@ def _publish(
                     catalogue_version,
                     _context=_context,
                 )
+        publication_succeeded = True
         return {"output": str(destination), **manifest, "pruned_captures": pruned}
     finally:
-        if temporary.exists():
-            shutil.rmtree(temporary)
-        store.sync(temporary_relative)
+        if catalogue_version == 3:
+            if publication_succeeded:
+                historical_export.remove_work(store, temporary_relative)
+            elif temporary.exists():
+                store.sync(temporary_relative)
+        else:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            store.sync(temporary_relative)
 
 
 def prune_superseded(
