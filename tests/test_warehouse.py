@@ -270,11 +270,41 @@ def test_expired_deadline_blocks_publication_without_pointer_change(store, facto
 
 
 def test_dbt_profile_sets_bounded_parallelism_and_memory(store, monkeypatch):
+    from dbt.adapters.duckdb.credentials import DuckDBCredentials
+    from dbt.adapters.duckdb.environments.local import LocalEnvironment
+
     seen = {}
+    engine_settings = []
 
     def fake_run(command, **kwargs):
         profiles = Path(command[command.index("--profiles-dir") + 1]) / "profiles.yml"
         seen.update(json.loads(profiles.read_text()))
+        output = seen["kalshi_events"]["outputs"]["local"]
+        credentials = DuckDBCredentials(
+            path=output["path"],
+            config_options=output["config_options"],
+            settings=output["settings"],
+            keep_open=True,
+        )
+        environment = LocalEnvironment(credentials)
+        handles = []
+        try:
+            for _ in range(2):
+                handle = environment.handle()
+                handles.append(handle)
+                engine_settings.append(
+                    handle.cursor()
+                    .execute(
+                        """select current_setting('threads'), current_setting('memory_limit'),
+                                  current_setting('temp_directory'),
+                                  current_setting('max_temp_directory_size')"""
+                    )
+                    .fetchone()
+                )
+        finally:
+            for handle in handles:
+                handle.close()
+            environment.close()
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(warehouse.subprocess, "run", fake_run)
@@ -282,7 +312,22 @@ def test_dbt_profile_sets_bounded_parallelism_and_memory(store, monkeypatch):
     output = seen["kalshi_events"]["outputs"]["local"]
     assert output["threads"] == 4
     assert output["settings"]["memory_limit"] == "4GB"
+    assert output["config_options"]["threads"] == str(warehouse.DBT_THREADS)
     assert output["config_options"]["temp_directory"].endswith("/spill")
+    expected_connection = warehouse.duckdb.connect(
+        config={**output["config_options"], **output["settings"]}
+    )
+    try:
+        expected_settings = expected_connection.execute(
+            """select current_setting('threads'), current_setting('memory_limit'),
+                      current_setting('temp_directory'),
+                      current_setting('max_temp_directory_size')"""
+        ).fetchone()
+    finally:
+        expected_connection.close()
+    assert engine_settings == [expected_settings, expected_settings]
+    assert engine_settings[0][0] == warehouse.DBT_THREADS
+    assert engine_settings[0][2] == output["config_options"]["temp_directory"]
 
 
 def test_dbt_spill_limit_uses_remaining_temp_and_root_headroom(store, monkeypatch):

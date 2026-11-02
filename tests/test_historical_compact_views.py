@@ -499,6 +499,9 @@ def test_historical_publication_uses_zstd_level_six(tmp_path, monkeypatch):
         with original_export(*args, **kwargs) as connection:
 
             class RecordingConnection:
+                def __getattr__(self, name):
+                    return getattr(connection, name)
+
                 def execute(self, query, parameters=None):
                     if query.lstrip().lower().startswith("copy "):
                         copied_queries.append(query)
@@ -522,8 +525,10 @@ def test_historical_publication_uses_zstd_level_six(tmp_path, monkeypatch):
     monkeypatch.setattr(pq, "write_table", record_coverage)
     release = publish.publish(store, state["capture_id"], catalogue_version=3)
 
-    assert historical_export_flags == [True]
-    assert len(copied_queries) == len(warehouse.RELATIONS)
+    assert len(historical_export_flags) == len(warehouse.RELATIONS)
+    assert all(historical_export_flags)
+    assert len(copied_queries) == 2 * len(warehouse.RELATIONS)
+    assert sum("limit 0" in query.lower() for query in copied_queries) == len(warehouse.RELATIONS)
     assert all(publish.HISTORICAL_COPY_OPTIONS in query.lower() for query in copied_queries)
     assert coverage_options == {"compression": "zstd", "compression_level": 6}
     directory = store.path(f"releases/{release['source_release_id']}")

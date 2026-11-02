@@ -30,7 +30,7 @@ import duckdb
 import pyarrow as pa
 from dlt.common.data_types.type_helpers import coerce_value, py_type_to_sc_type
 
-from kalshi_events import metrics
+from kalshi_events import historical_resume, metrics
 from kalshi_events.capture import (
     CURRENT_ACQUISITION_PROTOCOL,
     _acquisition_protocol,
@@ -752,52 +752,15 @@ def _land_historical_rows(
     if any(path.exists() or path.is_symlink() for path in (database, wal)):
         raise CatalogueError("historical landing requires a fresh database without a WAL")
 
-    capture_id = state["capture_id"]
-    observation_count = 0
-    seen_pages: dict[str, str] = {}
     store.check_deadline()
     store.check_storage()
-
-    def rows():
-        nonlocal observation_count
-        for receipts_verified, (manifest, payload) in enumerate(
-            capture_pages(store, state, evidence=verified_pages, task_indices=task_indices),
-            start=1,
-        ):
-            store.check_deadline()
-            _report_landing_progress(receipts_verified=receipts_verified)
-            manifest = _scope_manifest(state, manifest)
-            page_id = manifest.get("page_id")
-            if not isinstance(page_id, str) or not page_id:
-                raise CatalogueError("historical receipt lacks a page identity")
-            page_context = digest(json_bytes(manifest))
-            previous = seen_pages.get(page_id)
-            if previous is not None:
-                if previous != page_context:
-                    raise CatalogueError("historical page identity has contradictory context")
-                continue
-            seen_pages[page_id] = page_context
-            parent_index.add_page(manifest, payload)
-            for row in observations(((manifest, payload),)):
-                store.check_deadline()
-                observation_count += 1
-                kind = row["entity_kind"]
-                values = {
-                    "observation_id": row["observation_id"],
-                    "capture_id": capture_id,
-                    "entity_kind": kind,
-                    "entity_ticker": row[ENTITY_KEYS[kind]],
-                    "received_at": row["received_at"],
-                    "provider_updated_at": row["provider_updated_at"],
-                    "source_endpoint": row["source_endpoint"],
-                    "source_kind": row["source_kind"],
-                    "payload_json": row["payload_json"],
-                    "event_ticker": row.get("event_ticker"),
-                    "series_ticker": row.get("series_ticker"),
-                    "task_scope": manifest.get("task_scope"),
-                    "task_generation": str(manifest.get("task_generation", "")),
-                }
-                yield {key: _legacy_landing_text(value) for key, value in values.items()}
+    rows = _iter_historical_landing_rows(
+        store,
+        state,
+        verified_pages=verified_pages,
+        parent_index=parent_index,
+        task_indices=task_indices,
+    )
 
     database_relative = database.relative_to(store.root).as_posix()
     wal_relative = f"{database_relative}.wal"
@@ -852,7 +815,7 @@ def _land_historical_rows(
              )""",
         )
         sync_database()
-        for batch in _landing_arrow_batches(rows()):
+        for batch in _landing_arrow_batches(rows):
             store.check_deadline()
             registered = False
             try:
@@ -890,7 +853,75 @@ def _land_historical_rows(
         execute(connection, "checkpoint")
         sync_database()
     sync_database()
-    return observation_count
+    return rows.observation_count
+
+
+class _HistoricalLandingRows:
+    def __init__(self, rows, count: list[int]):
+        self.rows = rows
+        self._count = count
+
+    @property
+    def observation_count(self) -> int:
+        return self._count[0]
+
+    def __iter__(self):
+        return self.rows
+
+
+def _iter_historical_landing_rows(
+    store: Store,
+    state: dict[str, Any],
+    *,
+    verified_pages: dict[str, str],
+    parent_index: ParentIndex | DiskParentIndex,
+    task_indices: set[int],
+) -> _HistoricalLandingRows:
+    capture_id = state["capture_id"]
+    seen_pages: dict[str, str] = {}
+    count = [0]
+
+    def rows():
+        for receipts_verified, (manifest, payload) in enumerate(
+            capture_pages(store, state, evidence=verified_pages, task_indices=task_indices),
+            start=1,
+        ):
+            store.check_deadline()
+            _report_landing_progress(receipts_verified=receipts_verified)
+            manifest = _scope_manifest(state, manifest)
+            page_id = manifest.get("page_id")
+            if not isinstance(page_id, str) or not page_id:
+                raise CatalogueError("historical receipt lacks a page identity")
+            page_context = digest(json_bytes(manifest))
+            previous = seen_pages.get(page_id)
+            if previous is not None:
+                if previous != page_context:
+                    raise CatalogueError("historical page identity has contradictory context")
+                continue
+            seen_pages[page_id] = page_context
+            parent_index.add_page(manifest, payload)
+            for row in observations(((manifest, payload),)):
+                store.check_deadline()
+                count[0] += 1
+                kind = row["entity_kind"]
+                values = {
+                    "observation_id": row["observation_id"],
+                    "capture_id": capture_id,
+                    "entity_kind": kind,
+                    "entity_ticker": row[ENTITY_KEYS[kind]],
+                    "received_at": row["received_at"],
+                    "provider_updated_at": row["provider_updated_at"],
+                    "source_endpoint": row["source_endpoint"],
+                    "source_kind": row["source_kind"],
+                    "payload_json": row["payload_json"],
+                    "event_ticker": row.get("event_ticker"),
+                    "series_ticker": row.get("series_ticker"),
+                    "task_scope": manifest.get("task_scope"),
+                    "task_generation": str(manifest.get("task_generation", "")),
+                }
+                yield {key: _legacy_landing_text(value) for key, value in values.items()}
+
+    return _HistoricalLandingRows(rows(), count)
 
 
 def load(store: Store, capture_id: str) -> dict[str, Any]:
@@ -959,6 +990,7 @@ def dbt(
                         "path": str(store.path(database)),
                         "threads": DBT_THREADS,
                         "config_options": {
+                            "threads": str(DBT_THREADS),
                             "temp_directory": str(runtime / "spill"),
                             "max_temp_directory_size": f"{spill_budget}B",
                         },
@@ -1003,9 +1035,14 @@ def dbt(
             raise CatalogueError(
                 "dbt certification failed:\n" + result.stdout[-8000:] + result.stderr[-2000:]
             )
-        if args[0] == "build" and artifacts is not None:
+        if args[0] in {"build", "compile", "run", "test"} and artifacts is not None:
             values = {}
-            for name in ("manifest.json", "run_results.json"):
+            names = (
+                ("manifest.json", "run_results.json")
+                if args[0] != "compile"
+                else ("manifest.json",)
+            )
+            for name in names:
                 body = regular_bytes(runtime / "target" / name)
                 values[name] = {"sha256": digest(body), "content": json.loads(body)}
             store.write(artifacts, values)
@@ -1016,6 +1053,139 @@ def dbt(
     finally:
         shutil.rmtree(runtime, ignore_errors=True)
         store.sync(runtime_relative)
+
+
+def _read_dbt_artifacts(path: Path) -> dict[str, Any] | None:
+    try:
+        value = decode(regular_bytes(path, MAX_BUNDLE_BYTES))
+    except (CatalogueError, OSError):
+        return None
+    manifest_record = value.get("manifest.json") if isinstance(value, dict) else None
+    if not isinstance(manifest_record, dict) or not isinstance(
+        manifest_record.get("content"), dict
+    ):
+        return None
+    return value
+
+
+def _historical_model_cache_valid(
+    connection: duckdb.DuckDBPyConnection,
+    current_manifest: dict[str, Any],
+    model_name: str,
+    store: Store,
+) -> tuple[bool, int, str | None]:
+    output = _historical_model_output_or_none(connection, current_manifest, model_name, store)
+    if output is None:
+        return False, 0, None
+    count, checksum = output
+    return True, count, checksum
+
+
+def _historical_model_output(
+    connection: duckdb.DuckDBPyConnection,
+    current_manifest: dict[str, Any],
+    model_name: str,
+    store: Store,
+) -> tuple[int, str]:
+    output = _historical_model_output_or_none(connection, current_manifest, model_name, store)
+    if output is None:
+        raise CatalogueError(f"historical dbt model {model_name} differs from its current query")
+    return output
+
+
+def _historical_model_output_or_none(
+    connection: duckdb.DuckDBPyConnection,
+    current_manifest: dict[str, Any],
+    model_name: str,
+    store: Store,
+) -> tuple[int, str] | None:
+    current = current_manifest.get("nodes", {}).get(f"model.kalshi_events.{model_name}")
+    if not isinstance(current, dict):
+        raise CatalogueError(f"historical dbt manifest lacks model {model_name}")
+    schema = current.get("schema")
+    alias = current.get("alias")
+    compiled = current.get("compiled_code")
+    if not all(isinstance(value, str) and value for value in (schema, alias, compiled)):
+        raise CatalogueError(f"historical dbt model {model_name} has no compiled relation")
+    relation_type = _dbt_relation_type(connection, schema, alias)
+    materialized = current.get("config", {}).get("materialized")
+    expected_type = "VIEW" if materialized == "view" else "BASE TABLE"
+    if relation_type != expected_type:
+        return None
+
+    def quote(value: str) -> str:
+        return '"' + value.replace('"', '""') + '"'
+
+    relation = f"{quote(schema)}.{quote(alias)}"
+    query = compiled.rstrip().removesuffix(";")
+    from kalshi_events.historical_resume import compare_query_to_relation
+
+    digest_source = "landing.combo_legs_canonical" if model_name == "combo_legs" else relation
+    try:
+        with interrupt_at_deadline(store, connection.interrupt):
+            return compare_query_to_relation(
+                connection,
+                query,
+                relation,
+                check_deadline=store.check_deadline,
+                digest_source=digest_source,
+            )
+    except duckdb.InterruptException as exc:
+        raise BudgetExceeded(
+            "operation deadline exhausted validating historical model output"
+        ) from exc
+
+
+def _merge_historical_dbt_artifacts(
+    store: Store,
+    destination: str,
+    previous: dict[str, Any] | None,
+    phase_paths: list[str],
+) -> None:
+    manifests = []
+    run_metadata = None
+    results: dict[str, Any] = {}
+    if previous is not None:
+        manifests.append(previous["manifest.json"]["content"])
+        previous_results = previous.get("run_results.json", {}).get("content", {})
+        run_metadata = (
+            previous_results.get("metadata") if isinstance(previous_results, dict) else None
+        )
+        for result in (
+            previous_results.get("results", []) if isinstance(previous_results, dict) else []
+        ):
+            if isinstance(result, dict) and isinstance(result.get("unique_id"), str):
+                results[result["unique_id"]] = result
+    for relative in phase_paths:
+        phase = _read_dbt_artifacts(store.path(relative))
+        if phase is None:
+            continue
+        manifests.append(phase["manifest.json"]["content"])
+        phase_results = phase.get("run_results.json", {}).get("content", {})
+        if isinstance(phase_results, dict):
+            run_metadata = phase_results.get("metadata", run_metadata)
+        for result in phase_results.get("results", []) if isinstance(phase_results, dict) else []:
+            if isinstance(result, dict) and isinstance(result.get("unique_id"), str):
+                results[result["unique_id"]] = result
+    if not manifests:
+        raise CatalogueError("historical dbt artifacts are missing after certification")
+    manifest = manifests[-1]
+    run_results = {"metadata": run_metadata or {}, "results": list(results.values())}
+    manifest_body = json_bytes(manifest)
+    results_body = json_bytes(run_results)
+    store.write(
+        destination,
+        {
+            "manifest.json": {
+                "sha256": hashlib.sha256(manifest_body).hexdigest(),
+                "content": manifest,
+            },
+            "run_results.json": {
+                "sha256": hashlib.sha256(results_body).hexdigest(),
+                "content": run_results,
+            },
+        },
+    )
 
 
 SCOPE_KIND = {
@@ -2145,7 +2315,227 @@ def _check_historical_stage_references(
             raise CatalogueError("abandoned historical stage is referenced by a published manifest")
 
 
-def recover_and_cleanup_abandoned_historical_stages(store: Store, capture_id: str) -> None:
+def _historical_dbt_runtime_matches(
+    store: Store, runtime: Path, stage_relative: str, capture_id: str
+) -> tuple[Path, str, str] | None:
+    profiles = runtime / "profiles.yml"
+    try:
+        profile_stat = profiles.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(profile_stat.st_mode) or profile_stat.st_nlink != 1:
+        return None
+    try:
+        value = decode(regular_bytes(profiles, 1024**2))
+        output = value["kalshi_events"]["outputs"]["local"]
+        expected_databases = {
+            str(store.path(f"{stage_relative}/warehouse.duckdb")),
+            str(store.path(f"{stage_relative}/resume-candidate/warehouse.duckdb")),
+        }
+        spill = runtime / "spill"
+        if (
+            output.get("path") not in expected_databases
+            or output.get("config_options", {}).get("temp_directory") != str(spill)
+            or spill.is_symlink()
+            or not spill.is_dir()
+        ):
+            return None
+    except (KeyError, TypeError, ValueError, CatalogueError):
+        return None
+
+    manifest_path = runtime / "target" / "manifest.json"
+    try:
+        manifest_stat = manifest_path.lstat()
+    except FileNotFoundError:
+        manifest_stat = None
+    if manifest_stat is not None:
+        if not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
+            return None
+        try:
+            manifest = decode(regular_bytes(manifest_path, store.limits.max_root_bytes))
+            metadata = manifest.get("metadata", {})
+            if not isinstance(metadata, dict) or metadata.get("project_name") != "kalshi_events":
+                return None
+            variables = metadata.get("vars")
+            if isinstance(variables, dict) and (
+                variables.get("current_capture_id") != capture_id
+                or variables.get("historical_compact") is not True
+            ):
+                return None
+            nodes = manifest.get("nodes", {})
+            capture_bound_nodes = [
+                nodes.get(f"model.kalshi_events._historical_current_{name}")
+                for name in ("events", "series")
+            ]
+            if any(
+                not isinstance(node, dict)
+                or node.get("config", {}).get("enabled") is not True
+                or capture_id not in node.get("compiled_code", "")
+                for node in capture_bound_nodes
+            ):
+                return None
+        except (AttributeError, TypeError, ValueError, CatalogueError):
+            return None
+    return spill, digest(regular_bytes(profiles, 1024**2)), output["path"]
+
+
+def _cleanup_resumed_historical_dbt_spills(
+    store: Store, capture_id: str, stage_relative: str
+) -> None:
+    """Remove only spill files from abandoned dbt runtimes bound to this stage."""
+    temporary = store.path("tmp")
+    try:
+        root_device = store.root.lstat().st_dev
+        temporary_stat = temporary.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(temporary_stat.st_mode) or temporary_stat.st_dev != root_device:
+        raise CatalogueError("temporary build namespace is unsafe")
+
+    with os.scandir(temporary) as entries:
+        runtimes = [
+            Path(entry.path) for entry in entries if re.fullmatch(r"dbt-[0-9a-f]{32}", entry.name)
+        ]
+    for runtime in runtimes:
+        runtime_stat = runtime.lstat()
+        if not stat.S_ISDIR(runtime_stat.st_mode) or runtime_stat.st_dev != root_device:
+            continue
+        identity = _historical_dbt_runtime_matches(store, runtime, stage_relative, capture_id)
+        if identity is None:
+            continue
+        spill, profiles_sha256, database_path = identity
+        spill_stat = spill.lstat()
+        if (
+            not stat.S_ISDIR(runtime_stat.st_mode)
+            or runtime_stat.st_dev != root_device
+            or not stat.S_ISDIR(spill_stat.st_mode)
+            or spill_stat.st_dev != root_device
+        ):
+            continue
+
+        files: list[tuple[Path, tuple[int, int, int, int], str, int, str]] = []
+        directories = [spill]
+        safe = True
+        while directories and safe:
+            directory = directories.pop()
+            directory_stat = directory.lstat()
+            if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_dev != root_device:
+                safe = False
+                break
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    item_stat = entry.stat(follow_symlinks=False)
+                    if item_stat.st_dev != root_device:
+                        safe = False
+                        break
+                    if stat.S_ISDIR(item_stat.st_mode):
+                        directories.append(path)
+                    elif stat.S_ISREG(item_stat.st_mode) and item_stat.st_nlink == 1:
+                        relative_file = path.relative_to(store.root).as_posix()
+                        sha256, size = file_digest(path, store.limits.max_root_bytes)
+                        files.append(
+                            (
+                                path,
+                                (
+                                    item_stat.st_dev,
+                                    item_stat.st_ino,
+                                    item_stat.st_size,
+                                    item_stat.st_mtime_ns,
+                                ),
+                                relative_file,
+                                size,
+                                sha256,
+                            )
+                        )
+                    else:
+                        safe = False
+                        break
+        if not safe:
+            continue
+
+        inventory = [
+            {"path": relative, "bytes": size, "sha256": sha256}
+            for _path, _identity, relative, size, sha256 in files
+        ]
+        ownership = {
+            "root": str(store.root.resolve()),
+            "capture_id": capture_id,
+            "stage": stage_relative,
+            "runtime": runtime.relative_to(store.root).as_posix(),
+            "database": database_path,
+            "spill": str(spill),
+            "profiles_sha256": profiles_sha256,
+        }
+        proof = historical_resume.proof_record(
+            "abandoned-dbt-spill-cleanup",
+            ownership,
+            {"files": inventory, "total_bytes": sum(item["bytes"] for item in inventory)},
+        )
+        proof_names = set()
+        with os.scandir(runtime) as entries:
+            for entry in entries:
+                if not entry.name.startswith("historical-spill-cleanup"):
+                    continue
+                if (
+                    re.fullmatch(r"historical-spill-cleanup(?:-[0-9a-f]{32})?\.json", entry.name)
+                    is None
+                ):
+                    raise CatalogueError("historical spill-cleanup evidence name is invalid")
+                proof_path = Path(entry.path)
+                proof_stat = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(proof_stat.st_mode) or proof_stat.st_nlink != 1:
+                    raise CatalogueError("historical spill-cleanup evidence path is unsafe")
+                old_proof = decode(regular_bytes(proof_path, 1024**2))
+                old_result = historical_resume.validate_proof(
+                    old_proof, "abandoned-dbt-spill-cleanup", ownership
+                )
+                old_files = old_result.get("files")
+                if not isinstance(old_files, list):
+                    raise CatalogueError("historical spill-cleanup inventory is invalid")
+                old_total = 0
+                for item in old_files:
+                    if (
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("path"), str)
+                        or not item["path"].startswith(
+                            spill.relative_to(store.root).as_posix() + "/"
+                        )
+                        or isinstance(item.get("bytes"), bool)
+                        or not isinstance(item.get("bytes"), int)
+                        or item["bytes"] < 0
+                        or not isinstance(item.get("sha256"), str)
+                        or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+                    ):
+                        raise CatalogueError("historical spill-cleanup inventory is invalid")
+                    old_total += item["bytes"]
+                if old_result.get("total_bytes") != old_total:
+                    raise CatalogueError("historical spill-cleanup inventory total is invalid")
+                proof_names.add(entry.name)
+        proof_name = "historical-spill-cleanup.json"
+        if proof_name in proof_names:
+            proof_name = f"historical-spill-cleanup-{uuid.uuid4().hex}.json"
+            while proof_name in proof_names:
+                proof_name = f"historical-spill-cleanup-{uuid.uuid4().hex}.json"
+        proof_path = runtime / proof_name
+        store.write(proof_path.relative_to(store.root).as_posix(), proof)
+        fsync_file(proof_path)
+        fsync_directory(runtime)
+        for path, file_identity, relative, _size, _sha256 in files:
+            current = path.lstat()
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                != file_identity
+            ):
+                raise CatalogueError("abandoned historical dbt spill changed during cleanup")
+            store.remove(relative)
+
+
+def recover_and_cleanup_abandoned_historical_stages(
+    store: Store, capture_id: str, *, preserve_stage: str | None = None
+) -> None:
     """Recover a same-capture replacement, then prune only safe historical build stages."""
     if not store.writer_locked_by_current_thread:
         raise CatalogueError("historical stage cleanup requires the canonical writer lock")
@@ -2163,6 +2553,18 @@ def recover_and_cleanup_abandoned_historical_stages(store: Store, capture_id: st
         if state.get("capture_id") != capture_id:
             raise CatalogueError("historical stage cleanup source capture does not match")
         _historical_profile(state)
+        preserved: tuple[str, Path, tuple[int, int]] | None = None
+        if preserve_stage is not None:
+            from kalshi_events.historical_resume import stage_relative
+
+            relative = stage_relative(preserve_stage)
+            path = store.path(relative)
+            try:
+                identity = _validate_historical_stage(path, store.root.lstat().st_dev)
+            except FileNotFoundError as exc:
+                raise CatalogueError("requested historical resume stage is missing") from exc
+            preserved = (relative, path, identity)
+            _cleanup_resumed_historical_dbt_spills(store, capture_id, relative)
         _recover_build(store, capture_id, 3)
         temporary = store.path("tmp")
         try:
@@ -2174,11 +2576,21 @@ def recover_and_cleanup_abandoned_historical_stages(store: Store, capture_id: st
             raise CatalogueError("temporary build namespace is unsafe")
 
         stages: list[tuple[str, Path, tuple[int, int]]] = []
+        if preserved is not None:
+            relative, path, identity = preserved
+            try:
+                current_stat = path.lstat()
+            except FileNotFoundError as exc:
+                raise CatalogueError("requested historical resume stage disappeared") from exc
+            if (current_stat.st_dev, current_stat.st_ino) != identity:
+                raise CatalogueError("requested historical resume stage changed during validation")
         with os.scandir(temporary) as entries:
             for entry in entries:
                 if re.fullmatch(r"build-historical-[0-9a-f]{32}", entry.name) is None:
                     continue
                 path = store.path(f"tmp/{entry.name}")
+                if preserved is not None and entry.name == preserve_stage:
+                    continue
                 identity = _validate_historical_stage(path, root_stat.st_dev)
                 stages.append((f"tmp/{entry.name}", path, identity))
 
@@ -2476,81 +2888,821 @@ def _check_historical_coverage(
         raise CatalogueError("historical catalogue coverage does not match its build receipt")
 
 
-def _full_v2_build(
-    store: Store, state: dict[str, Any], *, rebuild: bool, historical: bool = False
+def _historical_resume_code_identity() -> str:
+    package = Path(str(files("kalshi_events").joinpath("dbt")))
+    sources = [
+        ("warehouse.py", Path(__file__).read_bytes()),
+        ("historical_resume.py", Path(historical_resume.__file__).read_bytes()),
+    ]
+    combo = Path(__file__).with_name("historical_combo.py")
+    if combo.is_file():
+        sources.append(("historical_combo.py", combo.read_bytes()))
+    for path in sorted(package.rglob("*")):
+        if path.is_file() and path.suffix in {".sql", ".yml", ".yaml"}:
+            sources.append((path.relative_to(package).as_posix(), path.read_bytes()))
+    return historical_resume.code_identity(sources)
+
+
+def _resume_file_identity(path: Path) -> tuple[int, int, int, int]:
+    value = path.lstat()
+    if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
+        raise CatalogueError("historical resume database file is unsafe")
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+
+def _resume_file_digest(store: Store, path: Path, limit: int) -> tuple[str, int]:
+    checksum = hashlib.sha256()
+    size = 0
+    store.check_deadline()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            store.check_deadline()
+            size += len(chunk)
+            if size > limit:
+                raise CatalogueError("historical resume database exceeds its storage limit")
+            checksum.update(chunk)
+    store.check_deadline()
+    return checksum.hexdigest(), size
+
+
+def _copy_resume_file(store: Store, source: Path, destination: Path, limit: int) -> tuple[str, int]:
+    checksum = hashlib.sha256()
+    copied = 0
+    store.check_deadline()
+    with source.open("rb") as input_stream, destination.open("xb") as output_stream:
+        while chunk := input_stream.read(1024 * 1024):
+            store.check_deadline()
+            copied += len(chunk)
+            if copied > limit:
+                raise CatalogueError("historical resume database exceeds its storage limit")
+            checksum.update(chunk)
+            output_stream.write(chunk)
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    store.check_deadline()
+    return checksum.hexdigest(), copied
+
+
+def _recover_resume_candidate(store: Store, directory: Path) -> None:
+    database = directory / "warehouse.duckdb"
+    wal = database.with_name(database.name + ".wal")
+    if not database.is_file() or database.is_symlink() or wal.is_symlink():
+        raise CatalogueError("historical resume candidate is missing or unsafe")
+    try:
+        with (
+            _duckdb_work_config(store, directory) as config,
+            duckdb.connect(str(database), config=config) as connection,
+        ):
+            try:
+                with interrupt_at_deadline(store, connection.interrupt):
+                    connection.execute("checkpoint")
+            except duckdb.InterruptException as exc:
+                raise BudgetExceeded(
+                    "operation deadline exhausted recovering historical stage"
+                ) from exc
+    except duckdb.Error as exc:
+        raise CatalogueError("historical resume candidate database is invalid") from exc
+    store.sync(directory.relative_to(store.root).as_posix())
+    fsync_file(database)
+    fsync_directory(directory)
+    if wal.exists() or wal.is_symlink():
+        raise CatalogueError("recovered historical candidate retained an uncheckpointed WAL")
+
+
+def _prepare_historical_resume_candidate(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+) -> tuple[str, Path, str]:
+    stage_relative = historical_resume.stage_relative(stage_name)
+    stage = store.path(stage_relative)
+    candidate_relative = f"{stage_relative}/resume-candidate"
+    candidate = store.path(candidate_relative)
+    source = stage / "warehouse.duckdb"
+    source_wal = source.with_name(source.name + ".wal")
+    binding = {
+        "root": str(store.root.resolve()),
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "stage": stage_name,
+    }
+    marker = candidate / "resume-source.json"
+    if candidate.exists() or candidate.is_symlink():
+        _validate_historical_stage(candidate, store.root.lstat().st_dev)
+        if not marker.is_file() or marker.is_symlink():
+            store.remove(candidate_relative)
+        else:
+            proof = decode(regular_bytes(marker, 1024**2))
+            result = historical_resume.validate_proof(proof, "resume-source", binding)
+            if _resume_file_identity(source) != tuple(result.get("source_identity", ())):
+                raise CatalogueError("historical resume source database changed after staging")
+            source_wal_identity = (
+                list(_resume_file_identity(source_wal)) if source_wal.exists() else None
+            )
+            if result.get("source_wal_identity") != source_wal_identity:
+                raise CatalogueError("historical resume source WAL changed after staging")
+            _recover_resume_candidate(store, candidate)
+            return candidate_relative, candidate, proof["sha256"]
+
+    try:
+        source_identity = _resume_file_identity(source)
+        source_wal_identity = _resume_file_identity(source_wal) if source_wal.exists() else None
+    except OSError as exc:
+        raise CatalogueError("historical resume stage has no safe source database") from exc
+    source_hash, source_size = _resume_file_digest(store, source, store.limits.max_database_bytes)
+    wal_hash = None
+    wal_size = 0
+    if source_wal_identity is not None:
+        wal_hash, wal_size = _resume_file_digest(store, source_wal, store.limits.max_database_bytes)
+    copy_size = source_size + wal_size
+    if store.usage()["database_bytes"] + copy_size > store.limits.max_database_bytes:
+        raise BudgetExceeded("historical resume copy exceeds the database storage allowance")
+    store.reserve_storage(copy_size)
+    try:
+        candidate.mkdir()
+        copied_hash, copied_size = _copy_resume_file(
+            store, source, candidate / "warehouse.duckdb", store.limits.max_database_bytes
+        )
+        if (copied_hash, copied_size) != (source_hash, source_size):
+            raise CatalogueError("historical resume database copy differs from its source")
+        if source_wal_identity is not None:
+            copied_wal_hash, copied_wal_size = _copy_resume_file(
+                store,
+                source_wal,
+                candidate / "warehouse.duckdb.wal",
+                store.limits.max_database_bytes,
+            )
+            if (copied_wal_hash, copied_wal_size) != (wal_hash, wal_size):
+                raise CatalogueError("historical resume WAL copy differs from its source")
+        store.sync(candidate_relative)
+    finally:
+        store.release_storage(copy_size)
+
+    if _resume_file_identity(source) != source_identity or _resume_file_digest(
+        store, source, store.limits.max_database_bytes
+    ) != (source_hash, source_size):
+        raise CatalogueError("historical resume source database changed while copied")
+    current_wal_identity = _resume_file_identity(source_wal) if source_wal.exists() else None
+    if current_wal_identity != source_wal_identity or (
+        source_wal_identity is not None
+        and _resume_file_digest(store, source_wal, store.limits.max_database_bytes)
+        != (wal_hash, wal_size)
+    ):
+        raise CatalogueError("historical resume source WAL changed while copied")
+
+    _recover_resume_candidate(store, candidate)
+    candidate_hash, candidate_size = _resume_file_digest(
+        store, candidate / "warehouse.duckdb", store.limits.max_database_bytes
+    )
+    result = {
+        "source_identity": list(source_identity),
+        "source_sha256": source_hash,
+        "source_size": source_size,
+        "source_wal_identity": (
+            list(source_wal_identity) if source_wal_identity is not None else None
+        ),
+        "source_wal_sha256": wal_hash,
+        "source_wal_size": wal_size,
+        "candidate_seed_sha256": candidate_hash,
+        "candidate_seed_size": candidate_size,
+    }
+    proof = historical_resume.proof_record("resume-source", binding, result)
+    store.write(f"{candidate_relative}/resume-source.json", proof)
+    fsync_file(marker)
+    fsync_directory(candidate)
+    return candidate_relative, candidate, proof["sha256"]
+
+
+def _compare_resumed_membership(
+    connection: duckdb.DuckDBPyConnection,
+    state: dict[str, Any],
+    index: DiskParentIndex,
+    store: Store,
+) -> tuple[int, int]:
+    from kalshi_events.historical_resume import compare_rows
+
+    def check_schema(table: str, expected: list[tuple[str, str]]) -> None:
+        description = connection.execute(f"describe landing.{table}").fetchall()
+        if [(row[0], row[1].upper()) for row in description] != [
+            (name, kind.upper()) for name, kind in expected
+        ]:
+            raise CatalogueError(f"resumed historical landing.{table} schema is invalid")
+
+    membership_schema = [
+        ("scope", "VARCHAR"),
+        ("entity_kind", "VARCHAR"),
+        ("entity_ticker", "VARCHAR"),
+    ]
+    check_schema("membership", membership_schema)
+    membership_count = compare_rows(
+        connection,
+        "select scope, entity_kind, entity_ticker from landing.membership "
+        "order by scope, entity_ticker, entity_kind",
+        ((scope, SCOPE_KIND[scope], ticker) for scope, ticker in index.stream_membership(state)),
+        membership_schema,
+        check_deadline=store.check_deadline,
+    )
+    eligibility_schema = [
+        ("capture_id", "VARCHAR"),
+        ("entity_kind", "VARCHAR"),
+        ("entity_ticker", "VARCHAR"),
+        ("status", "INTEGER"),
+        ("receipt", "VARCHAR"),
+    ]
+    check_schema("parent_eligibility", eligibility_schema)
+    eligibility_count = compare_rows(
+        connection,
+        "select capture_id, entity_kind, entity_ticker, status, receipt "
+        "from landing.parent_eligibility order by entity_kind, entity_ticker",
+        (
+            (state["capture_id"], kind, ticker, status, page_id)
+            for kind, ticker, status, page_id in index.stream_eligibility(state)
+        ),
+        eligibility_schema,
+        check_deadline=store.check_deadline,
+    )
+    return membership_count, eligibility_count
+
+
+def _resume_historical_landing(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    candidate_relative: str,
+    candidate: Path,
+    source_proof_sha256: str,
+    index: DiskParentIndex,
+    task_indices: set[int],
+    selection: dict[str, Any],
+) -> tuple[int, dict[str, str], _OperationEvidence, dict[str, Any]]:
+    from kalshi_events.historical_resume import compare_landing_rows
+
+    verified_pages: dict[str, str] = {}
+    landing = _iter_historical_landing_rows(
+        store,
+        state,
+        verified_pages=verified_pages,
+        parent_index=index,
+        task_indices=task_indices,
+    )
+    expected_rows = (tuple(row[name] for name in _LANDING_COLUMNS) for row in landing)
+    database = candidate / "warehouse.duckdb"
+    with (
+        _duckdb_work_config(store, candidate) as config,
+        duckdb.connect(str(database), read_only=True, config=config) as connection,
+        interrupt_at_deadline(store, connection.interrupt),
+        metrics.phase("recovery_validation"),
+        metrics.phase("historical_resume_validation"),
+    ):
+        observation_count = compare_landing_rows(
+            connection,
+            iter(expected_rows),
+            _LANDING_COLUMNS,
+            nullable={"provider_updated_at", "event_ticker", "series_ticker", "task_scope"},
+            check_deadline=store.check_deadline,
+        )
+        membership_count, eligibility_count = _compare_resumed_membership(
+            connection, state, index, store
+        )
+    if landing.observation_count != observation_count:
+        raise CatalogueError("historical resume census changed during landing validation")
+    _check_historical_coverage(database, state["capture_id"], state.get("complete") is True)
+    operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+    code_sha256 = _historical_resume_code_identity()
+    binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "historical_selection": selection,
+        "task_indices": sorted(task_indices),
+        "code_sha256": code_sha256,
+        "source_proof_sha256": source_proof_sha256,
+        "evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
+    }
+    proof = historical_resume.proof_record(
+        "historical-landing",
+        binding,
+        {
+            "observation_count": observation_count,
+            "membership_count": membership_count,
+            "eligibility_count": eligibility_count,
+        },
+    )
+    proof_relative = f"{candidate_relative}/resume-landing.json"
+    store.write(proof_relative, proof)
+    fsync_file(store.path(proof_relative))
+    fsync_directory(candidate)
+    return observation_count, verified_pages, operation_evidence, proof
+
+
+_HISTORICAL_COMPACT_MODELS = {
+    "_historical_current_events": ("event_ticker",),
+    "_historical_current_series": ("series_ticker",),
+    "_historical_current_markets": ("market_ticker",),
+}
+_HISTORICAL_COMPACT_DEPENDENCIES = {
+    "_historical_current_series": ("_historical_current_events",),
+    "_historical_current_markets": ("_historical_current_events", "_historical_current_series"),
+}
+_HISTORICAL_COMBO_SCHEMA = [
+    ("combo_market_ticker", "VARCHAR"),
+    ("leg_index", "INTEGER"),
+    ("event_ticker", "VARCHAR"),
+    ("market_ticker", "VARCHAR"),
+    ("side", "VARCHAR"),
+    ("yes_settlement_value_dollars", "DECIMAL(38,18)"),
+    ("resolved", "BOOLEAN"),
+    ("payload_json", "JSON"),
+]
+
+
+def _dbt_relation_type(connection: duckdb.DuckDBPyConnection, schema: str, name: str) -> str | None:
+    row = connection.execute(
+        "select table_type from information_schema.tables where table_schema=? and table_name=?",
+        [schema, name],
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def _drop_historical_combo_relation(store: Store, directory: Path) -> None:
+    with (
+        _duckdb_work_config(store, directory) as config,
+        duckdb.connect(str(directory / "warehouse.duckdb"), config=config) as connection,
+    ):
+        relation_type = _dbt_relation_type(connection, "main", "combo_legs")
+        if relation_type == "VIEW":
+            connection.execute("drop view main.combo_legs")
+        elif relation_type is not None:
+            connection.execute("drop table main.combo_legs")
+        connection.execute("checkpoint")
+    store.sync(directory.relative_to(store.root).as_posix())
+
+
+def _historical_combo_output(store: Store, database: Path) -> tuple[int, str] | None:
+    from kalshi_events.historical_resume import digest_relation
+
+    try:
+        with (
+            _duckdb_work_config(store, database.parent) as config,
+            duckdb.connect(str(database), read_only=True, config=config) as connection,
+        ):
+            return digest_relation(
+                connection,
+                "landing.combo_legs_canonical",
+                _HISTORICAL_COMBO_SCHEMA,
+                check_deadline=store.check_deadline,
+            )
+    except BudgetExceeded:
+        raise
+    except (CatalogueError, duckdb.Error):
+        return None
+
+
+def _historical_dbt_workflow(
+    store: Store,
+    state: dict[str, Any],
+    directory: Path,
+    directory_relative: str,
+    *,
+    previous_artifacts: dict[str, Any] | None,
+    landing_proof: dict[str, Any],
+    source_proof_sha256: str | None,
+    evidence: dict[str, str],
+    stage_name: str,
+    rebuild: bool,
+) -> None:
+    from kalshi_events import historical_combo
+    from kalshi_events.historical_resume import validate_proof
+
+    capture_id = state["capture_id"]
+    database_relative = f"{directory_relative}/warehouse.duckdb"
+    variables = {
+        "catalogue_version": 2,
+        "incremental_update": False,
+        "current_capture_id": capture_id,
+        "delta_capture_id": capture_id,
+        "historical_compact": True,
+        "historical_combo_prepared": True,
+    }
+    code_sha256 = _historical_resume_code_identity()
+    compile_artifacts = f"{directory_relative}/resume-compile-artifacts.json"
+    dbt(
+        store,
+        ["compile"],
+        database=database_relative,
+        artifacts=compile_artifacts,
+        variables=variables,
+    )
+    compiled = _read_dbt_artifacts(store.path(compile_artifacts))
+    if compiled is None:
+        raise CatalogueError("historical dbt compile artifacts are invalid")
+    current_manifest = compiled["manifest.json"]["content"]
+    compiled_manifest = current_manifest
+    if not isinstance(current_manifest.get("nodes"), dict):
+        raise CatalogueError("historical dbt manifest has no model inventory")
+
+    prepared_artifacts = f"{directory_relative}/resume-prepared-artifacts.json"
+    compact_cached: dict[str, bool] = {}
+    compact_output: dict[str, dict[str, Any]] = {}
+    with (
+        _duckdb_work_config(store, directory) as config,
+        duckdb.connect(
+            str(directory / "warehouse.duckdb"), read_only=True, config=config
+        ) as connection,
+    ):
+        for model in _HISTORICAL_COMPACT_MODELS:
+            dependencies_valid = all(
+                compact_cached.get(dependency, False)
+                for dependency in _HISTORICAL_COMPACT_DEPENDENCIES.get(model, ())
+            )
+            if rebuild or not dependencies_valid:
+                valid, count, checksum = False, 0, None
+            else:
+                valid, count, checksum = _historical_model_cache_valid(
+                    connection, current_manifest, model, store
+                )
+            compact_cached[model] = valid
+            if valid:
+                compact_output[model] = {"rows": count, "sha256": checksum}
+
+    missing_compact = [model for model, valid in compact_cached.items() if not valid]
+    prep_selectors = [
+        "observation_history",
+        "current_series",
+        "current_events",
+        "current_markets",
+        *missing_compact,
+    ]
+    dbt(
+        store,
+        ["run", "--select", *prep_selectors],
+        database=database_relative,
+        artifacts=prepared_artifacts,
+        variables=variables,
+    )
+    prepared = _read_dbt_artifacts(store.path(prepared_artifacts))
+    if prepared is None:
+        raise CatalogueError("historical compact model artifacts are invalid")
+
+    with (
+        _duckdb_work_config(store, directory) as config,
+        duckdb.connect(
+            str(directory / "warehouse.duckdb"), read_only=True, config=config
+        ) as connection,
+    ):
+        for model in _HISTORICAL_COMPACT_MODELS:
+            if model in compact_output:
+                continue
+            count, checksum = _historical_model_output(connection, compiled_manifest, model, store)
+            compact_output[model] = {"rows": count, "sha256": checksum}
+        relationships_valid, _relationship_count, _relationship_sha256 = (
+            _historical_model_cache_valid(
+                connection,
+                compiled_manifest,
+                "relationships",
+                store,
+            )
+        )
+
+    source_proof_sha256 = source_proof_sha256 or digest(
+        json_bytes(
+            {"root": str(store.root.resolve()), "stage": stage_name, "capture_id": capture_id}
+        )
+    )
+    landing_record_sha256 = landing_proof["sha256"]
+    combo_binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": capture_id,
+        "state_sha256": digest(json_bytes(dict(state))),
+        "source_proof_sha256": source_proof_sha256,
+        "landing_proof_sha256": landing_record_sha256,
+        "evidence_sha256": digest(json_bytes(evidence)),
+        "code_sha256": code_sha256,
+        "compact_outputs": compact_output,
+    }
+    combo_proof_path = directory / "resume-combo.json"
+    combo_proof_valid = False
+    if not rebuild and combo_proof_path.is_file() and not combo_proof_path.is_symlink():
+        try:
+            proof = decode(regular_bytes(combo_proof_path, 1024**2))
+            result = validate_proof(proof, "historical-combo", combo_binding)
+            current_output = _historical_combo_output(store, directory / "warehouse.duckdb")
+            combo_proof_valid = current_output == (
+                result.get("legs"),
+                result.get("sha256"),
+            )
+        except BudgetExceeded:
+            raise
+        except (CatalogueError, OSError, duckdb.Error):
+            combo_proof_valid = False
+
+    if not combo_proof_valid:
+        _drop_historical_combo_relation(store, directory)
+        with metrics.phase("combo_expansion"), _duckdb_work_config(store, directory) as config:
+            combo_stats = historical_combo.build_combo_legs(
+                store, directory / "warehouse.duckdb", config=config
+            )
+        combo_output = _historical_combo_output(store, directory / "warehouse.duckdb")
+        if combo_output is None or combo_output[0] != combo_stats["legs"]:
+            raise CatalogueError("historical combo phase failed exact output validation")
+        proof = historical_resume.proof_record(
+            "historical-combo",
+            combo_binding,
+            {
+                "markets": combo_stats["markets"],
+                "legs": combo_stats["legs"],
+                "batches": combo_stats["batches"],
+                "sha256": combo_output[1],
+            },
+        )
+        store.write(f"{directory_relative}/resume-combo.json", proof)
+        fsync_file(combo_proof_path)
+        fsync_directory(directory)
+
+    with (
+        _duckdb_work_config(store, directory) as config,
+        duckdb.connect(
+            str(directory / "warehouse.duckdb"), read_only=True, config=config
+        ) as connection,
+    ):
+        combo_valid, _combo_count, _combo_sha256 = _historical_model_cache_valid(
+            connection,
+            compiled_manifest,
+            "combo_legs",
+            store,
+        )
+
+    final_models = []
+    if not relationships_valid or rebuild:
+        final_models.append("relationships")
+    if not combo_valid or rebuild:
+        final_models.append("combo_legs")
+    final_artifacts = f"{directory_relative}/resume-final-artifacts.json"
+    dbt(
+        store,
+        ["build", "--select", *final_models, "test_type:data"],
+        database=database_relative,
+        artifacts=final_artifacts,
+        variables=variables,
+    )
+    _merge_historical_dbt_artifacts(
+        store,
+        f"{directory_relative}/build-artifacts.json",
+        previous_artifacts,
+        [compile_artifacts, prepared_artifacts, final_artifacts],
+    )
+    for relative in (compile_artifacts, prepared_artifacts, final_artifacts):
+        store.remove(relative)
+
+
+def _fresh_historical_landing_proof(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    staging_relative: str,
+    observation_count: int,
+    membership_count: int,
+    eligibility_count: int,
+    verified_pages: dict[str, str],
+    selection: dict[str, Any],
+    task_indices: set[int],
+) -> tuple[_OperationEvidence, dict[str, Any]]:
+    operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+    binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "historical_selection": selection,
+        "task_indices": sorted(task_indices),
+        "code_sha256": _historical_resume_code_identity(),
+        "evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
+    }
+    proof = historical_resume.proof_record(
+        "historical-landing",
+        binding,
+        {
+            "observation_count": observation_count,
+            "membership_count": membership_count,
+            "eligibility_count": eligibility_count,
+        },
+    )
+    relative = f"{staging_relative}/resume-landing.json"
+    store.write(relative, proof)
+    fsync_file(store.path(relative))
+    fsync_directory(store.path(staging_relative))
+    return operation_evidence, proof
+
+
+def _full_historical_build(
+    store: Store,
+    state: dict[str, Any],
+    *,
+    rebuild: bool,
+    resume_historical_stage: str | None,
 ) -> dict[str, Any]:
     capture_id = state["capture_id"]
-    if (
-        not historical
-        and not state.get("task_scopes")
-        and any(int(work.get("restarts", 0)) > 0 for work in state.get("tasks", []))
+    selection, task_indices = _historical_profile(state)
+    stage_name = resume_historical_stage
+    source_proof_sha256: str | None = None
+    resumed = stage_name is not None
+    if resumed:
+        stage_relative = historical_resume.stage_relative(stage_name)
+        recover_and_cleanup_abandoned_historical_stages(
+            store, capture_id, preserve_stage=stage_name
+        )
+        staging_relative, staging, source_proof_sha256 = _prepare_historical_resume_candidate(
+            store, state, stage_name
+        )
+        previous_path = staging / "build-artifacts.json"
+        if not previous_path.exists():
+            previous_path = store.path(f"{stage_relative}/build-artifacts.json")
+        previous_artifacts = _read_dbt_artifacts(previous_path)
+    else:
+        _recover_build(store, capture_id, 3)
+        staging_relative = f"tmp/build-historical-{uuid.uuid4().hex}"
+        stage_name = Path(staging_relative).name
+        staging = store.path(staging_relative)
+        durable_mkdir(staging.parent)
+        staging.mkdir()
+        previous_artifacts = None
+
+    verified_pages: dict[str, str] = {}
+    index: ParentIndex | DiskParentIndex = DiskParentIndex(store, collect_winners=False)
+    index_closed = False
+    try:
+        if resumed:
+            assert stage_name is not None and source_proof_sha256 is not None
+            observation_count, verified_pages, operation_evidence, landing_proof = (
+                _resume_historical_landing(
+                    store,
+                    state,
+                    stage_name,
+                    staging_relative,
+                    staging,
+                    source_proof_sha256,
+                    index,
+                    task_indices,
+                    selection,
+                )
+            )
+        else:
+            with metrics.phase("landing"):
+                observation_count = _land_historical_rows(
+                    store,
+                    state,
+                    staging,
+                    verified_pages=verified_pages,
+                    parent_index=index,
+                    task_indices=task_indices,
+                )
+            with (
+                _duckdb_work_config(store, staging) as config,
+                duckdb.connect(str(staging / "warehouse.duckdb"), config=config) as connection,
+                metrics.phase("current_projection"),
+            ):
+                _projection_membership(store, state, index, connection)
+                _write_historical_coverage(connection, state)
+                membership_count = connection.execute(
+                    "select count(*) from landing.membership"
+                ).fetchone()[0]
+                eligibility_count = connection.execute(
+                    "select count(*) from landing.parent_eligibility"
+                ).fetchone()[0]
+            store.sync_file(f"{staging_relative}/warehouse.duckdb")
+            operation_evidence, landing_proof = _fresh_historical_landing_proof(
+                store,
+                state,
+                stage_name,
+                staging_relative,
+                observation_count,
+                membership_count,
+                eligibility_count,
+                verified_pages,
+                selection,
+                task_indices,
+            )
+
+        if isinstance(index, DiskParentIndex):
+            index.close()
+            index_closed = True
+        _historical_dbt_workflow(
+            store,
+            state,
+            staging,
+            staging_relative,
+            previous_artifacts=previous_artifacts,
+            landing_proof=landing_proof,
+            source_proof_sha256=source_proof_sha256,
+            evidence=operation_evidence.evidence,
+            stage_name=stage_name,
+            rebuild=rebuild,
+        )
+        database = staging / "warehouse.duckdb"
+        _write_ordering_policy(store, database)
+        store.sync(staging_relative)
+        operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+        fsync_file(database)
+        fsync_directory(staging)
+        receipt = {
+            **_historical_receipt_fields(state),
+            "capture_id": capture_id,
+            "built_at": now(),
+            ORDERING_POLICY_FIELD: ORDERING_POLICY,
+            "evidence": operation_evidence.evidence,
+            "observation_count": observation_count,
+            "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
+            "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
+        }
+        store.write(f"{staging_relative}/build.json", receipt)
+        fsync_directory(staging)
+        promoted = _install_build(store, capture_id, 3, staging, operation_evidence)
+        store.check_storage()
+        for name in ("resume-source.json", "resume-landing.json", "resume-combo.json"):
+            relative = f"{build_directory(capture_id, 3)}/{name}"
+            if store.path(relative).exists():
+                store.remove(relative)
+        if resumed:
+            store.remove(historical_resume.stage_relative(stage_name))
+        return promoted
+    finally:
+        if isinstance(index, DiskParentIndex) and not index_closed:
+            index.close()
+        if resumed:
+            if staging.exists():
+                _recover_resume_candidate(store, staging)
+            store.sync(staging_relative)
+            store.sync(historical_resume.stage_relative(stage_name))
+        elif staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+            fsync_directory(staging.parent)
+            store.sync(staging_relative)
+
+
+def _full_v2_build(
+    store: Store,
+    state: dict[str, Any],
+    *,
+    rebuild: bool,
+    historical: bool = False,
+    resume_historical_stage: str | None = None,
+) -> dict[str, Any]:
+    capture_id = state["capture_id"]
+    if historical:
+        return _full_historical_build(
+            store,
+            state,
+            rebuild=rebuild,
+            resume_historical_stage=resume_historical_stage,
+        )
+    if not state.get("task_scopes") and any(
+        int(work.get("restarts", 0)) > 0 for work in state.get("tasks", [])
     ):
         raise CatalogueError(
             "legacy full capture lacks final-generation membership after cursor reset; capture a new full baseline"
         )
     store.check_deadline()
-    catalogue_version = 3 if historical else 2
-    historical_indices: set[int] | None = None
-    if historical:
-        _, historical_indices = _historical_profile(state)
+    catalogue_version = 2
     _recover_build(store, capture_id, catalogue_version)
-    staging_relative = (
-        f"tmp/build-historical-{uuid.uuid4().hex}"
-        if historical
-        else f"tmp/build-v2-{uuid.uuid4().hex}"
-    )
+    staging_relative = f"tmp/build-v2-{uuid.uuid4().hex}"
     staging = store.path(staging_relative)
     durable_mkdir(staging.parent)
     staging.mkdir()
     verified_pages: dict[str, str] = {}
     index: ParentIndex | DiskParentIndex = (
-        DiskParentIndex(store, collect_winners=not historical)
+        DiskParentIndex(store)
         if store.scope is None and _acquisition_protocol(state) == CURRENT_ACQUISITION_PROTOCOL
         else ParentIndex()
     )
     try:
-        if historical:
-            with metrics.phase("landing"):
-                _land_historical_rows(
-                    store,
-                    state,
-                    staging,
-                    verified_pages=verified_pages,
-                    parent_index=index,
-                    task_indices=historical_indices,
-                )
+        source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
+        source_exists = store.scope is None and store.path(source_relative).exists()
+        if source_exists and not rebuild:
+            source_receipt = certified(store, capture_id, catalogue_version=1)
+            _copy_closed_database(
+                store,
+                source_relative,
+                staging,
+                expected_sha256=source_receipt["warehouse_sha256"],
+            )
+            _projection_index(store, state, verified_pages=verified_pages, index=index)
         else:
-            source_relative = build_directory(capture_id, 1) + "/warehouse.duckdb"
-            source_exists = store.scope is None and store.path(source_relative).exists()
-            if source_exists and not rebuild:
-                source_receipt = certified(store, capture_id, catalogue_version=1)
-                _copy_closed_database(
-                    store,
-                    source_relative,
-                    staging,
-                    expected_sha256=source_receipt["warehouse_sha256"],
-                )
-                _projection_index(store, state, verified_pages=verified_pages, index=index)
-            else:
-                _land(
-                    store,
-                    state,
-                    staging,
-                    verified_pages=verified_pages,
-                    parent_index=index,
-                )
+            _land(
+                store,
+                state,
+                staging,
+                verified_pages=verified_pages,
+                parent_index=index,
+            )
         with (
-            _duckdb_work_config(store, staging) if historical else nullcontext({}) as config,
+            nullcontext({}) as config,
             duckdb.connect(str(staging / "warehouse.duckdb"), config=config) as connection,
             metrics.phase("current_projection"),
         ):
             _projection_membership(store, state, index, connection)
-            if historical:
-                _write_historical_coverage(connection, state)
-            else:
-                _parent_closure_is_fresh(connection, state, index)
-        if historical:
-            store.sync_file(f"{staging_relative}/warehouse.duckdb")
+            _parent_closure_is_fresh(connection, state, index)
         dbt(
             store,
             ["build"],
@@ -2561,7 +3713,6 @@ def _full_v2_build(
                 "incremental_update": False,
                 "current_capture_id": capture_id,
                 "delta_capture_id": capture_id,
-                **({"historical_compact": True} if historical else {}),
             },
         )
         database = staging / "warehouse.duckdb"
@@ -2571,14 +3722,11 @@ def _full_v2_build(
         fsync_file(database)
         fsync_directory(staging)
         receipt = {
-            **(
-                _historical_receipt_fields(state)
-                if historical
-                else {"version": 2, "catalogue_version": 2}
-            ),
+            "version": 2,
+            "catalogue_version": 2,
             "capture_id": capture_id,
             "built_at": now(),
-            **({} if historical else _build_scope_fields(state)),
+            **_build_scope_fields(state),
             ORDERING_POLICY_FIELD: ORDERING_POLICY,
             "evidence": operation_evidence.evidence,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
@@ -2603,11 +3751,23 @@ def build_v2_full(store: Store, capture_id: str, *, rebuild: bool = False) -> di
         return _build_v2_full_locked(store, capture_id, rebuild=rebuild)
 
 
-def build_historical(store: Store, capture_id: str, *, rebuild: bool = False) -> dict[str, Any]:
+def build_historical(
+    store: Store,
+    capture_id: str,
+    *,
+    rebuild: bool = False,
+    resume_historical_stage: str | None = None,
+) -> dict[str, Any]:
     with store.writer_guard():
         store.require_writable()
         if store.scope is not None:
             raise CatalogueError("historical catalogue builds require a catalogue root")
+        if resume_historical_stage is not None:
+            resume_relative = historical_resume.stage_relative(resume_historical_stage)
+            try:
+                _validate_historical_stage(store.path(resume_relative), store.root.lstat().st_dev)
+            except FileNotFoundError as exc:
+                raise CatalogueError("requested historical resume stage is missing") from exc
         from kalshi_events.incremental import finish_pending_retirement
 
         finish_pending_retirement(store)
@@ -2615,7 +3775,13 @@ def build_historical(store: Store, capture_id: str, *, rebuild: bool = False) ->
         _historical_profile(state)
         if state.get("incremental"):
             raise CatalogueError("incremental captures cannot be built as historical catalogues")
-        return _full_v2_build(store, state, rebuild=rebuild, historical=True)
+        return _full_v2_build(
+            store,
+            state,
+            rebuild=rebuild,
+            historical=True,
+            resume_historical_stage=resume_historical_stage,
+        )
 
 
 def _build_v2_full_locked(
