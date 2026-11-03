@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -33,16 +34,17 @@ def last_good_capture_root(tmp_path_factory):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(fixtures, "now", lambda: "2026-01-01T12:00:00+00:00")
         patch.setattr(acquisition, "now", lambda: "2026-01-01T12:00:00+00:00")
-        state = acquisition.capture(
-            Store(root), client_factory=FakeClient, catalogue_profile="exchange"
-        )
+        capture_options = {}
+        if "catalogue_profile" in inspect.signature(acquisition.capture).parameters:
+            capture_options["catalogue_profile"] = "exchange"
+        state = acquisition.capture(Store(root), client_factory=FakeClient, **capture_options)
     warehouse.build(Store(root), state["capture_id"])
     release = publishing.publish(Store(root), state["capture_id"])
     return root, state["capture_id"], release["source_release_id"]
 
 
 CAPTURE_SCRIPT = r"""
-import json, os, sys, threading
+import inspect, json, os, sys, threading
 from pathlib import Path
 import httpx
 from conftest import FakeClient
@@ -129,8 +131,10 @@ def replaced(source, destination, *args, **kwargs):
 
 EvidenceSpool.commit, Store.write, Store.append = committed, written, appended
 acquisition._apply_page_change, os.replace = installed, replaced
-state = acquisition.capture(store, resume=resume, client_factory=factory,
-                            catalogue_profile='exchange')
+capture_options = {}
+if 'catalogue_profile' in inspect.signature(acquisition.capture).parameters:
+    capture_options['catalogue_profile'] = 'exchange'
+state = acquisition.capture(store, resume=resume, client_factory=factory, **capture_options)
 assert state['complete']
 if boundary != 'resume':
     raise AssertionError('requested crash boundary was not reached: ' + boundary)

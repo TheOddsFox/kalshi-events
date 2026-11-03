@@ -17,11 +17,14 @@ import plistlib
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -121,6 +124,8 @@ MAX_OFFLINE_HISTORICAL_SECONDS = 24 * 3600
 CAPTURE_ID = re.compile(r"[0-9a-f]{32}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
 HISTORICAL_STAGE = re.compile(r"build-historical-[0-9a-f]{32}\Z")
+HISTORICAL_CONTROL_DIRECTORY = re.compile(r"kalshi-historical-completion-[0-9]{8}\Z")
+HISTORICAL_HOST_PYTHON = Path("/opt/homebrew/bin/python3")
 PROCESS_IDENTITY_UTC = re.compile(
     r"(\d+)\s+(\d+)\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
     r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
@@ -128,6 +133,7 @@ PROCESS_IDENTITY_UTC = re.compile(
 )
 REPORT_NAME = "session.json"
 OWNER_MARKER = ".production-root.json"
+HISTORICAL_SUPERVISOR_FD_ENV = "KALSHI_EVENTS_HISTORICAL_SUPERVISOR_FD"
 RESOURCE_SAMPLE_LIMIT = 256
 RESOURCE_SAMPLE_PEAK_FIELDS = (
     ("peak_child_process_group_rss_bytes", "child_process_group_rss_bytes"),
@@ -1238,6 +1244,307 @@ def _strict_json(path: Path, limit: int = 16 * MIB) -> dict[str, Any] | None:
     except (CatalogueError, OSError, UnicodeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _historical_session_report_bytes(path: Path, *, max_bytes: int = 16 * MIB) -> bytes:
+    """Read a regular session report safely without requiring control-file mode bits."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        before = path.lstat()
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RunnerError("historical session report is missing or unsafe") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size > max_bytes
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise RunnerError("historical session report is unsafe or oversized")
+        chunks = []
+        size = 0
+        while chunk := os.read(descriptor, min(65536, max_bytes + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > max_bytes:
+                raise RunnerError("historical session report is oversized")
+        after = os.fstat(descriptor)
+        final = path.lstat()
+
+        def signature(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_nlink,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        if signature(opened) != signature(after) or signature(opened) != signature(final):
+            raise RunnerError("historical session report changed during read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _historical_path_device(path: Path) -> int:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RunnerError("historical storage path is unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise RunnerError("historical storage path is not a real directory")
+    return info.st_dev
+
+
+def _historical_reboot_mount_proof(
+    report: dict[str, Any],
+    identity: dict[str, Any],
+    freeze: dict[str, Any],
+    *,
+    final_device: int,
+    final_volume_uuid: str,
+    final_boot_stamp: str,
+) -> dict[str, Any] | None:
+    history = report.get("reboot_recovery_history")
+    reconciliation = report.get("historical_reboot_reconciliation")
+    has_history = history is not None
+    has_reconciliation = reconciliation is not None
+    if not has_history and not has_reconciliation:
+        if final_device != freeze.get("root_device"):
+            raise RunnerError("changed historical mount has no completed reboot proof")
+        return None
+    if (
+        not isinstance(history, list)
+        or not history
+        or len(history) > 64
+        or not isinstance(reconciliation, dict)
+    ):
+        raise RunnerError("historical reboot mount history is missing or malformed")
+    origin_device = freeze.get("root_device")
+    expected_volume = freeze.get("root_volume_uuid")
+    if type(origin_device) is not int or origin_device < 0:
+        raise RunnerError("frozen historical root device is invalid")
+    if not isinstance(expected_volume, str) or not expected_volume:
+        raise RunnerError("frozen historical volume UUID is invalid")
+    expected_volume = expected_volume.upper()
+    prior_device = origin_device
+    prior_boot: str | None = None
+    deadlines = {
+        "started_epoch": report.get("started_epoch"),
+        "time_budget_started_epoch": _time_budget_started(report, "epoch"),
+        "deadline_epoch": _time_budget_deadline(report, "epoch"),
+    }
+    for index, event in enumerate(history):
+        if not isinstance(event, dict):
+            raise RunnerError("historical reboot mount history contains a malformed event")
+        previous_boot = event.get("previous_boot_stamp")
+        boot_stamp = event.get("boot_stamp")
+        previous_device = event.get("previous_filesystem_device")
+        filesystem_device = event.get("filesystem_device")
+        previous_group = event.get("previous_active_process_group")
+        if (
+            not isinstance(previous_boot, str)
+            or not previous_boot
+            or not isinstance(boot_stamp, str)
+            or not boot_stamp
+            or previous_boot == boot_stamp
+            or type(previous_device) is not int
+            or previous_device != prior_device
+            or type(filesystem_device) is not int
+            or filesystem_device < 0
+            or event.get("volume_uuid") != expected_volume
+            or event.get("accounting_basis") != "exact"
+            or event.get("accounting_complete") is not True
+            or event.get("processing_worker_started") is not False
+            or event.get("grant_started") is not False
+            or type(previous_group) not in {int, type(None)}
+            or isinstance(previous_group, int)
+            and previous_group <= 1
+            or event.get("prior_process_group_ignored_after_boot_change")
+            is not (previous_group is not None)
+            or event.get("wall_deadlines_preserved") != deadlines
+            or not isinstance(event.get("accounting_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", event["accounting_sha256"]) is None
+            or not isinstance(event.get("session_before_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", event["session_before_sha256"]) is None
+        ):
+            raise RunnerError("historical reboot mount history failed its transition proof")
+        if index and previous_boot != prior_boot:
+            raise RunnerError("historical reboot mount history has a stale boot transition")
+        prior_boot = boot_stamp
+        prior_device = filesystem_device
+    latest = history[-1]
+    if (
+        latest.get("boot_stamp") != final_boot_stamp
+        or latest.get("filesystem_device") != final_device
+        or latest.get("volume_uuid") != final_volume_uuid
+        or report.get("boot_stamp") != final_boot_stamp
+        or not isinstance(reconciliation, dict)
+        or reconciliation.get("state") != "complete"
+        or reconciliation.get("capture_id") != identity.get("capture_id")
+        or reconciliation.get("root_id") != identity.get("root_id")
+        or reconciliation.get("boot_stamp") != final_boot_stamp
+        or reconciliation.get("accounting_basis") != "exact"
+        or reconciliation.get("processing_worker_started") is not False
+        or reconciliation.get("grant_started") is not False
+        or report.get("accounting_complete") is not True
+        or report.get("unfinished_reservation_ids") != []
+        or report.get("consumption_state") != "verified"
+        or reconciliation.get("private_worker_reconciliation_sha256")
+        != latest.get("private_worker_reconciliation_sha256")
+        or report.get("root_id") != identity.get("root_id")
+        or report.get("capture_id") != identity.get("capture_id")
+    ):
+        raise RunnerError("historical reboot reconciliation does not bind the current mount")
+    original_system = report.get("original_system")
+    if isinstance(original_system, dict) and (
+        original_system.get("filesystem_device") != origin_device
+        or original_system.get("filesystem_volume_uuid") not in {None, expected_volume}
+    ):
+        raise RunnerError("historical reboot origin differs from its frozen root")
+    return latest
+
+
+def _historical_current_mount(
+    directory: Path,
+    operator: Path,
+    control_root: Path,
+    report: dict[str, Any],
+    identity: dict[str, Any],
+    freeze: dict[str, Any],
+    *,
+    current_boot: str | None = None,
+    session_root_device: int | None = None,
+    allow_unreconciled_boot_change: bool = False,
+    expected_current_device: int | None = None,
+    expected_current_volume_uuid: str | None = None,
+) -> dict[str, Any]:
+    """Validate the live mount while retaining the original frozen device as provenance."""
+    control_root = _historical_control_root(control_root)
+    current_boot = _boot_stamp() if current_boot is None else current_boot
+    system = report.get("system")
+    if not isinstance(system, dict):
+        raise RunnerError("historical report has no filesystem identity")
+    try:
+        root_device = _historical_path_device(directory)
+        operator_device = _historical_path_device(operator)
+        control_device = _historical_path_device(control_root)
+        root_volume = _volume_uuid(directory).upper()
+        operator_volume = _volume_uuid(operator).upper()
+        control_volume = _volume_uuid(control_root).upper()
+    except OSError as exc:
+        raise RunnerError("historical current mount identity is unavailable") from exc
+    expected_volume = freeze.get("root_volume_uuid")
+    saved_device = system.get("filesystem_device")
+    if (
+        not isinstance(expected_volume, str)
+        or not expected_volume
+        or type(saved_device) is not int
+        or saved_device < 0
+        or root_device != operator_device
+        or root_device != control_device
+        or (root_volume, operator_volume, control_volume) != (expected_volume.upper(),) * 3
+        or system.get("filesystem_volume_uuid") not in {None, expected_volume.upper()}
+        or _owner_root_id(directory) != identity.get("root_id")
+        or report.get("root_id") != identity.get("root_id")
+        or report.get("capture_id") != identity.get("capture_id")
+        or session_root_device is not None
+        and session_root_device != saved_device
+        or expected_current_device is not None
+        and expected_current_device != root_device
+        or expected_current_volume_uuid is not None
+        and expected_current_volume_uuid.upper() != root_volume
+    ):
+        raise RunnerError("historical root, operator or controls mount identity changed")
+    if allow_unreconciled_boot_change:
+        if report.get("boot_stamp") == current_boot:
+            raise RunnerError("private reboot reconciliation has no changed-boot proof")
+        if system.get("filesystem_volume_uuid") is None and saved_device != freeze.get(
+            "root_device"
+        ):
+            raise RunnerError("changed historical mount has no saved volume identity")
+        _historical_reboot_mount_proof(
+            report,
+            identity,
+            freeze,
+            final_device=saved_device,
+            final_volume_uuid=expected_volume.upper(),
+            final_boot_stamp=str(report.get("boot_stamp")),
+        )
+    else:
+        if report.get("boot_stamp") != current_boot or saved_device != root_device:
+            raise RunnerError("historical report does not match the current boot and mount")
+        if system.get("filesystem_volume_uuid") is None and (
+            root_device != freeze.get("root_device")
+            or report.get("reboot_recovery_history") is not None
+            or report.get("historical_reboot_reconciliation") is not None
+        ):
+            raise RunnerError("reconciled historical report has no current volume UUID")
+        _historical_reboot_mount_proof(
+            report,
+            identity,
+            freeze,
+            final_device=root_device,
+            final_volume_uuid=root_volume,
+            final_boot_stamp=current_boot,
+        )
+    device_lineage = [freeze["root_device"]]
+    history = report.get("reboot_recovery_history")
+    if isinstance(history, list):
+        for event in history:
+            device = event.get("filesystem_device") if isinstance(event, dict) else None
+            if type(device) is int and device not in device_lineage:
+                device_lineage.append(device)
+    if not allow_unreconciled_boot_change and root_device not in device_lineage:
+        raise RunnerError("current historical device is outside its completed reboot lineage")
+    return {
+        "device": root_device,
+        "volume_uuid": root_volume,
+        "saved_report_device": saved_device,
+        "boot_stamp": current_boot,
+        "device_lineage": device_lineage,
+    }
+
+
+def _historical_resume_source_identity_equal(
+    persisted: Any,
+    other: Any,
+    *,
+    store: Any,
+    state: dict[str, Any],
+    verified_mount: dict[str, Any] | None,
+    require_live: bool = False,
+) -> bool:
+    from kalshi_events import historical_resume
+
+    if persisted is None or other is None:
+        return persisted is None and other is None
+    normalized_persisted = historical_resume.normalize_resume_file_identity(
+        persisted,
+        store=store,
+        state=state,
+        verified_mount=verified_mount,
+    )
+    normalized_other = historical_resume.normalize_resume_file_identity(
+        other,
+        store=store,
+        state=state,
+        verified_mount=verified_mount,
+    )
+    if require_live and not historical_resume.resume_file_identity_matches(
+        persisted,
+        other,
+        store=store,
+        state=state,
+        verified_mount=verified_mount,
+    ):
+        return False
+    return normalized_persisted == normalized_other
 
 
 def _atomic_report(path: Path, report: dict[str, Any]) -> None:
@@ -2402,18 +2709,29 @@ def _invoke(
     capture_id: str | None = None,
     capture_notification: Path | None = None,
     workflow_deadline: bool = False,
+    wall_deadline_epoch_override: float | None = None,
     phase_on_start: str | None = None,
     storage_supervision: bool = False,
     storage_invocation_token: str | None = None,
     metrics_progress_path: Path | None = None,
     storage_progress_path: Path | None = None,
+    child_source_root: Path | None = None,
+    storage_maintenance: bool = False,
+    supervisor_handoff: dict[str, Any] | None = None,
 ) -> tuple[int | None, str | None, bool]:
     from kalshi_events.common import safe_path
     from kalshi_events.paths import child_environment, project_root
 
+    child_source_root = (
+        SOURCE_ROOT if child_source_root is None else _external_path(child_source_root)
+    )
+    if not (child_source_root / "src").is_dir() or not (child_source_root / "scripts").is_dir():
+        raise RunnerError("supervised child source root is incomplete")
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(SOURCE_ROOT / "src")
-    env = child_environment(env, project_root(code_root=SOURCE_ROOT))
+    env["PYTHONPATH"] = str(child_source_root / "src")
+    env = child_environment(env, project_root(code_root=child_source_root))
+    if supervisor_handoff is not None and not storage_supervision:
+        raise RunnerError("private supervisor handoff requires live storage supervision")
     directory = _external_path(directory)
     original_device = directory.stat().st_dev
     recorded_device = report.get("system", {}).get("filesystem_device")
@@ -2423,8 +2741,10 @@ def _invoke(
     stderr_path = safe_path(stderr_path)
     if time.monotonic() >= deadline - float(_effective_limits()["terminate_seconds"]):
         return None, "insufficient time remains to start and reap a child", True
-    wall_deadline_epoch = _child_wall_deadline_epoch(
-        report, deadline, workflow_deadline=workflow_deadline
+    wall_deadline_epoch = (
+        wall_deadline_epoch_override
+        if wall_deadline_epoch_override is not None
+        else _child_wall_deadline_epoch(report, deadline, workflow_deadline=workflow_deadline)
     )
     wall_now = time.time()
     if wall_deadline_epoch is not None and wall_now >= wall_deadline_epoch - float(
@@ -2470,6 +2790,9 @@ def _invoke(
         process: subprocess.Popen[Any] | None = None
         storage_state = None
         storage_external_paths = None
+        storage_token = None
+        handoff_read_fd: int | None = None
+        handoff_write_fd: int | None = None
         try:
             global _PENDING_STOP_SIGNAL, _SPAWNING_CHILD
             wall_now = time.time()
@@ -2487,8 +2810,11 @@ def _invoke(
                 )
                 return None, reason, True
             if storage_supervision:
-                if storage_progress_path is None:
+                if storage_progress_path is None or not isinstance(storage_invocation_token, str):
                     raise RunnerError("historical storage progress path is unavailable")
+                if re.fullmatch(r"[0-9a-f]{32}", storage_invocation_token) is None:
+                    raise RunnerError("historical storage invocation token is invalid")
+                storage_token = storage_invocation_token
                 storage_external_paths = {
                     "session_report": report_path,
                     "stdout": stdout_path,
@@ -2509,25 +2835,78 @@ def _invoke(
                     report,
                     storage_progress_path,
                     storage_external_paths,
+                    invocation_token=storage_token,
+                    allow_temporary_cleanup=storage_maintenance,
                 )
+            if supervisor_handoff is not None:
+                expected_handoff_fields = {
+                    "directory",
+                    "control_root",
+                    "grant_id",
+                    "launch_sha256",
+                    "phase",
+                    "substep",
+                    "storage_invocation_token",
+                    "storage_progress_path",
+                }
+                if (
+                    set(supervisor_handoff) != expected_handoff_fields
+                    or supervisor_handoff.get("directory") != str(directory)
+                    or supervisor_handoff.get("storage_invocation_token") != storage_token
+                    or supervisor_handoff.get("storage_progress_path") != str(storage_progress_path)
+                ):
+                    raise RunnerError(
+                        "private supervisor handoff fields do not match the live child"
+                    )
+                handoff_read_fd, handoff_write_fd = os.pipe()
+                os.set_inheritable(handoff_read_fd, True)
+                env[HISTORICAL_SUPERVISOR_FD_ENV] = str(handoff_read_fd)
             _SPAWNING_CHILD = True
             try:
                 process = subprocess.Popen(
                     command,
                     stdout=stdout,
                     stderr=stderr,
-                    cwd=SOURCE_ROOT,
+                    cwd=child_source_root,
                     env=env,
                     shell=False,
                     start_new_session=True,
+                    pass_fds=(handoff_read_fd,) if handoff_read_fd is not None else (),
                 )
+                if handoff_read_fd is not None:
+                    os.close(handoff_read_fd)
+                    handoff_read_fd = None
+                if handoff_write_fd is not None:
+                    handoff = {
+                        "version": 1,
+                        "nonce": uuid.uuid4().hex,
+                        **supervisor_handoff,
+                        "supervisor_pid": os.getpid(),
+                        "supervisor_pgid": os.getpgrp(),
+                        "worker_pid": process.pid,
+                        "worker_pgid": process.pid,
+                    }
+                    payload = json.dumps(
+                        handoff, sort_keys=True, separators=(",", ":"), allow_nan=False
+                    ).encode("utf-8")
+                    pending = memoryview(payload)
+                    while pending:
+                        written = os.write(handoff_write_fd, pending)
+                        if written <= 0:
+                            raise RunnerError("private supervisor handoff pipe closed early")
+                        pending = pending[written:]
+                    os.close(handoff_write_fd)
+                    handoff_write_fd = None
                 if phase_on_start is not None:
                     report["phase"] = phase_on_start
                 if storage_supervision:
-                    report["storage_supervision_invocation"] = (
-                        storage_invocation_token or uuid.uuid4().hex
-                    )
+                    report["storage_supervision_invocation"] = storage_token
+                    report["storage_supervision_file"] = str(storage_progress_path)
                 report["active_process_group"] = process.pid
+                private_grant = report.get("private_historical_grant")
+                if supervisor_handoff is not None and isinstance(private_grant, dict):
+                    private_grant["worker_pid"] = process.pid
+                    private_grant["worker_pgid"] = process.pid
                 _atomic_report(report_path, report)
             finally:
                 _SPAWNING_CHILD = False
@@ -2553,6 +2932,10 @@ def _invoke(
                 storage_external_paths=storage_external_paths,
             )
         except BaseException as exc:
+            for descriptor in (handoff_read_fd, handoff_write_fd):
+                if descriptor is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(descriptor)
             _merge_capture_notification(report, capture_notification)
             reaped = process is None or _terminate(process)
             if process is not None:
@@ -2696,6 +3079,7 @@ def _release_verify(
     deadline: float,
     *,
     storage_supervision: bool = False,
+    wall_deadline_epoch_override: float | None = None,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -2722,6 +3106,7 @@ def _release_verify(
             deadline=deadline,
             stdout_path=stdout,
             stderr_path=stderr,
+            wall_deadline_epoch_override=wall_deadline_epoch_override,
             storage_supervision=storage_supervision,
             storage_invocation_token=storage_token,
             metrics_progress_path=paths.get("metrics_progress"),
@@ -2780,7 +3165,7 @@ def _validate_initial_historical_accounting_session(
     if (
         report is None
         or report.get("version") != 1
-        or report.get("mode") not in {"full", "historical"}
+        or report.get("mode") not in {"full", "resume", "historical"}
         or report.get("session_id") != session_id
         or report.get("capture_id") != capture_id
         or report.get("root_id") != expected_root_id
@@ -3193,6 +3578,9 @@ def _bounded_tree_bytes(
         return totals
     if not stat.S_ISDIR(root.st_mode) or root.st_dev != device:
         raise RunnerError(f"live storage workspace is unsafe: {path.name}")
+    count[0] += 1
+    if count[0] > int(_effective_limits()["storage_inventory_entries"]):
+        raise RunnerError("live storage inventory exceeded its entry bound")
 
     def walk(directory: Path) -> None:
         try:
@@ -3271,7 +3659,6 @@ def _live_workspace_snapshot_once(
         or root_identity.get("root_id") != expected_root_id
     ):
         raise RunnerError("operator root identity changed during live storage supervision")
-    count = [0]
     allocated_inodes: set[tuple[int, int]] = set()
     logical = allocated = database = temporary = 0
     try:
@@ -3301,6 +3688,8 @@ def _live_workspace_snapshot_once(
         raise RunnerError("operator root could not be inventoried") from exc
     if len(operator_entries) > int(_effective_limits()["storage_inventory_entries"]):
         raise RunnerError("operator root exceeded its direct-entry bound")
+    # Count direct entries once; raw/capture descendants are intentionally exempt.
+    count = [len(operator_entries)]
     writer_lock = operator_entries.get("writer.lock")
     if writer_lock is None:
         raise RunnerError("operator root writer lock is missing or unsafe")
@@ -3353,6 +3742,9 @@ def _live_workspace_snapshot_once(
                     Path(entry.path), root_info.st_dev, count, allocated_inodes
                 )
             elif stat.S_ISREG(info.st_mode) and entry.name.startswith(".write-"):
+                count[0] += 1
+                if count[0] > int(_effective_limits()["storage_inventory_entries"]):
+                    raise RunnerError("live storage inventory exceeded its entry bound")
                 totals = {
                     "logical_bytes": info.st_size,
                     "allocated_bytes": info.st_blocks * 512,
@@ -3429,6 +3821,7 @@ def _live_workspace_snapshot_once(
     }
     return {
         **return_value,
+        "inventory_entries": count[0],
     }
 
 
@@ -3570,7 +3963,13 @@ def _begin_storage_supervision(
     report: dict[str, Any],
     progress_path: Path,
     external_paths: dict[str, Path],
+    *,
+    invocation_token: str | None = None,
+    allow_temporary_cleanup: bool = False,
 ) -> dict[str, Any]:
+    invocation_token = invocation_token or uuid.uuid4().hex
+    if re.fullmatch(r"[0-9a-f]{32}", invocation_token) is None:
+        raise RunnerError("live storage supervision invocation token is invalid")
     saved = report.get("storage")
     fields = (
         "operator_retained_bytes",
@@ -3602,11 +4001,14 @@ def _begin_storage_supervision(
         raise RunnerError(
             f"verified database storage baseline reaches the {threshold // GIB} GiB stop threshold"
         )
-    if _storage_stop_reached(saved["operator_temporary_bytes"], "temporary"):
+    temporary_stop = _storage_stop_reached(saved["operator_temporary_bytes"], "temporary")
+    if temporary_stop:
         threshold = int(_effective_limits()["storage_temporary_stop_bytes"])
-        raise RunnerError(
-            f"verified temporary storage baseline reaches the {threshold // GIB} GiB stop threshold"
-        )
+        hard_ceiling = int(_effective_limits()["temporary_bytes"])
+        if not allow_temporary_cleanup or saved["operator_temporary_bytes"] > hard_ceiling:
+            raise RunnerError(
+                f"verified temporary storage baseline reaches the {threshold // GIB} GiB stop threshold"
+            )
     if saved["operator_retained_bytes"] > int(_effective_limits()["root_bytes"]) or saved[
         "aggregate_estimate_bytes"
     ] > int(_effective_limits()["aggregate_bytes"]):
@@ -3628,6 +4030,15 @@ def _begin_storage_supervision(
     }
     state = {
         "version": 1,
+        "invocation_token": invocation_token,
+        "maintenance_temporary_baseline_bytes": (
+            saved["operator_temporary_bytes"]
+            if allow_temporary_cleanup and temporary_stop
+            else None
+        ),
+        "maintenance_temporary_growth_allowance_bytes": (
+            64 * MIB if allow_temporary_cleanup and temporary_stop else 0
+        ),
         "target_interval_seconds": int(_effective_limits()["storage_sample_seconds"]),
         "sample_count": 0,
         "last_sample_monotonic": None,
@@ -3789,7 +4200,18 @@ def _sample_live_storage(
     if _storage_stop_reached(current["operator_database_bytes"], "database"):
         return f"live database storage reached the {database_stop // GIB} GiB stop threshold"
     temporary_stop = int(_effective_limits()["storage_temporary_stop_bytes"])
-    if _storage_stop_reached(current["operator_temporary_bytes"], "temporary"):
+    maintenance_baseline = state.get("maintenance_temporary_baseline_bytes")
+    maintenance_allowance = state.get("maintenance_temporary_growth_allowance_bytes", 0)
+    if type(maintenance_baseline) is int and (
+        type(maintenance_allowance) is not int
+        or maintenance_allowance < 0
+        or current["operator_temporary_bytes"] > maintenance_baseline + maintenance_allowance
+    ):
+        return "startup cleanup exceeded its fixed temporary metadata allowance"
+    if _storage_stop_reached(current["operator_temporary_bytes"], "temporary") and not (
+        type(maintenance_baseline) is int
+        and current["operator_temporary_bytes"] <= maintenance_baseline + maintenance_allowance
+    ):
         _record_temporary_storage_stop(report, current["operator_temporary_bytes"])
         return f"live temporary storage reached the {temporary_stop // GIB} GiB stop threshold"
     if current["operator_retained_bytes"] > int(_effective_limits()["root_bytes"]):
@@ -4372,6 +4794,87 @@ def _append_stopped_worker_audit(
         os.close(descriptor)
 
 
+def _reconcile_private_historical_worker(
+    directory: Path,
+    operator: Path,
+    report_path: Path,
+    report: dict[str, Any],
+    raw_report: bytes,
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events.common import regular_bytes
+
+    proof = _historical_private_uncertain_authority(
+        directory,
+        report_path,
+        report,
+        current_boot=_boot_stamp(),
+        changed_boot=False,
+    )
+    _historical_private_processes_absent(proof)
+    marker = proof["marker"]
+    with _operator_writer_lock(operator):
+        if (
+            regular_bytes(report_path, 16 * MIB) != raw_report
+            or _strict_json(report_path) != report
+        ):
+            raise RunnerError("private uncertain session changed during reconciliation")
+        _historical_private_processes_absent(proof)
+        storage_state = _historical_validate_storage_handoff(
+            directory,
+            report_path,
+            Path(marker["storage_progress_path"]),
+            invocation_token=marker["storage_invocation_token"],
+            allow_stale=True,
+        )
+        if grants.sha256_json(storage_state) != proof["storage_sha256"]:
+            raise RunnerError("private uncertain storage handoff changed during reconciliation")
+        body = {
+            "version": 1,
+            "kind": "same_boot_worker_absence",
+            "identity": proof["identity"],
+            "grant_id": marker["grant_id"],
+            "launch_id": marker["launch_id"],
+            "launch_sha256": proof["launch_sha256"],
+            "session_before_sha256": hashlib.sha256(raw_report).hexdigest(),
+            "boot_stamp": report["boot_stamp"],
+            "controller_pid": marker["controller_pid"],
+            "controller_pgid": marker["controller_pgid"],
+            "worker_pid": marker["worker_pid"],
+            "worker_pgid": marker["worker_pgid"],
+            "storage_invocation_token": marker["storage_invocation_token"],
+            "storage_progress_path": marker["storage_progress_path"],
+            "storage_progress_sha256": proof["storage_sha256"],
+            "processes_proven_absent": True,
+            "reconciliation_worker_started": False,
+            "new_grant_started": False,
+        }
+        _record, record_sha256 = _historical_write_private_reconciliation(
+            proof["control_root"], marker["grant_id"], body
+        )
+        current = _strict_json(report_path)
+        if current != report:
+            raise RunnerError("private uncertain session changed before reconciliation readback")
+        current["phase"] = "stopped"
+        current["active_process_group"] = None
+        current["private_historical_grant"]["state"] = "reconciled"
+        current["private_historical_grant"]["reconciliation_sha256"] = record_sha256
+        current["private_historical_reconciliation"] = {
+            "state": "complete",
+            "kind": "same_boot_worker_absence",
+            "grant_id": marker["grant_id"],
+            "launch_id": marker["launch_id"],
+            "launch_sha256": proof["launch_sha256"],
+            "record_sha256": record_sha256,
+            "boot_stamp": report["boot_stamp"],
+            "reconciliation_worker_started": False,
+            "new_grant_started": False,
+        }
+        _atomic_report(report_path, current)
+    return current
+
+
 def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any]:
     from kalshi_events.common import regular_bytes, safe_path
 
@@ -4391,6 +4894,13 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
         if len(matches) != 1:
             raise RunnerError("stopped-worker reconciliation requires one exact capture report")
         report_path, report = matches[0]
+        if "private_historical_grant" in report or report.get("phase") == "uncertain":
+            raw_report = regular_bytes(report_path, 16 * MIB)
+            if _strict_json(report_path) != report:
+                raise RunnerError("private uncertain session changed before reconciliation")
+            return _reconcile_private_historical_worker(
+                directory, operator, report_path, report, raw_report
+            )
         group = report.get("active_process_group")
         if (
             not isinstance(report.get("session_id"), str)
@@ -4637,8 +5147,10 @@ def _reconcile_stopped_worker(directory: Path, capture_id: str) -> dict[str, Any
                 "event_id": event_id,
                 "audit_file": "stopped-worker-reconciliation.jsonl",
                 "reconciled_at": audit["reconciled_at"],
+                "boot_stamp": report["boot_stamp"],
                 "stale_process_group": group,
                 "supervisor_pid": supervisor_pid,
+                "supervisor_pgid": supervisor_pgid,
                 "primary_stop_reason": report.get("error"),
                 "termination_evidence_sha256": evidence_hash,
                 "session_before_sha256": session_before_hash,
@@ -5268,6 +5780,7 @@ def _run_external_child(
     capture_id: str | None = None,
     preserve_phase_until_start: bool = False,
     storage_supervision: bool = False,
+    wall_deadline_epoch_override: float | None = None,
 ) -> tuple[int | None, str | None, bool, Path, Path]:
     stdout = paths["logs"] / f"{label}.stdout.json"
     stderr = paths["logs"] / f"{label}.stderr.log"
@@ -5293,6 +5806,7 @@ def _run_external_child(
         capture_id=capture_id,
         capture_notification=notification,
         workflow_deadline=label == "refresh",
+        wall_deadline_epoch_override=wall_deadline_epoch_override,
         phase_on_start=label if preserve_phase_until_start else None,
         storage_supervision=storage_supervision,
         storage_invocation_token=storage_token,
@@ -5382,19 +5896,30 @@ def run_production(
             raise RunnerError("--reconcile-stopped-worker requires only --historical --capture-id")
         return _reconcile_stopped_worker(directory, str(capture_id)), 0
     _validate_runtime_versions(_package_versions())
-    if reconcile_accounting and mode != "resume":
+    historical_reboot_reconciliation = (
+        mode == "historical" and reconcile_accounting and recover_reboot
+    )
+    if reconcile_accounting and mode != "resume" and not historical_reboot_reconciliation:
         raise RunnerError("accounting reconciliation requires --capture-id resume")
     if extend_session and (mode != "resume" or not reconcile_accounting):
         raise RunnerError("session extension requires --capture-id and --reconcile-accounting")
     if recover_reboot and (
-        mode != "resume"
+        mode not in {"resume", "historical"}
         or not reconcile_accounting
         or extend_session
         or recovery_volume_uuid is None
+        or mode == "historical"
+        and (
+            offline_duration_seconds is not None
+            or renew_offline_window
+            or supersede_offline_window
+            or reconcile_stopped_worker
+            or resource_profile is not None
+        )
     ):
         raise RunnerError(
-            "reboot recovery requires --capture-id, --reconcile-accounting and "
-            "--recovery-volume-uuid, and cannot extend the session"
+            "reboot recovery requires accounting reconciliation and a verified volume UUID; "
+            "offline historical recovery accepts no other grant or resource options"
         )
     if recovery_volume_uuid is not None and not recover_reboot:
         raise RunnerError("--recovery-volume-uuid requires --recover-reboot")
@@ -5422,6 +5947,18 @@ def run_production(
                 recovery_volume_uuid=recovery_volume_uuid,
                 resource_profile=resource_profile,
             )
+            if historical_reboot_reconciliation:
+                profile = report.get("resource_profile", "default")
+                token = _ACTIVE_LIMITS.set(_limits_from_report(report, profile))
+                try:
+                    return _finish_historical_reboot_reconciliation(
+                        directory,
+                        report_path,
+                        report,
+                        str(capture_id),
+                    ), 0
+                finally:
+                    _ACTIVE_LIMITS.reset(token)
             profile = report.get("resource_profile", "default")
             _ACTIVE_LIMITS.set(_limits_from_report(report, profile))
             if reconcile_accounting:
@@ -6202,6 +6739,7 @@ def _activation_worker(
     expected: str,
     report_path: Path | None = None,
     expected_profile: str | None = None,
+    grant_deadlines: tuple[float, float] | None = None,
 ) -> int:
     try:
         directory = _external_path(directory)
@@ -6229,7 +6767,12 @@ def _activation_worker(
         )
         remaining = None
         if session_report is not None:
-            if "offline_historical_window" in session_report:
+            if grant_deadlines is not None:
+                remaining = min(
+                    float(grant_deadlines[0]) - time.time(),
+                    float(grant_deadlines[1]) - time.monotonic(),
+                )
+            elif "offline_historical_window" in session_report:
                 window = _validate_offline_historical_window(
                     session_report, str(session_report.get("capture_id"))
                 )
@@ -6438,8 +6981,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
         if not args.historical or not args.capture_id:
             parser.error("--resume-historical-stage requires --historical --capture-id")
-    if args.reconcile_accounting and (not args.capture_id or args.historical):
-        parser.error("--reconcile-accounting requires a network --capture-id resume")
+    if args.reconcile_accounting and (
+        not args.capture_id or args.historical and not args.recover_reboot
+    ):
+        parser.error(
+            "--reconcile-accounting requires network resume or explicit offline historical reboot recovery"
+        )
     if args.reconcile_stopped_worker and (
         not args.historical
         or not args.capture_id
@@ -6596,8 +7143,17 @@ def _load_resume(
         raise RunnerError(
             "--renew-offline-window requires offline historical completion and an explicit duration"
         )
-    if historical and (reconcile_accounting or extend_session or recover_reboot):
+    historical_reboot_reconciliation = historical and reconcile_accounting and recover_reboot
+    if (
+        historical
+        and (reconcile_accounting or extend_session or recover_reboot)
+        and not (historical_reboot_reconciliation)
+    ):
         raise RunnerError("offline historical completion cannot reconcile or extend acquisition")
+    if historical_reboot_reconciliation and (
+        duration is not None or renew_requested or extend_session
+    ):
+        raise RunnerError("offline historical reboot reconciliation accepts no grant options")
     if extend_session and not reconcile_accounting:
         raise RunnerError("session extension requires --reconcile-accounting")
     if recover_reboot and (
@@ -6726,19 +7282,42 @@ def _load_resume(
             raise RunnerError(
                 "current HTTP transport source and 64 KiB raw chunk bound cannot be verified"
             )
-    if report.get("active_process_group") is not None:
-        raise RunnerError(
-            "session records an unreconciled child process group; explicit recovery is required"
-        )
     now = time.time()
     if now < float(report.get("last_observed_epoch", report["started_epoch"])):
         raise RunnerError("wall clock moved backward since the last durable session report")
     current_boot = _boot_stamp()
     rebooted = report.get("boot_stamp") != current_boot
+    private_reboot_uncertain = (
+        historical_reboot_reconciliation
+        and rebooted
+        and isinstance(report.get("private_historical_grant"), dict)
+        and type(report.get("active_process_group")) is int
+        and (
+            report.get("phase") == "uncertain"
+            and report["private_historical_grant"].get("state") == "stopped"
+            or report["private_historical_grant"].get("state") == "supervised-child-pending"
+            and report.get("phase")
+            == "historical-{}-{}".format(
+                report["private_historical_grant"].get("phase"),
+                report["private_historical_grant"].get("substep"),
+            )
+        )
+    )
     if rebooted and not recover_reboot:
         raise RunnerError("Mac restarted; explicit reconciled reboot recovery is required")
-    if rebooted and report.get("phase") != "stopped":
+    if historical_reboot_reconciliation and not rebooted:
+        raise RunnerError("--recover-reboot requires a verified boot change")
+    if rebooted and report.get("phase") != "stopped" and not private_reboot_uncertain:
         raise RunnerError("reboot recovery requires a durably stopped session")
+    active_group = report.get("active_process_group")
+    if active_group is not None:
+        if not (historical_reboot_reconciliation and rebooted):
+            raise RunnerError(
+                "session records an unreconciled child process group that is live or ambiguous; "
+                "same-boot reconciliation is required"
+            )
+        if type(active_group) is not int or active_group <= 1:
+            raise RunnerError("prior-boot process group identity is malformed")
     if not isinstance(report.get("root_id"), str) or _owner_root_id(directory) != report["root_id"]:
         raise RunnerError("session logical root differs from production ownership marker")
     saved_system = report.get("system", {})
@@ -6762,6 +7341,15 @@ def _load_resume(
         operator_path = directory / "operator"
         if operator_path.exists() and operator_path.stat().st_dev != current_device:
             raise RunnerError("production operator directory is on another filesystem")
+    private_worker_reconciliation = None
+    if private_reboot_uncertain:
+        private_worker_reconciliation = _historical_private_uncertain_authority(
+            directory,
+            report_path,
+            report,
+            current_boot=current_boot,
+            changed_boot=True,
+        )
     if not rebooted and saved_device != current_device:
         raise RunnerError("production filesystem changed since the original session")
     existing_offline_window = "offline_historical_window" in report
@@ -6769,8 +7357,8 @@ def _load_resume(
         _validate_offline_historical_window(
             report,
             capture_id,
-            allow_expired=renew_requested,
-            allow_revision_change=renew_requested,
+            allow_expired=renew_requested or historical_reboot_reconciliation,
+            allow_revision_change=renew_requested or historical_reboot_reconciliation,
         )
     elif historical and (
         "offline_historical_window_history" in report
@@ -6842,39 +7430,79 @@ def _load_resume(
             "time_budget_started_monotonic": _time_budget_started(report, "monotonic"),
             "deadline_monotonic": _time_budget_deadline(report, "monotonic"),
         }
-        # Anchor monotonic time to the existing wall clock; never grant new time.
-        mono_sample = time.monotonic()
-        wall_sample = time.time()
-        offset = mono_sample - wall_sample
-        report["started_monotonic"] = offset + float(report["started_epoch"])
-        report["time_budget_started_monotonic"] = offset + _time_budget_started(report, "epoch")
-        report["deadline_monotonic"] = offset + _time_budget_deadline(report, "epoch")
-        history = report.setdefault("reboot_recovery_history", [])
-        if not isinstance(history, list):
-            raise RunnerError("reboot recovery history is invalid")
-        history.append(
-            {
-                "recovered_at": _utc(),
+        if historical_reboot_reconciliation:
+            report["_pending_historical_reboot_reconciliation"] = {
                 "previous_boot_stamp": report.get("boot_stamp"),
                 "boot_stamp": current_boot,
                 "previous_filesystem_device": saved_device,
                 "filesystem_device": current_device,
                 "volume_uuid": current_volume_uuid,
                 "prior_volume_uuid_available": saved_volume_uuid is not None,
+                "previous_active_process_group": active_group,
+                "private_worker_reconciliation": (
+                    {
+                        "control_root": str(private_worker_reconciliation["control_root"]),
+                        "identity": private_worker_reconciliation["identity"],
+                        "freeze": private_worker_reconciliation["freeze"],
+                        "session_root_device": private_worker_reconciliation["session_binding"][
+                            "root_device"
+                        ],
+                        "grant_id": private_worker_reconciliation["marker"]["grant_id"],
+                        "launch_id": private_worker_reconciliation["marker"]["launch_id"],
+                        "launch_sha256": private_worker_reconciliation["launch_sha256"],
+                        "controller_pid": private_worker_reconciliation["marker"]["controller_pid"],
+                        "controller_pgid": private_worker_reconciliation["marker"][
+                            "controller_pgid"
+                        ],
+                        "worker_pid": private_worker_reconciliation["marker"]["worker_pid"],
+                        "worker_pgid": private_worker_reconciliation["marker"]["worker_pgid"],
+                        "storage_sha256": private_worker_reconciliation["storage_sha256"],
+                        "report_sha256": private_worker_reconciliation["report_sha256"],
+                    }
+                    if private_worker_reconciliation is not None
+                    else None
+                ),
                 "previous_monotonic": old_deadlines,
                 "wall_deadlines_preserved": {
                     "started_epoch": report.get("started_epoch"),
                     "time_budget_started_epoch": _time_budget_started(report, "epoch"),
                     "deadline_epoch": _time_budget_deadline(report, "epoch"),
                 },
-                "accounting_reconciliation_required": True,
             }
-        )
-        report.setdefault("original_system", dict(saved_system))
-        saved_system["filesystem_device"] = current_device
-        saved_system["filesystem_volume_uuid"] = current_volume_uuid
-        report["boot_stamp"] = current_boot
-        _atomic_report(report_path, report)
+        else:
+            # Anchor only the expired session clocks after the explicit reboot proof.
+            mono_sample = time.monotonic()
+            wall_sample = time.time()
+            offset = mono_sample - wall_sample
+            report["started_monotonic"] = offset + float(report["started_epoch"])
+            report["time_budget_started_monotonic"] = offset + _time_budget_started(report, "epoch")
+            report["deadline_monotonic"] = offset + _time_budget_deadline(report, "epoch")
+            history = report.setdefault("reboot_recovery_history", [])
+            if not isinstance(history, list):
+                raise RunnerError("reboot recovery history is invalid")
+            history.append(
+                {
+                    "recovered_at": _utc(),
+                    "previous_boot_stamp": report.get("boot_stamp"),
+                    "boot_stamp": current_boot,
+                    "previous_filesystem_device": saved_device,
+                    "filesystem_device": current_device,
+                    "volume_uuid": current_volume_uuid,
+                    "prior_volume_uuid_available": saved_volume_uuid is not None,
+                    "previous_monotonic": old_deadlines,
+                    "wall_deadlines_preserved": {
+                        "started_epoch": report.get("started_epoch"),
+                        "time_budget_started_epoch": _time_budget_started(report, "epoch"),
+                        "deadline_epoch": _time_budget_deadline(report, "epoch"),
+                    },
+                    "accounting_reconciliation_required": True,
+                }
+            )
+            report.setdefault("original_system", dict(saved_system))
+            saved_system["filesystem_device"] = current_device
+            saved_system["filesystem_volume_uuid"] = current_volume_uuid
+            report["boot_stamp"] = current_boot
+            _atomic_report(report_path, report)
     run_root = report_path.parent
     paths = {
         "directory": directory,
@@ -6883,6 +7511,8 @@ def _load_resume(
         "metrics": run_root / f"metrics-resume-{uuid.uuid4().hex}.json",
         "capture_notification": run_root / "capture-notification.json",
     }
+    if historical_reboot_reconciliation:
+        return report_path, report, paths
     if extend_session:
         if report.get("phase") != "stopped":
             raise RunnerError("session extension requires a stopped capture")
@@ -6956,6 +7586,208 @@ def _load_resume(
         report[peak_field] = 0
     report["effective_memory_policy"] = _effective_memory_policy()
     return report_path, report, paths
+
+
+def _finish_historical_reboot_reconciliation(
+    directory: Path,
+    report_path: Path,
+    report: dict[str, Any],
+    capture_id: str,
+) -> dict[str, Any]:
+    """Read exact stopped-session accounting before recording the confirmed new boot."""
+
+    from kalshi_events.common import regular_bytes
+
+    pending = report.pop("_pending_historical_reboot_reconciliation", None)
+    if not isinstance(pending, dict):
+        raise RunnerError("offline historical reboot reconciliation has no changed-boot proof")
+    raw = regular_bytes(report_path, 16 * MIB)
+    saved = _strict_json(report_path)
+    if saved is None or saved != report:
+        raise RunnerError("session report changed before reboot accounting reconciliation")
+    private_worker = pending.get("private_worker_reconciliation")
+    private_uncertain = isinstance(private_worker, dict)
+    private_phase = report.get("private_historical_grant", {})
+    private_pending_phase = (
+        private_uncertain
+        and private_phase.get("state") == "supervised-child-pending"
+        and report.get("phase")
+        == f"historical-{private_phase.get('phase')}-{private_phase.get('substep')}"
+    )
+    if (
+        (
+            report.get("phase") != "stopped"
+            and not (
+                private_uncertain and (report.get("phase") == "uncertain" or private_pending_phase)
+            )
+        )
+        or report.get("production_state") == "verified"
+        or report.get("capture_id") != capture_id
+        or report.get("boot_stamp") == pending.get("boot_stamp")
+        or report.get("active_process_group") != pending.get("previous_active_process_group")
+        or private_uncertain
+        and (
+            report.get("private_historical_grant", {}).get("grant_id")
+            != private_worker.get("grant_id")
+            or report.get("private_historical_grant", {}).get("launch_sha256")
+            != private_worker.get("launch_sha256")
+            or report.get("private_historical_grant", {}).get("worker_pgid")
+            != pending.get("previous_active_process_group")
+        )
+    ):
+        raise RunnerError("offline historical reboot session identity changed")
+
+    if private_uncertain:
+        _historical_current_mount(
+            directory,
+            directory / "operator",
+            Path(private_worker["control_root"]),
+            report,
+            private_worker["identity"],
+            private_worker["freeze"],
+            current_boot=pending["boot_stamp"],
+            session_root_device=private_worker["session_root_device"],
+            allow_unreconciled_boot_change=True,
+            expected_current_device=pending["filesystem_device"],
+            expected_current_volume_uuid=pending["volume_uuid"],
+        )
+
+    snapshot = _read_accounting_worker(directory / "operator", capture_id)
+    if (
+        snapshot.get("root_id") != report.get("root_id")
+        or snapshot.get("accounting_complete") is not True
+        or snapshot.get("unfinished_reservations") != []
+    ):
+        raise RunnerError("reboot recovery requires complete exact receipt accounting")
+    accounting = _reconciliation_accounting(snapshot, capture_id)
+    if accounting.get("accounting_complete") is not True:
+        raise RunnerError("reboot recovery cannot proceed with bounded or incomplete accounting")
+    _check_accounting_match(snapshot, accounting)
+
+    private_reconciliation_sha256 = None
+    if private_uncertain:
+        if (
+            private_worker.get("identity", {}).get("capture_id") != capture_id
+            or private_worker.get("identity", {}).get("root_id") != report.get("root_id")
+            or private_worker.get("worker_pid") != private_worker.get("worker_pgid")
+            or private_worker.get("worker_pgid") != pending.get("previous_active_process_group")
+        ):
+            raise RunnerError("private reboot reconciliation binding changed")
+        accounting_sha256 = hashlib.sha256(
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()
+        private_record, private_reconciliation_sha256 = _historical_write_private_reconciliation(
+            Path(private_worker["control_root"]),
+            private_worker["grant_id"],
+            {
+                "version": 1,
+                "kind": "changed_boot_worker_ignored",
+                "identity": private_worker["identity"],
+                "grant_id": private_worker["grant_id"],
+                "launch_id": private_worker["launch_id"],
+                "launch_sha256": private_worker["launch_sha256"],
+                "from_boot_stamp": report["boot_stamp"],
+                "to_boot_stamp": pending["boot_stamp"],
+                "previous_active_process_group": pending["previous_active_process_group"],
+                "controller_pid": private_worker["controller_pid"],
+                "controller_pgid": private_worker["controller_pgid"],
+                "worker_pid": private_worker["worker_pid"],
+                "worker_pgid": private_worker["worker_pgid"],
+                "prior_process_group_ignored_after_boot_change": True,
+                "process_group_interaction": "not_queried_after_boot_change",
+                "session_before_sha256": private_worker["report_sha256"],
+                "storage_progress_sha256": private_worker["storage_sha256"],
+                "accounting_sha256": accounting_sha256,
+                "reconciliation_worker_started": False,
+                "new_grant_started": False,
+            },
+        )
+        if private_record.get("sha256") != private_reconciliation_sha256:
+            raise RunnerError("private reboot reconciliation record failed readback")
+
+    history = report.get("reboot_recovery_history", [])
+    if (
+        not isinstance(history, list)
+        or len(history) >= 64
+        or any(not isinstance(item, dict) for item in history)
+    ):
+        raise RunnerError("reboot recovery history is invalid or full")
+    previous_system = report.get("system")
+    if not isinstance(previous_system, dict):
+        raise RunnerError("reboot recovery has no saved filesystem identity")
+
+    wall_now = time.time()
+    mono_now = time.monotonic()
+    offset = mono_now - wall_now
+    report["started_monotonic"] = offset + float(report["started_epoch"])
+    report["time_budget_started_monotonic"] = offset + _time_budget_started(report, "epoch")
+    report["deadline_monotonic"] = offset + _time_budget_deadline(report, "epoch")
+    report.setdefault("original_system", dict(previous_system))
+    previous_system["filesystem_device"] = pending["filesystem_device"]
+    previous_system["filesystem_volume_uuid"] = pending["volume_uuid"]
+    report["boot_stamp"] = pending["boot_stamp"]
+    report["active_process_group"] = None
+    report.update(
+        requests=accounting["attempts"],
+        downloaded_bytes=accounting["downloaded_bytes"],
+        downloaded_bytes_upper_bound=None,
+        accounting_complete=True,
+        accounting_basis="exact",
+        accounting_bound_verified=False,
+        unfinished_reservation_ids=[],
+        consumption_state="verified",
+        network_activity_this_invocation={
+            "requests": 0,
+            "downloaded_bytes": 0,
+            "accounting_complete": True,
+        },
+        operator_accounting={
+            "state": "verified",
+            "requests": accounting["attempts"],
+            "downloaded_bytes": accounting["downloaded_bytes"],
+        },
+    )
+    reboot_event = {
+        "recovered_at": _utc(),
+        **pending,
+        "session_before_sha256": hashlib.sha256(raw).hexdigest(),
+        "accounting_sha256": hashlib.sha256(
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest(),
+        "accounting_basis": "exact",
+        "accounting_complete": True,
+        "prior_process_group_ignored_after_boot_change": pending["previous_active_process_group"]
+        is not None,
+        "processing_worker_started": False,
+        "grant_started": False,
+        "wall_deadlines_preserved": pending["wall_deadlines_preserved"],
+    }
+    if private_uncertain:
+        reboot_event["private_worker_reconciliation_sha256"] = private_reconciliation_sha256
+        report["private_historical_grant"]["state"] = "reconciled-after-boot-change"
+        report["private_historical_grant"]["reconciliation_sha256"] = private_reconciliation_sha256
+    report["reboot_recovery_history"] = [*history, reboot_event]
+    report["historical_reboot_reconciliation"] = {
+        "state": "complete",
+        "capture_id": capture_id,
+        "root_id": report["root_id"],
+        "boot_stamp": pending["boot_stamp"],
+        "accounting_basis": "exact",
+        "processing_worker_started": False,
+        "grant_started": False,
+        "private_worker_reconciliation_sha256": private_reconciliation_sha256,
+    }
+    report["phase"] = "stopped"
+    report["error"] = None
+    report["recovery"] = (
+        "No historical worker or grant was started. After runtime/control freeze and a fresh "
+        "phase approval, resume only with the private --_historical-control command for the "
+        f"next sealed phase and capture {capture_id}."
+    )
+    report["last_observed_at"] = _utc()
+    report["last_observed_epoch"] = wall_now
+    _atomic_report(report_path, report)
+    return report
 
 
 def _is_recoverable_accounting_stop(
@@ -7163,6 +7995,4947 @@ def _root_summary_worker_main(root: Path) -> int:
         return 1
 
 
+def _historical_control_root(path: Path) -> Path:
+    from kalshi_events.common import safe_path
+
+    try:
+        root = safe_path(path)
+        details = root.lstat()
+    except OSError as exc:
+        raise RunnerError("private historical control root is missing or unsafe") from exc
+    try:
+        checkout_runtime = (SOURCE_ROOT / "data" / "runtime").resolve(strict=True)
+    except OSError:
+        checkout_runtime = None
+    frozen_sibling_layout = (
+        SOURCE_ROOT.name == "source"
+        and root == SOURCE_ROOT.parent.resolve()
+        and root.parent.name == "runtime"
+    )
+    checkout_layout = checkout_runtime is not None and root.parent == checkout_runtime
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or stat.S_IMODE(details.st_mode) & 0o077
+        or not (checkout_layout or frozen_sibling_layout)
+        or HISTORICAL_CONTROL_DIRECTORY.fullmatch(root.name) is None
+    ):
+        raise RunnerError("private historical control root is outside the managed runtime layout")
+    return root
+
+
+def _historical_source_root(control_root: Path) -> Path:
+    """Resolve the frozen source tree from its managed control-root layout."""
+    root = _historical_control_root(control_root)
+    frozen_source = root / "source"
+    if frozen_source.is_dir() and not frozen_source.is_symlink():
+        source_root = frozen_source
+    else:
+        # In a checkout the control root is <project>/data/runtime/<controls>.
+        source_root = root.parent.parent.parent
+        if source_root / "data" / "runtime" != root.parent:
+            raise RunnerError("historical source root is not bound to the managed controls")
+    try:
+        script = (source_root / "scripts" / "production_run.py").resolve(strict=True)
+        package = (source_root / "src" / "kalshi_events").resolve(strict=True)
+        executing_script = Path(__file__).resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError("frozen historical source tree is unavailable") from exc
+    if (
+        script != executing_script
+        or not package.is_dir()
+        or not (source_root / "scripts" / "historical_grants.py").is_file()
+    ):
+        raise RunnerError("running historical controller is outside its bound source tree")
+    return source_root
+
+
+def _historical_venv_root(control_root: Path) -> Path:
+    root = _historical_control_root(control_root)
+    source_root = _historical_source_root(root)
+    if source_root == root / "source":
+        return root / ".venv"
+    return source_root / ".venv"
+
+
+def _historical_assert_pinned_python(control_root: Path) -> None:
+    """Require grant-consuming controllers and workers to use the frozen venv."""
+    venv_root = _historical_venv_root(control_root).resolve(strict=True)
+    expected_python = (venv_root / "bin" / "python").resolve(strict=True)
+    try:
+        active_prefix = Path(sys.prefix).resolve(strict=True)
+        active_executable = Path(sys.executable).resolve(strict=True)
+        base_prefix = Path(sys.base_prefix).resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError("historical Python environment identity is unavailable") from exc
+    if (
+        active_prefix != venv_root
+        or active_executable != expected_python
+        or active_prefix == base_prefix
+    ):
+        raise RunnerError(
+            "historical controller or worker is outside the pinned virtual environment"
+        )
+
+
+def _historical_file_record(path: Path, *, max_bytes: int = 256 * 1024 * 1024) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        before = path.lstat()
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RunnerError(f"frozen runtime input is missing or unsafe: {path}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size > max_bytes
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise RunnerError(f"frozen runtime input is unsafe or oversized: {path}")
+        checksum = hashlib.sha256()
+        size = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            checksum.update(chunk)
+            size += len(chunk)
+            if size > max_bytes:
+                raise RunnerError(f"frozen runtime input is oversized: {path}")
+        after = os.fstat(descriptor)
+        final = path.lstat()
+
+        def signature(item: os.stat_result) -> tuple[int, ...]:
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_mode,
+                item.st_nlink,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+
+        if signature(opened) != signature(after) or signature(opened) != signature(final):
+            raise RunnerError(f"frozen runtime input changed while being hashed: {path}")
+        return {
+            "sha256": checksum.hexdigest(),
+            "size": size,
+            "mode": oct(stat.S_IFMT(opened.st_mode) | stat.S_IMODE(opened.st_mode)),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _historical_operational_source_sha256(control_root: Path) -> str:
+    from historical_grants import sha256_json
+
+    source_root = _historical_source_root(control_root)
+    roots = [source_root / "src" / "kalshi_events"]
+    paths = [
+        source_root / "pyproject.toml",
+        source_root / "uv.lock",
+        source_root / "scripts" / "production_run.py",
+        source_root / "scripts" / "historical_grants.py",
+        source_root / "scripts" / "historical_admission.py",
+        source_root / "scripts" / "production_activation.py",
+        control_root / "controls" / "runtime_manifest.py",
+    ]
+    for package_root in roots:
+        try:
+            root_info = package_root.lstat()
+        except OSError as exc:
+            raise RunnerError("historical package source tree is missing") from exc
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise RunnerError("historical package source tree is unsafe")
+        for candidate in package_root.rglob("*"):
+            details = candidate.lstat()
+            if stat.S_ISLNK(details.st_mode):
+                raise RunnerError("historical package source tree contains a symlink")
+            if stat.S_ISREG(details.st_mode):
+                if candidate.name.endswith(".pyc") or candidate.parent.name == "__pycache__":
+                    raise RunnerError("historical source contains unfingerprinted Python cache")
+                paths.append(candidate)
+    records = []
+
+    def label(path: Path) -> str:
+        if path == control_root / "controls" / "runtime_manifest.py":
+            return "control-helper/runtime_manifest.py"
+        try:
+            return path.relative_to(source_root).as_posix()
+        except ValueError as exc:
+            raise RunnerError("operational source file is outside its bound source root") from exc
+
+    for path in sorted(set(paths), key=label):
+        record = _historical_file_record(path)
+        records.append({"path": label(path), **record})
+    try:
+        host = HISTORICAL_HOST_PYTHON.resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError("trusted host Python interpreter is missing") from exc
+    host_record = _historical_file_record(host, max_bytes=1024 * 1024 * 1024)
+    return sha256_json({"source_files": records, "host_python": host_record})
+
+
+def _historical_verify_runtime(
+    root: Path,
+    freeze: dict[str, Any],
+    *,
+    deadline_epoch: float | None = None,
+    deadline_monotonic: float | None = None,
+) -> str:
+    """Use the trusted host interpreter to verify the frozen venv before workers start."""
+    helper = root / "controls" / "runtime_manifest.py"
+    helper_record = _historical_file_record(helper, max_bytes=2 * 1024 * 1024)
+    if helper_record["mode"] != oct(stat.S_IFREG | 0o400):
+        raise RunnerError("trusted runtime inventory helper must be immutable and owner-readable")
+    host = HISTORICAL_HOST_PYTHON
+    commands = (
+        [
+            str(host),
+            "-I",
+            "-S",
+            "-B",
+            str(helper),
+            "--check-source-root",
+            str(_historical_source_root(root)),
+        ],
+        [
+            str(host),
+            "-I",
+            "-S",
+            "-B",
+            str(helper),
+            "--verify",
+            "--root",
+            str(_historical_venv_root(root)),
+            "--manifest",
+            str(root / "runtime-manifest.json"),
+            "--expected-sha256",
+            str(freeze["runtime_manifest_sha256"]),
+        ],
+    )
+    env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
+    env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1")
+    for command in commands:
+        timeout = 30 * 60.0
+        if deadline_epoch is not None or deadline_monotonic is not None:
+            if deadline_epoch is None or deadline_monotonic is None:
+                raise RunnerError("runtime precheck requires both grant deadlines")
+            remaining = min(
+                deadline_epoch - time.time(),
+                deadline_monotonic - time.monotonic(),
+            ) - float(_effective_limits()["terminate_seconds"])
+            if remaining <= 0:
+                raise RunnerError("no grant time remains for trusted runtime verification")
+            timeout = min(timeout, remaining)
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RunnerError("trusted host runtime precheck could not complete") from exc
+        if result.returncode != 0:
+            raise RunnerError("trusted host runtime precheck rejected the frozen inputs")
+    return result.stdout.strip()
+
+
+def _historical_store(operator: Path, *, max_duration_seconds: float) -> Any:
+    from kalshi_events.common import Limits, Store
+
+    limits = Limits(
+        max_rate=5,
+        max_requests=850_000,
+        max_download_bytes=256 * GIB,
+        max_response_bytes=384 * MIB,
+        max_decoded_response_bytes=768 * MIB,
+        max_duration_seconds=max_duration_seconds,
+        max_root_bytes=350 * GIB,
+        max_temp_bytes=192 * GIB,
+        max_database_bytes=128 * GIB,
+    )
+    return Store(operator, limits)
+
+
+def _historical_authorized_census(
+    authority: dict[str, Any], *, full_revalidation: bool
+) -> dict[str, Any]:
+    """Bind the target's immutable population report/index; optionally rewalk receipts."""
+    import collections
+    import json
+    import math
+    import time
+
+    import historical_admission
+
+    from kalshi_events import capture, historical, publish
+    from kalshi_events.common import CatalogueError
+
+    control = authority["control"].get("authorized_census")
+    if not isinstance(control, dict):
+        raise RunnerError("private controls have no authorized population census")
+    population_path = Path(control["population_report_path"])
+    index_path = Path(control["receipt_index_path"])
+    for path, expected_sha, label in (
+        (population_path, control["population_report_sha256"], "population report"),
+        (index_path, control["receipt_index_sha256"], "receipt index"),
+    ):
+        record = _historical_file_record(path, max_bytes=256 * MIB)
+        if record["sha256"] != expected_sha:
+            raise RunnerError(f"authorized {label} changed after the controls were frozen")
+        if path.stat().st_dev != authority["directory"].stat().st_dev:
+            raise RunnerError(f"authorized {label} is not on the frozen production volume")
+
+    def strict_json(raw: bytes) -> dict[str, Any]:
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            value: dict[str, Any] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate JSON key")
+                value[key] = item
+            return value
+
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=unique,
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)),
+        )
+        if not isinstance(value, dict):
+            raise ValueError("expected object")
+        return value
+
+    def read_regular(path: Path, limit: int) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            before = path.lstat()
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise CatalogueError("authorized census input is unavailable") from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size > limit
+                or opened.st_dev != authority["directory"].stat().st_dev
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise CatalogueError("authorized census input is unsafe or oversized")
+            chunks: list[bytes] = []
+            total = 0
+            while chunk := os.read(fd, min(1024 * 1024, limit + 1 - total)):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > limit:
+                    raise CatalogueError("authorized census input is oversized")
+            after = os.fstat(fd)
+            final = path.lstat()
+
+            def signature(item: os.stat_result) -> tuple[int, ...]:
+                return (
+                    item.st_dev,
+                    item.st_ino,
+                    item.st_mode,
+                    item.st_nlink,
+                    item.st_size,
+                    item.st_mtime_ns,
+                    item.st_ctime_ns,
+                )
+
+            if signature(opened) != signature(after) or signature(opened) != signature(final):
+                raise CatalogueError("authorized census input changed while reading")
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    population_raw = read_regular(population_path, MIB)
+    index_raw = read_regular(index_path, 256 * MIB)
+    try:
+        population = strict_json(population_raw)
+        index = strict_json(index_raw)
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("authorized population report or receipt index is malformed") from exc
+    expected_population = {
+        "capture_id": control["capture_id"],
+        "root_id": control["root_id"],
+        "capture_state_sha256": control["capture_state_sha256"],
+        "candidate_pages": control["candidate_pages"],
+        "observations_by_endpoint": control["observations_by_endpoint"],
+        "nested_event_markets": control["nested_event_markets"],
+        "exact_observations": control["exact_observations"],
+    }
+    report_counts = population.get("observation_counts")
+    actual_population = {
+        "capture_id": population.get("capture_id"),
+        "root_id": control["root_id"],
+        "capture_state_sha256": population.get("capture_state_sha256"),
+        "candidate_pages": population.get("candidate_pages"),
+        "observations_by_endpoint": (
+            {key: value for key, value in report_counts.items() if key.startswith("/")}
+            if isinstance(report_counts, dict)
+            else None
+        ),
+        "nested_event_markets": (
+            report_counts.get("nested_event_markets") if isinstance(report_counts, dict) else None
+        ),
+        "exact_observations": (
+            sum(value for key, value in report_counts.items() if key.startswith("/"))
+            if isinstance(report_counts, dict)
+            else None
+        ),
+    }
+    if (
+        population.get("status") != "complete"
+        or population.get("metadata_index_sha256") != control["receipt_index_sha256"]
+        or index.get("capture_id") != control["capture_id"]
+        or index.get("capture_state_sha256") != control["capture_state_sha256"]
+        or actual_population != expected_population
+    ):
+        raise RunnerError(
+            "authorized report and receipt index do not match the frozen exact census"
+        )
+
+    result = {
+        "population_report_sha256": control["population_report_sha256"],
+        "receipt_index_sha256": control["receipt_index_sha256"],
+        "candidate_pages": control["candidate_pages"],
+        "observations_by_endpoint": control["observations_by_endpoint"],
+        "nested_event_markets": control["nested_event_markets"],
+        "exact_observations": control["exact_observations"],
+    }
+    if not full_revalidation:
+        return result
+
+    class ReadOnlyStore:
+        def __init__(self, root: Path, deadline: float):
+            self.root = root.resolve(strict=True)
+            self.deadline = deadline
+            self.limits = type("ReadOnlyLimits", (), {"max_root_bytes": 350 * GIB})()
+
+        def path(self, relative: str) -> Path:
+            candidate = Path(relative)
+            if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+                raise CatalogueError("unsafe read-only census path")
+            path = self.root.joinpath(*candidate.parts)
+            if not path.resolve(strict=False).is_relative_to(self.root):
+                raise CatalogueError("read-only census path escaped the operator root")
+            current = self.root
+            for part in candidate.parts:
+                current = current / part
+                try:
+                    item = current.lstat()
+                except OSError as exc:
+                    raise CatalogueError("read-only census path is missing") from exc
+                if stat.S_ISLNK(item.st_mode) or item.st_dev != self.root.stat().st_dev:
+                    raise CatalogueError("read-only census path crossed a device or symlink")
+            return path
+
+        def check_deadline(self) -> None:
+            if time.monotonic() >= self.deadline:
+                raise TimeoutError(
+                    "authorized census receipt revalidation reached its grant cutoff"
+                )
+
+    class CensusFacade:
+        @staticmethod
+        def _read_regular_bytes(path: Path, limit: int) -> bytes:
+            return read_regular(path, limit)
+
+        @staticmethod
+        def _read_json(path: Path, limit: int) -> dict[str, Any]:
+            return strict_json(read_regular(path, limit))
+
+        @staticmethod
+        def _historical_task_plan(state: Any):
+            selection = historical.historical_selection(state, allow_legacy_incomplete=True)
+            task_indices = historical.historical_task_indices(state, allow_legacy_incomplete=True)
+            expected_scopes = {"series", "events_live", "markets_history"}
+            if set(selection) != expected_scopes:
+                raise CatalogueError(
+                    "authorized census selection differs from publication contract"
+                )
+            task_scopes = {int(key): value for key, value in state["task_scopes"].items()}
+            excluded = [
+                {
+                    "task_index": index,
+                    "scope": scope,
+                    "endpoint": state["tasks"][index]["endpoint"],
+                }
+                for index, scope in sorted(task_scopes.items())
+                if scope in publish.HISTORICAL_OMITTED_SCOPES
+            ]
+            if any(item["task_index"] in task_indices for item in excluded):
+                raise CatalogueError("excluded scopes entered authorized census tasks")
+            cutoff = {
+                index
+                for index, task in enumerate(state["tasks"])
+                if task.get("endpoint") == "/historical/cutoff" and task.get("singular") is True
+            }
+            expected_indices = {*(item["task_index"] for item in selection.values()), *cutoff}
+            if len(cutoff) != 1 or task_indices != expected_indices:
+                raise CatalogueError("authorized census task indices differ from selection")
+            return selection, task_indices, excluded
+
+        @staticmethod
+        def _page_metadata(source: Any, row: dict[str, Any], order: int, state: Any = None):
+            from pathlib import PurePosixPath
+
+            relative = row.get("relative")
+            if not isinstance(relative, str) or not relative.startswith("raw/"):
+                raise CatalogueError("capture journal contains an invalid census receipt path")
+            receipt_directory = source.path(PurePosixPath(relative).parent.as_posix())
+            manifest_path = receipt_directory / "manifest.json"
+            manifest = strict_json(read_regular(manifest_path, MIB))
+            if state is not None and (
+                manifest.get("capture_id") != state.get("capture_id")
+                or not capture._receipt_matches_state_protocol(manifest, state)
+            ):
+                raise CatalogueError("census receipt is not bound to current capture protocol")
+            if (
+                state is not None
+                and capture._acquisition_protocol(state) == capture.CURRENT_ACQUISITION_PROTOCOL
+            ):
+                capture._validate_receipt_task_binding(manifest, state, row)
+            body_path = receipt_directory / "body.bin"
+            body_info = body_path.lstat()
+            if not stat.S_ISREG(body_info.st_mode) or stat.S_ISLNK(body_info.st_mode):
+                raise CatalogueError("census receipt body is missing or unsafe")
+            decoded = manifest.get("decoded_size", manifest.get("size"))
+            generation = manifest.get("task_generation", manifest.get("request_generation", 0))
+            endpoint = manifest.get("endpoint")
+            if (
+                type(decoded) is not int
+                or decoded < 0
+                or type(generation) is not int
+                or generation < 0
+                or not isinstance(endpoint, str)
+            ):
+                raise CatalogueError("census receipt metadata is malformed")
+            return {
+                **row,
+                "order": order,
+                "endpoint": endpoint,
+                "generation": generation,
+                "encoded_bytes": body_info.st_size,
+                "decoded_bytes": decoded,
+                "status": manifest.get("status"),
+                "manifest_bytes": manifest_path.stat().st_size,
+            }
+
+        @staticmethod
+        def _is_control_page(page: dict[str, Any]) -> bool:
+            return page["status"] != 200 or page["endpoint"] == "/historical/cutoff"
+
+        @staticmethod
+        def _quantile(values: list[float], fraction: float) -> float:
+            if not values:
+                return 0.0
+            ordered = sorted(values)
+            return ordered[min(len(ordered) - 1, math.ceil(fraction * len(ordered)) - 1)]
+
+        @classmethod
+        def _receipt_population_metadata(cls, pages: list[dict[str, Any]]):
+            groups: dict[tuple[str, int], list[dict[str, Any]]] = collections.defaultdict(list)
+            for page in pages:
+                if not cls._is_control_page(page):
+                    groups[(page["endpoint"], page["generation"])].append(page)
+            return {
+                "data_strata": [
+                    {
+                        "endpoint": endpoint,
+                        "generation": generation,
+                        "candidate_pages": len(rows),
+                        "encoded_bytes": sum(row["encoded_bytes"] for row in rows),
+                        "decoded_bytes": sum(row["decoded_bytes"] for row in rows),
+                        "median_decoded_page_bytes": cls._quantile(
+                            [row["decoded_bytes"] for row in rows], 0.5
+                        ),
+                        "max_decoded_page_bytes": max(row["decoded_bytes"] for row in rows),
+                    }
+                    for (endpoint, generation), rows in sorted(groups.items())
+                ],
+                "control_receipts": [],
+            }
+
+        @classmethod
+        def _control_receipt_counts(cls, pages: list[dict[str, Any]]):
+            counts = collections.Counter(
+                (page["endpoint"], page["generation"], page["status"])
+                for page in pages
+                if cls._is_control_page(page)
+            )
+            return [
+                {
+                    "endpoint": endpoint,
+                    "generation": generation,
+                    "status": status,
+                    "receipts": count,
+                }
+                for (endpoint, generation, status), count in sorted(
+                    counts.items(), key=lambda item: str(item[0])
+                )
+            ]
+
+    store = ReadOnlyStore(
+        authority["operator"], float(authority["grant"]["workflow_deadline_monotonic"])
+    )
+    state = capture.read_capture(store, control["capture_id"])
+    try:
+        binding = historical_admission._admission_census_binding(
+            store,
+            state,
+            population_path,
+            index_path,
+            CensusFacade,
+            deadline=float(authority["grant"]["workflow_deadline_monotonic"]),
+        )
+        approved = historical_admission._check_authorized_census(binding)
+    except Exception as exc:
+        raise RunnerError("read-only authorized capture census revalidation failed") from exc
+    if (
+        approved["exact_observations"] != control["exact_observations"]
+        or approved["observations_by_endpoint"] != control["observations_by_endpoint"]
+        or approved["receipt_index_sha256"] != control["receipt_index_sha256"]
+        or binding["fingerprints"]["population_report_sha256"]
+        != control["population_report_sha256"]
+    ):
+        raise RunnerError("read-only capture census differs from identity-specific controls")
+    return result
+
+
+def _historical_census_proof(
+    authority: dict[str, Any], *, full_revalidation_if_missing: bool
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    path = authority["control_root"] / "source" / "authorized-census.json"
+    if path.exists() or path.is_symlink():
+        proof, _ = _historical_read_artifact(path, 1024**2)
+        body = {
+            key: proof.get(key)
+            for key in ("version", "identity", "source_snapshot_sha256", "census")
+        }
+        if (
+            set(proof) != set(body) | {"sha256"}
+            or proof.get("version") != 1
+            or proof.get("identity") != authority["identity"]
+            or proof.get("source_snapshot_sha256") != authority["source_snapshot"]["sha256"]
+            or proof.get("sha256") != grants.sha256_json(body)
+        ):
+            raise RunnerError("saved authorized population census proof is invalid")
+        census = _historical_authorized_census(authority, full_revalidation=False)
+        if proof.get("census") != census:
+            raise RunnerError("saved authorized census differs from its pinned report and index")
+        return census
+    if not full_revalidation_if_missing:
+        raise RunnerError("authorized population census proof is missing after source phase")
+    census = _historical_authorized_census(authority, full_revalidation=True)
+    body = {
+        "version": 1,
+        "identity": authority["identity"],
+        "source_snapshot_sha256": authority["source_snapshot"]["sha256"],
+        "census": census,
+    }
+    grants.write_once_json(path, body | {"sha256": grants.sha256_json(body)})
+    return census
+
+
+def _historical_validate_storage_handoff(
+    directory: Path,
+    report_path: Path,
+    progress_path: Path,
+    *,
+    invocation_token: str,
+    allow_stale: bool = False,
+) -> dict[str, Any]:
+    """Prove the live parent storage monitor is installed before the worker opens Store."""
+    import stat
+
+    if re.fullmatch(r"[0-9a-f]{32}", invocation_token) is None:
+        raise RunnerError("historical storage handoff token is invalid")
+    expected_parent = report_path.parent / "logs"
+    try:
+        relative = progress_path.relative_to(expected_parent)
+        parent_info = progress_path.parent.lstat()
+        logs_info = expected_parent.lstat()
+        before = progress_path.lstat()
+        descriptor = os.open(progress_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except (OSError, ValueError) as exc:
+        raise RunnerError("historical storage observer progress is unavailable") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            len(relative.parts) != 2
+            or re.fullmatch(r"invocation-[0-9a-f]{32}", relative.parts[0]) is None
+            or re.fullmatch(r"[a-z0-9-]+\.storage\.json", relative.parts[1]) is None
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_ISLNK(parent_info.st_mode)
+            or not stat.S_ISDIR(logs_info.st_mode)
+            or stat.S_ISLNK(logs_info.st_mode)
+            or parent_info.st_dev != directory.stat().st_dev
+            or logs_info.st_dev != directory.stat().st_dev
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_dev != directory.stat().st_dev
+            or opened.st_size > MIB
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise RunnerError("historical storage observer progress path is unsafe")
+        raw_parts = []
+        total = 0
+        while chunk := os.read(descriptor, min(64 * 1024, MIB + 1 - total)):
+            raw_parts.append(chunk)
+            total += len(chunk)
+            if total > MIB:
+                raise RunnerError("historical storage observer progress is oversized")
+        after = os.fstat(descriptor)
+        final = progress_path.lstat()
+
+        def signature(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_nlink,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        if signature(opened) != signature(after) or signature(opened) != signature(final):
+            raise RunnerError("historical storage observer progress changed during read")
+    finally:
+        os.close(descriptor)
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+
+    try:
+        value = json.loads(
+            b"".join(raw_parts).decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)),
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("historical storage observer progress is malformed") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or value.get("invocation_token") != invocation_token
+        or type(value.get("sample_count")) is not int
+        or value["sample_count"] < 0
+        or type(value.get("target_interval_seconds")) is not int
+        or value["target_interval_seconds"] != int(_effective_limits()["storage_sample_seconds"])
+    ):
+        raise RunnerError("historical storage observer progress is not bound to this worker")
+    now = time.time()
+    modified = final.st_mtime
+    if not allow_stale and (
+        modified > now + 2 or now - modified > max(20.0, value["target_interval_seconds"] * 4.0)
+    ):
+        raise RunnerError("historical storage observer heartbeat is stale")
+    return value
+
+
+def _historical_private_uncertain_authority(
+    directory: Path,
+    report_path: Path,
+    report: dict[str, Any],
+    *,
+    current_boot: str,
+    changed_boot: bool,
+) -> dict[str, Any]:
+    """Revalidate a private interrupted child without touching its saved PID."""
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    import historical_grants as grants
+
+    marker = report.get("private_historical_grant")
+    marker_fields = {
+        "version",
+        "grant_id",
+        "launch_sha256",
+        "launch_id",
+        "control_root",
+        "phases",
+        "phase",
+        "substep",
+        "controller_pid",
+        "controller_pgid",
+        "worker_pid",
+        "worker_pgid",
+        "storage_invocation_token",
+        "storage_progress_path",
+        "state",
+    }
+    if isinstance(marker, dict) and marker.get("state") == "stopped":
+        marker_fields.add("reason")
+    phase = marker.get("phase") if isinstance(marker, dict) else None
+    substep = marker.get("substep") if isinstance(marker, dict) else None
+    stopped_uncertain = (
+        isinstance(marker, dict)
+        and marker.get("state") == "stopped"
+        and report.get("phase") == "uncertain"
+        and isinstance(marker.get("reason"), str)
+        and bool(marker["reason"])
+    )
+    abruptly_interrupted = (
+        isinstance(marker, dict)
+        and marker.get("state") == "supervised-child-pending"
+        and phase in _HISTORICAL_PHASE_SUBSTEPS
+        and substep in _HISTORICAL_PHASE_SUBSTEPS[phase]
+        and report.get("phase") == f"historical-{phase}-{substep}"
+    )
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != marker_fields
+        or marker.get("version") != 1
+        or not (stopped_uncertain or abruptly_interrupted)
+        or report.get("production_state") == "verified"
+        or report.get("mode") not in {"full", "resume", "historical"}
+        or (
+            report.get("boot_stamp") == current_boot
+            if changed_boot
+            else report.get("boot_stamp") != current_boot
+        )
+    ):
+        raise RunnerError("session is not an exact private uncertain historical attempt")
+
+    control_root_value = marker.get("control_root")
+    if not isinstance(control_root_value, str) or not Path(control_root_value).is_absolute():
+        raise RunnerError("private uncertain attempt has no frozen control-root binding")
+    control_root = _historical_control_root(Path(control_root_value))
+    if str(control_root) != control_root_value:
+        raise RunnerError("private uncertain control-root path is not canonical")
+    grant_id = marker.get("grant_id")
+    if not isinstance(grant_id, str) or re.fullmatch(r"[0-9a-f]{32}", grant_id) is None:
+        raise RunnerError("private uncertain attempt grant ID is invalid")
+    if (
+        type(marker.get("controller_pid")) is not int
+        or marker["controller_pid"] <= 1
+        or type(marker.get("controller_pgid")) is not int
+        or marker["controller_pgid"] <= 1
+        or type(marker.get("worker_pid")) is not int
+        or marker["worker_pid"] <= 1
+        or type(marker.get("worker_pgid")) is not int
+        or marker["worker_pgid"] <= 1
+        or type(report.get("active_process_group")) is not int
+        or report.get("active_process_group") != marker["worker_pgid"]
+        or marker["worker_pid"] != marker["worker_pgid"]
+    ):
+        raise RunnerError("private uncertain attempt process identities are invalid")
+    if (
+        phase not in _HISTORICAL_PHASE_SUBSTEPS
+        or substep not in _HISTORICAL_PHASE_SUBSTEPS[phase]
+        or not isinstance(marker.get("phases"), list)
+        or phase not in marker["phases"]
+    ):
+        raise RunnerError("private uncertain attempt phase binding is invalid")
+
+    bundle = grants.read_control_bundle(control_root, grant_id)
+    identity = bundle["identity"]
+    approval, latch, launch = bundle["approval"], bundle["latch"], bundle["launch"]
+    session_binding = grants.validate_session_binding(
+        bundle["session_binding"], approval=approval, expected_identity=identity
+    )
+    launch_path = control_root / "grants" / grant_id / "launch.json"
+    launch_raw = grants._private_regular_file(launch_path, max_bytes=1024**2)
+    launch_sha256 = grants.sha256_bytes(launch_raw)
+    if (
+        launch_sha256 != marker.get("launch_sha256")
+        or launch.get("launch_id") != marker.get("launch_id")
+        or marker.get("phases") != approval.get("phases")
+        or phase not in approval.get("phases", [])
+        or launch.get("boot_stamp") != report.get("boot_stamp")
+        or session_binding.get("boot_stamp") != report.get("boot_stamp")
+        or session_binding.get("report_path") != str(report_path)
+        or session_binding.get("root_volume_uuid") != bundle["freeze"].get("root_volume_uuid")
+        or session_binding.get("root_device") != report.get("system", {}).get("filesystem_device")
+        or report.get("system", {}).get("filesystem_volume_uuid")
+        not in {None, bundle["freeze"].get("root_volume_uuid")}
+        or grants.sha256_json(session_binding) != launch.get("session_binding_sha256")
+        or any(report.get(key) != identity[key] for key in ("capture_id", "session_id", "root_id"))
+        or report_path.parent.name != identity["session_id"]
+        or report.get("root_id") != identity["root_id"]
+    ):
+        raise RunnerError("private uncertain attempt does not match its frozen grant")
+    try:
+        grant = grants.validate_grant_bundle(
+            approval,
+            latch,
+            launch,
+            expected_bindings=identity,
+            now_epoch=float(launch["started_epoch"]),
+            now_monotonic=float(launch["started_monotonic"]),
+            boot_stamp=str(launch["boot_stamp"]),
+            dbt_memory_limit="4GB",
+            dbt_threads=4,
+        )
+        if grant["phase"] != approval["phase"]:
+            raise RunnerError("private uncertain phase grant is inconsistent")
+    except grants.ControlError as exc:
+        raise RunnerError("private uncertain grant or launch failed its immutable checks") from exc
+    _historical_measurement_artifact(
+        control_root,
+        grant_id,
+        approval,
+        identity,
+        bundle["freeze"],
+        session_report_sha256=session_binding["report_sha256"],
+        session_root_device=session_binding["root_device"],
+        baseline=None,
+        require_fresh=False,
+        allow_initial_maintenance_overage=(phase == "source" and substep == "maintenance"),
+    )
+
+    _historical_assert_pinned_python(control_root)
+    operational_source_sha = _historical_operational_source_sha256(control_root)
+    freeze = bundle["freeze"]
+    runtime_sha = grants.sha256_json(
+        {
+            "runtime_manifest_sha256": freeze["runtime_manifest_sha256"],
+            "operational_source_sha256": operational_source_sha,
+        }
+    )
+    if (
+        operational_source_sha != freeze["operational_source_sha256"]
+        or runtime_sha != identity["runtime_sha256"]
+    ):
+        raise RunnerError("private uncertain attempt no longer matches frozen source/runtime")
+    _historical_verify_runtime(control_root, freeze)
+
+    operator = directory / "operator"
+    current_mount = _historical_current_mount(
+        directory,
+        operator,
+        control_root,
+        report,
+        identity,
+        freeze,
+        current_boot=current_boot,
+        session_root_device=session_binding["root_device"],
+        allow_unreconciled_boot_change=changed_boot,
+    )
+
+    token = marker.get("storage_invocation_token")
+    progress_path = Path(marker.get("storage_progress_path", ""))
+    if (
+        not isinstance(token, str)
+        or re.fullmatch(r"[0-9a-f]{32}", token) is None
+        or not progress_path.is_absolute()
+        or report.get("storage_supervision_invocation") != token
+        or report.get("storage_supervision_file") != str(progress_path)
+        or marker.get("controller_pid") <= 1
+        or marker.get("controller_pgid") <= 1
+    ):
+        raise RunnerError("private uncertain storage handoff binding is invalid")
+    storage_state = _historical_validate_storage_handoff(
+        directory,
+        report_path,
+        progress_path,
+        invocation_token=token,
+        allow_stale=True,
+    )
+    if storage_state.get("sample_count", 0) < 0:
+        raise RunnerError("private uncertain storage handoff has no valid inventory")
+
+    return {
+        "control_root": control_root,
+        "identity": identity,
+        "freeze": freeze,
+        "grant": grant,
+        "launch": launch,
+        "launch_sha256": launch_sha256,
+        "session_binding": session_binding,
+        "current_mount": current_mount,
+        "marker": marker,
+        "storage_state": storage_state,
+        "storage_sha256": grants.sha256_json(storage_state),
+        "report_sha256": hashlib.sha256(
+            _historical_session_report_bytes(report_path, max_bytes=16 * MIB)
+        ).hexdigest(),
+        "current_boot": current_boot,
+        "changed_boot": changed_boot,
+    }
+
+
+def _historical_private_processes_absent(proof: dict[str, Any]) -> None:
+    marker = proof["marker"]
+    try:
+        if any(
+            (
+                _pid_exists(marker["controller_pid"]),
+                _process_group_exists(marker["controller_pgid"]),
+                _pid_exists(marker["worker_pid"]),
+                _process_group_exists(marker["worker_pgid"]),
+            )
+        ):
+            raise RunnerError("private historical controller or worker is live or ambiguous")
+    except OSError as exc:
+        raise RunnerError("private historical controller or worker identity is ambiguous") from exc
+
+
+def _historical_write_private_reconciliation(
+    control_root: Path, grant_id: str, body: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    import historical_grants as grants
+
+    path = control_root / "grants" / grant_id / "private-reconciliation.json"
+    existing = None
+    if path.exists() or path.is_symlink():
+        existing = grants.read_json(path)
+        saved_body = {key: value for key, value in existing.items() if key not in {"sha256"}}
+        expected_body = {key: value for key, value in body.items() if key != "completed_at_epoch"}
+        compared_body = {
+            key: value for key, value in saved_body.items() if key != "completed_at_epoch"
+        }
+        if (
+            existing.get("sha256") != grants.sha256_json(saved_body)
+            or compared_body != expected_body
+        ):
+            raise RunnerError(
+                "private historical reconciliation record conflicts with this attempt"
+            )
+        return existing, existing["sha256"]
+    body = dict(body)
+    body["completed_at_epoch"] = time.time()
+    record = body | {"sha256": grants.sha256_json(body)}
+    grants.write_once_json(path, record)
+    return record, record["sha256"]
+
+
+class _HistoricalStorageHeartbeat:
+    """Stop native work if the parent storage supervisor stops producing samples."""
+
+    def __init__(
+        self,
+        directory: Path,
+        report_path: Path,
+        progress_path: Path,
+        invocation_token: str,
+    ) -> None:
+        self.directory = directory
+        self.report_path = report_path
+        self.progress_path = progress_path
+        self.invocation_token = invocation_token
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failure: str | None = None
+        self._interval = float(_effective_limits()["storage_sample_seconds"])
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RunnerError("historical storage heartbeat was started twice")
+        _historical_validate_storage_handoff(
+            self.directory,
+            self.report_path,
+            self.progress_path,
+            invocation_token=self.invocation_token,
+        )
+        context = contextvars.copy_context()
+        self._thread = threading.Thread(
+            target=context.run,
+            args=(self._watch,),
+            name="historical-storage-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _watch(self) -> None:
+        grace = max(20.0, self._interval * 4.0)
+        while not self._stop.wait(min(1.0, max(0.25, self._interval / 2.0))):
+            try:
+                state = _historical_validate_storage_handoff(
+                    self.directory,
+                    self.report_path,
+                    self.progress_path,
+                    invocation_token=self.invocation_token,
+                )
+                if state.get("target_interval_seconds", 0) * 4.0 > grace:
+                    grace = float(state["target_interval_seconds"] * 4)
+            except Exception as exc:
+                self._failure = f"historical live storage supervisor failed: {exc}"
+                if os.getpid() > 1 and os.getpgrp() == os.getpid():
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(os.getpgrp(), signal.SIGTERM)
+                return
+
+    def check(self) -> None:
+        if self._failure is not None:
+            raise RunnerError(self._failure)
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RunnerError("historical storage heartbeat did not stop cleanly")
+        self.check()
+
+
+def _historical_source_snapshot(
+    store: Any,
+    control_root: Path,
+    identity: dict[str, Any],
+    freeze: dict[str, Any],
+    *,
+    grant_id: str,
+    approval: dict[str, Any],
+    control: dict[str, Any],
+    verified_mount: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from historical_grants import ControlError, read_json
+
+    from kalshi_events import historical_resume, warehouse
+    from kalshi_events.common import decode, digest, json_bytes, regular_bytes
+
+    state = warehouse.read_capture(store, identity["capture_id"])
+    state_sha = digest(json_bytes(dict(state)))
+    selection, task_indices = warehouse._historical_profile(state)
+    scope_sha = warehouse._historical_scope_sha256(state, selection, task_indices)
+    code_sha = warehouse._historical_resume_code_identity()
+    stage_relative = historical_resume.stage_relative(identity["stage_name"])
+    source_path = store.path(f"{stage_relative}/warehouse.duckdb")
+    cleanup_path = store.path(f"{stage_relative}/resume-cleanup-intent.json")
+    cleanup_pending = cleanup_path.exists() or cleanup_path.is_symlink()
+    saved_path = control_root / "source" / "source-snapshot.json"
+    try:
+        frozen_snapshot = read_json(saved_path)
+    except ControlError as exc:
+        raise RunnerError("frozen historical source snapshot is missing or unsafe") from exc
+    frozen_body = {
+        key: frozen_snapshot.get(key) for key in ("version", "phase", "binding", "result")
+    }
+    if frozen_snapshot.get("sha256") != digest(json_bytes(frozen_body)):
+        raise RunnerError("saved historical source snapshot failed its self-check")
+    if (source_path.exists() or source_path.is_symlink()) and not cleanup_pending:
+        if source_path.is_symlink() or not source_path.is_file():
+            raise RunnerError("historical resume source path is unsafe")
+        current_snapshot = warehouse.historical_readiness_snapshot(
+            store,
+            identity["capture_id"],
+            identity["stage_name"],
+            _verified_mount=verified_mount,
+        )
+        current_body = {
+            key: current_snapshot.get(key) for key in ("version", "phase", "binding", "result")
+        }
+        if current_snapshot.get("sha256") != digest(json_bytes(current_body)):
+            raise RunnerError("current historical source snapshot failed its self-check")
+        frozen_result = frozen_snapshot.get("result")
+        current_result = current_snapshot.get("result")
+        if not isinstance(frozen_result, dict) or not isinstance(current_result, dict):
+            raise RunnerError("historical source snapshot result is malformed")
+        for identity_key in ("source_identity", "source_wal_identity"):
+            try:
+                matches = _historical_resume_source_identity_equal(
+                    frozen_result.get(identity_key),
+                    current_result.get(identity_key),
+                    store=store,
+                    state=state,
+                    verified_mount=verified_mount,
+                    require_live=True,
+                )
+            except Exception as exc:
+                raise RunnerError("historical source snapshot device lineage is invalid") from exc
+            if not matches:
+                raise RunnerError("historical source snapshot identity differs from frozen source")
+        normalized_frozen = dict(frozen_body)
+        normalized_result = dict(frozen_result)
+        for identity_key in ("source_identity", "source_wal_identity"):
+            persisted_identity = frozen_result.get(identity_key)
+            if persisted_identity is not None:
+                try:
+                    normalized_result[identity_key] = list(
+                        historical_resume.normalize_resume_file_identity(
+                            persisted_identity,
+                            store=store,
+                            state=state,
+                            verified_mount=verified_mount,
+                        )
+                    )
+                except Exception as exc:
+                    raise RunnerError(
+                        "frozen historical source identity is outside mount lineage"
+                    ) from exc
+        normalized_frozen["result"] = normalized_result
+        if normalized_frozen != current_body:
+            raise RunnerError("current historical source proof differs from its frozen snapshot")
+        snapshot = frozen_snapshot
+    else:
+        snapshot = frozen_snapshot
+        candidate_path = store.path(f"{stage_relative}/resume-candidate/warehouse.duckdb")
+        if candidate_path.is_file() and not candidate_path.is_symlink():
+            # The closed candidate may already contain valid derived model
+            # changes, or may need supervised readiness revalidation after an
+            # interrupted model attempt. Check immutable source/adoption
+            # provenance here; let the next supervised prepare decide whether
+            # the current candidate is sound. Never make source preflight depend
+            # on re-verifying a mutable candidate.
+            state = warehouse.read_capture(store, identity["capture_id"])
+            source_proof, source_result = warehouse._read_source_proof(
+                store, state, identity["stage_name"], candidate_path.parent
+            )
+            adoption_path = store.path(f"{stage_relative}/resume-adoption.json")
+            adoption_loaded = warehouse._load_self_proof(adoption_path, "historical-adoption")
+            if adoption_loaded is None:
+                raise RunnerError("retired historical source has no adoption origin")
+            adoption_proof, adoption_result = warehouse._validate_historical_adoption_origin(
+                store, state, identity["stage_name"], source_proof, source_result
+            )
+            try:
+                source_identities_match = all(
+                    _historical_resume_source_identity_equal(
+                        source_result.get(key),
+                        snapshot.get("result", {}).get(key),
+                        store=store,
+                        state=state,
+                        verified_mount=verified_mount,
+                    )
+                    for key in ("source_identity", "source_wal_identity")
+                )
+            except Exception as exc:
+                raise RunnerError("retired source proof device lineage is invalid") from exc
+            if (
+                source_result.get("source_sha256")
+                != snapshot.get("result", {}).get("source_sha256")
+                or source_result.get("source_wal_sha256")
+                != snapshot.get("result", {}).get("source_wal_sha256")
+                or not source_identities_match
+                or adoption_proof.get("binding", {}).get("source_proof_sha256")
+                != source_proof.get("sha256")
+                or adoption_result.get("source_sha256") != source_result.get("source_sha256")
+                or adoption_result.get("candidate_sha256")
+                != adoption_proof.get("binding", {}).get("candidate_sha256")
+            ):
+                raise RunnerError("retired historical source provenance differs from its snapshot")
+            if cleanup_pending:
+                warehouse._validate_historical_cleanup_intent(
+                    store,
+                    state,
+                    identity["stage_name"],
+                    source_result,
+                    source_proof["sha256"],
+                    cleanup_path,
+                )
+                if not _historical_cleanup_retirement_authorized(
+                    control_root,
+                    identity,
+                    freeze,
+                    grant_id,
+                    approval,
+                    adoption_proof,
+                    cleanup_path,
+                    store=store,
+                    source_snapshot=snapshot,
+                    control=control,
+                ):
+                    raise RunnerError("historical cleanup intent has no approved retirement grant")
+                warehouse._validate_historical_resume_source_presence(
+                    store,
+                    source_path,
+                    source_path.with_name(source_path.name + ".wal"),
+                    source_result,
+                    adopted=True,
+                    cleanup_intent=cleanup_path,
+                    stage_name=identity["stage_name"],
+                    state=state,
+                    source_proof_sha256=source_proof["sha256"],
+                    _verified_mount=verified_mount,
+                )
+            elif not source_path.is_file() or source_path.is_symlink():
+                raise RunnerError("retired historical source has no durable cleanup intent")
+        else:
+            build_path = store.path(f"builds-historical/{identity['capture_id']}/build.json")
+            if not build_path.is_file() or build_path.is_symlink():
+                raise RunnerError("retired historical source has no installed build lineage")
+            build = decode(regular_bytes(build_path, 1024**2))
+            adoption = build.get("historical_adoption") if isinstance(build, dict) else None
+            adoption_loaded = warehouse._load_self_proof(
+                store.path(f"builds-historical/{identity['capture_id']}/historical-adoption.json"),
+                "historical-adoption",
+            )
+            if adoption_loaded is None:
+                raise RunnerError("installed historical build lost its immutable adoption proof")
+            adoption_proof, adoption_result = adoption_loaded
+            if (
+                not isinstance(adoption, dict)
+                or adoption.get("stage") != identity["stage_name"]
+                or adoption.get("source_sha256") != snapshot.get("result", {}).get("source_sha256")
+                or adoption.get("source_wal_sha256")
+                != snapshot.get("result", {}).get("source_wal_sha256")
+                or adoption.get("sha256") != adoption_proof.get("sha256")
+                or adoption.get("candidate_sha256") != adoption_result.get("candidate_sha256")
+                or adoption_result.get("source_sha256")
+                != snapshot.get("result", {}).get("source_sha256")
+            ):
+                raise RunnerError(
+                    "installed historical build does not bind the frozen source proof"
+                )
+            warehouse.certified(store, identity["capture_id"], catalogue_version=3)
+    binding = snapshot.get("binding") if isinstance(snapshot, dict) else None
+    result = snapshot.get("result") if isinstance(snapshot, dict) else None
+    snapshot_body = {key: snapshot.get(key) for key in ("version", "phase", "binding", "result")}
+    if (
+        not isinstance(binding, dict)
+        or not isinstance(result, dict)
+        or snapshot.get("version") != 1
+        or snapshot.get("phase") != "historical-source-snapshot"
+        or snapshot.get("sha256") != digest(json_bytes(snapshot_body))
+        or binding.get("root") != str(store.root.resolve())
+        or binding.get("stage") != identity["stage_name"]
+        or binding.get("capture_id") != identity["capture_id"]
+        or binding.get("capture_state_sha256") != state_sha
+        or binding.get("scope_sha256") != scope_sha
+        or binding.get("code_sha256") != code_sha
+        or state_sha != freeze["state_sha256"]
+        or result.get("source_sha256") != freeze["source_sha256"]
+        or result.get("receipt_evidence_sha256") != freeze["receipt_evidence_sha256"]
+        or binding.get("scope_sha256") != freeze["scope_sha256"]
+        or binding.get("code_sha256") != freeze["code_sha256"]
+        or snapshot.get("sha256") != freeze["source_snapshot_sha256"]
+    ):
+        raise RunnerError("current historical capture/source no longer matches the frozen controls")
+    return snapshot
+
+
+def _historical_resource_baseline(
+    directory: Path, store: Any, report: dict[str, Any]
+) -> dict[str, int]:
+    storage = store.usage()
+    retained = storage.get("retained_bytes")
+    temporary = storage.get("temporary_bytes")
+    database = storage.get("database_bytes")
+    if any(type(value) is not int or value < 0 for value in (retained, temporary, database)):
+        raise RunnerError("historical measured storage inventory is incomplete")
+
+    capture_id = report.get("capture_id")
+    session_id = report.get("session_id")
+    root_id = report.get("root_id")
+    if (
+        not isinstance(capture_id, str)
+        or CAPTURE_ID.fullmatch(capture_id) is None
+        or not isinstance(session_id, str)
+        or CAPTURE_ID.fullmatch(session_id) is None
+        or not isinstance(root_id, str)
+        or CAPTURE_ID.fullmatch(root_id) is None
+    ):
+        raise RunnerError("historical inventory has no exact session, capture or root identity")
+    session_report = directory / "runs" / session_id / REPORT_NAME
+    _live_external_paths({"session_report": session_report}, directory)
+    workspace = _live_workspace_snapshot(store.root, directory, capture_id, root_id)
+    count = [workspace["inventory_entries"]]
+    inventory_limit = int(_effective_limits()["storage_inventory_entries"])
+    if type(count[0]) is not int or count[0] < 0 or count[0] > inventory_limit:
+        raise RunnerError("historical mutable workspace exceeded its entry bound")
+    device = directory.stat(follow_symlinks=False).st_dev
+    runs_path = directory / "runs"
+    if runs_path.exists() or runs_path.is_symlink():
+        _bounded_tree_bytes(runs_path, device, count, set())
+    pending = [directory]
+    while pending:
+        parent = pending.pop()
+        try:
+            with os.scandir(parent) as children:
+                for child in children:
+                    store.check_deadline()
+                    item = child.stat(follow_symlinks=False)
+                    if item.st_dev != device or stat.S_ISLNK(item.st_mode):
+                        raise RunnerError("historical resource inventory contains an unsafe entry")
+                    if stat.S_ISDIR(item.st_mode):
+                        pending.append(Path(child.path))
+                    elif not stat.S_ISREG(item.st_mode):
+                        raise RunnerError("historical resource inventory contains a special file")
+                    if parent == directory and child.name != "runs":
+                        count[0] += 1
+                        if count[0] > inventory_limit:
+                            raise RunnerError(
+                                "historical mutable workspace exceeded its entry bound"
+                            )
+        except OSError as exc:
+            raise RunnerError("historical resource inventory could not be read safely") from exc
+    external = _external_bytes(directory)
+    peaks = [
+        report.get("peak_child_process_group_rss_bytes", 0),
+        report.get("peak_child_process_group_physical_footprint_bytes", 0),
+        report.get("invocation_peak_child_process_group_rss_bytes", 0),
+        report.get("invocation_peak_child_process_group_physical_footprint_bytes", 0),
+    ]
+    if any(type(value) is not int or value < 0 for value in peaks):
+        raise RunnerError("historical measured RSS inventory is invalid")
+    return {
+        "database_bytes": database,
+        "temporary_bytes": temporary,
+        "root_bytes": retained,
+        "aggregate_bytes": retained + external,
+        "free_bytes": shutil.disk_usage(directory).free,
+        "inventory_entries": count[0],
+        "peak_rss_bytes": max(peaks),
+    }
+
+
+def _historical_measurement_artifact(
+    control_root: Path,
+    grant_id: str,
+    approval: dict[str, Any],
+    identity: dict[str, Any],
+    freeze: dict[str, Any],
+    *,
+    session_report_sha256: str,
+    session_root_device: int,
+    baseline: dict[str, int] | None,
+    require_fresh: bool,
+    allow_initial_maintenance_overage: bool = False,
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    path = control_root / "grants" / grant_id / "measurements.json"
+    raw = grants._private_regular_file(path, max_bytes=1024**2)
+    try:
+        value = json.loads(raw.decode("utf-8"), parse_constant=grants._reject_constant)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RunnerError("historical measurement artifact is malformed") from exc
+    if not isinstance(value, dict) or raw != grants.canonical_bytes(value) + b"\n":
+        raise RunnerError("historical measurement artifact is not canonical JSON")
+    fields = {
+        "version",
+        "grant_id",
+        "phases",
+        "identity",
+        "source_snapshot_sha256",
+        "receipt_evidence_sha256",
+        "scope_sha256",
+        "code_sha256",
+        "root_volume_uuid",
+        "root_device",
+        "session_report_sha256",
+        "measured_at_epoch",
+        "forecast_seconds",
+        "final_verification_seconds",
+        "projected_database_bytes",
+        "projected_temporary_bytes",
+        "projected_root_bytes",
+        "projected_aggregate_bytes",
+        "projected_free_bytes",
+        "inventory_entries",
+        "projected_peak_rss_bytes",
+        "baseline",
+    }
+    if set(value) != fields or value.get("version") != 1:
+        raise RunnerError("historical measurement artifact has an unsupported schema")
+    summary = approval.get("measurements")
+    if not isinstance(summary, dict):
+        raise RunnerError("historical approval has no measured inventory summary")
+    actual_sha256 = grants.sha256_bytes(raw)
+    approved_summary = {
+        key: summary.get(key)
+        for key in (
+            "session_report_sha256",
+            "measured_at_epoch",
+            "forecast_seconds",
+            "final_verification_seconds",
+            "projected_database_bytes",
+            "projected_temporary_bytes",
+            "projected_root_bytes",
+            "projected_aggregate_bytes",
+            "projected_free_bytes",
+            "inventory_entries",
+            "projected_peak_rss_bytes",
+        )
+    }
+    artifact_summary = {key: value.get(key) for key in approved_summary}
+    if (
+        summary.get("report_sha256") != actual_sha256
+        or artifact_summary != approved_summary
+        or value.get("grant_id") != grant_id
+        or value.get("phases") != approval.get("phases")
+        or value.get("identity") != identity
+        or value.get("source_snapshot_sha256") != freeze["source_snapshot_sha256"]
+        or value.get("receipt_evidence_sha256") != freeze["receipt_evidence_sha256"]
+        or value.get("scope_sha256") != freeze["scope_sha256"]
+        or value.get("code_sha256") != freeze["code_sha256"]
+        or value.get("root_volume_uuid") != freeze["root_volume_uuid"]
+        or type(session_root_device) is not int
+        or value.get("root_device") != session_root_device
+        or value.get("session_report_sha256") != session_report_sha256
+    ):
+        raise RunnerError("historical measured resource artifact does not match its approval")
+    measured_at = value.get("measured_at_epoch")
+    if type(measured_at) not in {int, float} or not math.isfinite(measured_at) or measured_at <= 0:
+        raise RunnerError("historical measurement timestamp is invalid")
+    if require_fresh and (
+        measured_at > time.time()
+        or time.time() - measured_at > 15 * 60
+        or approval.get("approved_at_epoch", 0) < measured_at
+        or approval.get("approved_at_epoch", 0) - measured_at > 15 * 60
+    ):
+        raise RunnerError("historical measurement baseline is stale at launch")
+    baseline_fields = {
+        "database_bytes",
+        "temporary_bytes",
+        "root_bytes",
+        "aggregate_bytes",
+        "free_bytes",
+        "inventory_entries",
+        "peak_rss_bytes",
+    }
+    recorded_baseline = value.get("baseline")
+    if (
+        not isinstance(recorded_baseline, dict)
+        or set(recorded_baseline) != baseline_fields
+        or any(type(item) is not int or item < 0 for item in recorded_baseline.values())
+    ):
+        raise RunnerError("historical measurement baseline is invalid")
+    if baseline is not None and (
+        not isinstance(baseline, dict)
+        or set(baseline) != baseline_fields
+        or any(type(item) is not int or item < 0 for item in baseline.values())
+    ):
+        raise RunnerError("current historical measurement baseline is invalid")
+    if (
+        require_fresh
+        and baseline is not None
+        and any(recorded_baseline[key] != baseline[key] for key in baseline_fields - {"free_bytes"})
+    ):
+        raise RunnerError("current measured resource inventory differs from approved baseline")
+    projected = {
+        "database_bytes": value["projected_database_bytes"],
+        "temporary_bytes": value["projected_temporary_bytes"],
+        "root_bytes": value["projected_root_bytes"],
+        "aggregate_bytes": value["projected_aggregate_bytes"],
+        "free_bytes": value["projected_free_bytes"],
+        "inventory_entries": value["inventory_entries"],
+        "peak_rss_bytes": value["projected_peak_rss_bytes"],
+    }
+    admission = grants.expected_resource_admission()
+    temporary_admission = admission["storage_temporary_admission_bytes"]
+    source_start_grant = (
+        isinstance(approval.get("phases"), list)
+        and bool(approval["phases"])
+        and approval["phases"][0] == "source"
+    )
+    maintenance_exception = allow_initial_maintenance_overage and source_start_grant
+    recorded_temporary_overage = recorded_baseline["temporary_bytes"] > projected["temporary_bytes"]
+    current_temporary_overage = (
+        baseline is not None and baseline["temporary_bytes"] > projected["temporary_bytes"]
+    )
+    if (
+        recorded_baseline["temporary_bytes"] > admission["temporary_bytes"]
+        or projected["temporary_bytes"] > temporary_admission
+        or recorded_temporary_overage
+        and not source_start_grant
+        or current_temporary_overage
+        and not maintenance_exception
+        or current_temporary_overage
+        and baseline["temporary_bytes"] > recorded_baseline["temporary_bytes"]
+    ):
+        raise RunnerError("historical temporary storage exceeds its approved maintenance allowance")
+    if type(projected["free_bytes"]) is not int or projected["free_bytes"] < 0:
+        raise RunnerError("historical free-space projection is invalid")
+    if (
+        projected["database_bytes"] < recorded_baseline["database_bytes"]
+        or projected["root_bytes"] < recorded_baseline["root_bytes"]
+        or projected["aggregate_bytes"] < recorded_baseline["aggregate_bytes"]
+        or projected["free_bytes"] > recorded_baseline["free_bytes"]
+        or projected["inventory_entries"] < recorded_baseline["inventory_entries"]
+        or projected["peak_rss_bytes"] < recorded_baseline["peak_rss_bytes"]
+        or projected["database_bytes"] > admission["storage_database_admission_bytes"]
+        or projected["temporary_bytes"] > temporary_admission
+        or projected["root_bytes"] > admission["root_bytes"]
+        or projected["aggregate_bytes"] > admission["aggregate_bytes"]
+        or projected["free_bytes"] < admission["minimum_free_bytes"]
+        or projected["inventory_entries"] > admission["storage_inventory_entries"]
+        or projected["peak_rss_bytes"] > admission["peak_rss_bytes"]
+    ):
+        raise RunnerError("historical resource projection exceeds measured fixed admission")
+    if require_fresh and baseline is not None:
+        reserved_growth = recorded_baseline["free_bytes"] - projected["free_bytes"]
+        minimum_fresh_free = admission["minimum_free_bytes"] + reserved_growth
+        if baseline["free_bytes"] < minimum_fresh_free:
+            raise RunnerError("current free space no longer covers its approved growth reserve")
+    if baseline is not None and (
+        any(
+            baseline[key] > projected[key]
+            for key in (
+                "database_bytes",
+                "root_bytes",
+                "aggregate_bytes",
+                "inventory_entries",
+                "peak_rss_bytes",
+            )
+        )
+        or baseline["temporary_bytes"] > projected["temporary_bytes"]
+        and not maintenance_exception
+        or baseline["temporary_bytes"] > admission["temporary_bytes"]
+        or baseline["free_bytes"] < admission["minimum_free_bytes"]
+    ):
+        raise RunnerError("current historical resource inventory exceeds approved projections")
+    return value
+
+
+def _historical_authority(
+    directory: Path,
+    control_root: Path,
+    grant_id: str,
+    *,
+    launch_sha256: str | None,
+    require_worker: bool,
+    prelaunch: bool = False,
+    cheap_only: bool = False,
+    expected_phase: str | None = None,
+    expected_substep: str | None = None,
+    storage_invocation_token: str | None = None,
+    storage_progress_path: Path | None = None,
+    supervisor_pid: int | None = None,
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    directory = _external_path(directory)
+    control_root = _historical_control_root(control_root)
+    bundle = grants.read_control_bundle(control_root, grant_id, prelaunch=prelaunch)
+    identity = bundle["identity"]
+    session_id = identity["session_id"]
+    report_path = directory / "runs" / session_id / REPORT_NAME
+    profile, report = _session_resource_profile(
+        report_path, expected_profile="expanded", capture_id=identity["capture_id"]
+    )
+    if (
+        report.get("session_id") != session_id
+        or report.get("root_id") != identity["root_id"]
+        or report.get("capture_id") != identity["capture_id"]
+        or report.get("mode") not in {"full", "resume", "historical"}
+        or _owner_root_id(directory) != identity["root_id"]
+        or report.get("boot_stamp") != _boot_stamp()
+    ):
+        raise RunnerError("private historical worker session or boot binding changed")
+    operator = directory / "operator"
+    current_mount = _historical_current_mount(
+        directory,
+        operator,
+        control_root,
+        report,
+        identity,
+        bundle["freeze"],
+    )
+    root_device = current_mount["device"]
+    root_volume = current_mount["volume_uuid"]
+    boot_stamp = report.get("boot_stamp")
+    if prelaunch:
+        approval = bundle["approval"]
+        latch = bundle["latch"]
+        launch = None
+        grant = {"phase": approval.get("phase"), "phases": approval.get("phases")}
+        session_binding = None
+    else:
+        approval, latch, launch = bundle["approval"], bundle["latch"], bundle["launch"]
+        grant = grants.validate_grant_bundle(
+            approval,
+            latch,
+            launch,
+            expected_bindings=identity,
+            now_epoch=time.time(),
+            now_monotonic=time.monotonic(),
+            boot_stamp=boot_stamp,
+            dbt_memory_limit="4GB",
+            dbt_threads=4,
+        )
+        if (
+            launch_sha256 is not None
+            and grants.sha256_bytes(
+                grants._private_regular_file(control_root / "grants" / grant_id / "launch.json")
+            )
+            != launch_sha256
+        ):
+            raise RunnerError("private historical launch artifact changed")
+        session_binding = grants.validate_session_binding(
+            bundle["session_binding"],
+            approval=approval,
+            expected_identity=identity,
+        )
+        if grants.sha256_json(session_binding) != launch.get("session_binding_sha256"):
+            raise RunnerError("private launch does not bind its session snapshot")
+    if not cheap_only:
+        operational_source_sha256 = _historical_operational_source_sha256(control_root)
+        runtime_sha256 = grants.sha256_json(
+            {
+                "runtime_manifest_sha256": bundle["freeze"]["runtime_manifest_sha256"],
+                "operational_source_sha256": operational_source_sha256,
+            }
+        )
+        if (
+            operational_source_sha256 != bundle["freeze"]["operational_source_sha256"]
+            or runtime_sha256 != identity["runtime_sha256"]
+        ):
+            raise RunnerError(
+                "operational runner or control source differs from the frozen runtime"
+            )
+        final_phase = expected_phase in {"independent-verification", "activation"}
+        _historical_verify_runtime(
+            control_root,
+            bundle["freeze"],
+            deadline_epoch=float(
+                grant["deadline_epoch"] if final_phase else grant["workflow_deadline_epoch"]
+            ),
+            deadline_monotonic=float(
+                grant["deadline_monotonic"] if final_phase else grant["workflow_deadline_monotonic"]
+            ),
+        )
+        if require_worker:
+            _historical_assert_pinned_python(control_root)
+    if not prelaunch and not require_worker:
+        _historical_assert_pinned_python(control_root)
+    if (
+        not isinstance(grant.get("phases"), list)
+        or not grant["phases"]
+        or expected_phase is not None
+        and expected_phase not in grant["phases"]
+    ):
+        raise RunnerError("private historical phase is outside the approved grant range")
+    next_durable_phase = grants.next_phase(bundle.get("current_phase"))
+    if expected_phase is not None and expected_phase != next_durable_phase:
+        raise RunnerError("private historical worker phase is not the next durable checkpoint")
+    if prelaunch and approval.get("phase") != next_durable_phase:
+        raise RunnerError("historical grant range does not start at the next durable checkpoint")
+    report_raw_hash = grants.sha256_bytes(_historical_session_report_bytes(report_path))
+    if not prelaunch and (
+        session_binding.get("report_path") != str(report_path)
+        or session_binding.get("boot_stamp") != boot_stamp
+        or session_binding.get("root_volume_uuid") != root_volume
+        or session_binding.get("root_device") != root_device
+        or approval["measurements"]["session_report_sha256"] != session_binding["report_sha256"]
+    ):
+        raise RunnerError("private grant session binding changed")
+    if require_worker:
+        running = report.get("private_historical_grant")
+        if (
+            report.get("active_process_group") != os.getpid()
+            or not isinstance(running, dict)
+            or running.get("grant_id") != grant_id
+            or running.get("launch_sha256") != launch_sha256
+            or running.get("phase") != expected_phase
+            or running.get("substep") != expected_substep
+            or not isinstance(storage_invocation_token, str)
+            or re.fullmatch(r"[0-9a-f]{32}", storage_invocation_token) is None
+            or running.get("storage_invocation_token") != storage_invocation_token
+            or running.get("controller_pid") != supervisor_pid
+            or report.get("storage_supervision_invocation") != storage_invocation_token
+            or not isinstance(storage_progress_path, Path)
+            or running.get("storage_progress_path") != str(storage_progress_path)
+            or report.get("storage_supervision_file") != str(storage_progress_path)
+        ):
+            raise RunnerError("historical worker is not the supervised child bound to this grant")
+        _historical_validate_storage_handoff(
+            directory,
+            report_path,
+            storage_progress_path,
+            invocation_token=storage_invocation_token,
+        )
+        if report_raw_hash == session_binding["report_sha256"]:
+            raise RunnerError("supervised session report did not record the child launch")
+    elif not prelaunch:
+        if report.get("phase") != "stopped" or report.get("active_process_group") is not None:
+            raise RunnerError("private historical grant requires the exact stopped session")
+        handoff = report.get("private_historical_grant")
+        if (
+            report_raw_hash == session_binding["report_sha256"]
+            or not isinstance(handoff, dict)
+            or handoff.get("grant_id") != grant_id
+            or handoff.get("launch_sha256") != launch_sha256
+        ):
+            raise RunnerError("private grant session report lost its launch handoff")
+    elif report.get("phase") != "stopped" or report.get("active_process_group") is not None:
+        raise RunnerError("private historical grant requires the exact stopped session")
+    source_snapshot = None
+    baseline = None
+    store = None
+    if not cheap_only:
+        store = _historical_store(operator, max_duration_seconds=MAX_OFFLINE_HISTORICAL_SECONDS)
+        if _root_id(store) != identity["root_id"]:
+            raise RunnerError("private historical operator root identity changed")
+        store_device = _historical_path_device(store.root)
+        if store_device != current_mount["device"]:
+            raise RunnerError("private historical operator mount changed during authority setup")
+        verified_mount = {
+            "root_path": str(store.root.resolve()),
+            "root_id": identity["root_id"],
+            "capture_id": identity["capture_id"],
+            "current_device": store_device,
+            "device_lineage": current_mount["device_lineage"],
+        }
+        source_snapshot = _historical_source_snapshot(
+            store,
+            control_root,
+            identity,
+            bundle["freeze"],
+            grant_id=grant_id,
+            approval=approval,
+            control=bundle["control"],
+            verified_mount=verified_mount,
+        )
+        baseline = _historical_resource_baseline(directory, store, report)
+    else:
+        verified_mount = None
+    measurement = _historical_measurement_artifact(
+        control_root,
+        grant_id,
+        approval,
+        identity,
+        bundle["freeze"],
+        session_report_sha256=(
+            session_binding["report_sha256"] if session_binding is not None else report_raw_hash
+        ),
+        session_root_device=(
+            session_binding["root_device"]
+            if session_binding is not None
+            else report["system"]["filesystem_device"]
+        ),
+        baseline=baseline,
+        require_fresh=prelaunch,
+        allow_initial_maintenance_overage=(
+            prelaunch
+            and approval.get("phases", [None])[0] == "source"
+            or require_worker
+            and expected_phase == "source"
+            and expected_substep == "maintenance"
+        ),
+    )
+    return {
+        "directory": directory,
+        "operator": operator,
+        "control_root": control_root,
+        "identity": identity,
+        "control": bundle["control"],
+        "freeze": bundle["freeze"],
+        "freeze_sha256": bundle["freeze_sha256"],
+        "approval": approval,
+        "latch": latch,
+        "launch": launch,
+        "launch_sha256": launch_sha256,
+        "grant": grant,
+        "session_binding": session_binding,
+        "report_path": report_path,
+        "report": report,
+        "profile": profile,
+        "store": store,
+        "current_mount": current_mount,
+        "verified_mount": verified_mount,
+        "source_snapshot": source_snapshot,
+        "baseline": baseline,
+        "measurement": measurement,
+    }
+
+
+def _historical_phase_grant(
+    authority: dict[str, Any], grant_id: str, expected_phase: str
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    approval, latch, launch = grants.read_grant_bundle(authority["control_root"], grant_id)
+    if expected_phase not in approval.get("phases", []):
+        raise RunnerError("historical phase seal references a different grant phase")
+    grant = grants.validate_grant_bundle(
+        approval,
+        latch,
+        launch,
+        expected_bindings=authority["identity"],
+        now_epoch=float(launch.get("started_epoch", 0)) + 0.01,
+        now_monotonic=float(launch.get("started_monotonic", 0)) + 0.01,
+        boot_stamp=launch.get("boot_stamp"),
+        dbt_memory_limit="4GB",
+        dbt_threads=4,
+    )
+    return {"approval": approval, "latch": latch, "launch": launch, "grant": grant}
+
+
+def _historical_read_artifact(path: Path, max_bytes: int = MIB) -> tuple[dict[str, Any], str]:
+    from kalshi_events.common import decode, digest, regular_bytes
+
+    raw = regular_bytes(path, max_bytes)
+    value = decode(raw)
+    if not isinstance(value, dict):
+        raise RunnerError(f"historical artifact is not a JSON object: {path.name}")
+    return value, digest(raw)
+
+
+def _historical_published_release(
+    authority: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from kalshi_events import publish
+
+    store = authority["store"]
+    current = publish.current(store, catalogue_version=3)
+    release_id = current.get("source_release_id")
+    if (
+        current.get("capture_id") != authority["identity"]["capture_id"]
+        or not isinstance(release_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", release_id) is None
+    ):
+        raise RunnerError("historical publication does not match the frozen capture")
+    release = store.path(f"releases/{release_id}")
+    manifest_path = release / "manifest.json"
+    manifest, manifest_sha = _historical_read_artifact(manifest_path)
+    pointer, pointer_sha = _historical_read_artifact(store.path("current-historical.json"), MIB)
+    if (
+        manifest.get("source_release_id") != release_id
+        or manifest.get("capture_id") != authority["identity"]["capture_id"]
+        or manifest.get("contract") != "oddsfox.kalshi.historical.v1"
+        or manifest.get("historical_export_policy") != "historical-arrow-external-merge-v1"
+        or pointer.get("source_release_id") != release_id
+        or pointer.get("manifest_sha256") != manifest_sha
+    ):
+        raise RunnerError("historical publication manifest does not match its current pointer")
+    return {**current, "manifest_sha256": manifest_sha, "pointer_sha256": pointer_sha}, manifest
+
+
+def _historical_release_verification(
+    authority: dict[str, Any], *, grant_id_for_receipt: str | None
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    current, manifest = _historical_published_release(authority)
+    paths = _prepare_run_paths(authority["directory"], authority["report_path"])
+    standalone = _release_verify(
+        Path(str(current["output"])),
+        authority["directory"],
+        authority["operator"],
+        paths,
+        authority["report"],
+        float(authority["grant"]["deadline_monotonic"]),
+        storage_supervision=False,
+        wall_deadline_epoch_override=float(authority["grant"]["deadline_epoch"]),
+    )
+    source_capture_complete = standalone.get("source_capture_complete")
+    scope_complete = (
+        standalone == manifest
+        and manifest.get("coverage_scope") == "historical"
+        and manifest.get("historical_contract") == "oddsfox.kalshi.historical.v1"
+    )
+    if (
+        standalone.get("source_release_id") != current["source_release_id"]
+        or standalone.get("coverage_scope") != "historical"
+        or standalone.get("capture_id") != authority["identity"]["capture_id"]
+        or type(source_capture_complete) is not bool
+        or source_capture_complete is not manifest.get("source_capture_complete")
+        or not scope_complete
+    ):
+        raise RunnerError("independent historical publication verification failed")
+    receipt = {
+        "version": 1,
+        "capture_id": authority["identity"]["capture_id"],
+        "release_id": current["source_release_id"],
+        "release_manifest_sha256": current["manifest_sha256"],
+        "coverage_scope": standalone["coverage_scope"],
+        "source_capture_complete": source_capture_complete,
+        "scope_complete": scope_complete,
+        "verifier": "production_run._release_verify",
+    }
+    receipt_sha = grants.sha256_json(receipt)
+    if grant_id_for_receipt is not None:
+        receipt_path = authority["control_root"] / "verifications" / f"{grant_id_for_receipt}.json"
+        if receipt_path.exists() or receipt_path.is_symlink():
+            saved, _ = _historical_read_artifact(receipt_path)
+            if saved != receipt:
+                raise RunnerError("saved independent verification receipt changed")
+        else:
+            grants.write_once_json(receipt_path, receipt)
+    return {
+        "verification_receipt_sha256": receipt_sha,
+        "release_id": current["source_release_id"],
+        "release_manifest_sha256": current["manifest_sha256"],
+        "receipt": receipt,
+        "manifest": manifest,
+        "standalone": standalone,
+    }
+
+
+def _historical_readiness_phase_origin(authority: dict[str, Any], grant_id: str) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events import historical_resume, warehouse
+    from kalshi_events.common import digest, json_bytes
+
+    identity = authority["identity"]
+    store = authority["store"]
+    source_snapshot = authority["source_snapshot"]
+    path = authority["control_root"] / "grants" / grant_id / "readiness-phase-origin.json"
+    receipt, _ = _historical_read_artifact(path, 16 * MIB)
+    body = {key: value for key, value in receipt.items() if key != "sha256"}
+    required = {
+        "version",
+        "identity",
+        "grant_id",
+        "source_snapshot",
+        "source_proof",
+        "readiness_proof",
+        "landing_proof",
+        "verification",
+    }
+    if (
+        set(body) != required
+        or body.get("version") != 1
+        or body.get("identity") != identity
+        or body.get("grant_id") != grant_id
+        or receipt.get("sha256") != grants.sha256_json(body)
+        or body.get("source_snapshot") != source_snapshot
+    ):
+        raise RunnerError("original readiness verification receipt is invalid or unbound")
+
+    snapshot = body["source_snapshot"]
+    state_sha = identity["state_sha256"]
+    state = warehouse.read_capture(store, identity["capture_id"])
+    root = str(store.root.resolve())
+    source_binding = {
+        "root": root,
+        "stage": identity["stage_name"],
+        "capture_id": identity["capture_id"],
+        "capture_state_sha256": state_sha,
+        "scope_sha256": snapshot.get("binding", {}).get("scope_sha256"),
+        "code_sha256": snapshot.get("binding", {}).get("code_sha256"),
+    }
+    source_snapshot_body = {
+        key: snapshot.get(key) for key in ("version", "phase", "binding", "result")
+    }
+    source_result = snapshot.get("result")
+    if (
+        snapshot.get("version") != 1
+        or snapshot.get("phase") != "historical-source-snapshot"
+        or snapshot.get("binding") != source_binding
+        or snapshot.get("sha256") != digest(json_bytes(source_snapshot_body))
+        or snapshot.get("sha256") != authority["freeze"]["source_snapshot_sha256"]
+        or not isinstance(source_result, dict)
+        or source_result.get("source_sha256") != authority["freeze"]["source_sha256"]
+        or source_result.get("receipt_evidence_sha256")
+        != authority["freeze"]["receipt_evidence_sha256"]
+        or snapshot["binding"].get("scope_sha256") != authority["freeze"]["scope_sha256"]
+        or snapshot["binding"].get("code_sha256") != authority["freeze"]["code_sha256"]
+    ):
+        raise RunnerError("readiness receipt source snapshot does not match frozen evidence")
+
+    source_proof = body["source_proof"]
+    source_proof_binding = {
+        "root": root,
+        "capture_id": identity["capture_id"],
+        "state_sha256": state_sha,
+        "stage": identity["stage_name"],
+    }
+    try:
+        source_proof_result = historical_resume.validate_proof(
+            source_proof, "resume-source", source_proof_binding
+        )
+    except Exception as exc:
+        raise RunnerError("readiness source-copy proof is invalid") from exc
+    try:
+        source_identities_match = all(
+            _historical_resume_source_identity_equal(
+                source_proof_result.get(identity_key),
+                source_result.get(identity_key),
+                store=store,
+                state=state,
+                verified_mount=authority.get("verified_mount"),
+            )
+            for identity_key in ("source_identity", "source_wal_identity")
+        )
+    except Exception as exc:
+        raise RunnerError("readiness source-copy device lineage is invalid") from exc
+    if (
+        source_proof_result.get("source_sha256") != source_result.get("source_sha256")
+        or source_proof_result.get("source_wal_sha256") != source_result.get("source_wal_sha256")
+        or not source_identities_match
+    ):
+        raise RunnerError("readiness source-copy proof differs from its frozen source")
+
+    readiness = body["readiness_proof"]
+    readiness_binding = readiness.get("binding") if isinstance(readiness, dict) else None
+    if not isinstance(readiness_binding, dict):
+        raise RunnerError("original readiness proof is missing its binding")
+    expected_readiness_binding = {
+        "root": root,
+        "stage": identity["stage_name"],
+        "capture_id": identity["capture_id"],
+        "state_sha256": state_sha,
+        "source_proof_sha256": source_proof["sha256"],
+        "landing_proof_sha256": readiness_binding.get("landing_proof_sha256"),
+        "candidate_sha256": readiness_binding.get("candidate_sha256"),
+        "scope_sha256": snapshot["binding"]["scope_sha256"],
+        "schema_sha256": readiness_binding.get("schema_sha256"),
+        "code_sha256": snapshot["binding"]["code_sha256"],
+        "adoption_origin_sha256": None,
+    }
+    try:
+        readiness_result = historical_resume.validate_proof(
+            readiness, "historical-readiness", expected_readiness_binding
+        )
+    except Exception as exc:
+        raise RunnerError("original readiness proof is invalid or was rewritten") from exc
+
+    landing = body["landing_proof"]
+    landing_binding = landing.get("binding") if isinstance(landing, dict) else None
+    if not isinstance(landing_binding, dict):
+        raise RunnerError("original readiness landing proof is missing its binding")
+    try:
+        landing_result = historical_resume.validate_proof(
+            landing, "historical-landing", landing_binding
+        )
+    except Exception as exc:
+        raise RunnerError("original readiness landing proof is invalid") from exc
+    if (
+        landing.get("sha256") != readiness_binding["landing_proof_sha256"]
+        or landing_binding.get("root") != root
+        or landing_binding.get("stage") != identity["stage_name"]
+        or landing_binding.get("capture_id") != identity["capture_id"]
+        or landing_binding.get("state_sha256") != state_sha
+        or landing_binding.get("source_proof_sha256") != source_proof["sha256"]
+        or landing_binding.get("scope_sha256") != snapshot["binding"]["scope_sha256"]
+        or landing_binding.get("code_sha256") != snapshot["binding"]["code_sha256"]
+        or landing_binding.get("candidate_sha256") != readiness_binding["candidate_sha256"]
+        or landing_result.get("observation_count") != readiness_result.get("observation_count")
+        or landing_result.get("membership_count") != readiness_result.get("membership_count")
+        or landing_result.get("eligibility_count") != readiness_result.get("eligibility_count")
+    ):
+        raise RunnerError("original readiness landing proof differs from the frozen candidate")
+
+    verification = body["verification"]
+    verification_binding = verification.get("binding") if isinstance(verification, dict) else None
+    if not isinstance(verification_binding, dict):
+        raise RunnerError("original readiness verification is missing its binding")
+    try:
+        verification_result = historical_resume.validate_proof(
+            verification, "historical-readiness-verification", verification_binding
+        )
+    except Exception as exc:
+        raise RunnerError("original readiness verification receipt is invalid") from exc
+    expected_counts = {
+        "observation_count": readiness_result.get("observation_count"),
+        "membership_count": readiness_result.get("membership_count"),
+        "eligibility_count": readiness_result.get("eligibility_count"),
+    }
+    if (
+        verification_binding.get("root") != root
+        or verification_binding.get("stage") != identity["stage_name"]
+        or verification_binding.get("capture_id") != identity["capture_id"]
+        or verification_binding.get("state_sha256") != state_sha
+        or verification_binding.get("readiness_sha256") != readiness["sha256"]
+        or verification_binding.get("candidate_sha256") != readiness_binding["candidate_sha256"]
+        or verification_binding.get("evidence_sha256")
+        != source_result.get("receipt_evidence_sha256")
+        or verification_binding.get("code_sha256") != snapshot["binding"]["code_sha256"]
+        or verification_binding.get("adoption_origin_sha256") is not None
+        or verification_result != expected_counts
+        or expected_counts["observation_count"]
+        != authority["control"]["authorized_census"]["exact_observations"]
+    ):
+        raise RunnerError("original readiness verification differs from frozen source or census")
+    return {
+        "readiness_sha256": readiness["sha256"],
+        "verification_sha256": verification["sha256"],
+        "capture_state_sha256": state_sha,
+        "receipt_evidence_sha256": source_result["receipt_evidence_sha256"],
+        "source_sha256": source_result["source_sha256"],
+        "source_wal_sha256": source_result["source_wal_sha256"],
+        "candidate_sha256": readiness_binding["candidate_sha256"],
+        **expected_counts,
+        "scope_sha256": snapshot["binding"]["scope_sha256"],
+        "code_sha256": snapshot["binding"]["code_sha256"],
+    }
+
+
+def _historical_source_retirement_receipt(
+    authority: dict[str, Any], grant_id: str, phase: str
+) -> tuple[dict[str, Any], str]:
+    import historical_grants as grants
+
+    from kalshi_events import historical_resume, warehouse
+
+    if phase not in {"adoption", "models"}:
+        raise RunnerError("source-retirement receipt has an unsupported phase")
+    path = authority["control_root"] / "grants" / grant_id / "source-retirement.json"
+    receipt, raw_sha = _historical_read_artifact(path, 4 * MIB)
+    body = {key: value for key, value in receipt.items() if key != "sha256"}
+    linked = _historical_phase_grant(authority, grant_id, phase)
+    approval = linked["approval"]
+    expected = {
+        "version": 1,
+        "identity": authority["identity"],
+        "grant_id": grant_id,
+        "phase": phase,
+        "launch_sha256": grants.sha256_bytes(
+            grants._private_regular_file(
+                authority["control_root"] / "grants" / grant_id / "launch.json"
+            )
+        ),
+        "retirement_policy": "coexistence-capacity-relief-approved-v1",
+        "adoption_sha256": body.get("adoption_sha256"),
+        "verification_sha256": body.get("verification_sha256"),
+        "cleanup_intent_sha256": body.get("cleanup_intent_sha256"),
+        "source_sha256": authority["source_snapshot"]["result"]["source_sha256"],
+        "source_wal_sha256": authority["source_snapshot"]["result"]["source_wal_sha256"],
+    }
+    verification_name = (
+        "adoption-verification.json" if phase == "adoption" else "models-adoption-verification.json"
+    )
+    verification_path = authority["control_root"] / "grants" / grant_id / verification_name
+    verification, _ = _historical_read_artifact(verification_path, 4 * MIB)
+    verification_body = {
+        key: verification.get(key) for key in ("version", "phase", "binding", "result")
+    }
+    verification_binding = verification.get("binding")
+    try:
+        verification_result = historical_resume.validate_proof(
+            verification,
+            "historical-readiness-verification",
+            verification_binding,
+        )
+    except Exception as exc:
+        raise RunnerError("source-retirement verification receipt is invalid") from exc
+    stage_relative = historical_resume.stage_relative(authority["identity"]["stage_name"])
+    stage_path = authority["store"].path(stage_relative)
+    if stage_path.is_dir() and not stage_path.is_symlink():
+        adoption_proof_path = stage_path / "resume-adoption.json"
+    else:
+        adoption_proof_path = authority["store"].path(
+            f"builds-historical/{authority['identity']['capture_id']}/historical-adoption.json"
+        )
+    adoption_loaded = warehouse._load_self_proof(adoption_proof_path, "historical-adoption")
+    if adoption_loaded is None:
+        raise RunnerError("source-retirement receipt lost the immutable adoption proof")
+    adoption_proof, adoption_result = adoption_loaded
+    adoption_binding = adoption_proof.get("binding", {})
+    original_verification = (
+        verification.get("sha256") == adoption_binding.get("verification_sha256")
+        and verification_binding.get("readiness_sha256") == adoption_binding.get("readiness_sha256")
+        and verification_binding.get("candidate_sha256") == adoption_binding.get("candidate_sha256")
+        and verification_result
+        == {
+            key: adoption_result.get(key)
+            for key in ("observation_count", "membership_count", "eligibility_count")
+        }
+    )
+    verified_adoption_origin = verification_binding.get("adoption_origin_sha256") == body.get(
+        "adoption_sha256"
+    )
+    if (
+        adoption_proof.get("sha256") != body.get("adoption_sha256")
+        or adoption_binding.get("root") != str(authority["store"].root.resolve())
+        or adoption_binding.get("stage") != authority["identity"]["stage_name"]
+        or adoption_binding.get("capture_id") != authority["identity"]["capture_id"]
+        or adoption_binding.get("state_sha256") != authority["identity"]["state_sha256"]
+        or (phase == "models" and not verified_adoption_origin)
+        or (
+            phase == "adoption"
+            and not verified_adoption_origin
+            and not (
+                verification_binding.get("adoption_origin_sha256") is None and original_verification
+            )
+        )
+    ):
+        raise RunnerError("retirement verification does not bind the immutable adoption lineage")
+    cleanup_sha = body.get("cleanup_intent_sha256")
+    origin_path = authority["control_root"] / "source" / "adoption-origin.json"
+    adoption_origin, _ = _historical_read_artifact(origin_path, 4 * MIB)
+    adoption_origin_body = {key: value for key, value in adoption_origin.items() if key != "sha256"}
+    origin_claims = _historical_adoption_origin_claims(
+        authority, adoption_origin_body.get("verification_sha256")
+    )
+    origin_claim = next(
+        (
+            claim
+            for claim in origin_claims
+            if claim.get("grant_id") == adoption_origin_body.get("origin_grant_id")
+        ),
+        None,
+    )
+    if (
+        set(body)
+        != {
+            "version",
+            "identity",
+            "grant_id",
+            "phase",
+            "launch_sha256",
+            "retirement_policy",
+            "adoption_sha256",
+            "verification_sha256",
+            "cleanup_intent_sha256",
+            "source_sha256",
+            "source_wal_sha256",
+        }
+        or body.get("version") != 1
+        or body.get("identity") != authority["identity"]
+        or body.get("grant_id") != grant_id
+        or body.get("phase") != phase
+        or approval.get("retire_source") is not True
+        or approval.get("retirement_policy") != expected["retirement_policy"]
+        or body != expected
+        or receipt.get("sha256") != grants.sha256_json(body)
+        or verification.get("phase") != "historical-readiness-verification"
+        or verification.get("sha256") != body.get("verification_sha256")
+        or not isinstance(verification_binding, dict)
+        or verification_binding.get("root") != str(authority["store"].root.resolve())
+        or verification_binding.get("capture_id") != authority["identity"]["capture_id"]
+        or verification_binding.get("stage") != authority["identity"]["stage_name"]
+        or verification_binding.get("state_sha256") != authority["identity"]["state_sha256"]
+        or verification_binding.get("evidence_sha256")
+        != authority["source_snapshot"]["result"]["receipt_evidence_sha256"]
+        or verification_binding.get("code_sha256")
+        != authority["source_snapshot"]["binding"]["code_sha256"]
+        or verification_body.get("result") != verification_result
+        or verification_result.get("observation_count")
+        != authority.get("control", {}).get("authorized_census", {}).get("exact_observations")
+        or adoption_origin.get("sha256") != grants.sha256_json(adoption_origin_body)
+        or adoption_origin_body.get("identity") != authority["identity"]
+        or adoption_origin_body.get("verification_sha256")
+        != adoption_binding.get("verification_sha256")
+        or origin_claim is None
+        or origin_claim.get("sha256") != adoption_origin_body.get("origin_claim_sha256")
+        or origin_claim.get("retire_source") is not adoption_origin_body.get("retire_source")
+        or origin_claim.get("retirement_policy") != adoption_origin_body.get("retirement_policy")
+        or adoption_origin_body.get("adoption_sha256") != body.get("adoption_sha256")
+        or phase == "adoption"
+        and (
+            approval.get("retire_source") is not origin_claim.get("retire_source")
+            or approval.get("retirement_policy") != origin_claim.get("retirement_policy")
+        )
+        or adoption_origin_body.get("source_sha256")
+        != authority["source_snapshot"]["result"]["source_sha256"]
+        or adoption_origin_body.get("source_wal_sha256")
+        != authority["source_snapshot"]["result"]["source_wal_sha256"]
+        or type(cleanup_sha) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", cleanup_sha) is None
+    ):
+        raise RunnerError("source-retirement receipt is not bound to its approved grant")
+    launch_sha = expected["launch_sha256"]
+    substep_record = _historical_validate_substep_record(
+        _historical_substep_path(authority["control_root"], grant_id, phase, "adopt"),
+        identity=authority["identity"],
+        grant_id=grant_id,
+        launch_sha256=launch_sha,
+        launch=linked["launch"],
+        phase=phase,
+        substep="adopt",
+    )
+    expected_output = {
+        "adoption_sha256": body["adoption_sha256"],
+        "source_retired": True,
+        "source_retirement_sha256": receipt["sha256"],
+    }
+    if substep_record.get("output_sha256") != grants.sha256_json(expected_output):
+        raise RunnerError("source-retirement receipt is not bound to a completed supervised child")
+    return receipt, raw_sha
+
+
+def _historical_cleanup_retirement_authorized(
+    control_root: Path,
+    identity: dict[str, Any],
+    freeze: dict[str, Any],
+    grant_id: str,
+    approval: dict[str, Any],
+    adoption_proof: dict[str, Any],
+    cleanup_path: Path,
+    *,
+    store: Any,
+    source_snapshot: dict[str, Any],
+    control: dict[str, Any],
+) -> bool:
+    """Require a linked retirement grant for every durable cleanup intent."""
+    from kalshi_events import warehouse
+
+    loaded_cleanup = warehouse._load_self_proof(cleanup_path, "historical-source-cleanup")
+    if loaded_cleanup is None:
+        return False
+    cleanup_proof, _cleanup_result = loaded_cleanup
+    expected_cleanup_sha = cleanup_proof.get("sha256")
+    authority = {
+        "control_root": control_root,
+        "identity": identity,
+        "source_snapshot": source_snapshot,
+        "store": store,
+        "freeze": freeze,
+        "control": control,
+    }
+    grants_root = control_root / "grants"
+    try:
+        with os.scandir(grants_root) as entries:
+            grant_dirs = [
+                entry.name
+                for entry in entries
+                if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)
+            ]
+    except OSError as exc:
+        raise RunnerError("historical cleanup authority inventory is unavailable") from exc
+    for prior_grant_id in grant_dirs:
+        for phase in ("adoption", "models"):
+            receipt_path = grants_root / prior_grant_id / "source-retirement.json"
+            if not receipt_path.exists() and not receipt_path.is_symlink():
+                continue
+            try:
+                receipt, _ = _historical_source_retirement_receipt(authority, prior_grant_id, phase)
+            except RunnerError:
+                continue
+            if receipt.get("cleanup_intent_sha256") == expected_cleanup_sha:
+                return True
+
+    if (
+        approval.get("grant_id") != grant_id
+        or approval.get("phase") not in {"adoption", "models"}
+        or approval.get("phase") not in approval.get("phases", [])
+        or approval.get("retire_source") is not True
+        or approval.get("retirement_policy") != "coexistence-capacity-relief-approved-v1"
+    ):
+        return False
+    if approval.get("phase") == "adoption":
+        verification_sha = adoption_proof.get("binding", {}).get("verification_sha256")
+        claims = _historical_adoption_origin_claims(authority, verification_sha)
+        return any(
+            claim.get("retire_source") is True
+            and claim.get("retirement_policy") == approval.get("retirement_policy")
+            for claim in claims
+        )
+    return True
+
+
+def _historical_write_source_retirement_receipt(
+    authority: dict[str, Any],
+    adoption: dict[str, Any],
+    verification: dict[str, Any],
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    grant_id = authority["grant"]["grant_id"]
+    launch_sha = authority["launch_sha256"]
+    receipt_body = {
+        "version": 1,
+        "identity": authority["identity"],
+        "grant_id": grant_id,
+        "phase": phase,
+        "launch_sha256": launch_sha,
+        "retirement_policy": "coexistence-capacity-relief-approved-v1",
+        "adoption_sha256": adoption.get("adoption_sha256"),
+        "verification_sha256": verification.get("sha256"),
+        "cleanup_intent_sha256": adoption.get("cleanup_intent_sha256"),
+        "source_sha256": authority["source_snapshot"]["result"]["source_sha256"],
+        "source_wal_sha256": authority["source_snapshot"]["result"]["source_wal_sha256"],
+    }
+    if (
+        authority["approval"].get("retire_source") is not True
+        or authority["approval"].get("retirement_policy") != receipt_body["retirement_policy"]
+        or adoption.get("source_retired") is not True
+        or not isinstance(receipt_body["adoption_sha256"], str)
+        or receipt_body["verification_sha256"] != verification.get("sha256")
+        or not isinstance(receipt_body["cleanup_intent_sha256"], str)
+    ):
+        raise RunnerError("source retirement was not authorized by this phase grant")
+    path = authority["control_root"] / "grants" / grant_id / "source-retirement.json"
+    receipt = receipt_body | {"sha256": grants.sha256_json(receipt_body)}
+    if path.exists() or path.is_symlink():
+        saved, _ = _historical_read_artifact(path, 4 * MIB)
+        if saved != receipt:
+            raise RunnerError("source-retirement receipt already exists with different lineage")
+    else:
+        grants.write_once_json(path, receipt)
+    return receipt
+
+
+def _historical_write_readiness_phase_origin(
+    authority: dict[str, Any], verification: dict[str, Any]
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events import warehouse
+
+    identity = authority["identity"]
+    grant_id = authority["grant"]["grant_id"]
+    stage_relative = f"tmp/{identity['stage_name']}"
+    candidate = authority["store"].path(f"{stage_relative}/resume-candidate")
+    state = warehouse.read_capture(authority["store"], identity["capture_id"])
+    source_proof, _source_result = warehouse._read_source_proof(
+        authority["store"], state, identity["stage_name"], candidate
+    )
+    readiness_loaded = warehouse._load_self_proof(
+        authority["store"].path(f"{stage_relative}/resume-readiness.json"),
+        "historical-readiness",
+    )
+    if readiness_loaded is None:
+        raise RunnerError("verified historical readiness lost its immutable proof")
+    readiness, _readiness_result = readiness_loaded
+    landing_sha = readiness["binding"].get("landing_proof_sha256")
+    if not isinstance(landing_sha, str):
+        raise RunnerError("verified historical readiness has no landing proof binding")
+    landing_loaded = warehouse._load_self_proof(
+        candidate / f"resume-landing-{landing_sha}.json", "historical-landing"
+    )
+    if landing_loaded is None:
+        raise RunnerError("verified historical readiness lost its landing proof")
+    landing, _landing_result = landing_loaded
+    body = {
+        "version": 1,
+        "identity": identity,
+        "grant_id": grant_id,
+        "source_snapshot": authority["source_snapshot"],
+        "source_proof": source_proof,
+        "readiness_proof": readiness,
+        "landing_proof": landing,
+        "verification": verification,
+    }
+    receipt = body | {"sha256": grants.sha256_json(body)}
+    path = authority["control_root"] / "grants" / grant_id / "readiness-phase-origin.json"
+    if path.exists() or path.is_symlink():
+        saved, _ = _historical_read_artifact(path, 16 * MIB)
+        if saved != receipt:
+            raise RunnerError(
+                "original readiness phase receipt already exists with different proof"
+            )
+    else:
+        grants.write_once_json(path, receipt)
+    return receipt
+
+
+def _historical_adoption_claim_path(control_root: Path, grant_id: str) -> Path:
+    return control_root / "grants" / grant_id / "adoption-origin-claim.json"
+
+
+def _historical_adoption_origin_claims(
+    authority: dict[str, Any], verification_sha256: str
+) -> list[dict[str, Any]]:
+    import historical_grants as grants
+
+    control_root = authority["control_root"]
+    grants_root = control_root / "grants"
+    matches: list[dict[str, Any]] = []
+    try:
+        with os.scandir(grants_root) as entries:
+            for entry in entries:
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    raise RunnerError("historical grant inventory contains an unsafe entry")
+                grant_id = entry.name
+                if re.fullmatch(r"[0-9a-f]{32}", grant_id) is None:
+                    raise RunnerError("historical grant inventory contains an invalid ID")
+                claim_path = _historical_adoption_claim_path(control_root, grant_id)
+                if not claim_path.exists() and not claim_path.is_symlink():
+                    continue
+                claim, _ = _historical_read_artifact(claim_path, 4 * MIB)
+                body = {key: value for key, value in claim.items() if key != "sha256"}
+                linked = _historical_phase_grant(authority, grant_id, "adoption")
+                approval = linked["approval"]
+                expected = {
+                    "version": 1,
+                    "identity": authority["identity"],
+                    "grant_id": grant_id,
+                    "launch_sha256": grants.sha256_bytes(
+                        grants._private_regular_file(
+                            control_root / "grants" / grant_id / "launch.json"
+                        )
+                    ),
+                    "approval_sha256": grants.sha256_json(approval),
+                    "verification_sha256": body.get("verification_sha256"),
+                    "retire_source": approval.get("retire_source"),
+                    "retirement_policy": approval.get("retirement_policy"),
+                }
+                if body != expected or claim.get("sha256") != grants.sha256_json(body):
+                    raise RunnerError("historical adoption-origin claim is malformed")
+                if body["verification_sha256"] == verification_sha256:
+                    matches.append(claim)
+    except OSError as exc:
+        raise RunnerError("historical adoption-origin claims cannot be inventoried") from exc
+    return matches
+
+
+def _historical_resolve_adoption_origin_claim(
+    authority: dict[str, Any],
+    verification_sha256: str,
+    *,
+    create_if_missing: bool,
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    matches = _historical_adoption_origin_claims(authority, verification_sha256)
+    approval = authority["approval"]
+    if matches:
+        decision = (matches[0]["retire_source"], matches[0]["retirement_policy"])
+        if any((item["retire_source"], item["retirement_policy"]) != decision for item in matches):
+            raise RunnerError("adoption origin has conflicting immutable retirement approvals")
+        if decision != (approval.get("retire_source"), approval.get("retirement_policy")):
+            raise RunnerError(
+                "adoption retry differs from the immutable origin retirement approval"
+            )
+        return matches[0]
+    if not create_if_missing:
+        raise RunnerError("immutable historical adoption origin has no approved grant claim")
+
+    grant_id = authority["grant"]["grant_id"]
+    body = {
+        "version": 1,
+        "identity": authority["identity"],
+        "grant_id": grant_id,
+        "launch_sha256": authority["launch_sha256"],
+        "approval_sha256": grants.sha256_json(approval),
+        "verification_sha256": verification_sha256,
+        "retire_source": approval.get("retire_source"),
+        "retirement_policy": approval.get("retirement_policy"),
+    }
+    path = _historical_adoption_claim_path(authority["control_root"], grant_id)
+    claim = body | {"sha256": grants.sha256_json(body)}
+    if path.exists() or path.is_symlink():
+        saved, _ = _historical_read_artifact(path, 4 * MIB)
+        if saved != claim:
+            raise RunnerError("adoption-origin claim already exists with different approval")
+    else:
+        grants.write_once_json(path, claim)
+    return claim
+
+
+def _historical_write_adoption_origin(
+    authority: dict[str, Any], claim: dict[str, Any], adoption_proof: dict[str, Any]
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    body = {
+        "version": 1,
+        "identity": authority["identity"],
+        "origin_grant_id": claim["grant_id"],
+        "origin_claim_sha256": claim["sha256"],
+        "verification_sha256": adoption_proof.get("binding", {}).get("verification_sha256"),
+        "adoption_sha256": adoption_proof.get("sha256"),
+        "candidate_sha256": adoption_proof.get("result", {}).get("candidate_sha256"),
+        "source_sha256": authority["source_snapshot"]["result"]["source_sha256"],
+        "source_wal_sha256": authority["source_snapshot"]["result"]["source_wal_sha256"],
+        "retire_source": claim["retire_source"],
+        "retirement_policy": claim["retirement_policy"],
+    }
+    if (
+        body["verification_sha256"] != claim["verification_sha256"]
+        or not isinstance(body["adoption_sha256"], str)
+        or not isinstance(body["candidate_sha256"], str)
+    ):
+        raise RunnerError("adopted origin does not match its immutable grant claim")
+    path = authority["control_root"] / "source" / "adoption-origin.json"
+    record = body | {"sha256": grants.sha256_json(body)}
+    if path.exists() or path.is_symlink():
+        saved, _ = _historical_read_artifact(path, 4 * MIB)
+        if saved != record:
+            raise RunnerError("immutable adoption origin record changed across retry")
+    else:
+        grants.write_once_json(path, record)
+    return record
+
+
+def _historical_phase_outputs(authority: dict[str, Any], phase: str) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events import historical_export, historical_resume, warehouse
+    from kalshi_events.common import digest, regular_bytes
+
+    identity = authority["identity"]
+    store = authority["store"]
+    source_snapshot = authority["source_snapshot"]
+    source_result = source_snapshot["result"]
+    census = _historical_census_proof(
+        authority,
+        full_revalidation_if_missing=False,
+    )
+    capture_id = identity["capture_id"]
+    stage_relative = historical_resume.stage_relative(identity["stage_name"])
+    stage = store.path(stage_relative)
+    build_relative = f"builds-historical/{capture_id}"
+    build_dir = store.path(build_relative)
+    build_path = build_dir / "build.json"
+    adoption_path = store.path(f"{stage_relative}/resume-adoption.json")
+    if phase == "source":
+        maintenance = _historical_read_startup_maintenance(authority)
+        source_seal_path = authority["control_root"] / "phases" / "source.json"
+        if source_seal_path.exists():
+            source_seal, _ = _historical_read_artifact(source_seal_path)
+            source_grant_id = source_seal.get("grant_id")
+        else:
+            source_grant_id = authority["grant"]["grant_id"]
+        source_grant = _historical_phase_grant(authority, source_grant_id, "source")
+        source_launch_sha = grants.sha256_bytes(
+            grants._private_regular_file(
+                authority["control_root"] / "grants" / source_grant_id / "launch.json"
+            )
+        )
+        maintenance_record = _historical_validate_substep_record(
+            _historical_substep_path(
+                authority["control_root"], source_grant_id, "source", "maintenance"
+            ),
+            identity=identity,
+            grant_id=source_grant_id,
+            launch_sha256=source_launch_sha,
+            launch=source_grant["launch"],
+            phase="source",
+            substep="maintenance",
+        )
+        if maintenance_record.get("output_sha256") != grants.sha256_json(
+            {"startup_maintenance_sha256": maintenance["sha256"]}
+        ):
+            raise RunnerError("source checkpoint is not bound to its startup cleanup proof")
+        return {
+            "startup_maintenance_sha256": maintenance["sha256"],
+            "source_snapshot_sha256": source_snapshot["sha256"],
+            "capture_state_sha256": source_snapshot["binding"]["capture_state_sha256"],
+            "receipt_evidence_sha256": source_result["receipt_evidence_sha256"],
+            "source_sha256": source_result["source_sha256"],
+            "source_wal_sha256": source_result["source_wal_sha256"],
+            "receipt_count": source_result["receipt_count"],
+            "population_report_sha256": census["population_report_sha256"],
+            "receipt_index_sha256": census["receipt_index_sha256"],
+            "exact_observations": census["exact_observations"],
+            "observations_by_endpoint": census["observations_by_endpoint"],
+            "scope_sha256": source_snapshot["binding"]["scope_sha256"],
+            "code_sha256": source_snapshot["binding"]["code_sha256"],
+        }
+    if phase == "readiness":
+        seal_path = authority["control_root"] / "phases" / "readiness.json"
+        if seal_path.exists():
+            seal, _ = _historical_read_artifact(seal_path)
+            linked_grant_id = seal.get("grant_id")
+        elif "readiness" in authority["approval"].get("phases", []):
+            linked_grant_id = authority["grant"]["grant_id"]
+        else:
+            raise RunnerError("readiness phase has no original linked grant")
+        _historical_phase_grant(authority, linked_grant_id, "readiness")
+        return _historical_readiness_phase_origin(authority, linked_grant_id)
+    if phase == "adoption":
+        seal_path = authority["control_root"] / "phases" / "adoption.json"
+        if seal_path.exists():
+            seal, _ = _historical_read_artifact(seal_path)
+            linked_grant_id = seal.get("grant_id")
+        elif "adoption" in authority["approval"].get("phases", []):
+            linked_grant_id = authority["grant"]["grant_id"]
+        else:
+            raise RunnerError("adoption phase has no original linked grant")
+        linked = _historical_phase_grant(authority, linked_grant_id, "adoption")
+        approval = linked["approval"]
+        if stage.is_dir() and not stage.is_symlink():
+            adoption_loaded = warehouse._load_self_proof(adoption_path, "historical-adoption")
+            if adoption_loaded is None:
+                raise RunnerError("historical adoption origin proof is missing")
+            adoption_proof, adoption_result = adoption_loaded
+            state = warehouse.read_capture(store, capture_id)
+            source_proof, source_result = warehouse._read_source_proof(
+                store,
+                state,
+                identity["stage_name"],
+                store.path(f"{stage_relative}/resume-candidate"),
+            )
+            origin, verified_origin = warehouse._validate_historical_adoption_origin(
+                store, state, identity["stage_name"], source_proof, source_result
+            )
+            if origin != adoption_proof or verified_origin != adoption_result:
+                raise RunnerError("historical adoption origin changed after sealing")
+        elif build_path.is_file() and not build_path.is_symlink():
+            certified = warehouse.certified(store, capture_id, catalogue_version=3)
+            adoption_loaded = warehouse._load_self_proof(
+                build_dir / "historical-adoption.json", "historical-adoption"
+            )
+            if adoption_loaded is None:
+                raise RunnerError("installed historical build lost its adoption origin")
+            adoption_proof, adoption_result = adoption_loaded
+            source_result = source_snapshot["result"]
+            build, _ = _historical_read_artifact(build_path)
+            installed = build.get("historical_adoption")
+            if (
+                certified.get("historical_adoption") != installed
+                or not isinstance(installed, dict)
+                or installed.get("sha256") != adoption_proof.get("sha256")
+                or installed.get("candidate_sha256") != adoption_result.get("candidate_sha256")
+            ):
+                raise RunnerError("installed build does not preserve its immutable adoption origin")
+        else:
+            raise RunnerError("historical adoption candidate or installed build is missing")
+
+        origin_path = authority["control_root"] / "source" / "adoption-origin.json"
+        origin, _ = _historical_read_artifact(origin_path, 4 * MIB)
+        origin_body = {key: value for key, value in origin.items() if key != "sha256"}
+        if (
+            origin.get("sha256") != grants.sha256_json(origin_body)
+            or origin_body.get("version") != 1
+            or origin_body.get("identity") != identity
+            or origin_body.get("adoption_sha256") != adoption_proof["sha256"]
+            or origin_body.get("verification_sha256")
+            != adoption_proof["binding"].get("verification_sha256")
+            or origin_body.get("candidate_sha256") != adoption_result.get("candidate_sha256")
+            or origin_body.get("source_sha256") != source_result["source_sha256"]
+            or origin_body.get("source_wal_sha256") != source_result["source_wal_sha256"]
+        ):
+            raise RunnerError("immutable adoption origin record differs from its warehouse proof")
+        claims = _historical_adoption_origin_claims(
+            authority, adoption_proof["binding"]["verification_sha256"]
+        )
+        origin_claim = next(
+            (claim for claim in claims if claim["grant_id"] == origin_body.get("origin_grant_id")),
+            None,
+        )
+        if (
+            origin_claim is None
+            or origin_claim.get("sha256") != origin_body.get("origin_claim_sha256")
+            or origin_claim.get("retire_source") is not origin_body.get("retire_source")
+            or origin_claim.get("retirement_policy") != origin_body.get("retirement_policy")
+            or approval.get("retire_source") is not origin_claim.get("retire_source")
+            or approval.get("retirement_policy") != origin_claim.get("retirement_policy")
+        ):
+            raise RunnerError("adoption phase grant differs from immutable origin authority")
+        retired = approval.get("retire_source") is True
+        retirement_receipt_sha256 = None
+        receipt_path = (
+            authority["control_root"] / "grants" / linked_grant_id / "source-retirement.json"
+        )
+        if retired:
+            retirement_receipt, _ = _historical_source_retirement_receipt(
+                authority, linked_grant_id, "adoption"
+            )
+            retirement_receipt_sha256 = retirement_receipt["sha256"]
+        elif receipt_path.exists() or receipt_path.is_symlink():
+            raise RunnerError("non-retiring adoption grant has a retirement receipt")
+        return {
+            "adoption_sha256": adoption_proof["sha256"],
+            "verification_receipt_sha256": adoption_proof["binding"]["verification_sha256"],
+            "candidate_sha256": adoption_result["candidate_sha256"],
+            "source_retired": retired,
+            "retirement_receipt_sha256": retirement_receipt_sha256,
+        }
+    if phase in {"models", "certified-build"}:
+        if not build_path.is_file() or build_path.is_symlink():
+            raise RunnerError("historical model build receipt is missing")
+        build, build_receipt_sha = _historical_read_artifact(build_path)
+        if build.get("capture_id") != capture_id or build.get("catalogue_version") != 3:
+            raise RunnerError("historical model build receipt does not match the capture")
+        if build.get("observation_count") != census["exact_observations"]:
+            raise RunnerError(
+                "historical model build count differs from the authorized exact census"
+            )
+        certified = warehouse.certified(store, capture_id, catalogue_version=3)
+        artifact_path = build_dir / "build-artifacts.json"
+        model_artifact_sha = digest(regular_bytes(artifact_path, 64 * MIB))
+        if model_artifact_sha != build.get("dbt_artifacts_sha256"):
+            raise RunnerError("historical model build artifacts changed")
+        if phase == "models":
+            seal_path = authority["control_root"] / "phases" / "models.json"
+            if seal_path.exists():
+                seal, _ = _historical_read_artifact(seal_path)
+                linked_grant_id = seal.get("grant_id")
+            elif "models" in authority["approval"].get("phases", []):
+                linked_grant_id = authority["grant"]["grant_id"]
+            else:
+                raise RunnerError("models phase has no original linked grant")
+            _historical_phase_grant(authority, linked_grant_id, "models")
+            source_retirement_sha256 = None
+            grant_root = authority["control_root"] / "grants"
+            retirements: list[tuple[float, str, str]] = []
+            grant_count = 0
+            try:
+                with os.scandir(grant_root) as entries:
+                    for entry in entries:
+                        grant_count += 1
+                        if grant_count > 4096:
+                            raise RunnerError("historical grant inventory exceeded its bound")
+                        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                            raise RunnerError("historical grant inventory contains an unsafe entry")
+                        if re.fullmatch(r"[0-9a-f]{32}", entry.name) is None:
+                            raise RunnerError("historical grant inventory contains an invalid ID")
+                        receipt_path = Path(entry.path) / "source-retirement.json"
+                        if not receipt_path.exists() and not receipt_path.is_symlink():
+                            continue
+                        retirement_header, _ = _historical_read_artifact(receipt_path, 4 * MIB)
+                        if retirement_header.get("phase") != "models":
+                            continue
+                        retirement, _ = _historical_source_retirement_receipt(
+                            authority, entry.name, "models"
+                        )
+                        linked_retirement = _historical_phase_grant(authority, entry.name, "models")
+                        retirements.append(
+                            (
+                                float(linked_retirement["launch"]["started_epoch"]),
+                                entry.name,
+                                retirement["sha256"],
+                            )
+                        )
+            except OSError as exc:
+                raise RunnerError("historical retirement receipt inventory is unavailable") from exc
+            if retirements:
+                source_retirement_sha256 = min(retirements)[2]
+            return {
+                "build_receipt_sha256": build_receipt_sha,
+                "warehouse_sha256": certified["warehouse_sha256"],
+                "dbt_artifacts_sha256": model_artifact_sha,
+                "source_retirement_sha256": source_retirement_sha256,
+            }
+        return {
+            "build_sha256": digest(regular_bytes(build_path, MIB)),
+            "build_manifest_sha256": model_artifact_sha,
+            "certified_receipt_sha256": grants.sha256_json(certified),
+        }
+    if phase in {"export", "verified-publication"}:
+        current, manifest = _historical_published_release(authority)
+        export = {
+            "export_policy_sha256": grants.sha256_json(historical_export.POLICY),
+            "parquet_inventory_sha256": grants.sha256_json(manifest.get("files")),
+            "release_metadata_sha256": grants.sha256_json(manifest),
+        }
+        publication = {
+            "release_id": current["source_release_id"],
+            "release_manifest_sha256": current["manifest_sha256"],
+            "publication_pointer_sha256": current["pointer_sha256"],
+        }
+        return export if phase == "export" else publication
+    if phase == "independent-verification":
+        seal_path = authority["control_root"] / "phases" / "independent-verification.json"
+        receipt_grant = authority["grant"]["grant_id"]
+        if seal_path.exists():
+            seal, _ = _historical_read_artifact(seal_path)
+            receipt_grant = seal["grant_id"]
+        verified = _historical_release_verification(authority, grant_id_for_receipt=receipt_grant)
+        return {
+            key: verified[key]
+            for key in (
+                "verification_receipt_sha256",
+                "release_id",
+                "release_manifest_sha256",
+            )
+        }
+    if phase == "activation":
+        result_path = (
+            authority["control_root"] / "activations" / f"{authority['grant']['grant_id']}.json"
+        )
+        result, _ = _historical_read_artifact(result_path, 4 * MIB)
+        current, _manifest = _historical_published_release(authority)
+        database_path = authority["directory"] / "production.duckdb"
+        database_record = _historical_file_record(database_path, max_bytes=128 * GIB)
+        relation_rows = result.get("relation_rows")
+        readback = result.get("production_readback")
+        audit_binding = authority["report"].get("activation_audit")
+        if not isinstance(audit_binding, dict):
+            raise RunnerError("historical activation lost its independent audit binding")
+        from production_activation import _activation_audit_payload
+
+        audit = _activation_audit_payload(
+            authority["directory"],
+            audit_binding,
+            expected_session_id=identity["session_id"],
+        )
+        audit_sha = audit_binding.get("sha256")
+        census_control = authority["control"].get("authorized_census", {})
+        if (
+            result.get("state") != "verified"
+            or result.get("capture_id") != capture_id
+            or result.get("source_release_id") != current["source_release_id"]
+            or result.get("warehouse_sha256") != database_record["sha256"]
+            or audit_sha != authority["approval"].get("activation_audit_sha256")
+            or audit.get("capture_id") != census_control.get("capture_id")
+            or audit.get("root_id") != census_control.get("root_id")
+            or audit.get("capture_state_sha256") != census_control.get("capture_state_sha256")
+            or audit.get("receipt_index_sha256") != census_control.get("receipt_index_sha256")
+            or audit.get("population_report_sha256")
+            != census_control.get("population_report_sha256")
+            or audit.get("observations_by_endpoint")
+            != census_control.get("observations_by_endpoint")
+            or audit.get("exact_observations") != census_control.get("exact_observations")
+            or not isinstance(readback, dict)
+            or readback.get("read_only") is not True
+            or readback.get("relation_rows") != relation_rows
+            or not isinstance(relation_rows, dict)
+            or set(relation_rows)
+            != {"series", "events", "markets", "relationships", "combo_legs", "observation_history"}
+            or relation_rows.get("observation_history") != census_control.get("exact_observations")
+        ):
+            raise RunnerError(
+                "historical activation readback does not match its verified artifacts"
+            )
+        return {
+            "activation_audit_sha256": audit_sha,
+            "production_database_sha256": database_record["sha256"],
+            "release_id": current["source_release_id"],
+            "activation_readback_sha256": grants.sha256_json(readback),
+            "relation_rows": relation_rows,
+        }
+    raise RunnerError("unknown private historical phase")
+
+
+def _historical_validate_phase_chain(authority: dict[str, Any]) -> tuple[str | None, str | None]:
+    import historical_grants as grants
+
+    current, previous = grants.read_phase_chain(
+        authority["control_root"] / "phases", authority["identity"]
+    )
+    seals = [
+        _historical_read_artifact(authority["control_root"] / "phases" / f"{phase}.json")[0]
+        for phase in grants.PHASES[: len(grants.PHASES) if current is not None else 0]
+        if (authority["control_root"] / "phases" / f"{phase}.json").exists()
+    ]
+    for seal in seals:
+        phase = seal["phase"]
+        actual = _historical_phase_outputs(authority, phase)
+        if seal["outputs"] != actual:
+            raise RunnerError(f"sealed {phase} phase no longer matches verified artifacts")
+        linked = _historical_phase_grant(authority, seal["grant_id"], phase)
+        if phase == "adoption":
+            grants.validate_adoption_retirement(
+                linked["approval"], seal["outputs"].get("source_retired")
+            )
+    return current, previous
+
+
+_HISTORICAL_PHASE_SUBSTEPS = {
+    "source": ("maintenance", "snapshot"),
+    "readiness": ("prepare", "verify"),
+    "adoption": ("verify", "adopt"),
+    "models": ("prepare", "verify", "adopt", "build"),
+    "certified-build": ("certify",),
+    "export": ("publish",),
+    "verified-publication": ("verify",),
+    "independent-verification": ("verify",),
+    "activation": ("activate",),
+}
+
+
+def _historical_substeps_for_grant(
+    phase: str, approval: dict[str, Any], store: Any, capture_id: str
+) -> tuple[str, ...]:
+    ordered = _HISTORICAL_PHASE_SUBSTEPS.get(phase)
+    if ordered is None:
+        raise RunnerError("private historical phase is not recognized")
+    if phase != "models" or approval.get("retire_source") is not True:
+        return ordered if phase != "models" else ("build",)
+    build_path = store.path(f"builds-historical/{capture_id}/build.json")
+    if build_path.is_symlink():
+        raise RunnerError("installed historical build receipt is a symlink")
+    if build_path.exists():
+        if not build_path.is_file():
+            raise RunnerError("installed historical build receipt is not a regular file")
+        # An installed build means retirement already preceded this retry. Never
+        # revisit the pending stage or alter its source-retirement lineage.
+        return ("build",)
+    stage_path = store.path(f"tmp/{approval.get('bindings', {}).get('stage_name', '')}")
+    if stage_path.is_symlink() or not stage_path.is_dir():
+        raise RunnerError("approved models retirement requires the exact pending stage")
+    return ("prepare", "verify", "adopt", "build")
+
+
+def _historical_substep_path(control_root: Path, grant_id: str, phase: str, substep: str) -> Path:
+    if phase not in _HISTORICAL_PHASE_SUBSTEPS or substep not in _HISTORICAL_PHASE_SUBSTEPS[phase]:
+        raise RunnerError("private historical worker substep is not recognized")
+    return control_root / "grants" / grant_id / "substeps" / f"{phase}-{substep}.json"
+
+
+def _historical_validate_substep_record(
+    path: Path,
+    *,
+    identity: dict[str, Any],
+    grant_id: str,
+    launch_sha256: str,
+    launch: dict[str, Any],
+    phase: str,
+    substep: str,
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    record, _ = _historical_read_artifact(path, 1024**2)
+    fields = {
+        "version",
+        "identity",
+        "grant_id",
+        "launch_sha256",
+        "phase",
+        "substep",
+        "completed_at_epoch",
+        "output_sha256",
+    }
+    if (
+        set(record) != fields
+        or record.get("version") != 1
+        or record.get("identity") != identity
+        or record.get("grant_id") != grant_id
+        or record.get("launch_sha256") != launch_sha256
+        or record.get("phase") != phase
+        or record.get("substep") != substep
+    ):
+        raise RunnerError("supervised historical substep receipt is not bound to its launch")
+    completed = record.get("completed_at_epoch")
+    if type(completed) not in {int, float, Decimal} or not math.isfinite(float(completed)):
+        raise RunnerError("supervised historical substep completion time is invalid")
+    grants.validate_phase_completion_time(phase, float(completed), launch)
+    if (
+        not isinstance(record.get("output_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["output_sha256"]) is None
+    ):
+        raise RunnerError("supervised historical substep receipt hash is invalid")
+    return record
+
+
+def _historical_activation_claimed(
+    control_root: Path,
+    grant_id: str,
+    launch_id: str,
+    identity: dict[str, Any],
+) -> bool:
+    import historical_grants as grants
+
+    markers = control_root / "activation-audits"
+    try:
+        marker_directory = markers.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RunnerError("activation audit marker directory is unavailable") from exc
+    if not stat.S_ISDIR(marker_directory.st_mode):
+        raise RunnerError("activation audit marker directory is unsafe")
+    try:
+        grants._private_directory(markers, "activation audit marker directory")
+        if (
+            not isinstance(grant_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", grant_id) is None
+            or not isinstance(launch_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", launch_id) is None
+        ):
+            raise RunnerError("activation audit marker lookup identity is invalid")
+        expected_identity = grants._identity(identity)
+        marker_path = markers / f"{grant_id}.json"
+        if not marker_path.exists() and not marker_path.is_symlink():
+            return False
+        marker = grants.read_json(marker_path)
+    except OSError as exc:
+        raise RunnerError("activation audit marker is unavailable") from exc
+    except grants.ControlError as exc:
+        raise RunnerError("activation audit marker is invalid") from exc
+    if (
+        set(marker) != {"version", "audit_sha256", "identity", "grant_id", "launch_id"}
+        or marker.get("version") != 1
+        or not isinstance(marker.get("audit_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", marker["audit_sha256"]) is None
+        or marker.get("identity") != expected_identity
+        or marker.get("grant_id") != grant_id
+        or marker.get("launch_id") != launch_id
+    ):
+        raise RunnerError("activation audit marker is not bound to the current grant and launch")
+    return True
+
+
+def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events.common import regular_bytes
+
+    report = authority["report"]
+    identity = authority["identity"]
+    operator = authority["operator"]
+    reconciliation = report.get("stopped_worker_reconciliation")
+    stop = reconciliation.get("storage_stop_evidence") if isinstance(reconciliation, dict) else None
+    admission = grants.expected_resource_admission()
+    expected_stop_reason = (
+        f"live temporary storage reached the "
+        f"{admission['storage_temporary_stop_bytes'] // GIB} GiB stop threshold"
+    )
+    current_boot = _boot_stamp()
+    if (
+        report.get("boot_stamp") != current_boot
+        or report.get("active_process_group") is not None
+        or report.get("phase") != "stopped"
+        or not isinstance(reconciliation, dict)
+        or not {
+            "event_id",
+            "audit_file",
+            "boot_stamp",
+            "stale_process_group",
+            "supervisor_pid",
+            "supervisor_pgid",
+            "primary_stop_reason",
+            "reconciliation_kind",
+            "storage_stop_evidence",
+        }
+        <= set(reconciliation)
+        or reconciliation.get("audit_file") != "stopped-worker-reconciliation.jsonl"
+        or not isinstance(reconciliation.get("boot_stamp"), str)
+        or not reconciliation["boot_stamp"]
+        or reconciliation.get("reconciliation_kind") != "temporary_storage_stop"
+        or reconciliation.get("primary_stop_reason") != expected_stop_reason
+        or not isinstance(stop, dict)
+        or stop.get("mode") != "historical"
+        or stop.get("category") != "temporary"
+        or stop.get("threshold_bytes") != admission["storage_temporary_stop_bytes"]
+        or stop.get("threshold_inclusive") is not True
+        or type(stop.get("observed_bytes")) is not int
+        or stop["observed_bytes"] < stop["threshold_bytes"]
+        or stop.get("original_process_group") != reconciliation.get("stale_process_group")
+    ):
+        raise RunnerError(
+            "startup cleanup requires the exact reconciled same-boot temporary-stop audit"
+        )
+    event_id = reconciliation.get("event_id")
+    stale_group = reconciliation.get("stale_process_group")
+    supervisor_pid = reconciliation.get("supervisor_pid")
+    supervisor_pgid = reconciliation.get("supervisor_pgid")
+    stop_boot = reconciliation.get("boot_stamp")
+    if (
+        not isinstance(event_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", event_id) is None
+        or type(stale_group) is not int
+        or stale_group <= 1
+        or type(supervisor_pid) is not int
+        or supervisor_pid <= 1
+        or type(supervisor_pgid) is not int
+        or supervisor_pgid <= 1
+    ):
+        raise RunnerError("startup cleanup stopped-worker identity is invalid")
+    if stop_boot == current_boot:
+        if report.get("error") != expected_stop_reason:
+            raise RunnerError("same-boot stopped-worker report lost its storage stop reason")
+        try:
+            if (
+                _pid_exists(stale_group)
+                or _process_group_exists(stale_group)
+                or _pid_exists(supervisor_pid)
+                or _process_group_exists(supervisor_pgid)
+            ):
+                raise RunnerError("reconciled stopped worker identity is live or ambiguous")
+        except OSError as exc:
+            raise RunnerError("reconciled stopped worker identity is ambiguous") from exc
+    else:
+        recovery = report.get("historical_reboot_reconciliation")
+        history = report.get("reboot_recovery_history")
+        reboot = history[-1] if isinstance(history, list) and history else None
+        freeze = authority.get("freeze")
+        current_mount = authority.get("current_mount")
+        current_device = (
+            current_mount.get("device")
+            if isinstance(current_mount, dict)
+            else (freeze or {}).get("root_device")
+        )
+        current_volume = (
+            current_mount.get("volume_uuid")
+            if isinstance(current_mount, dict)
+            else (freeze or {}).get("root_volume_uuid")
+        )
+        if (
+            report.get("error") is not None
+            or not isinstance(recovery, dict)
+            or recovery.get("state") != "complete"
+            or recovery.get("capture_id") != identity["capture_id"]
+            or recovery.get("root_id") != identity["root_id"]
+            or recovery.get("boot_stamp") != current_boot
+            or recovery.get("accounting_basis") != "exact"
+            or recovery.get("processing_worker_started") is not False
+            or recovery.get("grant_started") is not False
+            or not isinstance(reboot, dict)
+            or reboot.get("previous_boot_stamp") != stop_boot
+            or reboot.get("boot_stamp") != current_boot
+            or reboot.get("volume_uuid") != current_volume
+            or reboot.get("filesystem_device") != current_device
+            or reboot.get("accounting_basis") != "exact"
+            or reboot.get("accounting_complete") is not True
+            or reboot.get("processing_worker_started") is not False
+            or reboot.get("grant_started") is not False
+            or reboot.get("prior_process_group_ignored_after_boot_change")
+            is not (reboot.get("previous_active_process_group") is not None)
+            or reboot.get("previous_active_process_group") not in (None, stale_group)
+            or report.get("system", {}).get("filesystem_device") != current_device
+            or report.get("system", {}).get("filesystem_volume_uuid") != current_volume
+        ):
+            raise RunnerError(
+                "old-boot stopped-worker identity lacks exact reboot accounting proof"
+            )
+    audit_path = operator / reconciliation["audit_file"]
+    try:
+        audit_info = audit_path.lstat()
+        if (
+            not stat.S_ISREG(audit_info.st_mode)
+            or stat.S_ISLNK(audit_info.st_mode)
+            or audit_info.st_nlink != 1
+            or audit_info.st_dev != operator.stat().st_dev
+        ):
+            raise RunnerError("stopped-worker audit readback is unsafe")
+        raw = regular_bytes(audit_path, MIB)
+    except OSError as exc:
+        raise RunnerError("stopped-worker audit readback is unavailable") from exc
+    matching = []
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line.decode("utf-8"), parse_constant=grants._reject_constant)
+        except (UnicodeError, ValueError) as exc:
+            raise RunnerError("stopped-worker audit readback is malformed") from exc
+        if not isinstance(row, dict) or row.get("version") != 1:
+            raise RunnerError("stopped-worker audit readback is malformed")
+        if row.get("event_id") == event_id:
+            matching.append(row)
+    if len(matching) != 1:
+        raise RunnerError("stopped-worker audit event is missing or duplicated")
+    record = matching[0]
+    if (
+        record.get("capture_id") != identity["capture_id"]
+        or record.get("session_id") != identity["session_id"]
+        or record.get("root_id") != identity["root_id"]
+        or (
+            record.get("boot_stamp") != report.get("boot_stamp")
+            and record.get("boot_stamp") != stop_boot
+        )
+        or record.get("stale_process_group") != stale_group
+        or record.get("supervisor_pid") != supervisor_pid
+        or record.get("supervisor_pgid") != supervisor_pgid
+        or record.get("primary_stop_reason") != expected_stop_reason
+        or record.get("reconciliation_kind") != "temporary_storage_stop"
+        or record.get("storage_stop_evidence") != stop
+    ):
+        raise RunnerError("stopped-worker audit readback does not match the selected session")
+    return {
+        "event_id": event_id,
+        "record_sha256": grants.sha256_json(record),
+        "audit_file": reconciliation["audit_file"],
+        "boot_stamp": stop_boot,
+        "primary_stop_reason": expected_stop_reason,
+        "supervisor_pid": supervisor_pid,
+        "supervisor_pgid": supervisor_pgid,
+    }
+
+
+def _historical_startup_maintenance_path(authority: dict[str, Any]) -> Path:
+    return authority["control_root"] / "source" / "startup-maintenance.json"
+
+
+def _historical_read_startup_maintenance(authority: dict[str, Any]) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events import historical_resume, warehouse
+
+    path = _historical_startup_maintenance_path(authority)
+    proof, _raw_sha = _historical_read_artifact(path, 16 * MIB)
+    body = {key: value for key, value in proof.items() if key != "sha256"}
+    expected_fields = {
+        "version",
+        "identity",
+        "grant_id",
+        "launch_sha256",
+        "source_snapshot_sha256",
+        "reconciliation",
+        "stage_identity",
+        "pre_inventory",
+        "cleanup_proofs",
+        "removed_files",
+        "post_inventory",
+        "completed_at_epoch",
+    }
+    if (
+        set(body) != expected_fields
+        or proof.get("version") != 1
+        or proof.get("identity") != authority["identity"]
+        or proof.get("sha256") != grants.sha256_json(body)
+        or proof.get("source_snapshot_sha256") != authority["freeze"]["source_snapshot_sha256"]
+        or not isinstance(proof.get("grant_id"), str)
+        or not isinstance(proof.get("launch_sha256"), str)
+    ):
+        raise RunnerError("startup cleanup control proof is malformed or changed")
+    linked = _historical_phase_grant(authority, proof["grant_id"], "source")
+    if (
+        grants.sha256_bytes(
+            grants._private_regular_file(
+                authority["control_root"] / "grants" / proof["grant_id"] / "launch.json"
+            )
+        )
+        != proof["launch_sha256"]
+    ):
+        raise RunnerError("startup cleanup proof is not bound to its source grant launch")
+    if linked["launch"].get("session_binding_sha256") is None:
+        raise RunnerError("startup cleanup grant lost its immutable session binding")
+    grants.validate_phase_completion_time(
+        "source", proof.get("completed_at_epoch", 0), linked["launch"]
+    )
+    reconciliation = _historical_reconciliation_audit(authority)
+    if proof.get("reconciliation") != reconciliation:
+        raise RunnerError("startup cleanup proof lost its stopped-worker audit readback")
+    stage_relative = historical_resume.stage_relative(authority["identity"]["stage_name"])
+    spill_files: dict[str, tuple[int, str]] = {}
+    cleanup_proofs = proof.get("cleanup_proofs")
+    if not isinstance(cleanup_proofs, list) or len(cleanup_proofs) > 64:
+        raise RunnerError("startup cleanup proof inventory is invalid")
+    stage_path = authority["store"].path(stage_relative)
+    if stage_path.is_symlink():
+        raise RunnerError("startup cleanup stage path became a symlink")
+    stage_exists = stage_path.exists()
+    for item in cleanup_proofs:
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "path",
+                "sha256",
+                "runtime",
+                "spill",
+                "file_count",
+                "total_bytes",
+                "inventory_sha256",
+            }
+            or not isinstance(item.get("path"), str)
+            or re.fullmatch(
+                r"tmp/dbt-[0-9a-f]{32}/historical-spill-cleanup(?:-[0-9a-f]{32})?\.json",
+                item["path"],
+            )
+            is None
+            or not isinstance(item.get("runtime"), str)
+            or re.fullmatch(r"tmp/dbt-[0-9a-f]{32}", item["runtime"]) is None
+            or item.get("spill") != f"{item['runtime']}/spill"
+            or not item["path"].startswith(item["runtime"] + "/")
+            or type(item.get("file_count")) is not int
+            or item["file_count"] < 0
+            or type(item.get("total_bytes")) is not int
+            or item["total_bytes"] < 0
+            or not isinstance(item.get("inventory_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["inventory_sha256"]) is None
+        ):
+            raise RunnerError("startup cleanup proof inventory entry is malformed")
+        if (
+            not isinstance(item.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+        ):
+            raise RunnerError("startup cleanup proof hash is invalid")
+        proof_path = authority["operator"] / item["path"]
+        if proof_path.exists() or proof_path.is_symlink():
+            cleanup, cleanup_sha = _historical_read_artifact(proof_path, MIB)
+            if cleanup_sha != item["sha256"]:
+                raise RunnerError("warehouse spill cleanup proof changed after readback")
+            runtime = authority["operator"] / item["runtime"]
+            if stage_exists:
+                match = warehouse._historical_dbt_runtime_matches(
+                    authority["store"], runtime, stage_relative, authority["identity"]["capture_id"]
+                )
+                if match is None:
+                    raise RunnerError(
+                        "warehouse cleanup runtime no longer matches the selected stage"
+                    )
+                spill, profiles_sha256, database_path = match
+                ownership = {
+                    "root": str(authority["store"].root.resolve()),
+                    "capture_id": authority["identity"]["capture_id"],
+                    "stage": stage_relative,
+                    "runtime": item["runtime"],
+                    "database": database_path,
+                    "spill": str(spill),
+                    "profiles_sha256": profiles_sha256,
+                }
+            else:
+                ownership = cleanup.get("binding")
+            if (
+                not isinstance(ownership, dict)
+                or ownership.get("root") != str(authority["store"].root.resolve())
+                or ownership.get("capture_id") != authority["identity"]["capture_id"]
+                or ownership.get("stage") != stage_relative
+                or ownership.get("runtime") != item["runtime"]
+                or ownership.get("spill") != str(authority["operator"] / item["spill"])
+            ):
+                raise RunnerError("warehouse spill cleanup proof is bound to another stage")
+            result = historical_resume.validate_proof(
+                cleanup,
+                "abandoned-dbt-spill-cleanup",
+                ownership,
+            )
+            files = result.get("files")
+            if (
+                not isinstance(files, list)
+                or len(files) != item["file_count"]
+                or result.get("total_bytes") != item["total_bytes"]
+                or grants.sha256_json(files) != item["inventory_sha256"]
+            ):
+                raise RunnerError("warehouse spill cleanup proof inventory changed")
+            for file in files:
+                relative = file.get("path") if isinstance(file, dict) else None
+                if (
+                    not isinstance(relative, str)
+                    or not relative.startswith(item["spill"] + "/")
+                    or type(file.get("bytes")) is not int
+                    or not isinstance(file.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", file["sha256"]) is None
+                ):
+                    raise RunnerError("warehouse spill cleanup file record is malformed")
+                existing = spill_files.get(relative)
+                record = (file["bytes"], file["sha256"])
+                if existing is not None and existing != record:
+                    raise RunnerError("warehouse spill cleanup attempts disagree on file identity")
+                spill_files[relative] = record
+                target = authority["operator"] / relative
+                if stage_exists and (target.exists() or target.is_symlink()):
+                    raise RunnerError("audited abandoned spill file reappeared")
+        elif stage_exists:
+            raise RunnerError("warehouse spill cleanup proof disappeared while its stage remains")
+    removed = proof.get("removed_files")
+    expected_removed = [
+        {"path": path, "bytes": value[0], "sha256": value[1]}
+        for path, value in sorted(spill_files.items())
+    ]
+    if stage_exists and removed != expected_removed:
+        raise RunnerError("startup cleanup removed-file inventory differs from warehouse proofs")
+    if not stage_exists:
+        if not isinstance(removed, list) or len(removed) > 65_536:
+            raise RunnerError("retired startup cleanup inventory is invalid")
+        for item in removed:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"path", "bytes", "sha256"}
+                or not isinstance(item.get("path"), str)
+                or re.fullmatch(r"tmp/dbt-[0-9a-f]{32}/spill/.+", item["path"]) is None
+                or type(item.get("bytes")) is not int
+                or item["bytes"] < 0
+                or not isinstance(item.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+            ):
+                raise RunnerError("retired startup cleanup file inventory is malformed")
+    if type(proof.get("completed_at_epoch")) not in {int, float} or not math.isfinite(
+        proof["completed_at_epoch"]
+    ):
+        raise RunnerError("startup cleanup completion time is invalid")
+    return proof
+
+
+def _historical_startup_maintenance(authority: dict[str, Any]) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events import historical_resume, warehouse
+
+    proof_path = _historical_startup_maintenance_path(authority)
+    if proof_path.exists() or proof_path.is_symlink():
+        return _historical_read_startup_maintenance(authority)
+    reconciliation = _historical_reconciliation_audit(authority)
+    store = authority["store"]
+    identity = authority["identity"]
+    stage_relative = historical_resume.stage_relative(identity["stage_name"])
+    stage_path = store.path(stage_relative)
+    device = store.root.lstat().st_dev
+    stage_identity = warehouse._validate_historical_stage(stage_path, device)
+
+    def inventory() -> dict[str, Any]:
+        workspace = _live_workspace_snapshot(
+            authority["operator"],
+            authority["directory"],
+            identity["capture_id"],
+            identity["root_id"],
+        )
+        usage = store.usage()
+        external = _external_bytes(authority["directory"])
+        return {
+            "retained_bytes": usage["retained_bytes"],
+            "temporary_bytes": usage["temporary_bytes"],
+            "database_bytes": usage["database_bytes"],
+            "external_bytes": external,
+            "aggregate_bytes": usage["retained_bytes"] + external,
+            "free_bytes": shutil.disk_usage(authority["directory"]).free,
+            "inventory_entries": len(workspace["operator_entries"]),
+            "workspace": {
+                key: workspace[key]
+                for key in (
+                    "logical_bytes",
+                    "allocated_bytes",
+                    "database_bytes",
+                    "temporary_bytes",
+                    "tmp_names",
+                    "build_names",
+                    "release_names",
+                )
+            },
+        }
+
+    with store.writer_guard():
+        if not store.writer_locked_by_current_thread:
+            raise RunnerError("startup cleanup failed to acquire the canonical writer guard")
+        store.reconcile()
+        before = inventory()
+        candidates: list[tuple[Path, Path, str, str]] = []
+        temporary = store.path("tmp")
+        try:
+            with os.scandir(temporary) as entries:
+                runtimes = list(entries)
+        except FileNotFoundError:
+            runtimes = []
+        if len(runtimes) > 4096:
+            raise RunnerError("startup cleanup found too many temporary runtime entries")
+        for entry in runtimes:
+            if re.fullmatch(r"dbt-[0-9a-f]{32}", entry.name) is None:
+                continue
+            runtime = Path(entry.path)
+            match = warehouse._historical_dbt_runtime_matches(
+                store, runtime, stage_relative, identity["capture_id"]
+            )
+            if match is None:
+                continue
+            spill, profiles_sha256, database_path = match
+            allowed_databases = {
+                str(stage_path / "warehouse.duckdb"),
+                str(stage_path / "resume-candidate" / "warehouse.duckdb"),
+            }
+            if database_path not in allowed_databases:
+                raise RunnerError("startup cleanup runtime targets another historical stage")
+            candidates.append((runtime, spill, profiles_sha256, database_path))
+        if len(candidates) > 16:
+            raise RunnerError("startup cleanup exceeds its fixed abandoned-runtime bound")
+        if before["temporary_bytes"] > int(_effective_limits()["temporary_bytes"]):
+            raise RunnerError("startup cleanup baseline exceeds the fixed 192 GiB hard ceiling")
+        if (
+            not candidates
+            and before["temporary_bytes"]
+            > grants.expected_resource_admission()["storage_temporary_admission_bytes"]
+        ):
+            raise RunnerError("over-admission temporary storage has no exact selected-stage spill")
+        audit_before = _historical_reconciliation_audit(authority)
+        if audit_before != reconciliation:
+            raise RunnerError("stopped-worker reconciliation changed before startup cleanup")
+        warehouse._cleanup_resumed_historical_dbt_spills(
+            store, identity["capture_id"], stage_relative
+        )
+        store.reconcile()
+        after = inventory()
+        if warehouse._validate_historical_stage(stage_path, device) != stage_identity:
+            raise RunnerError("startup cleanup changed the exact selected historical stage")
+        if after["temporary_bytes"] > int(
+            grants.expected_resource_admission()["storage_temporary_admission_bytes"]
+        ):
+            raise RunnerError(
+                "audited startup cleanup did not restore processing storage admission"
+            )
+        if after["temporary_bytes"] >= before["temporary_bytes"] and candidates:
+            raise RunnerError("audited startup cleanup did not reduce temporary storage")
+        audit_after = _historical_reconciliation_audit(authority)
+        if audit_after != reconciliation:
+            raise RunnerError("stopped-worker reconciliation changed during startup cleanup")
+
+        cleanup_records = []
+        all_removed: dict[str, tuple[int, str]] = {}
+        for runtime, spill, profiles_sha256, database_path in candidates:
+            ownership = {
+                "root": str(store.root.resolve()),
+                "capture_id": identity["capture_id"],
+                "stage": stage_relative,
+                "runtime": runtime.relative_to(store.root).as_posix(),
+                "database": database_path,
+                "spill": str(spill),
+                "profiles_sha256": profiles_sha256,
+            }
+            try:
+                with os.scandir(runtime) as entries:
+                    proof_entries = [
+                        Path(entry.path)
+                        for entry in entries
+                        if entry.name.startswith("historical-spill-cleanup")
+                    ]
+            except OSError as exc:
+                raise RunnerError("warehouse spill cleanup audit could not be inventoried") from exc
+            for proof_path in proof_entries:
+                cleanup, cleanup_sha = _historical_read_artifact(proof_path, MIB)
+                result = historical_resume.validate_proof(
+                    cleanup, "abandoned-dbt-spill-cleanup", ownership
+                )
+                files = result.get("files")
+                total_bytes = result.get("total_bytes")
+                if (
+                    not isinstance(files, list)
+                    or type(total_bytes) is not int
+                    or total_bytes != sum(item.get("bytes", -1) for item in files)
+                    or any(
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("path"), str)
+                        or not item["path"].startswith(
+                            spill.relative_to(store.root).as_posix() + "/"
+                        )
+                        or type(item.get("bytes")) is not int
+                        or item["bytes"] < 0
+                        or not isinstance(item.get("sha256"), str)
+                        or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+                        for item in files
+                    )
+                ):
+                    raise RunnerError(
+                        "warehouse spill cleanup proof failed exact inventory readback"
+                    )
+                cleanup_records.append(
+                    {
+                        "path": proof_path.relative_to(store.root).as_posix(),
+                        "sha256": cleanup_sha,
+                        "runtime": ownership["runtime"],
+                        "spill": spill.relative_to(store.root).as_posix(),
+                        "file_count": len(files),
+                        "total_bytes": total_bytes,
+                        "inventory_sha256": grants.sha256_json(files),
+                    }
+                )
+                for item in files:
+                    relative = item["path"]
+                    prior = all_removed.get(relative)
+                    record = (item["bytes"], item["sha256"])
+                    if prior is not None and prior != record:
+                        raise RunnerError("warehouse cleanup proofs disagree on spill identity")
+                    all_removed[relative] = record
+                    target = store.path(relative)
+                    if target.exists() or target.is_symlink():
+                        raise RunnerError("warehouse spill cleanup left an audited file in place")
+            if not proof_entries:
+                raise RunnerError("warehouse spill cleanup did not leave durable audit evidence")
+            stack = [spill]
+            while stack:
+                parent = stack.pop()
+                if parent.is_symlink() or parent.lstat().st_dev != device:
+                    raise RunnerError("warehouse spill path became unsafe during cleanup")
+                with os.scandir(parent) as entries:
+                    for item in entries:
+                        details = item.stat(follow_symlinks=False)
+                        if details.st_dev != device or stat.S_ISLNK(details.st_mode):
+                            raise RunnerError("warehouse spill path contains an unsafe entry")
+                        if stat.S_ISDIR(details.st_mode):
+                            stack.append(Path(item.path))
+                        else:
+                            raise RunnerError("audited abandoned spill cleanup left a file behind")
+
+        if len(cleanup_records) > 64:
+            raise RunnerError("startup cleanup audit inventory exceeded its fixed bound")
+        body = {
+            "version": 1,
+            "identity": identity,
+            "grant_id": authority["grant"]["grant_id"],
+            "launch_sha256": authority["launch_sha256"],
+            "source_snapshot_sha256": authority["source_snapshot"]["sha256"],
+            "reconciliation": reconciliation,
+            "stage_identity": list(stage_identity),
+            "pre_inventory": before,
+            "cleanup_proofs": sorted(cleanup_records, key=lambda item: item["path"]),
+            "removed_files": [
+                {"path": path, "bytes": value[0], "sha256": value[1]}
+                for path, value in sorted(all_removed.items())
+            ],
+            "post_inventory": after,
+            "completed_at_epoch": time.time(),
+        }
+        grants.write_once_json(proof_path, body | {"sha256": grants.sha256_json(body)})
+    return _historical_read_startup_maintenance(authority)
+
+
+def _historical_worker_action(
+    authority: dict[str, Any], phase: str, substep: str
+) -> dict[str, Any]:
+    import historical_grants as grants
+
+    from kalshi_events import historical_resume, publish, warehouse
+    from kalshi_events.common import digest, regular_bytes
+
+    control_root = authority["control_root"]
+    grant_id = authority["grant"]["grant_id"]
+    identity = authority["identity"]
+    store = authority["store"]
+    verified_mount = authority.get("verified_mount")
+    capture_id = identity["capture_id"]
+    stage_name = identity["stage_name"]
+    stage_relative = historical_resume.stage_relative(stage_name)
+    stage_path = store.path(stage_relative)
+
+    if phase == "source" and substep == "maintenance":
+        proof = _historical_startup_maintenance(authority)
+        return {"startup_maintenance_sha256": proof["sha256"]}
+
+    if phase == "source" and substep == "snapshot":
+        _historical_read_startup_maintenance(authority)
+        snapshot = authority["source_snapshot"]
+        source_path = control_root / "source" / "source-snapshot.json"
+        try:
+            grants.write_once_json(source_path, snapshot)
+        except grants.ControlError:
+            saved, _ = _historical_read_artifact(source_path, 4 * MIB)
+            if saved != snapshot:
+                raise RunnerError(
+                    "saved source snapshot differs from current read-only proof"
+                ) from None
+        census = _historical_census_proof(authority, full_revalidation_if_missing=True)
+        return {
+            "source_snapshot_sha256": snapshot["sha256"],
+            "census_sha256": grants.sha256_json(census),
+        }
+
+    if phase == "readiness":
+        if substep == "prepare":
+            summary = warehouse.prepare_historical_readiness(
+                store, capture_id, stage_name, _verified_mount=verified_mount
+            )
+            if (
+                summary.get("ready") is not True
+                or summary.get("capture_id") != capture_id
+                or summary.get("stage") != stage_name
+                or summary.get("observation_count")
+                != authority["control"]["authorized_census"]["exact_observations"]
+            ):
+                raise RunnerError(
+                    "historical readiness preparation did not satisfy the frozen census"
+                )
+            return summary
+        verification = warehouse.verify_historical_readiness(
+            store, capture_id, stage_name, _verified_mount=verified_mount
+        )
+        if (
+            verification.get("phase") != "historical-readiness-verification"
+            or verification.get("binding", {}).get("capture_id") != capture_id
+            or verification.get("binding", {}).get("stage") != stage_name
+            or verification.get("result", {}).get("observation_count")
+            != authority["control"]["authorized_census"]["exact_observations"]
+        ):
+            raise RunnerError("independent readiness verification differs from the frozen census")
+        receipt_path = control_root / "grants" / grant_id / "readiness-verification.json"
+        grants.write_once_json(receipt_path, verification)
+        _historical_write_readiness_phase_origin(authority, verification)
+        return {"verification_sha256": verification["sha256"]}
+
+    if phase == "adoption":
+        if substep == "verify":
+            verification = warehouse.verify_historical_readiness(
+                store, capture_id, stage_name, _verified_mount=verified_mount
+            )
+            if (
+                verification.get("result", {}).get("observation_count")
+                != authority["control"]["authorized_census"]["exact_observations"]
+            ):
+                raise RunnerError("historical adoption verification differs from the exact census")
+            grants.write_once_json(
+                control_root / "grants" / grant_id / "adoption-verification.json",
+                verification,
+            )
+            return {"verification_sha256": verification["sha256"]}
+        verification_path = control_root / "grants" / grant_id / "adoption-verification.json"
+        verification, _ = _historical_read_artifact(verification_path, 4 * MIB)
+        adoption_path = stage_path / "resume-adoption.json"
+        existing_adoption = warehouse._load_self_proof(adoption_path, "historical-adoption")
+        origin_verification_sha = (
+            existing_adoption[0].get("binding", {}).get("verification_sha256")
+            if existing_adoption is not None
+            else verification.get("sha256")
+        )
+        claim = _historical_resolve_adoption_origin_claim(
+            authority,
+            origin_verification_sha,
+            create_if_missing=existing_adoption is None,
+        )
+        approved_retirement = authority["approval"].get("retire_source") is True
+        adoption = warehouse.adopt_historical_readiness(
+            store,
+            capture_id,
+            stage_name,
+            verification,
+            retire_source=approved_retirement,
+            retirement_policy=(
+                "coexistence-capacity-relief-approved-v1" if approved_retirement else None
+            ),
+            _verified_mount=verified_mount,
+        )
+        adoption_loaded = warehouse._load_self_proof(adoption_path, "historical-adoption")
+        if adoption_loaded is None or adoption_loaded[0].get("sha256") != adoption.get(
+            "adoption_sha256"
+        ):
+            raise RunnerError("historical adoption origin failed immutable readback")
+        adoption_proof = adoption_loaded[0]
+        _historical_write_adoption_origin(authority, claim, adoption_proof)
+        retirement_sha = None
+        if approved_retirement:
+            retirement = _historical_write_source_retirement_receipt(
+                authority, adoption, verification, phase="adoption"
+            )
+            retirement_sha = retirement["sha256"]
+        return {
+            "adoption_sha256": adoption_proof["sha256"],
+            "source_retired": adoption.get("source_retired") is True,
+            "source_retirement_sha256": retirement_sha,
+        }
+
+    if phase == "models" and substep in {"prepare", "verify", "adopt"}:
+        if substep == "prepare":
+            summary = warehouse.prepare_historical_readiness(
+                store, capture_id, stage_name, _verified_mount=verified_mount
+            )
+            if (
+                summary.get("ready") is not True
+                or summary.get("capture_id") != capture_id
+                or summary.get("stage") != stage_name
+                or summary.get("observation_count")
+                != authority["control"]["authorized_census"]["exact_observations"]
+            ):
+                raise RunnerError(
+                    "models retirement preparation failed current candidate and exact-census checks"
+                )
+            return summary
+        verification_path = control_root / "grants" / grant_id / "models-adoption-verification.json"
+        if substep == "verify":
+            verification = warehouse.verify_historical_readiness(
+                store, capture_id, stage_name, _verified_mount=verified_mount
+            )
+            if (
+                verification.get("phase") != "historical-readiness-verification"
+                or verification.get("binding", {}).get("capture_id") != capture_id
+                or verification.get("binding", {}).get("stage") != stage_name
+                or verification.get("result", {}).get("observation_count")
+                != authority["control"]["authorized_census"]["exact_observations"]
+            ):
+                raise RunnerError("models retirement verification failed the exact census")
+            grants.write_once_json(verification_path, verification)
+            return {"verification_sha256": verification["sha256"]}
+        if (
+            authority["approval"].get("retire_source") is not True
+            or authority["approval"].get("retirement_policy")
+            != "coexistence-capacity-relief-approved-v1"
+        ):
+            raise RunnerError("models source retirement is outside the approved grant")
+        verification, _ = _historical_read_artifact(verification_path, 4 * MIB)
+        adoption = warehouse.adopt_historical_readiness(
+            store,
+            capture_id,
+            stage_name,
+            verification,
+            retire_source=True,
+            retirement_policy="coexistence-capacity-relief-approved-v1",
+            _verified_mount=verified_mount,
+        )
+        receipt = _historical_write_source_retirement_receipt(
+            authority, adoption, verification, phase="models"
+        )
+        return {
+            "adoption_sha256": adoption.get("adoption_sha256"),
+            "source_retired": adoption.get("source_retired") is True,
+            "source_retirement_sha256": receipt["sha256"],
+        }
+
+    if phase == "models" and substep == "build":
+        build_path = store.path(f"builds-historical/{capture_id}/build.json")
+        if build_path.is_symlink():
+            raise RunnerError("installed historical build receipt is a symlink")
+        if build_path.is_file():
+            # Install may have completed before a worker or phase seal was interrupted.
+            # Certify that durable result; never enter the fresh landing fallback here.
+            pass
+        elif not build_path.exists():
+            if stage_path.is_symlink() or not stage_path.is_dir():
+                raise RunnerError("historical build requires the exact validated pending stage")
+            warehouse._validate_historical_stage(stage_path, store.root.lstat().st_dev)
+            warehouse.build_historical(
+                store,
+                capture_id,
+                resume_historical_stage=stage_name,
+                _verified_mount=verified_mount,
+            )
+        else:
+            raise RunnerError("installed historical build receipt is not a regular file")
+        build, build_receipt_sha256 = _historical_read_artifact(build_path, MIB)
+        exact_observations = authority["control"]["authorized_census"]["exact_observations"]
+        if (
+            build.get("capture_id") != capture_id
+            or build.get("catalogue_version") != 3
+            or build.get("observation_count") != exact_observations
+        ):
+            raise RunnerError("installed historical build differs from the authorized exact census")
+        adoption = build.get("historical_adoption")
+        if (
+            not isinstance(adoption, dict)
+            or adoption.get("stage") != stage_name
+            or adoption.get("source_sha256")
+            != authority["source_snapshot"]["result"].get("source_sha256")
+            or adoption.get("source_wal_sha256")
+            != authority["source_snapshot"]["result"].get("source_wal_sha256")
+            or not isinstance(adoption.get("candidate_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", adoption["candidate_sha256"]) is None
+        ):
+            raise RunnerError("installed historical build lost its validated adoption lineage")
+        certified = warehouse.certified(store, capture_id, catalogue_version=3)
+        if (
+            certified.get("capture_id") != capture_id
+            or certified.get("observation_count") != exact_observations
+            or certified.get("historical_adoption") != adoption
+        ):
+            raise RunnerError(
+                "installed historical build certification differs from its frozen lineage"
+            )
+        artifact_path = build_path.parent / "build-artifacts.json"
+        model_artifact_sha256 = digest(regular_bytes(artifact_path, 64 * MIB))
+        if model_artifact_sha256 != certified.get("dbt_artifacts_sha256"):
+            raise RunnerError("installed historical model artifacts failed certified readback")
+        return {
+            "build_receipt_sha256": build_receipt_sha256,
+            "warehouse_sha256": certified["warehouse_sha256"],
+            "dbt_artifacts_sha256": model_artifact_sha256,
+        }
+
+    if phase == "certified-build" and substep == "certify":
+        build_path = store.path(f"builds-historical/{capture_id}/build.json")
+        if not build_path.is_file() or build_path.is_symlink():
+            raise RunnerError("certification requires an installed historical build")
+        build, _ = _historical_read_artifact(build_path)
+        if (
+            build.get("observation_count")
+            != authority["control"]["authorized_census"]["exact_observations"]
+        ):
+            raise RunnerError("certified build differs from the authorized observation census")
+        certified = warehouse.certified(store, capture_id, catalogue_version=3)
+        return {"certified_receipt_sha256": grants.sha256_json(certified)}
+
+    if phase == "export" and substep == "publish":
+        build_path = store.path(f"builds-historical/{capture_id}/build.json")
+        if not build_path.is_file() or build_path.is_symlink():
+            raise RunnerError("historical publication requires an installed build")
+        build, _ = _historical_read_artifact(build_path)
+        if (
+            build.get("observation_count")
+            != authority["control"]["authorized_census"]["exact_observations"]
+        ):
+            raise RunnerError("historical publication build differs from exact authorized census")
+        warehouse.certified(store, capture_id, catalogue_version=3)
+        result = publish.publish(store, capture_id, catalogue_version=3)
+        if result.get("capture_id") != capture_id:
+            raise RunnerError("historical publication returned a different capture")
+        return {"release_id": result.get("source_release_id")}
+
+    if phase == "verified-publication" and substep == "verify":
+        current, _ = _historical_published_release(authority)
+        return {"release_id": current["source_release_id"]}
+
+    if phase == "independent-verification" and substep == "verify":
+        receipt = _historical_release_verification(authority, grant_id_for_receipt=grant_id)
+        return {"verification_receipt_sha256": receipt["verification_receipt_sha256"]}
+
+    if phase == "activation" and substep == "activate":
+        current, manifest = _historical_published_release(authority)
+        independent_path = control_root / "verifications" / f"{grant_id}.json"
+        # Activation may be a separate grant from independent verification.
+        phase_path = control_root / "phases" / "independent-verification.json"
+        independent_seal, _ = _historical_read_artifact(phase_path)
+        prior_grant = independent_seal["grant_id"]
+        independent_path = control_root / "verifications" / f"{prior_grant}.json"
+        receipt, _receipt_file_sha = _historical_read_artifact(independent_path)
+        receipt_sha = grants.sha256_json(receipt)
+        if (
+            receipt_sha != independent_seal["outputs"]["verification_receipt_sha256"]
+            or receipt.get("capture_id") != identity["capture_id"]
+            or receipt.get("release_id") != current["source_release_id"]
+            or receipt.get("release_manifest_sha256") != current["manifest_sha256"]
+            or receipt.get("coverage_scope") != "historical"
+            or type(receipt.get("source_capture_complete")) is not bool
+            or receipt.get("source_capture_complete") is not manifest.get("source_capture_complete")
+            or receipt.get("scope_complete") is not True
+            or manifest.get("coverage_scope") != "historical"
+            or manifest.get("historical_contract") != "oddsfox.kalshi.historical.v1"
+        ):
+            raise RunnerError("activation requires the sealed independent verification receipt")
+        audit_binding = authority["report"].get("activation_audit")
+        if not isinstance(audit_binding, dict):
+            raise RunnerError("activation requires the session's independent audit binding")
+        from production_activation import _activation_audit_payload
+
+        audit = _activation_audit_payload(
+            authority["directory"],
+            audit_binding,
+            expected_session_id=identity["session_id"],
+        )
+        census = authority["control"]["authorized_census"]
+        if (
+            audit_binding.get("sha256") != authority["approval"].get("activation_audit_sha256")
+            or audit.get("capture_id") != census["capture_id"]
+            or audit.get("root_id") != census["root_id"]
+            or audit.get("capture_state_sha256") != census["capture_state_sha256"]
+            or audit.get("receipt_index_sha256") != census["receipt_index_sha256"]
+            or audit.get("population_report_sha256") != census["population_report_sha256"]
+            or audit.get("observations_by_endpoint") != census["observations_by_endpoint"]
+            or audit.get("exact_observations") != census["exact_observations"]
+        ):
+            raise RunnerError("activation audit differs from the bound exact census")
+        audits = {
+            seal["outputs"]["activation_audit_sha256"]
+            for seal in [
+                _historical_read_artifact(control_root / "phases" / f"{phase_name}.json")[0]
+                for phase_name in grants.PHASES
+                if (control_root / "phases" / f"{phase_name}.json").is_file()
+            ]
+            if seal["phase"] == "activation"
+        }
+        grants.claim_activation_audit(
+            control_root,
+            audit_sha256=audit_binding["sha256"],
+            grant_id=grant_id,
+            launch_id=authority["launch"]["launch_id"],
+            identity=identity,
+            prior_audits=audits,
+        )
+        report_path = authority["report_path"]
+        authority["report"]["production_state"] = "attempting"
+        _atomic_report(report_path, authority["report"])
+        expected = f"historical:{current['source_release_id']}"
+        capture_output = __import__("io").StringIO()
+        with contextlib.redirect_stdout(capture_output):
+            code = _activation_worker(
+                authority["operator"],
+                authority["directory"],
+                expected,
+                report_path,
+                "expanded",
+                (
+                    float(authority["grant"]["deadline_epoch"]),
+                    float(authority["grant"]["deadline_monotonic"]),
+                ),
+            )
+        raw_result = capture_output.getvalue().strip()
+        try:
+            activation = json.loads(raw_result)
+        except (TypeError, ValueError) as exc:
+            raise RunnerError("historical activation worker returned invalid readback") from exc
+        if code != 0 or not isinstance(activation, dict) or activation.get("state") != "verified":
+            raise RunnerError("historical activation did not complete a verified readback")
+        result_path = control_root / "activations" / f"{grant_id}.json"
+        grants.write_once_json(result_path, activation)
+        authority["report"]["production_state"] = "verified"
+        _atomic_report(report_path, authority["report"])
+        return {
+            "activation_audit_sha256": audit_binding["sha256"],
+            "production_database_sha256": activation.get("warehouse_sha256"),
+            "relation_rows": activation.get("relation_rows"),
+        }
+
+    raise RunnerError("private historical phase action is not implemented")
+
+
+def _historical_worker_main(
+    directory: Path,
+    control_root: Path,
+    grant_id: str,
+    launch_sha256: str,
+    phase: str,
+    substep: str,
+    storage_invocation_token: str,
+    storage_progress_path: Path,
+) -> int:
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    import historical_grants as grants
+
+    try:
+        directory = _external_path(directory)
+        control_root = _historical_control_root(control_root)
+        handoff = _historical_consume_supervisor_handoff(
+            directory,
+            control_root,
+            grant_id,
+            launch_sha256,
+            phase,
+            substep,
+            storage_invocation_token,
+            storage_progress_path,
+        )
+        # The supervisor writes active_process_group after spawn; allow only that bounded handoff race.
+        authority = None
+        last_error: Exception | None = None
+        for _ in range(50):
+            bundle = grants.read_control_bundle(_historical_control_root(control_root), grant_id)
+            session_report_path = (
+                Path(directory) / "runs" / bundle["identity"]["session_id"] / REPORT_NAME
+            )
+            handoff_report = _strict_json(session_report_path)
+            if (
+                handoff_report is None
+                or handoff_report.get("active_process_group") != os.getpid()
+                or os.getpgrp() != os.getpid()
+            ):
+                time.sleep(0.1)
+                continue
+            try:
+                authority = _historical_authority(
+                    directory,
+                    control_root,
+                    grant_id,
+                    launch_sha256=launch_sha256,
+                    require_worker=True,
+                    expected_phase=phase,
+                    expected_substep=substep,
+                    storage_invocation_token=storage_invocation_token,
+                    storage_progress_path=storage_progress_path,
+                    supervisor_pid=handoff["supervisor_pid"],
+                )
+                break
+            except RunnerError as exc:
+                last_error = exc
+                raise
+        if authority is None:
+            raise last_error or RunnerError("supervised worker handoff did not complete")
+        _historical_validate_phase_chain(authority)
+        substep_path = _historical_substep_path(authority["control_root"], grant_id, phase, substep)
+        if substep_path.exists() or substep_path.is_symlink():
+            raise RunnerError("private historical substep launch was already consumed")
+        ordered = _historical_substeps_for_grant(
+            phase, authority["approval"], authority["store"], authority["identity"]["capture_id"]
+        )
+        substep_index = ordered.index(substep)
+        for prior_substep in ordered[:substep_index]:
+            prior = _historical_substep_path(
+                authority["control_root"], grant_id, phase, prior_substep
+            )
+            if not prior.is_file() or prior.is_symlink():
+                raise RunnerError("private historical worker substep was invoked out of order")
+        token = _ACTIVE_LIMITS.set(_limits_from_report(authority["report"], "expanded"))
+        heartbeat = _HistoricalStorageHeartbeat(
+            directory,
+            authority["report_path"],
+            storage_progress_path,
+            storage_invocation_token,
+        )
+        try:
+            heartbeat.start()
+            output = _historical_worker_action(authority, phase, substep)
+            heartbeat.check()
+        finally:
+            heartbeat.close()
+            _ACTIVE_LIMITS.reset(token)
+        body = {
+            "version": 1,
+            "identity": authority["identity"],
+            "grant_id": grant_id,
+            "launch_sha256": launch_sha256,
+            "phase": phase,
+            "substep": substep,
+            "completed_at_epoch": time.time(),
+            "output_sha256": grants.sha256_json(output),
+        }
+        with grants.control_lock(authority["control_root"]):
+            grants.write_once_json(substep_path, body)
+        print(json.dumps({"ok": True, "phase": phase, "substep": substep}, sort_keys=True))
+        return 0
+    except Exception as exc:
+        if phase == "activation":
+            with contextlib.suppress(Exception):
+                control_root = _historical_control_root(control_root)
+                bundle = grants.read_control_bundle(control_root, grant_id)
+                report_path = (
+                    Path(directory) / "runs" / bundle["identity"]["session_id"] / REPORT_NAME
+                )
+                report = _strict_json(report_path)
+                handoff = report.get("private_historical_grant") if report is not None else None
+                if (
+                    _historical_activation_claimed(
+                        control_root,
+                        grant_id,
+                        bundle["launch"]["launch_id"],
+                        bundle["identity"],
+                    )
+                    and isinstance(handoff, dict)
+                    and handoff.get("grant_id") == grant_id
+                    and handoff.get("launch_sha256") == launch_sha256
+                ):
+                    report["production_state"] = "unknown"
+                    _atomic_report(report_path, report)
+        print(json.dumps({"error": str(exc), "phase": phase, "substep": substep}, sort_keys=True))
+        return 1
+
+
+def _historical_stop_record(
+    directory: Path,
+    control_root: Path,
+    grant_id: str,
+    launch_sha256: str,
+    *,
+    outcome: str,
+    phase: str,
+    substep: str | None,
+    completed_phases: list[str],
+    reason: str | None,
+    bindings: dict[str, Any],
+    root_volume_uuid: str | None = None,
+) -> None:
+    import shlex
+
+    import historical_grants as grants
+
+    current, durable_sha256 = grants.read_phase_chain(control_root / "phases", bindings)
+    try:
+        next_phase = grants.next_phase(current)
+    except grants.ControlError:
+        next_phase = None
+    remaining_phases = (
+        grants.PHASES[grants.PHASES.index(next_phase) :] if next_phase is not None else []
+    )
+    proposed_grant_id = uuid.uuid4().hex if next_phase is not None else None
+    interpreter = str(_historical_venv_root(control_root) / "bin" / "python")
+    script = str(_historical_source_root(control_root) / "scripts" / "production_run.py")
+    same_boot_reconciliation_argv = None
+    changed_boot_reconciliation_argv = None
+    if next_phase is None:
+        next_argv = None
+    elif outcome == "uncertain":
+        same_boot_reconciliation_argv = [
+            interpreter,
+            "-B",
+            script,
+            "--directory",
+            str(directory.resolve()),
+            "--capture-id",
+            bindings["capture_id"],
+            "--historical",
+            "--reconcile-stopped-worker",
+        ]
+        if (
+            not isinstance(root_volume_uuid, str)
+            or re.fullmatch(r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}", root_volume_uuid)
+            is None
+        ):
+            raise RunnerError("uncertain historical attempt has no frozen volume UUID")
+        changed_boot_reconciliation_argv = [
+            interpreter,
+            "-B",
+            script,
+            "--directory",
+            str(directory.resolve()),
+            "--capture-id",
+            bindings["capture_id"],
+            "--historical",
+            "--reconcile-accounting",
+            "--recover-reboot",
+            "--recovery-volume-uuid",
+            root_volume_uuid,
+        ]
+        next_argv = same_boot_reconciliation_argv
+    else:
+        next_argv = [
+            interpreter,
+            "-B",
+            script,
+            "--_historical-control",
+            str(directory.resolve()),
+            str(control_root.resolve()),
+            proposed_grant_id,
+        ]
+    body = {
+        "version": 1,
+        "grant_id": grant_id,
+        "launch_sha256": launch_sha256,
+        "outcome": outcome,
+        "phase": phase,
+        "substep": substep,
+        "completed_phases": completed_phases,
+        "last_durable_phase": current,
+        "last_durable_phase_sha256": durable_sha256,
+        "next_phase": next_phase,
+        "remaining_phases": remaining_phases,
+        "proposed_grant_id": proposed_grant_id,
+        "proposed_grant_status": "unapproved" if proposed_grant_id is not None else None,
+        "next_command_argv": next_argv,
+        "next_command": shlex.join(next_argv) if next_argv is not None else None,
+        "same_boot_reconciliation_command_argv": same_boot_reconciliation_argv,
+        "changed_boot_reconciliation_command_argv": changed_boot_reconciliation_argv,
+        "reconciliation_required": outcome == "uncertain",
+        "new_approval_required": next_phase is not None,
+        "reason": reason,
+        "written_at_epoch": time.time(),
+    }
+    with grants.control_lock(control_root):
+        grants.write_once_json(control_root / "grants" / grant_id / "attempt-result.json", body)
+
+
+def _historical_private_controller_command_matches(
+    command: str,
+    *,
+    expected_python: Path,
+    control_root: Path,
+    directory: Path,
+    grant_id: str,
+) -> bool:
+    script = str(_historical_source_root(control_root) / "scripts" / "production_run.py")
+    pinned_python = _historical_venv_root(control_root) / "bin" / "python"
+    return (
+        command
+        == " ".join(
+            (
+                str(pinned_python),
+                "-B",
+                script,
+                "--_historical-control",
+                str(directory),
+                str(control_root),
+                grant_id,
+            )
+        )
+        and expected_python == pinned_python
+    )
+
+
+def _historical_consume_supervisor_handoff(
+    directory: Path,
+    control_root: Path,
+    grant_id: str,
+    launch_sha256: str,
+    phase: str,
+    substep: str,
+    storage_invocation_token: str,
+    storage_progress_path: Path,
+) -> dict[str, Any]:
+    import select
+
+    raw_fd = os.environ.pop(HISTORICAL_SUPERVISOR_FD_ENV, None)
+    if not isinstance(raw_fd, str) or re.fullmatch(r"(?:[3-9]|[1-9][0-9]+)", raw_fd) is None:
+        raise RunnerError("private historical worker has no parent-issued supervisor pipe")
+    descriptor = int(raw_fd)
+    chunks: list[bytes] = []
+    total = 0
+    deadline = time.monotonic() + 5.0
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([descriptor], [], [], remaining)[0]:
+                raise RunnerError("parent-issued supervisor handoff timed out")
+            chunk = os.read(descriptor, min(4096, 8193 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > 8192:
+                raise RunnerError("parent-issued supervisor handoff is oversized")
+    except OSError as exc:
+        raise RunnerError("parent-issued supervisor handoff is unreadable") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+
+    try:
+        value = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)),
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise RunnerError("parent-issued supervisor handoff is malformed") from exc
+    fields = {
+        "version",
+        "nonce",
+        "directory",
+        "control_root",
+        "grant_id",
+        "launch_sha256",
+        "phase",
+        "substep",
+        "storage_invocation_token",
+        "storage_progress_path",
+        "supervisor_pid",
+        "supervisor_pgid",
+        "worker_pid",
+        "worker_pgid",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or value.get("version") != 1
+        or not isinstance(value.get("nonce"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["nonce"]) is None
+        or value.get("directory") != str(directory)
+        or value.get("control_root") != str(control_root)
+        or value.get("grant_id") != grant_id
+        or value.get("launch_sha256") != launch_sha256
+        or value.get("phase") != phase
+        or value.get("substep") != substep
+        or value.get("storage_invocation_token") != storage_invocation_token
+        or value.get("storage_progress_path") != str(storage_progress_path)
+        or type(value.get("supervisor_pid")) is not int
+        or value["supervisor_pid"] != os.getppid()
+        or type(value.get("supervisor_pgid")) is not int
+        or type(value.get("worker_pid")) is not int
+        or value["worker_pid"] != os.getpid()
+        or value.get("worker_pgid") != os.getpid()
+        or os.getpgrp() != os.getpid()
+        or os.getpgid(value["supervisor_pid"]) != value["supervisor_pgid"]
+    ):
+        raise RunnerError("parent-issued supervisor handoff does not match this worker")
+    try:
+        expected_python = _historical_venv_root(control_root) / "bin" / "python"
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(value["supervisor_pid"]), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerError("private controller process identity is unavailable") from exc
+    command = result.stdout.rstrip("\r\n")
+    if result.returncode != 0 or not _historical_private_controller_command_matches(
+        command,
+        expected_python=expected_python,
+        control_root=control_root,
+        directory=directory,
+        grant_id=grant_id,
+    ):
+        raise RunnerError("supervised worker parent is not the pinned private controller")
+    lock_path = directory / ".production-run.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise RunnerError("private controller run lock is unavailable to its worker") from exc
+    try:
+        lock_info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or lock_info.st_dev != directory.stat().st_dev
+        ):
+            raise RunnerError("private controller run lock is unsafe")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            raise RunnerError("private controller did not retain the canonical run lock")
+    finally:
+        os.close(lock_fd)
+    return value
+
+
+def _historical_control_main(directory: Path, control_root: Path, grant_id: str) -> int:
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    import historical_grants as grants
+
+    directory = _external_path(directory)
+    control_root = _historical_control_root(control_root)
+    launch = None
+    launch_sha256 = None
+    report = None
+    report_path = None
+    paths = None
+    completed: list[str] = []
+    current_phase = "source"
+    current_substep: str | None = None
+    token = None
+    run_lock_context = None
+    run_lock_acquired = False
+    try:
+        control_root = _historical_control_root(control_root)
+        _historical_assert_pinned_python(control_root)
+        run_lock_context = _run_lock(directory)
+        run_lock_context.__enter__()
+        run_lock_acquired = True
+        preflight = _historical_authority(
+            directory,
+            control_root,
+            grant_id,
+            launch_sha256=None,
+            require_worker=False,
+            prelaunch=True,
+            cheap_only=True,
+        )
+        approval = preflight["approval"]
+        identity = preflight["identity"]
+        report = preflight["report"]
+        report_path = preflight["report_path"]
+        report_hash = grants.sha256_bytes(_historical_session_report_bytes(report_path))
+        session_binding = {
+            "version": 1,
+            "grant_id": grant_id,
+            "approval_sha256": grants.sha256_json(approval),
+            "capture_id": identity["capture_id"],
+            "session_id": identity["session_id"],
+            "root_id": identity["root_id"],
+            "stage_name": identity["stage_name"],
+            "report_sha256": report_hash,
+            "report_path": str(report_path),
+            "boot_stamp": report["boot_stamp"],
+            "root_volume_uuid": _volume_uuid(directory).upper(),
+            "root_device": directory.stat().st_dev,
+        }
+        launch, launch_sha256 = grants.issue_launch(
+            control_root,
+            expected_identity=identity,
+            requested_phase=approval["phase"],
+            grant_id=grant_id,
+            now_epoch=time.time(),
+            now_monotonic=time.monotonic(),
+            boot_stamp=report["boot_stamp"],
+            session_binding=session_binding,
+        )
+        token = _ACTIVE_LIMITS.set(_limits_for_profile("expanded"))
+        store = _historical_store(
+            directory / "operator", max_duration_seconds=MAX_OFFLINE_HISTORICAL_SECONDS
+        )
+        if _root_id(store) != identity["root_id"]:
+            raise RunnerError("private historical operator root identity changed")
+        baseline = _historical_resource_baseline(directory, store, report)
+        _historical_measurement_artifact(
+            control_root,
+            grant_id,
+            approval,
+            identity,
+            preflight["freeze"],
+            session_report_sha256=session_binding["report_sha256"],
+            session_root_device=session_binding["root_device"],
+            baseline=baseline,
+            require_fresh=True,
+            allow_initial_maintenance_overage=(approval["phases"][0] == "source"),
+        )
+        report["phase"] = "stopped"
+        report["active_process_group"] = None
+        report["private_historical_grant"] = {
+            "version": 1,
+            "grant_id": grant_id,
+            "launch_sha256": launch_sha256,
+            "launch_id": launch["launch_id"],
+            "control_root": str(control_root),
+            "phases": approval["phases"],
+            "phase": approval["phase"],
+            "substep": None,
+            "controller_pid": os.getpid(),
+            "controller_pgid": os.getpgrp(),
+            "state": "launched",
+        }
+        _atomic_report(report_path, report)
+        paths = _prepare_run_paths(directory, report_path)
+        report["metrics_file"] = str(paths["metrics"])
+        report["metrics_progress_file"] = str(paths["metrics_progress"])
+        report["storage_progress_file"] = str(paths["storage_progress"])
+        _atomic_report(report_path, report)
+
+        freeze = grants.read_frozen_control(control_root, expected_identity=identity)[0]["freeze"]
+        operational_source_sha = _historical_operational_source_sha256(control_root)
+        runtime_sha = grants.sha256_json(
+            {
+                "runtime_manifest_sha256": freeze["runtime_manifest_sha256"],
+                "operational_source_sha256": operational_source_sha,
+            }
+        )
+        if (
+            operational_source_sha != freeze["operational_source_sha256"]
+            or runtime_sha != identity["runtime_sha256"]
+        ):
+            raise RunnerError("frozen operational source identity changed after grant consumption")
+        first_phase = approval["phases"][0]
+        final_preflight = first_phase in {"independent-verification", "activation"}
+        _historical_verify_runtime(
+            control_root,
+            freeze,
+            deadline_epoch=float(
+                launch["deadline_epoch"] if final_preflight else launch["workflow_deadline_epoch"]
+            ),
+            deadline_monotonic=float(
+                launch["deadline_monotonic"]
+                if final_preflight
+                else launch["workflow_deadline_monotonic"]
+            ),
+        )
+        source_root = _historical_source_root(control_root)
+        python = _historical_venv_root(control_root) / "bin" / "python"
+        if not python.is_file() or (python.is_symlink() and not python.exists()):
+            raise RunnerError("pinned private historical Python launcher is unavailable")
+        _historical_control_root(control_root)
+
+        for phase in approval["phases"]:
+            current_phase = phase
+            for substep in _historical_substeps_for_grant(
+                phase, approval, store, identity["capture_id"]
+            ):
+                current_substep = substep
+                report = _strict_json(report_path)
+                if report is None:
+                    raise RunnerError("historical session report disappeared during grant")
+                if store is None:
+                    raise RunnerError("historical storage supervisor has no reconciled Store")
+                store.reconcile()
+                storage_baseline = _historical_resource_baseline(directory, store, report)
+                report["storage"] = {
+                    "operator_retained_bytes": storage_baseline["root_bytes"],
+                    "operator_temporary_bytes": storage_baseline["temporary_bytes"],
+                    "operator_database_bytes": storage_baseline["database_bytes"],
+                    "external_bytes": storage_baseline["aggregate_bytes"]
+                    - storage_baseline["root_bytes"],
+                    "aggregate_estimate_bytes": storage_baseline["aggregate_bytes"],
+                    "ssd_free_bytes": storage_baseline["free_bytes"],
+                }
+                report["phase"] = "stopped"
+                report["active_process_group"] = None
+                label = f"historical-{grant_id[:8]}-{phase}-{substep}"
+                stdout_path = paths["logs"] / f"{label}.stdout.json"
+                stderr_path = paths["logs"] / f"{label}.stderr.log"
+                storage_token = uuid.uuid4().hex
+                storage_progress_path = paths["logs"] / f"{label}.storage.json"
+                report["private_historical_grant"] = {
+                    "version": 1,
+                    "grant_id": grant_id,
+                    "launch_sha256": launch_sha256,
+                    "launch_id": launch["launch_id"],
+                    "control_root": str(control_root),
+                    "phases": approval["phases"],
+                    "phase": phase,
+                    "substep": substep,
+                    "controller_pid": os.getpid(),
+                    "controller_pgid": os.getpgrp(),
+                    "storage_invocation_token": storage_token,
+                    "storage_progress_path": str(storage_progress_path),
+                    "state": "supervised-child-pending",
+                }
+                _atomic_report(report_path, report)
+                command = [
+                    str(python),
+                    "-B",
+                    str(source_root / "scripts" / "production_run.py"),
+                    "--_historical-worker",
+                    str(directory),
+                    str(control_root),
+                    grant_id,
+                    launch_sha256,
+                    phase,
+                    substep,
+                    storage_token,
+                    str(storage_progress_path),
+                ]
+                workflow = phase not in {"independent-verification", "activation"}
+                deadline_mono = float(
+                    launch["workflow_deadline_monotonic"]
+                    if workflow
+                    else launch["deadline_monotonic"]
+                )
+                deadline_epoch = float(
+                    launch["workflow_deadline_epoch"] if workflow else launch["deadline_epoch"]
+                )
+                status = _invoke(
+                    command,
+                    directory=directory,
+                    operator=directory / "operator",
+                    report=report,
+                    report_path=report_path,
+                    deadline=deadline_mono,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    wall_deadline_epoch_override=deadline_epoch,
+                    phase_on_start=f"historical-{phase}-{substep}",
+                    storage_supervision=True,
+                    storage_invocation_token=storage_token,
+                    metrics_progress_path=paths.get("metrics_progress"),
+                    storage_progress_path=storage_progress_path,
+                    storage_maintenance=(phase == "source" and substep == "maintenance"),
+                    supervisor_handoff={
+                        "directory": str(directory),
+                        "control_root": str(control_root),
+                        "grant_id": grant_id,
+                        "launch_sha256": launch_sha256,
+                        "phase": phase,
+                        "substep": substep,
+                        "storage_invocation_token": storage_token,
+                        "storage_progress_path": str(storage_progress_path),
+                    },
+                    child_source_root=source_root,
+                )
+                code, reason, reaped = status
+                storage_state = _historical_validate_storage_handoff(
+                    directory,
+                    report_path,
+                    storage_progress_path,
+                    invocation_token=storage_token,
+                )
+                if (
+                    report.get("storage_supervision_invocation") != storage_token
+                    or storage_state.get("sample_count", 0) < 1
+                ):
+                    raise RunnerError("historical worker did not receive live storage supervision")
+                report["storage_supervision_file"] = str(storage_progress_path)
+                report["storage_supervision"] = {
+                    key: value for key, value in storage_state.items() if key != "baseline"
+                }
+                _atomic_report(report_path, report)
+                latest = _strict_json(report_path)
+                if latest is not None:
+                    report = latest
+                report["active_process_group"] = (
+                    None if reaped else report.get("active_process_group")
+                )
+                report["phase"] = "stopped" if reaped else "uncertain"
+                report["private_historical_grant"]["state"] = (
+                    "child-complete" if code == 0 and not reason and reaped else "stopped"
+                )
+                _atomic_report(report_path, report)
+                if code != 0 or reason or not reaped:
+                    if phase == "activation" and _historical_activation_claimed(
+                        control_root, grant_id, launch["launch_id"], identity
+                    ):
+                        report["production_state"] = "unknown"
+                        _atomic_report(report_path, report)
+                    raise RunnerError(
+                        reason or f"historical {phase}/{substep} child failed or was not reaped"
+                    )
+                child_result = _strict_json(stdout_path)
+                if (
+                    child_result is None
+                    or child_result.get("ok") is not True
+                    or child_result.get("phase") != phase
+                    or child_result.get("substep") != substep
+                ):
+                    if phase == "activation" and _historical_activation_claimed(
+                        control_root, grant_id, launch["launch_id"], identity
+                    ):
+                        report["production_state"] = "unknown"
+                        _atomic_report(report_path, report)
+                    raise RunnerError("supervised historical worker did not confirm its action")
+                _historical_validate_substep_record(
+                    _historical_substep_path(control_root, grant_id, phase, substep),
+                    identity=identity,
+                    grant_id=grant_id,
+                    launch_sha256=launch_sha256,
+                    launch=launch,
+                    phase=phase,
+                    substep=substep,
+                )
+                if phase == "source" and substep == "maintenance":
+                    store.reconcile()
+                    post_cleanup_baseline = _historical_resource_baseline(directory, store, report)
+                    admission = grants.expected_resource_admission()
+                    if (
+                        post_cleanup_baseline["temporary_bytes"]
+                        > admission["storage_temporary_admission_bytes"]
+                    ):
+                        raise RunnerError(
+                            "startup cleanup did not restore temporary storage admission before work"
+                        )
+                    _historical_measurement_artifact(
+                        control_root,
+                        grant_id,
+                        approval,
+                        identity,
+                        freeze,
+                        session_report_sha256=session_binding["report_sha256"],
+                        session_root_device=session_binding["root_device"],
+                        baseline=post_cleanup_baseline,
+                        require_fresh=False,
+                    )
+                    report["storage"] = {
+                        "operator_retained_bytes": post_cleanup_baseline["root_bytes"],
+                        "operator_temporary_bytes": post_cleanup_baseline["temporary_bytes"],
+                        "operator_database_bytes": post_cleanup_baseline["database_bytes"],
+                        "external_bytes": post_cleanup_baseline["aggregate_bytes"]
+                        - post_cleanup_baseline["root_bytes"],
+                        "aggregate_estimate_bytes": post_cleanup_baseline["aggregate_bytes"],
+                        "ssd_free_bytes": post_cleanup_baseline["free_bytes"],
+                    }
+                    _atomic_report(report_path, report)
+
+            report = _strict_json(report_path)
+            if report is None:
+                raise RunnerError("historical session report disappeared before phase sealing")
+            report["active_process_group"] = None
+            report["phase"] = "stopped"
+            report["private_historical_grant"]["phase"] = phase
+            report["private_historical_grant"]["substep"] = None
+            report["private_historical_grant"]["state"] = "phase-ready-to-seal"
+            _atomic_report(report_path, report)
+            authority = _historical_authority(
+                directory,
+                control_root,
+                grant_id,
+                launch_sha256=launch_sha256,
+                require_worker=False,
+                expected_phase=phase,
+            )
+            _historical_validate_phase_chain(authority)
+            outputs = _historical_phase_outputs(authority, phase)
+            if phase == "adoption":
+                grants.validate_adoption_retirement(approval, outputs.get("source_retired"))
+            current, previous = grants.read_phase_chain(control_root / "phases", identity)
+            seal = {
+                "version": 1,
+                "phase": phase,
+                "bindings": identity,
+                "previous_sha256": previous,
+                "outputs": outputs,
+                "completed_at_epoch": time.time(),
+                "grant_id": grant_id,
+            }
+            grants.write_phase_seal(
+                control_root,
+                seal,
+                bindings=identity,
+                grant_launch=launch,
+            )
+            completed.append(phase)
+        _historical_stop_record(
+            directory,
+            control_root,
+            grant_id,
+            launch_sha256,
+            outcome="complete",
+            phase=current_phase,
+            substep=None,
+            completed_phases=completed,
+            reason=None,
+            bindings=identity,
+            root_volume_uuid=freeze["root_volume_uuid"],
+        )
+        print(json.dumps({"ok": True, "grant_id": grant_id, "completed_phases": completed}))
+        return 0
+    except Exception as exc:
+        if launch_sha256 is not None and report_path is not None:
+            current = _strict_json(report_path) or report or {}
+            if current.get("active_process_group") is None:
+                current["phase"] = "stopped"
+            # The current controller already validated and holds this identity.
+            # Do not re-read the freeze through an incomplete call signature in
+            # the failure path; the consumed launch is bound to this snapshot.
+            bindings = identity if "identity" in locals() else None
+            if (
+                current_phase == "activation"
+                and launch_sha256 is not None
+                and "launch" in locals()
+                and isinstance(launch, dict)
+                and _historical_activation_claimed(
+                    control_root, grant_id, launch["launch_id"], identity
+                )
+            ):
+                current["production_state"] = "unknown"
+            prior_private = current.get("private_historical_grant")
+            private_handoff = dict(prior_private) if isinstance(prior_private, dict) else {}
+            private_handoff.update(
+                {
+                    "version": 1,
+                    "grant_id": grant_id,
+                    "launch_sha256": launch_sha256,
+                    "launch_id": launch.get("launch_id") if isinstance(launch, dict) else None,
+                    "control_root": str(control_root),
+                    "phases": (approval.get("phases") if "approval" in locals() else []),
+                    "phase": current_phase,
+                    "substep": current_substep,
+                    "controller_pid": os.getpid(),
+                    "controller_pgid": os.getpgrp(),
+                    "state": "stopped",
+                    "reason": str(exc),
+                }
+            )
+            if current.get("active_process_group") is not None:
+                private_handoff.setdefault("worker_pid", current["active_process_group"])
+                private_handoff.setdefault("worker_pgid", current["active_process_group"])
+            current["private_historical_grant"] = private_handoff
+            _atomic_report(report_path, current)
+            _historical_stop_record(
+                directory,
+                control_root,
+                grant_id,
+                launch_sha256,
+                outcome=(
+                    "uncertain" if current.get("active_process_group") is not None else "stopped"
+                ),
+                phase=current_phase,
+                substep=current_substep,
+                completed_phases=completed,
+                reason=str(exc),
+                bindings=bindings,
+                root_volume_uuid=(
+                    preflight["freeze"]["root_volume_uuid"] if "preflight" in locals() else None
+                ),
+            )
+        print(json.dumps({"error": str(exc), "grant_id": grant_id}, sort_keys=True))
+        return 1
+    finally:
+        if token is not None:
+            _ACTIVE_LIMITS.reset(token)
+        if run_lock_acquired and run_lock_context is not None:
+            run_lock_context.__exit__(None, None, None)
+
+
 def _existing_operator_root(root: Path) -> Path:
     from kalshi_events.common import CatalogueError
     from kalshi_events.paths import PathPolicyError
@@ -7350,6 +13123,8 @@ def _merge_capture_notification(report: dict[str, Any], path: Path | None) -> No
 
 def _main_hidden(argv: list[str]) -> int | None:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--_historical-control", nargs=3)
+    parser.add_argument("--_historical-worker", nargs=8)
     parser.add_argument("--_account-root", type=Path)
     parser.add_argument("--_account-recovery", nargs="+")
     parser.add_argument("--_account-historical-initial", nargs=7)
@@ -7359,6 +13134,8 @@ def _main_hidden(argv: list[str]) -> int | None:
     parser.add_argument("--_activate-current", nargs="+")
     args, rest = parser.parse_known_args(argv)
     selected_workers = (
+        args._historical_control,
+        args._historical_worker,
         args._account_root,
         args._account_recovery,
         args._account_historical_initial,
@@ -7370,6 +13147,30 @@ def _main_hidden(argv: list[str]) -> int | None:
     if sum(value is not None for value in selected_workers) > 1:
         print(json.dumps({"error": "conflicting hidden worker modes"}))
         return 1
+    if args._historical_control is not None and not rest:
+        directory, control_root, grant_id = args._historical_control
+        return _historical_control_main(Path(directory), Path(control_root), grant_id)
+    if args._historical_worker is not None and not rest:
+        (
+            directory,
+            control_root,
+            grant_id,
+            launch_sha,
+            phase,
+            substep,
+            storage_token,
+            storage_progress,
+        ) = args._historical_worker
+        return _historical_worker_main(
+            Path(directory),
+            Path(control_root),
+            grant_id,
+            launch_sha,
+            phase,
+            substep,
+            storage_token,
+            Path(storage_progress),
+        )
     if args._account_root is not None and not rest:
         return _accounting_worker_main(args._account_root)
     if args._account_recovery is not None and not rest:
@@ -7428,7 +13229,7 @@ def _main_hidden(argv: list[str]) -> int | None:
                 Path(args._activate_current[1]),
                 args._activate_current[2],
             )
-        if len(args._activate_current) != 5:
+        if len(args._activate_current) not in {5, 7}:
             print(json.dumps({"error": "activation worker session identity is incomplete"}))
             return 1
         return _activation_worker(
@@ -7437,6 +13238,11 @@ def _main_hidden(argv: list[str]) -> int | None:
             args._activate_current[2],
             Path(args._activate_current[3]),
             args._activate_current[4],
+            (
+                (float(args._activate_current[5]), float(args._activate_current[6]))
+                if len(args._activate_current) == 7
+                else None
+            ),
         )
     return None
 

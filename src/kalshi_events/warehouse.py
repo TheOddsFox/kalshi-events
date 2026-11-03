@@ -19,8 +19,10 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as installed_version
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -163,9 +165,10 @@ def _legacy_landing_text(value: Any) -> str | None:
 def _duckdb_work_config(store: Store, directory: Path):
     relative = directory.relative_to(store.root).as_posix()
     usage = store.usage()
+    reserved = getattr(store, "_storage_reservations", 0)
     spill_budget = min(
-        store.limits.max_temp_bytes - usage["temporary_bytes"],
-        store.limits.max_root_bytes - usage["retained_bytes"],
+        store.limits.max_temp_bytes - usage["temporary_bytes"] - reserved,
+        store.limits.max_root_bytes - usage["retained_bytes"] - reserved,
     )
     if spill_budget < 1:
         raise BudgetExceeded("no bounded temporary storage is available for DuckDB work")
@@ -876,6 +879,8 @@ def _iter_historical_landing_rows(
     verified_pages: dict[str, str],
     parent_index: ParentIndex | DiskParentIndex,
     task_indices: set[int],
+    page_index: historical_resume.PageContextIndex | None = None,
+    with_positions: bool = False,
 ) -> _HistoricalLandingRows:
     capture_id = state["capture_id"]
     seen_pages: dict[str, str] = {}
@@ -893,14 +898,17 @@ def _iter_historical_landing_rows(
             if not isinstance(page_id, str) or not page_id:
                 raise CatalogueError("historical receipt lacks a page identity")
             page_context = digest(json_bytes(manifest))
-            previous = seen_pages.get(page_id)
-            if previous is not None:
-                if previous != page_context:
-                    raise CatalogueError("historical page identity has contradictory context")
+            if page_index is None:
+                previous = seen_pages.get(page_id)
+                if previous is not None:
+                    if previous != page_context:
+                        raise CatalogueError("historical page identity has contradictory context")
+                    continue
+                seen_pages[page_id] = page_context
+            elif not page_index.add(page_id, page_context):
                 continue
-            seen_pages[page_id] = page_context
             parent_index.add_page(manifest, payload)
-            for row in observations(((manifest, payload),)):
+            for row_offset, row in enumerate(observations(((manifest, payload),))):
                 store.check_deadline()
                 count[0] += 1
                 kind = row["entity_kind"]
@@ -919,7 +927,19 @@ def _iter_historical_landing_rows(
                     "task_scope": manifest.get("task_scope"),
                     "task_generation": str(manifest.get("task_generation", "")),
                 }
-                yield {key: _legacy_landing_text(value) for key, value in values.items()}
+                normalized = {key: _legacy_landing_text(value) for key, value in values.items()}
+                if with_positions:
+                    yield (
+                        tuple(normalized[name] for name in _LANDING_COLUMNS),
+                        {
+                            "receipt_position": receipts_verified,
+                            "page_id": page_id,
+                            "page_context_sha256": page_context,
+                            "row_offset": row_offset,
+                        },
+                    )
+                else:
+                    yield normalized
 
     return _HistoricalLandingRows(rows(), count)
 
@@ -2533,8 +2553,78 @@ def _cleanup_resumed_historical_dbt_spills(
             store.remove(relative)
 
 
+def _historical_stage_has_uninstalled_adoption(
+    store: Store,
+    relative: str,
+    path: Path,
+    *,
+    _verified_mount: dict[str, Any] | None = None,
+) -> bool:
+    stage_name = path.name
+    adoption_path = path / "resume-adoption.json"
+    cleanup_path = path / "resume-cleanup-intent.json"
+    if not adoption_path.exists() and not adoption_path.is_symlink():
+        if cleanup_path.exists() or cleanup_path.is_symlink():
+            raise CatalogueError("historical cleanup intent has no adoption record")
+        return False
+    adoption = _load_self_proof(adoption_path, "historical-adoption")
+    if adoption is None:
+        raise CatalogueError("historical adoption record is missing")
+    proof, result = adoption
+    capture_id = proof["binding"].get("capture_id")
+    if not isinstance(capture_id, str) or re.fullmatch(r"[0-9a-f]{32}", capture_id) is None:
+        raise CatalogueError("historical adoption capture identity is invalid")
+    installed = None
+    with suppress(CatalogueError, OSError):
+        installed = certified(store, capture_id, catalogue_version=3)
+    if installed is not None and installed.get("historical_adoption", {}).get(
+        "sha256"
+    ) == proof.get("sha256"):
+        return False
+    state = read_capture(store, capture_id)
+    if (
+        state.get("capture_id") != capture_id
+        or proof["binding"].get("root") != str(store.root.resolve())
+        or proof["binding"].get("stage") != stage_name
+        or proof["binding"].get("state_sha256") != digest(json_bytes(dict(state)))
+    ):
+        raise CatalogueError("historical adopted stage is bound to another capture")
+    candidate = path / "resume-candidate"
+    source_proof, source_result = _read_source_proof(store, state, stage_name, candidate)
+    _validate_historical_adoption_origin(store, state, stage_name, source_proof, source_result)
+    if _verified_mount is not None and _verified_mount.get("capture_id") != capture_id:
+        if cleanup_path.exists() or cleanup_path.is_symlink():
+            _validate_historical_cleanup_intent(
+                store, state, stage_name, source_result, source_proof["sha256"], cleanup_path
+            )
+        elif not (path / "warehouse.duckdb").exists():
+            raise CatalogueError(
+                "unrelated adopted historical source is missing without cleanup intent"
+            )
+        return True
+    _validate_historical_resume_source_presence(
+        store,
+        path / "warehouse.duckdb",
+        path / "warehouse.duckdb.wal",
+        source_result,
+        adopted=True,
+        cleanup_intent=cleanup_path,
+        stage_name=stage_name,
+        state=state,
+        source_proof_sha256=source_proof["sha256"],
+        _verified_mount=_verified_mount,
+    )
+    if result.get("candidate_sha256") != proof["result"].get("candidate_sha256"):
+        raise CatalogueError("historical adoption candidate lineage is invalid")
+    return True
+
+
 def recover_and_cleanup_abandoned_historical_stages(
-    store: Store, capture_id: str, *, preserve_stage: str | None = None
+    store: Store,
+    capture_id: str,
+    *,
+    preserve_stage: str | None = None,
+    _verified_mount: dict[str, Any] | None = None,
 ) -> None:
     """Recover a same-capture replacement, then prune only safe historical build stages."""
     if not store.writer_locked_by_current_thread:
@@ -2552,6 +2642,10 @@ def recover_and_cleanup_abandoned_historical_stages(
         state = read_capture(store, capture_id)
         if state.get("capture_id") != capture_id:
             raise CatalogueError("historical stage cleanup source capture does not match")
+        if _verified_mount is not None:
+            historical_resume.validate_resume_mount_context(
+                store=store, state=state, verified_mount=_verified_mount
+            )
         _historical_profile(state)
         preserved: tuple[str, Path, tuple[int, int]] | None = None
         if preserve_stage is not None:
@@ -2592,6 +2686,10 @@ def recover_and_cleanup_abandoned_historical_stages(
                 if preserved is not None and entry.name == preserve_stage:
                     continue
                 identity = _validate_historical_stage(path, root_stat.st_dev)
+                if _historical_stage_has_uninstalled_adoption(
+                    store, f"tmp/{entry.name}", path, _verified_mount=_verified_mount
+                ):
+                    continue
                 stages.append((f"tmp/{entry.name}", path, identity))
 
         if not stages:
@@ -2889,17 +2987,22 @@ def _check_historical_coverage(
 
 
 def _historical_resume_code_identity() -> str:
-    package = Path(str(files("kalshi_events").joinpath("dbt")))
-    sources = [
-        ("warehouse.py", Path(__file__).read_bytes()),
-        ("historical_resume.py", Path(historical_resume.__file__).read_bytes()),
-    ]
-    combo = Path(__file__).with_name("historical_combo.py")
-    if combo.is_file():
-        sources.append(("historical_combo.py", combo.read_bytes()))
+    package = Path(str(files("kalshi_events")))
+    sources = []
     for path in sorted(package.rglob("*")):
-        if path.is_file() and path.suffix in {".sql", ".yml", ".yaml"}:
+        if path.is_file() and path.suffix in {".py", ".sql", ".yml", ".yaml"}:
             sources.append((path.relative_to(package).as_posix(), path.read_bytes()))
+    for name in ("pyproject.toml", "uv.lock"):
+        path = Path(__file__).parents[2] / name
+        if path.is_file():
+            sources.append((f"project/{name}", path.read_bytes()))
+    sources.append(("runtime/python", sys.version.encode()))
+    for distribution in ("duckdb", "dlt", "pyarrow", "dbt-core", "dbt-duckdb"):
+        try:
+            runtime = installed_version(distribution)
+        except PackageNotFoundError:
+            runtime = "unavailable"
+        sources.append((f"runtime/{distribution}", runtime.encode()))
     return historical_resume.code_identity(sources)
 
 
@@ -2973,13 +3076,20 @@ def _prepare_historical_resume_candidate(
     store: Store,
     state: dict[str, Any],
     stage_name: str,
-) -> tuple[str, Path, str]:
+    *,
+    _verified_mount: dict[str, Any] | None = None,
+) -> tuple[str, Path, str, bool]:
+    if _verified_mount is not None:
+        historical_resume.validate_resume_mount_context(
+            store=store, state=state, verified_mount=_verified_mount
+        )
     stage_relative = historical_resume.stage_relative(stage_name)
     stage = store.path(stage_relative)
     candidate_relative = f"{stage_relative}/resume-candidate"
     candidate = store.path(candidate_relative)
     source = stage / "warehouse.duckdb"
     source_wal = source.with_name(source.name + ".wal")
+    adoption_path = stage / "resume-adoption.json"
     binding = {
         "root": str(store.root.resolve()),
         "capture_id": state["capture_id"],
@@ -2987,22 +3097,46 @@ def _prepare_historical_resume_candidate(
         "stage": stage_name,
     }
     marker = candidate / "resume-source.json"
+    if (
+        not candidate.exists()
+        and not candidate.is_symlink()
+        and (adoption_path.exists() or adoption_path.is_symlink())
+    ):
+        raise CatalogueError("adopted historical candidate is missing")
     if candidate.exists() or candidate.is_symlink():
+        recovered_wal = False
         _validate_historical_stage(candidate, store.root.lstat().st_dev)
         if not marker.is_file() or marker.is_symlink():
+            if adoption_path.exists() or adoption_path.is_symlink():
+                raise CatalogueError("adopted historical candidate has no source proof")
             store.remove(candidate_relative)
         else:
             proof = decode(regular_bytes(marker, 1024**2))
             result = historical_resume.validate_proof(proof, "resume-source", binding)
-            if _resume_file_identity(source) != tuple(result.get("source_identity", ())):
-                raise CatalogueError("historical resume source database changed after staging")
-            source_wal_identity = (
-                list(_resume_file_identity(source_wal)) if source_wal.exists() else None
+            cleanup_path = stage / "resume-cleanup-intent.json"
+            if adoption_path.exists() or adoption_path.is_symlink():
+                _validate_historical_adoption_origin(store, state, stage_name, proof, result)
+            _validate_historical_resume_source_presence(
+                store,
+                source,
+                source_wal,
+                result,
+                adopted=adoption_path.is_file() and not adoption_path.is_symlink(),
+                cleanup_intent=cleanup_path,
+                stage_name=stage_name,
+                state=state,
+                source_proof_sha256=proof["sha256"],
+                _verified_mount=_verified_mount,
             )
-            if result.get("source_wal_identity") != source_wal_identity:
-                raise CatalogueError("historical resume source WAL changed after staging")
-            _recover_resume_candidate(store, candidate)
-            return candidate_relative, candidate, proof["sha256"]
+            candidate_wal = candidate / "warehouse.duckdb.wal"
+            if candidate_wal.is_symlink():
+                raise CatalogueError("historical resume candidate WAL is unsafe")
+            if candidate_wal.exists():
+                _recover_resume_candidate(store, candidate)
+                recovered_wal = True
+            else:
+                _validate_resume_candidate_database(store, candidate)
+            return candidate_relative, candidate, proof["sha256"], recovered_wal
 
     try:
         source_identity = _resume_file_identity(source)
@@ -3050,7 +3184,12 @@ def _prepare_historical_resume_candidate(
     ):
         raise CatalogueError("historical resume source WAL changed while copied")
 
-    _recover_resume_candidate(store, candidate)
+    candidate_wal = candidate / "warehouse.duckdb.wal"
+    recovered_wal = candidate_wal.exists()
+    if candidate_wal.exists():
+        _recover_resume_candidate(store, candidate)
+    else:
+        _validate_resume_candidate_database(store, candidate)
     candidate_hash, candidate_size = _resume_file_digest(
         store, candidate / "warehouse.duckdb", store.limits.max_database_bytes
     )
@@ -3068,9 +3207,1231 @@ def _prepare_historical_resume_candidate(
     }
     proof = historical_resume.proof_record("resume-source", binding, result)
     store.write(f"{candidate_relative}/resume-source.json", proof)
+    if decode(regular_bytes(marker, 1024**2)) != proof:
+        raise CatalogueError("historical resume source proof failed readback")
     fsync_file(marker)
     fsync_directory(candidate)
-    return candidate_relative, candidate, proof["sha256"]
+    fsync_directory(stage)
+    return candidate_relative, candidate, proof["sha256"], recovered_wal
+
+
+def _validate_resume_candidate_database(store: Store, directory: Path) -> None:
+    database = directory / "warehouse.duckdb"
+    if not database.is_file() or database.is_symlink():
+        raise CatalogueError("historical resume candidate is missing or unsafe")
+    try:
+        with (
+            _duckdb_work_config(store, directory) as config,
+            duckdb.connect(str(database), read_only=True, config=config) as connection,
+        ):
+            connection.execute("select 1").fetchone()
+    except duckdb.Error as exc:
+        raise CatalogueError("historical resume candidate database is invalid") from exc
+
+
+def _validate_historical_resume_source_presence(
+    store: Store,
+    source: Path,
+    source_wal: Path,
+    source_result: dict[str, Any],
+    *,
+    adopted: bool,
+    cleanup_intent: Path,
+    stage_name: str,
+    state: dict[str, Any],
+    source_proof_sha256: str,
+    _verified_mount: dict[str, Any] | None = None,
+) -> None:
+    source_exists = source.exists() or source.is_symlink()
+    wal_exists = source_wal.exists() or source_wal.is_symlink()
+    if not source_exists and not wal_exists:
+        if not adopted:
+            raise CatalogueError("historical resume source database disappeared before adoption")
+        _validate_historical_cleanup_intent(
+            store, state, stage_name, source_result, source_proof_sha256, cleanup_intent
+        )
+        return
+    if not source_exists:
+        if not adopted or not cleanup_intent.exists():
+            raise CatalogueError("historical resume source database is missing")
+        _validate_historical_cleanup_intent(
+            store, state, stage_name, source_result, source_proof_sha256, cleanup_intent
+        )
+        if (
+            source_result.get("source_wal_identity") is None
+            or source_wal.is_symlink()
+            or not historical_resume.resume_file_identity_matches(
+                source_result.get("source_wal_identity"),
+                _resume_file_identity(source_wal),
+                store=store,
+                state=state,
+                verified_mount=_verified_mount,
+            )
+            or _resume_file_digest(store, source_wal, store.limits.max_database_bytes)
+            != (source_result.get("source_wal_sha256"), source_result.get("source_wal_size"))
+        ):
+            raise CatalogueError("historical resume source WAL changed during cleanup")
+        return
+    if (
+        source.is_symlink()
+        or not historical_resume.resume_file_identity_matches(
+            source_result.get("source_identity"),
+            _resume_file_identity(source),
+            store=store,
+            state=state,
+            verified_mount=_verified_mount,
+        )
+        or _resume_file_digest(store, source, store.limits.max_database_bytes)
+        != (source_result.get("source_sha256"), source_result.get("source_size"))
+    ):
+        raise CatalogueError("historical resume source database changed after staging")
+    expected_wal = source_result.get("source_wal_identity")
+    if expected_wal is None:
+        if wal_exists:
+            raise CatalogueError("historical resume source gained a WAL after staging")
+    elif (
+        not wal_exists
+        or source_wal.is_symlink()
+        or not historical_resume.resume_file_identity_matches(
+            expected_wal,
+            _resume_file_identity(source_wal),
+            store=store,
+            state=state,
+            verified_mount=_verified_mount,
+        )
+        or _resume_file_digest(store, source_wal, store.limits.max_database_bytes)
+        != (source_result.get("source_wal_sha256"), source_result.get("source_wal_size"))
+    ):
+        if not (adopted and cleanup_intent.exists()):
+            raise CatalogueError("historical resume source WAL changed after staging")
+        _validate_historical_cleanup_intent(
+            store, state, stage_name, source_result, source_proof_sha256, cleanup_intent
+        )
+
+
+def _historical_landing_schema_sha256() -> str:
+    return digest(
+        json_bytes(
+            {
+                "columns": list(_LANDING_COLUMNS),
+                "nullable": ["event_ticker", "provider_updated_at", "series_ticker", "task_scope"],
+                "types": ["VARCHAR"] * len(_LANDING_COLUMNS),
+            }
+        )
+    )
+
+
+def _historical_scope_sha256(
+    state: dict[str, Any], selection: dict[str, Any], task_indices: set[int]
+) -> str:
+    return digest(
+        json_bytes(
+            {
+                "historical_selection": selection,
+                "task_indices": sorted(task_indices),
+                "state_sha256": digest(json_bytes(dict(state))),
+            }
+        )
+    )
+
+
+def _historical_read_only_config() -> dict[str, str]:
+    return {"memory_limit": DBT_MEMORY_LIMIT, "threads": str(DBT_THREADS)}
+
+
+def _load_self_proof(path: Path, phase: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if path.is_symlink():
+        raise CatalogueError("historical stage proof is unsafe")
+    if not path.exists():
+        return None
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise CatalogueError("historical stage proof is unsafe")
+    proof = decode(regular_bytes(path, 1024**2))
+    binding = proof.get("binding") if isinstance(proof, dict) else None
+    if not isinstance(binding, dict):
+        raise CatalogueError("historical stage proof binding is invalid")
+    result = historical_resume.validate_proof(proof, phase, binding)
+    return proof, result
+
+
+def _historical_adoption_record(store: Store, stage_name: str) -> dict[str, Any] | None:
+    relative = historical_resume.stage_relative(stage_name)
+    loaded = _load_self_proof(store.path(f"{relative}/resume-adoption.json"), "historical-adoption")
+    return loaded[0] if loaded is not None else None
+
+
+def _candidate_phase_relative(
+    candidate_relative: str,
+    candidate_sha256: str,
+    phase_name: str,
+    adoption_sha256: str | None,
+    landing_proof_sha256: str,
+) -> str:
+    if (
+        phase_name not in {"landing-ready", "dbt-complete"}
+        or re.fullmatch(r"[0-9a-f]{64}", landing_proof_sha256) is None
+    ):
+        raise CatalogueError("historical candidate phase name is invalid")
+    adoption = adoption_sha256 or "origin"
+    return (
+        f"{candidate_relative}/resume-candidate-phase-{phase_name}-"
+        f"{adoption}-{candidate_sha256}-{landing_proof_sha256}.json"
+    )
+
+
+def _historical_candidate_phase_binding(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    candidate_sha256: str,
+    source_proof_sha256: str,
+    landing_proof_sha256: str,
+    scope_sha256: str,
+) -> dict[str, Any]:
+    adoption = _historical_adoption_record(store, stage_name)
+    return {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "candidate_sha256": candidate_sha256,
+        "source_proof_sha256": source_proof_sha256,
+        "adoption_sha256": adoption["sha256"] if adoption is not None else None,
+        "landing_proof_sha256": landing_proof_sha256,
+        "scope_sha256": scope_sha256,
+        "schema_sha256": _historical_landing_schema_sha256(),
+        "code_sha256": _historical_resume_code_identity(),
+    }
+
+
+def _write_historical_candidate_phase(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    candidate_relative: str,
+    candidate: Path,
+    source_proof_sha256: str,
+    selection: dict[str, Any],
+    task_indices: set[int],
+    landing_proof: dict[str, Any],
+    phase_name: str,
+) -> dict[str, Any]:
+    database = candidate / "warehouse.duckdb"
+    if database.with_name(database.name + ".wal").exists():
+        raise CatalogueError("historical candidate phase cannot be sealed with a WAL")
+    fsync_file(database)
+    fsync_directory(candidate)
+    candidate_sha256, candidate_size = _resume_file_digest(
+        store, database, store.limits.max_database_bytes
+    )
+    scope_sha256 = _historical_scope_sha256(state, selection, task_indices)
+    binding = _historical_candidate_phase_binding(
+        store,
+        state,
+        stage_name,
+        candidate_sha256,
+        source_proof_sha256,
+        landing_proof["sha256"],
+        scope_sha256,
+    )
+    proof = historical_resume.proof_record(
+        "historical-candidate-phase",
+        binding,
+        {
+            "phase": phase_name,
+            "candidate_size": candidate_size,
+            "observation_count": landing_proof["result"]["observation_count"],
+            "membership_count": landing_proof["result"]["membership_count"],
+            "eligibility_count": landing_proof["result"]["eligibility_count"],
+        },
+    )
+    adoption = _historical_adoption_record(store, stage_name)
+    relative = _candidate_phase_relative(
+        candidate_relative,
+        candidate_sha256,
+        phase_name,
+        adoption["sha256"] if adoption is not None else None,
+        landing_proof["sha256"],
+    )
+    path = store.path(relative)
+    if path.exists() or path.is_symlink():
+        current = decode(regular_bytes(path, 1024**2))
+        if current != proof:
+            raise CatalogueError("historical candidate phase seal conflicts with its origin")
+    else:
+        store.write(relative, proof)
+    if decode(regular_bytes(path, 1024**2)) != proof:
+        raise CatalogueError("historical candidate phase seal failed readback")
+    fsync_file(path)
+    fsync_directory(candidate)
+    return proof
+
+
+def _reuse_historical_candidate_phase(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    candidate_relative: str,
+    candidate: Path,
+    source_proof_sha256: str,
+    selection: dict[str, Any],
+    task_indices: set[int],
+    verified_pages: dict[str, str],
+) -> tuple[int, _OperationEvidence, dict[str, Any]] | None:
+    database = candidate / "warehouse.duckdb"
+    wal = database.with_name(database.name + ".wal")
+    if wal.exists() or wal.is_symlink():
+        return None
+    candidate_sha256, _candidate_size = _resume_file_digest(
+        store, database, store.limits.max_database_bytes
+    )
+    adoption = _historical_adoption_record(store, stage_name)
+    adoption_sha256 = adoption["sha256"] if adoption is not None else None
+    landing_alias = _load_self_proof(candidate / "resume-landing.json", "historical-landing")
+    if landing_alias is None:
+        return None
+    landing_proof_sha256 = landing_alias[0]["sha256"]
+    loaded = None
+    for phase_name in ("dbt-complete", "landing-ready"):
+        seal_path = store.path(
+            _candidate_phase_relative(
+                candidate_relative,
+                candidate_sha256,
+                phase_name,
+                adoption_sha256,
+                landing_proof_sha256,
+            )
+        )
+        loaded = _load_self_proof(seal_path, "historical-candidate-phase")
+        if loaded is not None:
+            break
+    if loaded is None:
+        return None
+    seal, seal_result = loaded
+    if seal["binding"].get("landing_proof_sha256") != landing_proof_sha256:
+        raise CatalogueError("historical candidate phase seal changed its landing proof")
+    scope_sha256 = _historical_scope_sha256(state, selection, task_indices)
+    expected_fields = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "candidate_sha256": candidate_sha256,
+        "source_proof_sha256": source_proof_sha256,
+        "adoption_sha256": adoption_sha256,
+        "scope_sha256": scope_sha256,
+        "schema_sha256": _historical_landing_schema_sha256(),
+        "code_sha256": _historical_resume_code_identity(),
+    }
+    if any(seal["binding"].get(key) != value for key, value in expected_fields.items()):
+        if seal["binding"].get("code_sha256") != expected_fields["code_sha256"]:
+            return None
+        raise CatalogueError("historical candidate phase seal does not match its scope")
+    if (
+        not isinstance(landing_proof_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", landing_proof_sha256) is None
+    ):
+        raise CatalogueError("historical candidate phase seal lacks a landing proof")
+    landing_path = candidate / f"resume-landing-{landing_proof_sha256}.json"
+    loaded_landing = _load_self_proof(landing_path, "historical-landing")
+    if loaded_landing is None or loaded_landing[0].get("sha256") != landing_proof_sha256:
+        raise CatalogueError("historical candidate phase seal lost its landing proof")
+    landing_proof, landing_result = loaded_landing
+    if any(
+        seal_result.get(key) != landing_result.get(key)
+        for key in ("observation_count", "membership_count", "eligibility_count")
+    ):
+        raise CatalogueError("historical candidate phase counts differ from its landing proof")
+
+    for _manifest, _payload in capture_pages(
+        store, state, evidence=verified_pages, task_indices=task_indices
+    ):
+        store.check_deadline()
+    operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+    landing_binding = landing_proof["binding"]
+    if (
+        landing_binding.get("root") != str(store.root.resolve())
+        or landing_binding.get("stage") != stage_name
+        or landing_binding.get("capture_id") != state["capture_id"]
+        or landing_binding.get("state_sha256") != digest(json_bytes(dict(state)))
+        or landing_binding.get("source_proof_sha256") != source_proof_sha256
+        or landing_binding.get("historical_selection") != selection
+        or landing_binding.get("task_indices") != sorted(task_indices)
+        or landing_binding.get("scope_sha256") != scope_sha256
+        or landing_binding.get("schema_sha256") != _historical_landing_schema_sha256()
+        or landing_binding.get("code_sha256") != _historical_resume_code_identity()
+        or landing_binding.get("evidence_sha256") != digest(json_bytes(operation_evidence.evidence))
+        or not isinstance(landing_binding.get("candidate_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", landing_binding["candidate_sha256"]) is None
+    ):
+        raise CatalogueError("historical landing proof differs from current receipt evidence")
+    try:
+        with (
+            duckdb.connect(
+                str(database), read_only=True, config=_historical_read_only_config()
+            ) as connection,
+        ):
+            _check_historical_landing_schemas(connection)
+            observation_count = connection.execute(
+                "select count(*) from landing.observations"
+            ).fetchone()[0]
+            membership_count = connection.execute(
+                "select count(*) from landing.membership"
+            ).fetchone()[0]
+            eligibility_count = connection.execute(
+                "select count(*) from landing.parent_eligibility"
+            ).fetchone()[0]
+    except duckdb.Error as exc:
+        raise CatalogueError("historical candidate phase output is invalid") from exc
+    if (
+        observation_count != landing_result.get("observation_count")
+        or membership_count != landing_result.get("membership_count")
+        or eligibility_count != landing_result.get("eligibility_count")
+    ):
+        raise CatalogueError("historical candidate phase counts changed after sealing")
+    _check_historical_coverage(database, state["capture_id"], state.get("complete") is True)
+    return observation_count, operation_evidence, landing_proof
+
+
+def _historical_readiness_context(
+    store: Store, capture_id: str, stage_name: str
+) -> tuple[str, Path, dict[str, Any], dict[str, Any], set[int]]:
+    if store.scope is not None:
+        raise CatalogueError("historical readiness requires a catalogue root")
+    if not isinstance(capture_id, str) or re.fullmatch(r"[0-9a-f]{32}", capture_id) is None:
+        raise CatalogueError("historical readiness capture identity is invalid")
+    stage_relative = historical_resume.stage_relative(stage_name)
+    stage = store.path(stage_relative)
+    _validate_historical_stage(stage, store.root.lstat().st_dev)
+    state = read_capture(store, capture_id)
+    if state.get("capture_id") != capture_id:
+        raise CatalogueError("historical readiness capture does not match its stage")
+    if state.get("incremental"):
+        raise CatalogueError("incremental captures cannot use historical readiness")
+    selection, task_indices = _historical_profile(state)
+    return stage_relative, stage, state, selection, task_indices
+
+
+def _read_source_proof(
+    store: Store, state: dict[str, Any], stage_name: str, candidate: Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    binding = {
+        "root": str(store.root.resolve()),
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "stage": stage_name,
+    }
+    loaded = _load_self_proof(candidate / "resume-source.json", "resume-source")
+    if loaded is None:
+        raise CatalogueError("historical resume source proof is missing")
+    proof, result = loaded
+    historical_resume.validate_proof(proof, "resume-source", binding)
+    return proof, result
+
+
+def _validate_historical_adoption_origin(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    source_proof: dict[str, Any],
+    source_result: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    relative = historical_resume.stage_relative(stage_name)
+    loaded = _load_self_proof(store.path(f"{relative}/resume-adoption.json"), "historical-adoption")
+    if loaded is None:
+        raise CatalogueError("historical adoption record is missing")
+    proof, result = loaded
+    binding = proof["binding"]
+    if (
+        binding.get("root") != str(store.root.resolve())
+        or binding.get("stage") != stage_name
+        or binding.get("capture_id") != state["capture_id"]
+        or binding.get("state_sha256") != digest(json_bytes(dict(state)))
+        or binding.get("source_proof_sha256") != source_proof.get("sha256")
+        or binding.get("candidate_sha256") != result.get("candidate_sha256")
+        or result.get("source_sha256") != source_result.get("source_sha256")
+        or result.get("source_size") != source_result.get("source_size")
+        or result.get("source_identity") != source_result.get("source_identity")
+        or result.get("source_wal_sha256") != source_result.get("source_wal_sha256")
+        or result.get("source_wal_size") != source_result.get("source_wal_size")
+        or result.get("source_wal_identity") != source_result.get("source_wal_identity")
+        or not isinstance(result.get("candidate_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", result["candidate_sha256"]) is None
+        or not isinstance(binding.get("readiness_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["readiness_sha256"]) is None
+        or not isinstance(binding.get("verification_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["verification_sha256"]) is None
+        or any(
+            isinstance(result.get(key), bool)
+            or not isinstance(result.get(key), int)
+            or result[key] < 0
+            for key in ("observation_count", "membership_count", "eligibility_count")
+        )
+    ):
+        raise CatalogueError("historical adoption origin does not match its source")
+    return proof, result
+
+
+def _validate_historical_cleanup_intent(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    source_result: dict[str, Any],
+    source_proof_sha256: str,
+    path: Path,
+) -> dict[str, Any]:
+    loaded = _load_self_proof(path, "historical-source-cleanup")
+    if loaded is None:
+        raise CatalogueError("historical source cleanup has no durable intent")
+    proof, result = loaded
+    adoption = _historical_adoption_record(store, stage_name)
+    binding = proof["binding"]
+    if (
+        adoption is None
+        or binding.get("root") != str(store.root.resolve())
+        or binding.get("stage") != stage_name
+        or binding.get("capture_id") != state["capture_id"]
+        or binding.get("state_sha256") != digest(json_bytes(dict(state)))
+        or binding.get("source_proof_sha256") != source_proof_sha256
+        or binding.get("adoption_sha256") != adoption.get("sha256")
+        or binding.get("retirement_policy") != "coexistence-capacity-relief-approved-v1"
+        or result.get("source_sha256") != source_result.get("source_sha256")
+        or result.get("source_size") != source_result.get("source_size")
+        or result.get("source_identity") != source_result.get("source_identity")
+        or result.get("source_wal_sha256") != source_result.get("source_wal_sha256")
+        or result.get("source_wal_size") != source_result.get("source_wal_size")
+        or result.get("source_wal_identity") != source_result.get("source_wal_identity")
+        or result.get("retire_source") is not True
+    ):
+        raise CatalogueError("historical source cleanup intent does not match its adoption")
+    return proof
+
+
+def _historical_cleanup_retry_receipt_matches(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    source_proof: dict[str, Any],
+    source_result: dict[str, Any],
+    readiness: dict[str, Any],
+    current_verification: dict[str, Any],
+    receipt: Any,
+    adoption: dict[str, Any],
+    adoption_result: dict[str, Any],
+    cleanup_path: Path,
+) -> bool:
+    if not (cleanup_path.exists() or cleanup_path.is_symlink()):
+        return False
+    try:
+        _validate_historical_cleanup_intent(
+            store,
+            state,
+            stage_name,
+            source_result,
+            source_proof["sha256"],
+            cleanup_path,
+        )
+        if not isinstance(receipt, dict) or not isinstance(receipt.get("binding"), dict):
+            return False
+        origin_binding = receipt["binding"]
+        origin_result = historical_resume.validate_proof(
+            receipt, "historical-readiness-verification", origin_binding
+        )
+    except (CatalogueError, TypeError, ValueError):
+        return False
+
+    adoption_binding = adoption["binding"]
+    current_binding = current_verification["binding"]
+    expected_counts = {
+        "observation_count": adoption_result["observation_count"],
+        "membership_count": adoption_result["membership_count"],
+        "eligibility_count": adoption_result["eligibility_count"],
+    }
+    return (
+        receipt.get("sha256") == adoption_binding.get("verification_sha256")
+        and origin_binding.get("root") == str(store.root.resolve())
+        and origin_binding.get("stage") == stage_name
+        and origin_binding.get("capture_id") == state["capture_id"]
+        and origin_binding.get("state_sha256") == digest(json_bytes(dict(state)))
+        and origin_binding.get("readiness_sha256") == adoption_binding.get("readiness_sha256")
+        and origin_binding.get("candidate_sha256") == adoption_result.get("candidate_sha256")
+        and origin_binding.get("code_sha256") == adoption_binding.get("code_sha256")
+        and origin_binding.get("adoption_origin_sha256") is None
+        and current_binding.get("root") == origin_binding.get("root")
+        and current_binding.get("stage") == origin_binding.get("stage")
+        and current_binding.get("capture_id") == origin_binding.get("capture_id")
+        and current_binding.get("state_sha256") == origin_binding.get("state_sha256")
+        and current_binding.get("candidate_sha256") == adoption_result.get("candidate_sha256")
+        and current_binding.get("code_sha256") == origin_binding.get("code_sha256")
+        and current_binding.get("evidence_sha256") == origin_binding.get("evidence_sha256")
+        and current_binding.get("adoption_origin_sha256") == adoption.get("sha256")
+        and readiness["binding"].get("adoption_origin_sha256") == adoption.get("sha256")
+        and readiness["binding"].get("candidate_sha256") == adoption_result.get("candidate_sha256")
+        and origin_result == expected_counts
+        and current_verification["result"] == expected_counts
+        and {
+            key: readiness["result"].get(key)
+            for key in ("observation_count", "membership_count", "eligibility_count")
+        }
+        == expected_counts
+    )
+
+
+def _historical_readiness_proof(
+    store: Store,
+    state: dict[str, Any],
+    stage_name: str,
+    candidate: Path,
+    source_proof: dict[str, Any],
+    landing_proof: dict[str, Any],
+    selection: dict[str, Any],
+    task_indices: set[int],
+    *,
+    adoption_origin_sha256: str | None = None,
+) -> dict[str, Any]:
+    candidate_sha256, candidate_size = _resume_file_digest(
+        store, candidate / "warehouse.duckdb", store.limits.max_database_bytes
+    )
+    scope_sha256 = _historical_scope_sha256(state, selection, task_indices)
+    binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "source_proof_sha256": source_proof["sha256"],
+        "landing_proof_sha256": landing_proof["sha256"],
+        "candidate_sha256": candidate_sha256,
+        "scope_sha256": scope_sha256,
+        "schema_sha256": _historical_landing_schema_sha256(),
+        "code_sha256": _historical_resume_code_identity(),
+        "adoption_origin_sha256": adoption_origin_sha256,
+    }
+    result = landing_proof["result"]
+    source = source_proof["result"]
+    return historical_resume.proof_record(
+        "historical-readiness",
+        binding,
+        {
+            "candidate_size": candidate_size,
+            "source_sha256": source["source_sha256"],
+            "source_size": source["source_size"],
+            "source_wal_sha256": source["source_wal_sha256"],
+            "source_wal_size": source["source_wal_size"],
+            "observation_count": result["observation_count"],
+            "membership_count": result["membership_count"],
+            "eligibility_count": result["eligibility_count"],
+            "prefix_replay_rows": result.get("prefix_replay_rows", 0),
+            "prefix_replay_policy": result.get("prefix_replay_policy"),
+        },
+    )
+
+
+def _persist_historical_readiness_proof(
+    store: Store, stage_relative: str, proof: dict[str, Any]
+) -> None:
+    relative = f"{stage_relative}/resume-readiness.json"
+    path = store.path(relative)
+    store.write(relative, proof)
+    if decode(regular_bytes(path, 1024**2)) != proof:
+        raise CatalogueError("historical readiness seal failed readback")
+    fsync_file(path)
+    fsync_directory(path.parent)
+
+
+def _verify_historical_readiness_locked(
+    store: Store,
+    capture_id: str,
+    stage_name: str,
+    *,
+    _verified_mount: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], Path, dict[str, Any]]:
+    stage_relative, stage, state, selection, task_indices = _historical_readiness_context(
+        store, capture_id, stage_name
+    )
+    if _verified_mount is not None:
+        historical_resume.validate_resume_mount_context(
+            store=store, state=state, verified_mount=_verified_mount
+        )
+    candidate_relative = f"{stage_relative}/resume-candidate"
+    candidate = store.path(candidate_relative)
+    database = candidate / "warehouse.duckdb"
+    wal = database.with_name(database.name + ".wal")
+    if wal.exists() or wal.is_symlink():
+        raise CatalogueError("historical readiness candidate has an uncheckpointed WAL")
+    source_proof, source_result = _read_source_proof(store, state, stage_name, candidate)
+    adoption_path = store.path(f"{stage_relative}/resume-adoption.json")
+    cleanup_path = store.path(f"{stage_relative}/resume-cleanup-intent.json")
+    adoption_origin_sha256 = None
+    if adoption_path.exists() or adoption_path.is_symlink():
+        adoption, _adoption_result = _validate_historical_adoption_origin(
+            store, state, stage_name, source_proof, source_result
+        )
+        adoption_origin_sha256 = adoption["sha256"]
+    _validate_historical_resume_source_presence(
+        store,
+        stage / "warehouse.duckdb",
+        stage / "warehouse.duckdb.wal",
+        source_result,
+        adopted=adoption_path.is_file() and not adoption_path.is_symlink(),
+        cleanup_intent=cleanup_path,
+        stage_name=stage_name,
+        state=state,
+        source_proof_sha256=source_proof["sha256"],
+        _verified_mount=_verified_mount,
+    )
+    candidate_sha256, _candidate_size = _resume_file_digest(
+        store, database, store.limits.max_database_bytes
+    )
+    readiness_path = store.path(f"{stage_relative}/resume-readiness.json")
+    loaded = _load_self_proof(readiness_path, "historical-readiness")
+    if loaded is None:
+        raise CatalogueError("historical readiness seal is missing")
+    readiness_proof, readiness_result = loaded
+    binding = readiness_proof["binding"]
+    landing_sha256 = binding.get("landing_proof_sha256")
+    expected_binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": capture_id,
+        "state_sha256": digest(json_bytes(dict(state))),
+        "source_proof_sha256": source_proof["sha256"],
+        "landing_proof_sha256": landing_sha256,
+        "candidate_sha256": candidate_sha256,
+        "scope_sha256": _historical_scope_sha256(state, selection, task_indices),
+        "schema_sha256": _historical_landing_schema_sha256(),
+        "code_sha256": _historical_resume_code_identity(),
+        "adoption_origin_sha256": adoption_origin_sha256,
+    }
+    if binding != expected_binding:
+        raise CatalogueError("historical readiness proof does not match its candidate")
+    if not isinstance(landing_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", landing_sha256) is None:
+        raise CatalogueError("historical readiness landing proof identity is invalid")
+    landing_path = candidate / f"resume-landing-{landing_sha256}.json"
+    landing_loaded = _load_self_proof(landing_path, "historical-landing")
+    if landing_loaded is None or landing_loaded[0].get("sha256") != binding.get(
+        "landing_proof_sha256"
+    ):
+        raise CatalogueError("historical readiness landing proof is missing")
+    landing_proof, landing_result = landing_loaded
+    expected_landing_binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": capture_id,
+        "state_sha256": digest(json_bytes(dict(state))),
+        "historical_selection": selection,
+        "task_indices": sorted(task_indices),
+        "code_sha256": _historical_resume_code_identity(),
+        "candidate_sha256": candidate_sha256,
+        "source_proof_sha256": source_proof["sha256"],
+        "scope_sha256": _historical_scope_sha256(state, selection, task_indices),
+        "schema_sha256": _historical_landing_schema_sha256(),
+    }
+    if any(
+        landing_proof["binding"].get(key) != value
+        for key, value in expected_landing_binding.items()
+    ):
+        raise CatalogueError("historical readiness landing proof has a mismatched binding")
+    if any(
+        readiness_result.get(key) != landing_result.get(key)
+        for key in ("observation_count", "membership_count", "eligibility_count")
+    ):
+        raise CatalogueError("historical readiness counts differ from landing proof")
+
+    verified_pages: dict[str, str] = {}
+    for _manifest, _payload in capture_pages(
+        store, state, evidence=verified_pages, task_indices=task_indices
+    ):
+        store.check_deadline()
+    operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+    if landing_proof["binding"].get("evidence_sha256") != digest(
+        json_bytes(operation_evidence.evidence)
+    ):
+        raise CatalogueError("historical readiness evidence differs from its landing proof")
+    try:
+        with (
+            duckdb.connect(
+                str(database), read_only=True, config=_historical_read_only_config()
+            ) as connection,
+        ):
+            _check_historical_landing_schemas(connection)
+            counts = {
+                "observation_count": connection.execute(
+                    "select count(*) from landing.observations"
+                ).fetchone()[0],
+                "membership_count": connection.execute(
+                    "select count(*) from landing.membership"
+                ).fetchone()[0],
+                "eligibility_count": connection.execute(
+                    "select count(*) from landing.parent_eligibility"
+                ).fetchone()[0],
+            }
+    except duckdb.Error as exc:
+        raise CatalogueError("historical readiness candidate is invalid") from exc
+    if any(counts[key] != readiness_result.get(key) for key in counts):
+        raise CatalogueError("historical readiness candidate counts changed")
+    _check_historical_coverage(database, capture_id, state.get("complete") is True)
+    verification_binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": capture_id,
+        "state_sha256": digest(json_bytes(dict(state))),
+        "readiness_sha256": readiness_proof["sha256"],
+        "candidate_sha256": candidate_sha256,
+        "evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
+        "code_sha256": _historical_resume_code_identity(),
+        "adoption_origin_sha256": adoption_origin_sha256,
+    }
+    verification = historical_resume.proof_record(
+        "historical-readiness-verification", verification_binding, counts
+    )
+    return verification, readiness_proof, candidate, source_result
+
+
+def historical_readiness_snapshot(
+    store: Store,
+    capture_id: str,
+    stage_name: str,
+    *,
+    _verified_mount: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pin a historical stage's source files and receipt evidence without opening its database."""
+    with store.writer_guard():
+        stage_relative, stage, state, selection, task_indices = _historical_readiness_context(
+            store, capture_id, stage_name
+        )
+        if _verified_mount is not None:
+            historical_resume.validate_resume_mount_context(
+                store=store, state=state, verified_mount=_verified_mount
+            )
+        source = stage / "warehouse.duckdb"
+        source_wal = source.with_name(source.name + ".wal")
+        try:
+            source_identity = _resume_file_identity(source)
+            source_sha256, source_size = _resume_file_digest(
+                store, source, store.limits.max_database_bytes
+            )
+            source_wal_identity = _resume_file_identity(source_wal) if source_wal.exists() else None
+            source_wal_sha256, source_wal_size = (
+                _resume_file_digest(store, source_wal, store.limits.max_database_bytes)
+                if source_wal_identity is not None
+                else (None, 0)
+            )
+        except OSError as exc:
+            raise CatalogueError("historical source snapshot is missing or unsafe") from exc
+        if _resume_file_identity(source) != source_identity or _resume_file_digest(
+            store, source, store.limits.max_database_bytes
+        ) != (source_sha256, source_size):
+            raise CatalogueError("historical source database changed during snapshot")
+        current_wal_identity = _resume_file_identity(source_wal) if source_wal.exists() else None
+        if current_wal_identity != source_wal_identity or (
+            source_wal_identity is not None
+            and _resume_file_digest(store, source_wal, store.limits.max_database_bytes)
+            != (source_wal_sha256, source_wal_size)
+        ):
+            raise CatalogueError("historical source WAL changed during snapshot")
+
+        verified_pages: dict[str, str] = {}
+        receipt_count = 0
+        for _manifest, _payload in capture_pages(
+            store, state, evidence=verified_pages, task_indices=task_indices
+        ):
+            store.check_deadline()
+            receipt_count += 1
+        operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+        state_sha256 = digest(json_bytes(dict(state)))
+        evidence_sha256 = digest(json_bytes(operation_evidence.evidence))
+        if _resume_file_identity(source) != source_identity or _resume_file_digest(
+            store, source, store.limits.max_database_bytes
+        ) != (source_sha256, source_size):
+            raise CatalogueError("historical source database changed during snapshot")
+        current_wal_identity = _resume_file_identity(source_wal) if source_wal.exists() else None
+        if current_wal_identity != source_wal_identity or (
+            source_wal_identity is not None
+            and _resume_file_digest(store, source_wal, store.limits.max_database_bytes)
+            != (source_wal_sha256, source_wal_size)
+        ):
+            raise CatalogueError("historical source WAL changed during snapshot")
+        scope_sha256 = _historical_scope_sha256(state, selection, task_indices)
+        binding = {
+            "root": str(store.root.resolve()),
+            "stage": stage_name,
+            "capture_id": capture_id,
+            "capture_state_sha256": state_sha256,
+            "scope_sha256": scope_sha256,
+            "code_sha256": _historical_resume_code_identity(),
+        }
+        return historical_resume.proof_record(
+            "historical-source-snapshot",
+            binding,
+            {
+                "source_identity": list(source_identity),
+                "source_sha256": source_sha256,
+                "source_size": source_size,
+                "source_wal_identity": (
+                    list(source_wal_identity) if source_wal_identity is not None else None
+                ),
+                "source_wal_sha256": source_wal_sha256,
+                "source_wal_size": source_wal_size,
+                "receipt_count": receipt_count,
+                "receipt_evidence_sha256": evidence_sha256,
+            },
+        )
+
+
+def prepare_historical_readiness(
+    store: Store,
+    capture_id: str,
+    stage_name: str,
+    *,
+    _verified_mount: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Copy and fully prove a historical stage, leaving its source intact for independent review."""
+    with store.writer_guard():
+        store.require_writable()
+        stage_relative, _stage, state, selection, task_indices = _historical_readiness_context(
+            store, capture_id, stage_name
+        )
+        candidate_relative, candidate, source_proof_sha256, recovered_wal = (
+            _prepare_historical_resume_candidate(
+                store, state, stage_name, _verified_mount=_verified_mount
+            )
+        )
+        source_proof, source_result = _read_source_proof(store, state, stage_name, candidate)
+        index = DiskParentIndex(store, collect_winners=False)
+        try:
+            observation_count, verified_pages, operation_evidence, landing_proof = (
+                _resume_historical_landing(
+                    store,
+                    state,
+                    stage_name,
+                    candidate_relative,
+                    candidate,
+                    source_proof_sha256,
+                    index,
+                    task_indices,
+                    selection,
+                    force_revalidate=recovered_wal,
+                )
+            )
+        finally:
+            index.close()
+        adoption_path = store.path(f"{stage_relative}/resume-adoption.json")
+        if adoption_path.exists() or adoption_path.is_symlink():
+            adoption, adoption_result = _validate_historical_adoption_origin(
+                store, state, stage_name, source_proof, source_result
+            )
+            readiness_proof = _historical_readiness_proof(
+                store,
+                state,
+                stage_name,
+                candidate,
+                source_proof,
+                landing_proof,
+                selection,
+                task_indices,
+                adoption_origin_sha256=adoption["sha256"],
+            )
+            _persist_historical_readiness_proof(store, stage_relative, readiness_proof)
+            summary = {
+                "ready": True,
+                "adopted": True,
+                "capture_id": capture_id,
+                "stage": stage_name,
+                "adoption_sha256": adoption["sha256"],
+                "readiness_sha256": readiness_proof["sha256"],
+                "capture_state_sha256": digest(json_bytes(dict(state))),
+                "candidate_sha256": _resume_file_digest(
+                    store, candidate / "warehouse.duckdb", store.limits.max_database_bytes
+                )[0],
+                "origin_candidate_sha256": adoption_result["candidate_sha256"],
+                "source_sha256": source_result["source_sha256"],
+                "source_wal_sha256": source_result["source_wal_sha256"],
+                "observation_count": observation_count,
+                "membership_count": landing_proof["result"]["membership_count"],
+                "eligibility_count": landing_proof["result"]["eligibility_count"],
+                "scope_sha256": _historical_scope_sha256(state, selection, task_indices),
+                "code_sha256": _historical_resume_code_identity(),
+                "prefix_replay_rows": landing_proof["result"].get("prefix_replay_rows", 0),
+                "evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
+                "receipt_evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
+            }
+            return summary
+        readiness_proof = _historical_readiness_proof(
+            store,
+            state,
+            stage_name,
+            candidate,
+            source_proof,
+            landing_proof,
+            selection,
+            task_indices,
+        )
+        _persist_historical_readiness_proof(store, stage_relative, readiness_proof)
+        summary = {
+            "ready": True,
+            "adopted": False,
+            "capture_id": capture_id,
+            "stage": stage_name,
+            "readiness_sha256": readiness_proof["sha256"],
+            "capture_state_sha256": digest(json_bytes(dict(state))),
+            "source_sha256": source_result["source_sha256"],
+            "source_wal_sha256": source_result["source_wal_sha256"],
+            "candidate_sha256": readiness_proof["binding"]["candidate_sha256"],
+            "observation_count": observation_count,
+            "membership_count": landing_proof["result"]["membership_count"],
+            "eligibility_count": landing_proof["result"]["eligibility_count"],
+            "scope_sha256": readiness_proof["binding"]["scope_sha256"],
+            "code_sha256": readiness_proof["binding"]["code_sha256"],
+            "prefix_replay_rows": readiness_proof["result"]["prefix_replay_rows"],
+            "evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
+            "receipt_evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
+        }
+        return summary
+
+
+def verify_historical_readiness(
+    store: Store,
+    capture_id: str,
+    stage_name: str,
+    *,
+    _verified_mount: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read back the closed candidate and readiness proof without changing stage files."""
+    with store.writer_guard():
+        store.require_writable()
+        verification, _readiness, _candidate, _source = _verify_historical_readiness_locked(
+            store, capture_id, stage_name, _verified_mount=_verified_mount
+        )
+        return verification
+
+
+def adopt_historical_readiness(
+    store: Store,
+    capture_id: str,
+    stage_name: str,
+    verification_receipt: dict[str, Any],
+    *,
+    retire_source: bool = False,
+    retirement_policy: str | None = None,
+    _verified_mount: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bind a separate verification receipt to the candidate, optionally retiring its source."""
+    if not isinstance(retire_source, bool):
+        raise CatalogueError("historical source retirement flag must be boolean")
+    if retire_source and retirement_policy != "coexistence-capacity-relief-approved-v1":
+        raise CatalogueError("historical source retirement lacks its approved capacity policy")
+    if not retire_source and retirement_policy is not None:
+        raise CatalogueError("historical source retirement policy requires explicit retirement")
+    with store.writer_guard():
+        store.require_writable()
+        verification, readiness, _candidate, source_result = _verify_historical_readiness_locked(
+            store, capture_id, stage_name, _verified_mount=_verified_mount
+        )
+        stage_relative = historical_resume.stage_relative(stage_name)
+        state = read_capture(store, capture_id)
+        source_proof_path = store.path(f"{stage_relative}/resume-candidate/resume-source.json")
+        source_proof, _source_result = _read_source_proof(
+            store, state, stage_name, source_proof_path.parent
+        )
+        adoption_path = store.path(f"{stage_relative}/resume-adoption.json")
+        cleanup_path = store.path(f"{stage_relative}/resume-cleanup-intent.json")
+        if adoption_path.exists() or adoption_path.is_symlink():
+            adoption, adoption_result = _validate_historical_adoption_origin(
+                store, state, stage_name, source_proof, source_result
+            )
+            if (
+                verification_receipt != verification
+                and not _historical_cleanup_retry_receipt_matches(
+                    store,
+                    state,
+                    stage_name,
+                    source_proof,
+                    source_result,
+                    readiness,
+                    verification,
+                    verification_receipt,
+                    adoption,
+                    adoption_result,
+                    cleanup_path,
+                )
+            ):
+                raise CatalogueError(
+                    "historical readiness verification receipt does not match readback"
+                )
+        else:
+            if verification_receipt != verification:
+                raise CatalogueError(
+                    "historical readiness verification receipt does not match readback"
+                )
+            adoption_binding = {
+                "root": str(store.root.resolve()),
+                "stage": stage_name,
+                "capture_id": capture_id,
+                "state_sha256": digest(json_bytes(dict(read_capture(store, capture_id)))),
+                "source_proof_sha256": source_proof["sha256"],
+                "readiness_sha256": readiness["sha256"],
+                "verification_sha256": verification["sha256"],
+                "candidate_sha256": readiness["binding"]["candidate_sha256"],
+                "code_sha256": readiness["binding"]["code_sha256"],
+            }
+            adoption_proof = historical_resume.proof_record(
+                "historical-adoption",
+                adoption_binding,
+                {
+                    "source_identity": source_result["source_identity"],
+                    "source_sha256": source_result["source_sha256"],
+                    "source_size": source_result["source_size"],
+                    "source_wal_identity": source_result["source_wal_identity"],
+                    "source_wal_sha256": source_result["source_wal_sha256"],
+                    "source_wal_size": source_result["source_wal_size"],
+                    "candidate_sha256": readiness["binding"]["candidate_sha256"],
+                    "observation_count": readiness["result"]["observation_count"],
+                    "membership_count": readiness["result"]["membership_count"],
+                    "eligibility_count": readiness["result"]["eligibility_count"],
+                },
+            )
+            relative = f"{stage_relative}/resume-adoption.json"
+            store.write(relative, adoption_proof)
+            if decode(regular_bytes(adoption_path, 1024**2)) != adoption_proof:
+                raise CatalogueError("historical adoption record failed readback")
+            fsync_file(adoption_path)
+            fsync_directory(adoption_path.parent)
+            adoption, adoption_result = adoption_proof, adoption_proof["result"]
+
+        stage_relative, _stage, state, selection, task_indices = _historical_readiness_context(
+            store, capture_id, stage_name
+        )
+        candidate_relative = f"{stage_relative}/resume-candidate"
+        landing_loaded = _load_self_proof(
+            store.path(f"{candidate_relative}/resume-landing.json"), "historical-landing"
+        )
+        if landing_loaded is None:
+            raise CatalogueError("adopted historical candidate lost its landing proof")
+        current_readiness = _historical_readiness_proof(
+            store,
+            state,
+            stage_name,
+            store.path(candidate_relative),
+            source_proof,
+            landing_loaded[0],
+            selection,
+            task_indices,
+            adoption_origin_sha256=adoption["sha256"],
+        )
+        _persist_historical_readiness_proof(store, stage_relative, current_readiness)
+        _write_historical_candidate_phase(
+            store,
+            state,
+            stage_name,
+            candidate_relative,
+            store.path(candidate_relative),
+            source_proof["sha256"],
+            selection,
+            task_indices,
+            landing_loaded[0],
+            "landing-ready",
+        )
+
+        if retire_source:
+            intent_binding = {
+                "root": str(store.root.resolve()),
+                "stage": stage_name,
+                "capture_id": capture_id,
+                "state_sha256": digest(json_bytes(dict(read_capture(store, capture_id)))),
+                "source_proof_sha256": source_proof["sha256"],
+                "adoption_sha256": adoption["sha256"],
+                "retirement_policy": retirement_policy,
+            }
+            intent = historical_resume.proof_record(
+                "historical-source-cleanup",
+                intent_binding,
+                {
+                    "retire_source": True,
+                    "source_identity": source_result["source_identity"],
+                    "source_sha256": source_result["source_sha256"],
+                    "source_size": source_result["source_size"],
+                    "source_wal_identity": source_result["source_wal_identity"],
+                    "source_wal_sha256": source_result["source_wal_sha256"],
+                    "source_wal_size": source_result["source_wal_size"],
+                },
+            )
+            intent_path = store.path(f"{stage_relative}/resume-cleanup-intent.json")
+            if intent_path.exists() or intent_path.is_symlink():
+                existing = decode(regular_bytes(intent_path, 1024**2))
+                if existing != intent:
+                    raise CatalogueError("historical source cleanup intent conflicts with adoption")
+            else:
+                store.write(f"{stage_relative}/resume-cleanup-intent.json", intent)
+            if decode(regular_bytes(intent_path, 1024**2)) != intent:
+                raise CatalogueError("historical source cleanup intent failed readback")
+            fsync_file(intent_path)
+            fsync_directory(intent_path.parent)
+            source = store.path(f"{stage_relative}/warehouse.duckdb")
+            source_wal = source.with_name(source.name + ".wal")
+            _validate_historical_resume_source_presence(
+                store,
+                source,
+                source_wal,
+                source_result,
+                adopted=True,
+                cleanup_intent=intent_path,
+                stage_name=stage_name,
+                state=read_capture(store, capture_id),
+                source_proof_sha256=source_proof["sha256"],
+                _verified_mount=_verified_mount,
+            )
+            for path, expected_identity, expected_sha in (
+                (source, source_result["source_identity"], source_result["source_sha256"]),
+                (
+                    source_wal,
+                    source_result["source_wal_identity"],
+                    source_result["source_wal_sha256"],
+                ),
+            ):
+                if expected_identity is None:
+                    continue
+                if path.exists() or path.is_symlink():
+                    if (
+                        path.is_symlink()
+                        or not historical_resume.resume_file_identity_matches(
+                            expected_identity,
+                            _resume_file_identity(path),
+                            store=store,
+                            state=state,
+                            verified_mount=_verified_mount,
+                        )
+                        or _resume_file_digest(store, path, store.limits.max_database_bytes)[0]
+                        != expected_sha
+                    ):
+                        raise CatalogueError("historical source changed during approved cleanup")
+                    path.unlink()
+            fsync_directory(store.path(stage_relative))
+            store.sync(stage_relative)
+
+        return {
+            "adopted": True,
+            "capture_id": capture_id,
+            "stage": stage_name,
+            "adoption_sha256": adoption["sha256"],
+            "readiness_sha256": current_readiness["sha256"],
+            "candidate_sha256": readiness["binding"]["candidate_sha256"],
+            "origin_candidate_sha256": adoption_result["candidate_sha256"],
+            "capture_state_sha256": digest(json_bytes(dict(read_capture(store, capture_id)))),
+            "source_sha256": adoption_result["source_sha256"],
+            "source_wal_sha256": adoption_result["source_wal_sha256"],
+            "receipt_evidence_sha256": verification["binding"]["evidence_sha256"],
+            "source_retired": retire_source,
+            "cleanup_intent_sha256": (
+                decode(
+                    regular_bytes(
+                        store.path(f"{stage_relative}/resume-cleanup-intent.json"), 1024**2
+                    )
+                )["sha256"]
+                if retire_source
+                else None
+            ),
+        }
 
 
 def _compare_resumed_membership(
@@ -3124,6 +4485,32 @@ def _compare_resumed_membership(
     return membership_count, eligibility_count
 
 
+def _check_historical_landing_schemas(connection: duckdb.DuckDBPyConnection) -> None:
+    historical_resume._logical_schema(
+        connection,
+        _LANDING_COLUMNS,
+        {"provider_updated_at", "event_ticker", "series_ticker", "task_scope"},
+    )
+    expected = {
+        "membership": [
+            ("scope", "VARCHAR"),
+            ("entity_kind", "VARCHAR"),
+            ("entity_ticker", "VARCHAR"),
+        ],
+        "parent_eligibility": [
+            ("capture_id", "VARCHAR"),
+            ("entity_kind", "VARCHAR"),
+            ("entity_ticker", "VARCHAR"),
+            ("status", "INTEGER"),
+            ("receipt", "VARCHAR"),
+        ],
+    }
+    for table, schema in expected.items():
+        description = connection.execute(f"describe landing.{table}").fetchall()
+        if [(row[0], row[1].upper()) for row in description] != schema:
+            raise CatalogueError(f"resumed historical landing.{table} schema is invalid")
+
+
 def _resume_historical_landing(
     store: Store,
     state: dict[str, Any],
@@ -3134,42 +4521,162 @@ def _resume_historical_landing(
     index: DiskParentIndex,
     task_indices: set[int],
     selection: dict[str, Any],
+    *,
+    force_revalidate: bool = False,
 ) -> tuple[int, dict[str, str], _OperationEvidence, dict[str, Any]]:
-    from kalshi_events.historical_resume import compare_landing_rows
+    from kalshi_events.historical_resume import (
+        compare_landing_rows_resumable,
+        resume_landing_cursor,
+    )
 
     verified_pages: dict[str, str] = {}
-    landing = _iter_historical_landing_rows(
-        store,
-        state,
-        verified_pages=verified_pages,
-        parent_index=index,
-        task_indices=task_indices,
-    )
-    expected_rows = (tuple(row[name] for name in _LANDING_COLUMNS) for row in landing)
     database = candidate / "warehouse.duckdb"
-    with (
-        _duckdb_work_config(store, candidate) as config,
-        duckdb.connect(str(database), read_only=True, config=config) as connection,
-        interrupt_at_deadline(store, connection.interrupt),
-        metrics.phase("recovery_validation"),
-        metrics.phase("historical_resume_validation"),
-    ):
-        observation_count = compare_landing_rows(
-            connection,
-            iter(expected_rows),
-            _LANDING_COLUMNS,
-            nullable={"provider_updated_at", "event_ticker", "series_ticker", "task_scope"},
-            check_deadline=store.check_deadline,
+    if not force_revalidate:
+        reused = _reuse_historical_candidate_phase(
+            store,
+            state,
+            stage_name,
+            candidate_relative,
+            candidate,
+            source_proof_sha256,
+            selection,
+            task_indices,
+            verified_pages,
         )
-        membership_count, eligibility_count = _compare_resumed_membership(
-            connection, state, index, store
-        )
-    if landing.observation_count != observation_count:
-        raise CatalogueError("historical resume census changed during landing validation")
-    _check_historical_coverage(database, state["capture_id"], state.get("complete") is True)
-    operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+        if reused is not None:
+            observation_count, operation_evidence, proof = reused
+            return observation_count, verified_pages, operation_evidence, proof
+    candidate_sha256, _candidate_size = _resume_file_digest(
+        store, database, store.limits.max_database_bytes
+    )
+    schema_sha256 = _historical_landing_schema_sha256()
+    scope_sha256 = _historical_scope_sha256(state, selection, task_indices)
     code_sha256 = _historical_resume_code_identity()
     binding = {
+        "root": str(store.root.resolve()),
+        "stage": stage_name,
+        "capture_id": state["capture_id"],
+        "state_sha256": digest(json_bytes(dict(state))),
+        "candidate_sha256": candidate_sha256,
+        "source_proof_sha256": source_proof_sha256,
+        "historical_selection": selection,
+        "task_indices": sorted(task_indices),
+        "scope_sha256": scope_sha256,
+        "schema_sha256": schema_sha256,
+        "code_sha256": code_sha256,
+        "normalization_policy": "historical-landing-v1",
+        "deduplication_policy": "disk-page-id-context-v1",
+    }
+    cursor_relative = f"{candidate_relative}/resume-landing-cursor.json"
+    cursor_path = store.path(cursor_relative)
+    cursor = None
+    if cursor_path.is_symlink():
+        raise CatalogueError("historical landing cursor is unsafe")
+    if cursor_path.exists() and not force_revalidate:
+        try:
+            cursor = decode(regular_bytes(cursor_path, 1024**2))
+        except (CatalogueError, OSError):
+            cursor = None
+    selected_receipt_count = 0
+    for _receipt in _iter_page_receipts(store, state, task_indices=task_indices):
+        store.check_deadline()
+        selected_receipt_count += 1
+    # Check the candidate before reserving the disposable page index.
+    try:
+        with (
+            _duckdb_work_config(store, candidate) as config,
+            duckdb.connect(str(database), read_only=True, config=config) as count_connection,
+            interrupt_at_deadline(store, count_connection.interrupt),
+        ):
+            store.check_deadline()
+            candidate_rows = count_connection.execute(
+                "select count(*) from landing.observations"
+            ).fetchone()[0]
+            store.check_deadline()
+    except duckdb.InterruptException as exc:
+        raise BudgetExceeded(
+            "operation deadline exhausted counting historical candidate observations"
+        ) from exc
+    except duckdb.Error as exc:
+        raise CatalogueError("historical resume candidate landing schema is invalid") from exc
+    if isinstance(cursor, dict):
+        result = cursor.get("result")
+        if (
+            isinstance(result, dict)
+            and isinstance(result.get("observation_position"), int)
+            and result["observation_position"] > candidate_rows
+        ):
+            cursor = None
+    page_index = historical_resume.PageContextIndex(
+        store,
+        f"{candidate_relative}/resume-page-index.sqlite",
+        max_entries=selected_receipt_count,
+    )
+
+    def expected_rows():
+        page_index.reset()
+        landing = _iter_historical_landing_rows(
+            store,
+            state,
+            verified_pages=verified_pages,
+            parent_index=index,
+            task_indices=task_indices,
+            page_index=page_index,
+            with_positions=True,
+        )
+        yield from landing
+
+    expected_stream = None
+    try:
+        (
+            expected_stream,
+            prefix_checksum,
+            start_position,
+            last_position,
+            replayed_prefix_rows,
+        ) = resume_landing_cursor(
+            expected_rows,
+            cursor,
+            binding,
+            check_deadline=store.check_deadline,
+        )
+
+        def save_cursor(proof: dict[str, Any]) -> None:
+            store.write(cursor_relative, proof)
+            fsync_file(cursor_path)
+            fsync_directory(candidate)
+
+        with (
+            _duckdb_work_config(store, candidate) as config,
+            duckdb.connect(str(database), read_only=True, config=config) as connection,
+            interrupt_at_deadline(store, connection.interrupt),
+            metrics.phase("recovery_validation"),
+            metrics.phase("historical_resume_validation"),
+        ):
+            observation_count, cursor_result = compare_landing_rows_resumable(
+                connection,
+                expected_stream,
+                _LANDING_COLUMNS,
+                nullable={"provider_updated_at", "event_ticker", "series_ticker", "task_scope"},
+                check_deadline=store.check_deadline,
+                binding=binding,
+                save_cursor=save_cursor,
+                start_position=start_position,
+                prefix_checksum=prefix_checksum,
+                last_position=last_position,
+                replayed_prefix_rows=replayed_prefix_rows,
+            )
+            membership_count, eligibility_count = _compare_resumed_membership(
+                connection, state, index, store
+            )
+    finally:
+        close = getattr(expected_stream, "close", None)
+        if close is not None:
+            close()
+        page_index.close()
+    _check_historical_coverage(database, state["capture_id"], state.get("complete") is True)
+    operation_evidence = _operation_evidence(store, state, 3, verified_pages)
+    landing_binding = {
         "root": str(store.root.resolve()),
         "stage": stage_name,
         "capture_id": state["capture_id"],
@@ -3177,22 +4684,48 @@ def _resume_historical_landing(
         "historical_selection": selection,
         "task_indices": sorted(task_indices),
         "code_sha256": code_sha256,
+        "candidate_sha256": candidate_sha256,
         "source_proof_sha256": source_proof_sha256,
+        "scope_sha256": scope_sha256,
+        "schema_sha256": schema_sha256,
         "evidence_sha256": digest(json_bytes(operation_evidence.evidence)),
     }
     proof = historical_resume.proof_record(
         "historical-landing",
-        binding,
+        landing_binding,
         {
             "observation_count": observation_count,
             "membership_count": membership_count,
             "eligibility_count": eligibility_count,
+            "cursor_sha256": digest(json_bytes(cursor_result)),
+            "prefix_replay_rows": replayed_prefix_rows,
+            "prefix_replay_policy": "normalize-deduplicate-and-digest-v1",
         },
     )
-    proof_relative = f"{candidate_relative}/resume-landing.json"
-    store.write(proof_relative, proof)
-    fsync_file(store.path(proof_relative))
+    proof_relative = f"{candidate_relative}/resume-landing-{proof['sha256']}.json"
+    proof_path = store.path(proof_relative)
+    if proof_path.exists() or proof_path.is_symlink():
+        if decode(regular_bytes(proof_path, 1024**2)) != proof:
+            raise CatalogueError("historical landing proof conflicts with its immutable identity")
+    else:
+        store.write(proof_relative, proof)
+    alias_relative = f"{candidate_relative}/resume-landing.json"
+    store.write(alias_relative, proof)
+    fsync_file(proof_path)
+    fsync_file(store.path(alias_relative))
     fsync_directory(candidate)
+    _write_historical_candidate_phase(
+        store,
+        state,
+        stage_name,
+        candidate_relative,
+        candidate,
+        source_proof_sha256,
+        selection,
+        task_indices,
+        proof,
+        "landing-ready",
+    )
     return observation_count, verified_pages, operation_evidence, proof
 
 
@@ -3502,19 +5035,29 @@ def _full_historical_build(
     *,
     rebuild: bool,
     resume_historical_stage: str | None,
+    _verified_mount: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     capture_id = state["capture_id"]
     selection, task_indices = _historical_profile(state)
     stage_name = resume_historical_stage
     source_proof_sha256: str | None = None
+    candidate_recovered_wal = False
     resumed = stage_name is not None
     if resumed:
         stage_relative = historical_resume.stage_relative(stage_name)
         recover_and_cleanup_abandoned_historical_stages(
-            store, capture_id, preserve_stage=stage_name
+            store,
+            capture_id,
+            preserve_stage=stage_name,
+            _verified_mount=_verified_mount,
         )
-        staging_relative, staging, source_proof_sha256 = _prepare_historical_resume_candidate(
-            store, state, stage_name
+        (
+            staging_relative,
+            staging,
+            source_proof_sha256,
+            candidate_recovered_wal,
+        ) = _prepare_historical_resume_candidate(
+            store, state, stage_name, _verified_mount=_verified_mount
         )
         previous_path = staging / "build-artifacts.json"
         if not previous_path.exists():
@@ -3546,6 +5089,7 @@ def _full_historical_build(
                     index,
                     task_indices,
                     selection,
+                    force_revalidate=candidate_recovered_wal,
                 )
             )
         else:
@@ -3606,6 +5150,45 @@ def _full_historical_build(
         operation_evidence = _operation_evidence(store, state, 3, verified_pages)
         fsync_file(database)
         fsync_directory(staging)
+        if resumed:
+            assert stage_name is not None and source_proof_sha256 is not None
+            _write_historical_candidate_phase(
+                store,
+                state,
+                stage_name,
+                staging_relative,
+                staging,
+                source_proof_sha256,
+                selection,
+                task_indices,
+                landing_proof,
+                "dbt-complete",
+            )
+        historical_adoption = None
+        if resumed:
+            assert stage_name is not None
+            adoption_proof = _historical_adoption_record(store, stage_name)
+            if adoption_proof is not None:
+                source_proof, source_result = _read_source_proof(store, state, stage_name, staging)
+                _validate_historical_adoption_origin(
+                    store, state, stage_name, source_proof, source_result
+                )
+                adoption_result = adoption_proof["result"]
+                historical_adoption = {
+                    "stage": stage_name,
+                    "sha256": adoption_proof["sha256"],
+                    "source_proof_sha256": source_proof["sha256"],
+                    "candidate_sha256": adoption_result["candidate_sha256"],
+                    "source_sha256": adoption_result["source_sha256"],
+                    "source_wal_sha256": adoption_result["source_wal_sha256"],
+                }
+                adoption_relative = f"{staging_relative}/historical-adoption.json"
+                adoption_path = store.path(adoption_relative)
+                store.write(adoption_relative, adoption_proof)
+                if decode(regular_bytes(adoption_path, 1024**2)) != adoption_proof:
+                    raise CatalogueError("installed historical adoption lineage failed readback")
+                fsync_file(adoption_path)
+                fsync_directory(staging)
         receipt = {
             **_historical_receipt_fields(state),
             "capture_id": capture_id,
@@ -3615,17 +5198,26 @@ def _full_historical_build(
             "observation_count": observation_count,
             "warehouse_sha256": file_digest(database, store.limits.max_database_bytes)[0],
             "dbt_artifacts_sha256": digest(regular_bytes(staging / "build-artifacts.json")),
+            **({"historical_adoption": historical_adoption} if historical_adoption else {}),
         }
         store.write(f"{staging_relative}/build.json", receipt)
         fsync_directory(staging)
         promoted = _install_build(store, capture_id, 3, staging, operation_evidence)
         store.check_storage()
-        for name in ("resume-source.json", "resume-landing.json", "resume-combo.json"):
-            relative = f"{build_directory(capture_id, 3)}/{name}"
-            if store.path(relative).exists():
-                store.remove(relative)
+        installed_relative = build_directory(capture_id, 3)
+        installed = store.path(installed_relative)
+        with os.scandir(installed) as entries:
+            resume_files = [
+                f"{installed_relative}/{entry.name}"
+                for entry in entries
+                if entry.name.startswith("resume-")
+            ]
+        for relative in resume_files:
+            store.remove(relative)
+        fsync_directory(installed)
         if resumed:
             store.remove(historical_resume.stage_relative(stage_name))
+            fsync_directory(store.path("tmp"))
         return promoted
     finally:
         if isinstance(index, DiskParentIndex) and not index_closed:
@@ -3648,6 +5240,7 @@ def _full_v2_build(
     rebuild: bool,
     historical: bool = False,
     resume_historical_stage: str | None = None,
+    _verified_mount: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     capture_id = state["capture_id"]
     if historical:
@@ -3656,6 +5249,7 @@ def _full_v2_build(
             state,
             rebuild=rebuild,
             resume_historical_stage=resume_historical_stage,
+            _verified_mount=_verified_mount,
         )
     if not state.get("task_scopes") and any(
         int(work.get("restarts", 0)) > 0 for work in state.get("tasks", [])
@@ -3757,6 +5351,7 @@ def build_historical(
     *,
     rebuild: bool = False,
     resume_historical_stage: str | None = None,
+    _verified_mount: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with store.writer_guard():
         store.require_writable()
@@ -3768,6 +5363,12 @@ def build_historical(
                 _validate_historical_stage(store.path(resume_relative), store.root.lstat().st_dev)
             except FileNotFoundError as exc:
                 raise CatalogueError("requested historical resume stage is missing") from exc
+        if _verified_mount is not None:
+            historical_resume.validate_resume_mount_context(
+                store=store,
+                state=read_capture(store, capture_id),
+                verified_mount=_verified_mount,
+            )
         from kalshi_events.incremental import finish_pending_retirement
 
         finish_pending_retirement(store)
@@ -3781,6 +5382,7 @@ def build_historical(
             rebuild=rebuild,
             historical=True,
             resume_historical_stage=resume_historical_stage,
+            _verified_mount=_verified_mount,
         )
 
 
@@ -3964,6 +5566,42 @@ def certified(
         expected_profile = _historical_receipt_fields(state)
         if any(receipt.get(key) != value for key, value in expected_profile.items()):
             raise CatalogueError("historical build receipt does not match its source capture")
+        adoption_file = directory_path / "historical-adoption.json"
+        adoption_summary = receipt.get("historical_adoption")
+        if adoption_summary is None:
+            if adoption_file.exists() or adoption_file.is_symlink():
+                raise CatalogueError("historical build has unbound adoption lineage")
+        else:
+            if not isinstance(adoption_summary, dict) or set(adoption_summary) != {
+                "stage",
+                "sha256",
+                "source_proof_sha256",
+                "candidate_sha256",
+                "source_sha256",
+                "source_wal_sha256",
+            }:
+                raise CatalogueError("historical build adoption summary is invalid")
+            historical_resume.stage_relative(adoption_summary.get("stage"))
+            loaded_adoption = _load_self_proof(adoption_file, "historical-adoption")
+            if loaded_adoption is None:
+                raise CatalogueError("historical build adoption proof is missing")
+            adoption_proof, adoption_result = loaded_adoption
+            adoption_binding = adoption_proof["binding"]
+            if (
+                adoption_proof.get("sha256") != adoption_summary.get("sha256")
+                or adoption_binding.get("root") != str(store.root.resolve())
+                or adoption_binding.get("stage") != adoption_summary.get("stage")
+                or adoption_binding.get("capture_id") != capture_id
+                or adoption_binding.get("state_sha256") != digest(json_bytes(dict(state)))
+                or adoption_binding.get("source_proof_sha256")
+                != adoption_summary.get("source_proof_sha256")
+                or adoption_result.get("candidate_sha256")
+                != adoption_summary.get("candidate_sha256")
+                or adoption_result.get("source_sha256") != adoption_summary.get("source_sha256")
+                or adoption_result.get("source_wal_sha256")
+                != adoption_summary.get("source_wal_sha256")
+            ):
+                raise CatalogueError("historical build adoption lineage does not match its receipt")
     elif receipt.get("scope") == "historical":
         raise CatalogueError("historical build receipt requires catalogue version 3")
     base = f"captures/{capture_id}"

@@ -12,13 +12,18 @@ CHILD_TIMEOUT_SECONDS = 180
 COMPATIBILITY_TESTS = (
     "tests/test_duckdb_upgrade.py::test_harness_preserves_venv_symlink_and_resolves_relative_paths",
     "tests/test_duckdb_upgrade.py::test_harness_imports_application_from_expected_source",
-    "tests/test_duckdb_upgrade.py::test_harness_timeout_reaps_child_group_and_saves_logs",
-    "tests/test_arrow_landing.py::test_arrow_merge_replays_dict_landed_database_with_text_coercion",
     "tests/test_arrow_landing.py::test_duplicate_ids_across_arrow_batches_match_legacy_and_replay",
     "tests/test_series_warehouse.py::test_scoped_full_build_is_certified_as_internal_v2_"
     "with_exact_values",
     "tests/test_capture_process_recovery.py::test_process_exit_capture_resumes_from_"
     "durable_evidence",
+)
+CANDIDATE_COMPATIBILITY_TESTS = (
+    *COMPATIBILITY_TESTS,
+    # Both comparison databases use one runtime; these resource settings are candidate-only.
+    "tests/test_arrow_landing.py::test_arrow_merge_replays_dict_landed_database_with_text_coercion",
+    # The checker self-test imports paths.py, which the pinned reference package lacks.
+    "tests/test_duckdb_upgrade.py::test_harness_timeout_reaps_child_group_and_saves_logs",
 )
 
 
@@ -225,7 +230,7 @@ def main() -> int:
             (
                 "candidate compatibility",
                 interpreters["candidate"],
-                COMPATIBILITY_TESTS,
+                CANDIDATE_COMPATIBILITY_TESTS,
                 candidate_environment,
             ),
         )

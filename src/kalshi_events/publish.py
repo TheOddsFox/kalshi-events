@@ -92,33 +92,138 @@ V2_LINEAGE_FIELDS = (
 )
 MAX_COVERAGE_BINDING_BYTES = 1024**2
 HISTORICAL_SPILL_BUDGET = 1024**3
+_SPILL_OWNER = historical_export._SPILL_OWNER
+_HISTORICAL_EXPORT = historical_export
+
+
+def _spill_owner_record(
+    store: Store,
+    database: Path,
+    temporary: Path,
+    *,
+    historical_export: bool,
+    export_binding_sha256: str | None,
+) -> dict[str, Any]:
+    root = store.root.resolve()
+    try:
+        temporary_relative = temporary.resolve().relative_to(root).as_posix()
+        database_relative = database.resolve(strict=True).relative_to(root).as_posix()
+    except (OSError, ValueError) as exc:
+        raise CatalogueError("DuckDB spill paths must stay inside the operator root") from exc
+    if export_binding_sha256 is not None and (
+        not isinstance(export_binding_sha256, str)
+        or len(export_binding_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in export_binding_sha256)
+    ):
+        raise CatalogueError("DuckDB spill export binding is invalid")
+    binding_sha256 = export_binding_sha256 or digest(
+        json_bytes(
+            {
+                "version": 1,
+                "root": str(root),
+                "temporary": temporary_relative,
+                "source_database": database_relative,
+                "historical_export": historical_export,
+            }
+        )
+    )
+    return {
+        "version": 1,
+        "root": str(root),
+        "temporary": temporary_relative,
+        "source_database": database_relative,
+        "spill": f"{temporary_relative}/duckdb-spill",
+        "historical_export": historical_export,
+        "export_binding_sha256": binding_sha256,
+    }
+
+
+def _remove_spill_owner(store: Store, temporary: Path) -> None:
+    owner_path = temporary / _SPILL_OWNER
+    if not owner_path.exists() and not owner_path.is_symlink():
+        return
+    historical_export._assert_regular(store, owner_path)
+    owner_path.unlink()
+    fsync_directory(temporary)
+    store.sync(owner_path.relative_to(store.root).as_posix())
+
+
+def _clear_owned_spill(
+    store: Store,
+    temporary: Path,
+    owner: dict[str, Any],
+) -> None:
+    owner_path = temporary / _SPILL_OWNER
+    spill_directory = temporary / "duckdb-spill"
+    has_owner = owner_path.exists() or owner_path.is_symlink()
+    has_spill = spill_directory.exists() or spill_directory.is_symlink()
+    if not has_owner:
+        if has_spill:
+            raise CatalogueError("DuckDB spill directory has no durable owner intent")
+        return
+    if not store.writer_locked_by_current_thread:
+        raise CatalogueError("DuckDB spill recovery requires the canonical writer lock")
+    actual = historical_export._validate_spill_owner_marker(store, temporary)
+    if actual != owner:
+        raise CatalogueError("DuckDB spill owner binding changed")
+    if has_spill:
+        historical_export._validate_safe_tree(store, spill_directory)
+        shutil.rmtree(spill_directory)
+        fsync_directory(temporary)
+        store.sync(owner["spill"])
+    _remove_spill_owner(store, temporary)
 
 
 @contextmanager
 def _export_connection(
-    store: Store, database: Path, temporary: Path, *, historical_export: bool = False
+    store: Store,
+    database: Path,
+    temporary: Path,
+    *,
+    historical_export: bool = False,
+    export_binding_sha256: str | None = None,
 ) -> Any:
-    relative_temporary = temporary.relative_to(store.root).as_posix()
-    relative_spill = f"{relative_temporary}/duckdb-spill"
-    usage = store.usage()
-    spill_budget = min(
-        store.limits.max_temp_bytes - usage["temporary_bytes"],
-        store.limits.max_root_bytes - usage["retained_bytes"],
+    _HISTORICAL_EXPORT._assert_directory(store, temporary)
+    owner = _spill_owner_record(
+        store,
+        database,
+        temporary,
+        historical_export=historical_export,
+        export_binding_sha256=export_binding_sha256,
     )
-    if historical_export:
-        # Keep most free capacity available for the merge runs and final output.
-        spill_budget = min(spill_budget // 4, HISTORICAL_SPILL_BUDGET)
-    if spill_budget < 1:
-        raise BudgetExceeded("no bounded temporary storage is available for publication export")
-    store.reserve_storage(spill_budget)
-
+    relative_temporary = owner["temporary"]
+    relative_spill = owner["spill"]
+    owner_relative = f"{relative_temporary}/{_SPILL_OWNER}"
+    owner_path = temporary / _SPILL_OWNER
     spill_directory = temporary / "duckdb-spill"
+
+    # Only a previous, explicitly owned spill can be cleaned on entry. In normal
+    # publication this runs under the operator's writer lock, after any prior
+    # exporter process has exited.
+    _clear_owned_spill(store, temporary, owner)
+
+    store.write(owner_relative, owner)
+    store.sync(owner_relative)
+    try:
+        usage = store.usage()
+        spill_budget = min(
+            store.limits.max_temp_bytes - usage["temporary_bytes"],
+            store.limits.max_root_bytes - usage["retained_bytes"],
+        )
+        if historical_export:
+            # Keep most free capacity available for the merge runs and final output.
+            spill_budget = min(spill_budget // 4, HISTORICAL_SPILL_BUDGET)
+        if spill_budget < 1:
+            raise BudgetExceeded("no bounded temporary storage is available for publication export")
+        store.reserve_storage(spill_budget)
+    except BaseException:
+        _remove_spill_owner(store, temporary)
+        raise
+
     connection = None
     try:
-        if spill_directory.exists():
-            shutil.rmtree(spill_directory)
-            store.sync(relative_spill)
         spill_directory.mkdir()
+        fsync_directory(temporary)
         store.check_deadline()
         config = {
             # DuckDB 2.x inference otherwise changes the public Parquet nullability schema.
@@ -147,13 +252,23 @@ def _export_connection(
                 connection.close()
         finally:
             try:
-                if spill_directory.exists():
+                has_owner = owner_path.exists() or owner_path.is_symlink()
+                has_spill = spill_directory.exists() or spill_directory.is_symlink()
+                if has_owner:
+                    actual = _HISTORICAL_EXPORT._validate_spill_owner_marker(store, temporary)
+                    if actual != owner:
+                        raise CatalogueError("DuckDB spill owner binding changed")
+                if has_spill:
+                    if not has_owner:
+                        raise CatalogueError("DuckDB spill directory has no durable owner intent")
+                    _HISTORICAL_EXPORT._validate_safe_tree(store, spill_directory)
                     shutil.rmtree(spill_directory)
-            finally:
-                try:
+                    fsync_directory(temporary)
                     store.sync(relative_spill)
-                finally:
-                    store.release_storage(spill_budget)
+                if has_owner:
+                    _remove_spill_owner(store, temporary)
+            finally:
+                store.release_storage(spill_budget)
 
 
 def inventory(directory: Path, names: set[str], limit: int) -> dict[str, dict[str, Any]]:
@@ -778,7 +893,11 @@ def _publish(
             historical_binding_sha256,
         )
         if existing_current is not None:
-            historical_export.remove_work(store, temporary_relative)
+            historical_export.remove_work(
+                store,
+                temporary_relative,
+                binding_sha256=historical_binding_sha256,
+            )
             with metrics.phase("pruning"):
                 pruned = incremental.prune(
                     store,
@@ -834,7 +953,11 @@ def _publish(
                 for name, table in RELATIONS.items():
                     store.check_deadline()
                     with _export_connection(
-                        store, warehouse, temporary, historical_export=True
+                        store,
+                        warehouse,
+                        temporary,
+                        historical_export=True,
+                        export_binding_sha256=historical_binding_sha256,
                     ) as connection:
                         historical_export.export_relation(
                             store,
@@ -1006,7 +1129,11 @@ def _publish(
     finally:
         if catalogue_version == 3:
             if publication_succeeded:
-                historical_export.remove_work(store, temporary_relative)
+                historical_export.remove_work(
+                    store,
+                    temporary_relative,
+                    binding_sha256=historical_binding_sha256,
+                )
             elif temporary.exists():
                 store.sync(temporary_relative)
         else:

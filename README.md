@@ -525,3 +525,63 @@ python scripts/run-production.py \
 ```
 
 Renewal requires the prior offline window to have expired on both clocks. If the operator explicitly authorizes replacing an unexpired window, use `--supersede-offline-window` instead; the old window and supersession remain in audit history. Neither option can be combined with `--reconcile-stopped-worker`; run reconciliation separately first. The requested 86,280 seconds leaves two minutes before the outer deadline. Renewal does not reset acquisition totals or limits and does not retry automatically. A stage resume is bound to the exact capture and historical mode, verifies the existing database and WAL in an isolated copy against fresh saved-receipt results, and does not fall back to loading a new stage. It preserves the source stage until verified adoption is durable. This is an offline build continuation, not a production acceptance claim. The October 30 and October 31 capacity experiments did **not** pass admission; see the dated correction and current stopped-session evidence in [performance guidance](docs/performance.md#stopped-historical-stage-and-continuation-correction-2026-11-02).
+
+### Readiness, adoption and checkpointed grants
+
+Private supervised readiness controls separate validation of a saved stage from
+publication and activation. A partial validation cursor records progress only.
+Readiness requires every value in all 13 landing columns, membership, parent
+eligibility and selected coverage to match validated receipt evidence. Resuming
+the comparison verifies the saved prefix and candidate binding; rebuilding
+receipt context can still reread and decode earlier receipts.
+
+The recovered candidate must be checkpointed, closed and checksummed without an
+outstanding WAL before its validation seal can be reused. Adoption provenance is
+retained separately from subsequent derived-model phase seals. When duplicate
+source/candidate storage prevents later work from fitting, independently verified
+adoption and a durable cleanup intent must precede removal of the exact original
+DB/WAL. Raw evidence is retained. An interrupted adoption remains a managed
+recovery state; it is never a reason to reload landing or discard the candidate.
+Source retirement can be approved during adoption or in a later model grant
+after further capacity measurements. Later cleanup keeps its own verification
+and receipt while preserving the original adoption decision.
+
+Historical export compacts sorted runs incrementally with eight readers. A durable
+frontier couples the input cursor to its referenced runs; merge inputs remain
+until their output and replacement frontier are durable. A completed,
+checksummed scratch input can support resume, while partial materialization is
+discarded. Compaction bounds live run inventory without increasing Arrow batch
+sizes or establishing a speedup.
+
+An incompatible private strategy uses a different work binding. Older export
+work remains preserved and counts toward storage admission; it is not silently
+migrated or deleted. If retained work prevents admission, inventory and validate
+its ownership before making an explicit cleanup decision.
+
+The 65,536-entry admission bound covers mutable workspaces and external run
+artifacts. Preserved raw evidence stays in storage accounting without consuming
+that mutable-file quota. All root paths still undergo filesystem safety checks.
+
+Each operational grant needs a fresh approval and latch, lasts at most 24 hours,
+and preserves earlier clocks and cumulative acquisition accounting. Select its
+work from the validated durable phase: after installation retires the original
+stage, resume the certified build instead of naming the missing stage. Budget
+for repeated warehouse/release checksum scans as well as processing. Keep the
+final two hours for checkpointing, verification and reporting, allowing more
+verification time when measurements require it. No grant renews automatically.
+Revalidate the session's activation audit before each activation attempt. Fresh
+grants can reference the same immutable audit artifact; each records its own
+claim and preserves earlier failed claims.
+
+An interrupted private worker must be reconciled before another grant. Its pause
+receipt records separate same-boot and verified-reboot commands from the frozen
+runtime. Same-boot recovery proves the recorded processes absent; reboot recovery
+checks the saved volume, root and accounting without probing old process IDs.
+Neither reconciliation starts processing or extends a grant. Use the literal
+virtual-environment interpreter path recorded in the command.
+
+The private controls remain inert until source, runtime, control hashes and the
+specific grant are bound and approved. They add no public readiness flag. A
+successful readiness or qualification result alone does not publish or activate
+`production.duckdb`; release verification, independent audit and fresh production
+readback remain separate gates.

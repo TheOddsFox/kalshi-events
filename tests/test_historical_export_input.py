@@ -279,17 +279,24 @@ def test_materialized_input_has_exact_owner_inventory_and_dense_rowids(tmp_path)
     )
     try:
         owner = json.loads((input_path.parent / "owner.json").read_text())
+        input_sha256, input_size = historical_export.file_digest(
+            input_path, store.limits.max_root_bytes
+        )
         assert owner == {
-            "version": 1,
+            "version": 2,
+            "state": "sealed",
             "binding_sha256": binding_sha256,
             "relation": "source_rows",
             "table": "source_rows",
             "schema_sha256": schema_sha256,
+            "input_sha256": input_sha256,
+            "input_size": input_size,
+            "row_count": len(rows),
         }
-        assert set(path.name for path in input_path.parent.iterdir()) in (
-            {"owner.json", "input.duckdb"},
-            {"owner.json", "input.duckdb", "input.duckdb.wal"},
-        )
+        assert {path.name for path in input_path.parent.iterdir()} == {
+            "owner.json",
+            "input.duckdb",
+        }
         for path in input_path.parent.iterdir():
             assert not path.is_symlink()
             assert path.stat().st_nlink == 1
@@ -558,9 +565,7 @@ def test_partial_input_cleanup_retries_without_losing_sealed_export(tmp_path, mo
         connection.close()
 
 
-def test_generation_zero_checkpoint_survives_interruption_before_input_cleanup(
-    tmp_path, monkeypatch
-):
+def test_complete_frontier_survives_interruption_before_input_cleanup(tmp_path, monkeypatch):
     rows = [(f"key-{index:03d}", index, f"value-{index}") for index in range(6)]
     connection = duckdb.connect(
         ":memory:",
@@ -589,20 +594,24 @@ def test_generation_zero_checkpoint_survives_interruption_before_input_cleanup(
         materializations += 1
         return original_materialize(*args, **kwargs)
 
-    def interrupt_after_generation_zero(*args, **kwargs):
+    def interrupt_after_frontier_seal(*args, **kwargs):
         nonlocal interrupted
         if checkpoint_path.is_file() and not interrupted:
             checkpoint = json.loads(checkpoint_path.read_text())
-            if checkpoint.get("generation") == 0 and checkpoint.get("complete") is False:
+            if (
+                checkpoint.get("next_rowid") == len(rows)
+                and checkpoint.get("complete") is False
+                and checkpoint.get("pending_write") is None
+            ):
                 interrupted = True
                 assert checkpoint["row_count"] == len(rows)
-                raise RuntimeError("simulated stop after generation-zero seal")
+                raise RuntimeError("simulated stop after frontier seal")
         return original_discard(*args, **kwargs)
 
     monkeypatch.setattr(historical_export, "_materialize_input", count_materialization)
-    monkeypatch.setattr(historical_export, "_discard_input", interrupt_after_generation_zero)
+    monkeypatch.setattr(historical_export, "_discard_input", interrupt_after_frontier_seal)
     try:
-        with pytest.raises(RuntimeError, match="generation-zero seal"):
+        with pytest.raises(RuntimeError, match="frontier seal"):
             historical_export.export_relation(
                 store,
                 connection,
@@ -613,9 +622,10 @@ def test_generation_zero_checkpoint_survives_interruption_before_input_cleanup(
                 keys=("ticker", "ordinal"),
             )
         assert interrupted and materializations == 1
-        sealed_generation = json.loads(checkpoint_path.read_text())
-        assert sealed_generation["complete"] is False
-        assert sealed_generation["generation"] == 0
+        sealed_frontier = json.loads(checkpoint_path.read_text())
+        assert sealed_frontier["complete"] is False
+        assert sealed_frontier["next_rowid"] == len(rows)
+        assert sealed_frontier["pending_write"] is None
 
         monkeypatch.setattr(historical_export, "_discard_input", original_discard)
         retry = historical_export.export_relation(
@@ -1223,13 +1233,13 @@ def test_scratch_reader_deadline_interrupts_its_own_connection_and_preserves_sea
             for timer in timer_holder:
                 timer.cancel()
 
-    def slow_prefetch(connection, table, schema):
+    def slow_prefetch(connection, table, schema, **kwargs):
         assert scratch_contexts, "scratch reader has no deadline interrupt context"
         window_started.set()
         connection.execute(
             "select sum(length(md5(cast(i as varchar)))) from range(100000000) as scan(i)"
         ).fetchone()
-        yield from original_prefetch(connection, table, schema)
+        yield from original_prefetch(connection, table, schema, **kwargs)
 
     monkeypatch.setattr(historical_export, "interrupt_at_deadline", interrupt_scratch_reader)
     monkeypatch.setattr(historical_export, "_prefetch_windows", slow_prefetch)

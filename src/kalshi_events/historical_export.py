@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import heapq
-import itertools
-import json
 import os
 import re
 import shutil
@@ -39,6 +36,7 @@ from kalshi_events.common import (
 
 POLICY = "historical-arrow-external-merge-v1"
 _INPUT_READER_STRATEGY = "owned-duckdb-scratch-byte-windows-v1"
+_FRONTIER_STRATEGY = "owned-online-eight-way-frontier-v2"
 COPY_OPTIONS = "compression zstd, compression_level 6, row_group_size_bytes 16777216"
 _BATCH_ROWS = 4096
 _BATCH_BYTES = 8 * 1024 * 1024
@@ -46,6 +44,10 @@ _MERGE_FAN_IN = 8
 _MAX_SCHEMA_BYTES = 16 * 1024 * 1024
 _INPUT_WRITE_RESERVE = 8 * 1024 * 1024
 _INPUT_TABLE = "export_input"
+_SPILL_OWNER = "duckdb-spill.owner.json"
+_DUCKDB_SPILL_FILE = re.compile(
+    r"duckdb_temp_[0-9]+_[0-9]+_(?:owner|storage_(?:DEFAULT|S[0-9]+K)-[0-9]+\.tmp)\Z"
+)
 _WRITE_TEMP = re.compile(r"\.write-[a-z0-9_]{8}\Z")
 _RELATION = re.compile(r"[a-z][a-z0-9_]*\Z")
 _SCALAR_SQL_TYPE = re.compile(
@@ -58,6 +60,8 @@ _SCALAR_SQL_TYPE = re.compile(
 )
 _GENERATION = re.compile(r"gen-[0-9]{8}\Z")
 _RUN = re.compile(r"run-[0-9]{8}\.parquet\Z")
+_FRONTIER_RUN = re.compile(r"run-([0-9]{12})\.parquet\Z")
+_FRONTIER_PARTIAL = re.compile(r"run-([0-9]{12})\.parquet\.partial\Z")
 _OUTPUT = re.compile(r"[a-z][a-z0-9_]*\.parquet(?:\.partial)?\Z")
 
 
@@ -79,6 +83,7 @@ def binding(
         "writer_policy": {
             "name": POLICY,
             "input_reader_strategy": _INPUT_READER_STRATEGY,
+            "run_compaction_strategy": _FRONTIER_STRATEGY,
             "copy_options": COPY_OPTIONS,
             "run_compression": "zstd-6",
             "batch_rows": _BATCH_ROWS,
@@ -100,6 +105,14 @@ def prepare(
     binding_sha256: str | None = None,
     tables: dict[str, str] | None = None,
 ) -> Path:
+    if not store.writer_locked_by_current_thread:
+        with store.writer_guard():
+            return prepare(
+                store,
+                relative,
+                binding_sha256=binding_sha256,
+                tables=tables,
+            )
     if not re.fullmatch(r"tmp/publish-[0-9a-f]{32}", relative):
         raise CatalogueError("invalid historical export work directory")
     if (binding_sha256 is None) != (tables is None):
@@ -115,9 +128,18 @@ def prepare(
     root = store.path(relative)
     if root.exists():
         _validate_work_tree(store, root)
+        owner_path = root / _SPILL_OWNER
+        if owner_path.exists() or owner_path.is_symlink():
+            spill_owner = _validate_spill_owner_marker(store, root)
+            if binding_sha256 is not None and (
+                spill_owner["historical_export"] is not True
+                or spill_owner["export_binding_sha256"] != binding_sha256
+            ):
+                raise CatalogueError("historical DuckDB spill owner binding changed")
         _discard_interrupted_marker_temps(store, root)
         if binding_sha256 is not None:
             _discard_stale_inputs(store, root, binding_sha256, tables or {})
+            _validate_prepared_frontiers(store, root, binding_sha256, tables or {})
     else:
         durable_mkdir(root.parent)
         root.mkdir()
@@ -142,76 +164,114 @@ def export_relation(
     table: str,
     keys: tuple[str, ...],
 ) -> dict[str, Any]:
+    if not store.writer_locked_by_current_thread:
+        with store.writer_guard():
+            return export_relation(
+                store,
+                connection,
+                work_relative=work_relative,
+                binding_sha256=binding_sha256,
+                name=name,
+                table=table,
+                keys=keys,
+            )
+    return _export_frontier_relation(
+        store,
+        connection,
+        work_relative=work_relative,
+        binding_sha256=binding_sha256,
+        name=name,
+        table=table,
+        keys=keys,
+    )
+
+
+def _export_frontier_relation(
+    store: Store,
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    work_relative: str,
+    binding_sha256: str,
+    name: str,
+    table: str,
+    keys: tuple[str, ...],
+) -> dict[str, Any]:
     if _RELATION.fullmatch(name) is None or _RELATION.fullmatch(table) is None:
         raise CatalogueError("invalid historical export relation")
     if not keys or any(_RELATION.fullmatch(key) is None for key in keys):
         raise CatalogueError("invalid historical export ordering key")
+    if not _hex(binding_sha256, 64):
+        raise CatalogueError("historical export binding is invalid")
 
     root = store.path(work_relative)
     _assert_directory(store, root)
-    _discard_stale_inputs(store, root, binding_sha256, {name: table})
+    _discard_stale_inputs(store, root, binding_sha256, {name: table}, relations={name})
     schema = _reference_schema(store, connection, root, name, table)
     key_indices, key_types = _ordering_columns(schema, keys)
     schema_sha256 = digest(schema.serialize().to_pybytes())
     _validate_prefetch_schema(schema)
-    _discard_input(
-        store,
-        work_relative,
-        name,
-        binding_sha256,
-        table,
-        schema_sha256,
-    )
     checkpoint_relative = f"{work_relative}/checkpoints/{name}.json"
     checkpoint_path = store.path(checkpoint_relative)
     output_relative = f"{work_relative}/output/{name}.parquet"
     output_path = store.path(output_relative)
-    checkpoint = _read_checkpoint(store, checkpoint_path)
-
-    if checkpoint is not None and checkpoint.get("complete") is True:
-        if (
-            checkpoint.get("binding_sha256") == binding_sha256
-            and checkpoint.get("table") == table
-            and checkpoint.get("keys") == list(keys)
-            and checkpoint.get("schema_sha256") == schema_sha256
-            and _valid_completed_export(store, output_path, checkpoint, schema)
-        ):
-            _input_prefetch_metrics(checkpoint)
-            _remove_relation_runs(store, work_relative, name)
-            return checkpoint
-        _remove_owned_file(store, output_path)
-        _remove_relation_runs(store, work_relative, name)
-        store.remove(checkpoint_relative)
-        checkpoint = None
-
     run_relative = f"{work_relative}/runs/{name}"
     run_directory = store.path(run_relative)
     durable_mkdir(run_directory)
-    expected_state = {
-        "version": 1,
+
+    identity = {
+        "version": 2,
         "binding_sha256": binding_sha256,
         "table": table,
         "keys": list(keys),
         "schema_sha256": schema_sha256,
-        "complete": False,
     }
+    checkpoint = _read_checkpoint(store, checkpoint_path)
+    _ensure_frontier_owner(store, run_directory, name, identity, create=checkpoint is None)
+    if checkpoint is None:
+        checkpoint = _empty_frontier(identity)
+        store.write(checkpoint_relative, checkpoint)
+    elif not _checkpoint_matches(checkpoint, identity):
+        raise CatalogueError("historical frontier checkpoint binding changed")
 
-    generation = None
-    if checkpoint is not None and _checkpoint_matches(checkpoint, expected_state):
-        generation = checkpoint.get("generation")
-        if (
-            isinstance(generation, int)
-            and not isinstance(generation, bool)
-            and generation >= 0
-            and _valid_generation(store, run_directory, generation, checkpoint, schema)
+    _validate_frontier(store, run_directory, checkpoint, schema)
+    checkpoint = _recover_pending_write(
+        store, checkpoint_relative, run_directory, checkpoint, schema
+    )
+    _finish_frontier_deletes(store, checkpoint_relative, run_directory, checkpoint, schema)
+    checkpoint = _read_checkpoint(store, checkpoint_path) or checkpoint
+    _discard_unreferenced_frontier_runs(store, run_directory, checkpoint)
+
+    if checkpoint.get("complete") is True and _valid_completed_export(
+        store, output_path, checkpoint, schema
+    ):
+        _input_prefetch_metrics(checkpoint)
+        return checkpoint
+
+    input_directory = _input_directory(store, work_relative, name)
+    input_marker = _validate_input_tree(
+        store, input_directory, name, binding_sha256, table, schema_sha256
+    )
+    source_row_count = checkpoint.get("source_row_count")
+    input_database = None
+    if input_marker is not None and input_marker.get("state") == "sealed":
+        _validate_sealed_input(store, input_directory, input_marker, schema)
+        input_database = input_directory / "input.duckdb"
+        if source_row_count is None:
+            source_row_count = input_marker["row_count"]
+            checkpoint = {
+                **checkpoint,
+                "source_row_count": source_row_count,
+                "input_sha256": input_marker["input_sha256"],
+                "input_size": input_marker["input_size"],
+            }
+            store.write(checkpoint_relative, checkpoint)
+        elif (
+            source_row_count != input_marker["row_count"]
+            or checkpoint.get("input_sha256") != input_marker["input_sha256"]
+            or checkpoint.get("input_size") != input_marker["input_size"]
         ):
-            _remove_unreferenced_generations(store, run_relative, generation)
-        else:
-            generation = None
-
-    if generation is None:
-        _remove_relation_runs(store, work_relative, name)
-        run_directory.mkdir(exist_ok=True)
+            raise CatalogueError("sealed historical input does not match the frontier checkpoint")
+    elif source_row_count is None and checkpoint["next_rowid"] == 0:
         input_database = _materialize_input(
             store,
             connection,
@@ -222,6 +282,30 @@ def export_relation(
             schema,
             schema_sha256,
         )
+        input_marker = _validate_input_tree(
+            store, input_directory, name, binding_sha256, table, schema_sha256
+        )
+        if input_marker is None or input_marker.get("state") != "sealed":
+            raise CatalogueError("historical input was not sealed")
+        source_row_count = input_marker["row_count"]
+        checkpoint = {
+            **checkpoint,
+            "source_row_count": source_row_count,
+            "input_sha256": input_marker["input_sha256"],
+            "input_size": input_marker["input_size"],
+        }
+        store.write(checkpoint_relative, checkpoint)
+    elif source_row_count is None or checkpoint["next_rowid"] != source_row_count:
+        if checkpoint["next_rowid"] > 0 or source_row_count is not None:
+            raise CatalogueError("sealed historical input is missing for the committed prefix")
+    if source_row_count is None:
+        raise CatalogueError("historical input row count was not sealed")
+    if checkpoint["next_rowid"] > source_row_count:
+        raise CatalogueError("historical frontier cursor exceeds the sealed input")
+
+    if checkpoint["next_rowid"] < source_row_count:
+        if input_database is None:
+            raise CatalogueError("sealed historical input is missing before the frontier cursor")
         try:
             input_connection = duckdb.connect(
                 str(input_database),
@@ -238,22 +322,106 @@ def export_relation(
                     input_schema = _reference_schema(
                         store,
                         input_connection,
-                        store.path(work_relative),
+                        root,
                         name,
                         _INPUT_TABLE,
                         schema_name=f"{name}_input",
                     )
                     if not input_schema.equals(schema, check_metadata=True):
                         raise CatalogueError("historical input changed the reference schema")
-                    generation = _spool_runs(
-                        store,
+                    cursor = checkpoint["next_rowid"]
+                    for window_start, window_rows, estimated_bytes in _prefetch_windows(
                         input_connection,
-                        run_directory,
                         _INPUT_TABLE,
                         schema,
-                        key_indices,
-                        f"{work_relative}/inputs/{name}",
-                    )
+                        start_rowid=cursor,
+                        total_row_count=source_row_count,
+                    ):
+                        store.check_deadline()
+                        if window_start != cursor:
+                            raise CatalogueError("historical input cursor has a gap")
+                        if window_rows == 1:
+                            checkpoint["input_max_singleton_bytes"] = max(
+                                checkpoint["input_max_singleton_bytes"], estimated_bytes
+                            )
+                            metrics.peak("historical_input_singleton_bytes", estimated_bytes)
+                        reader = _read_input_window(
+                            input_connection, _INPUT_TABLE, window_start, window_rows
+                        )
+                        fetched_rows = 0
+                        try:
+                            for batch in reader:
+                                store.check_deadline()
+                                fetched_rows += batch.num_rows
+                                checkpoint["input_arrow_peak_bytes"] = max(
+                                    checkpoint["input_arrow_peak_bytes"], batch.nbytes
+                                )
+                                checkpoint["input_arrow_peak_rows"] = max(
+                                    checkpoint["input_arrow_peak_rows"], batch.num_rows
+                                )
+                                if batch.num_rows == 1:
+                                    checkpoint["input_singleton_peak_bytes"] = max(
+                                        checkpoint["input_singleton_peak_bytes"], batch.nbytes
+                                    )
+                                    metrics.peak(
+                                        "historical_input_singleton_arrow_bytes", batch.nbytes
+                                    )
+                                if batch.num_rows > window_rows or (
+                                    batch.num_rows > 1 and batch.nbytes > _BATCH_BYTES
+                                ):
+                                    raise CatalogueError(
+                                        "historical input exceeded its Arrow window"
+                                    )
+                                metrics.peak("historical_input_arrow_bytes", batch.nbytes)
+                                metrics.peak("historical_input_arrow_rows", batch.num_rows)
+                                next_cursor = checkpoint["next_rowid"]
+                                converted = pa.Table.from_batches([batch]).cast(schema)
+                                for piece in _byte_bounded_batches(
+                                    converted.to_batches(max_chunksize=_BATCH_ROWS)[0]
+                                ):
+                                    next_cursor += piece.num_rows
+                                    checkpoint = _begin_frontier_write(
+                                        store,
+                                        checkpoint_relative,
+                                        checkpoint,
+                                        kind="leaf",
+                                        cursor_end=next_cursor,
+                                    )
+                                    planned = checkpoint["pending_write"]["planned"][0]
+                                    descriptor = _write_frontier_run(
+                                        store,
+                                        run_directory,
+                                        int(_FRONTIER_RUN.fullmatch(planned["name"]).group(1)),
+                                        planned["level"],
+                                        piece,
+                                        schema,
+                                        key_indices,
+                                    )
+                                    checkpoint = _record_frontier_write(
+                                        store, checkpoint_relative, checkpoint, descriptor
+                                    )
+                                    checkpoint = _commit_frontier_leaf(
+                                        store,
+                                        checkpoint_relative,
+                                        run_directory,
+                                        checkpoint,
+                                        descriptor,
+                                        next_cursor,
+                                        schema,
+                                        key_indices,
+                                        key_types,
+                                    )
+                        finally:
+                            reader.close()
+                        if fetched_rows != window_rows:
+                            raise CatalogueError("historical input payload window has a gap")
+                        cursor = window_start + window_rows
+                        if checkpoint["next_rowid"] != cursor:
+                            raise CatalogueError(
+                                "historical frontier cursor changed within a window"
+                            )
+                        store.sync(f"{work_relative}/inputs/{name}")
+                        store.check_storage()
             finally:
                 input_connection.close()
         except duckdb.InterruptException as exc:
@@ -264,34 +432,55 @@ def export_relation(
             raise CatalogueError("historical input read was interrupted") from exc
         except duckdb.Error as exc:
             raise CatalogueError("could not read the owned historical input snapshot") from exc
-        checkpoint = {
-            **expected_state,
-            **generation,
-            "generation": 0,
-        }
-        store.write(checkpoint_relative, checkpoint)
-        _discard_input(
-            store,
-            work_relative,
-            name,
-            binding_sha256,
-            table,
-            schema_sha256,
-        )
 
-    while checkpoint["run_count"] > _MERGE_FAN_IN:
-        next_generation = checkpoint["generation"] + 1
-        checkpoint = _merge_generation(
+    if source_row_count == 0 and checkpoint["run_count"] == 0:
+        empty = pa.RecordBatch.from_arrays(
+            [pa.array([], type=field.type) for field in schema], schema=schema
+        )
+        checkpoint = _begin_frontier_write(
+            store,
+            checkpoint_relative,
+            checkpoint,
+            kind="leaf",
+            cursor_end=0,
+        )
+        planned = checkpoint["pending_write"]["planned"][0]
+        descriptor = _write_frontier_run(
             store,
             run_directory,
+            int(_FRONTIER_RUN.fullmatch(planned["name"]).group(1)),
+            planned["level"],
+            empty,
+            schema,
+            key_indices,
+        )
+        checkpoint = _record_frontier_write(store, checkpoint_relative, checkpoint, descriptor)
+        checkpoint = _commit_frontier_leaf(
+            store,
+            checkpoint_relative,
+            run_directory,
+            checkpoint,
+            descriptor,
+            0,
             schema,
             key_indices,
             key_types,
-            checkpoint,
-            next_generation,
         )
-        store.write(checkpoint_relative, checkpoint)
-        _remove_unreferenced_generations(store, run_relative, next_generation)
+
+    if checkpoint["next_rowid"] != source_row_count:
+        raise CatalogueError("historical input cursor did not reach the sealed row count")
+    _discard_input(store, work_relative, name, binding_sha256, table, schema_sha256)
+    checkpoint = _collapse_frontier(
+        store,
+        checkpoint_relative,
+        run_directory,
+        checkpoint,
+        schema,
+        key_indices,
+        key_types,
+    )
+    if checkpoint["run_count"] > _MERGE_FAN_IN:
+        raise CatalogueError("historical final frontier exceeds eight runs")
 
     _copy_merged(
         store,
@@ -307,7 +496,7 @@ def export_relation(
     checksum, size = file_digest(output_path, store.limits.max_root_bytes)
     rows = pq.ParquetFile(output_path).metadata.num_rows
     result = {
-        **expected_state,
+        **checkpoint,
         **_input_prefetch_metrics(checkpoint),
         "complete": True,
         "output_sha256": checksum,
@@ -321,15 +510,46 @@ def export_relation(
         _remove_owned_file(store, output_path)
         raise CatalogueError("historical export changed the DuckDB reference schema")
     store.write(checkpoint_relative, result)
-    _remove_relation_runs(store, work_relative, name)
     return result
 
 
-def remove_work(store: Store, relative: str) -> None:
+def remove_work(
+    store: Store,
+    relative: str,
+    *,
+    binding_sha256: str | None = None,
+) -> None:
     path = store.path(relative)
     if not path.exists():
         return
     _validate_work_tree(store, path)
+    owner_path = path / _SPILL_OWNER
+    spill_path = path / "duckdb-spill"
+    if (
+        owner_path.exists()
+        or owner_path.is_symlink()
+        or spill_path.exists()
+        or spill_path.is_symlink()
+    ):
+        if not store.writer_locked_by_current_thread:
+            raise CatalogueError(
+                "historical DuckDB spill cleanup requires the canonical writer lock"
+            )
+        if not _hex(binding_sha256, 64):
+            raise CatalogueError("historical DuckDB spill cleanup binding is missing")
+        owner = _validate_spill_owner_marker(store, path)
+        if (
+            owner["historical_export"] is not True
+            or owner["export_binding_sha256"] != binding_sha256
+        ):
+            raise CatalogueError("historical DuckDB spill owner binding changed")
+        if spill_path.exists() or spill_path.is_symlink():
+            _validate_safe_tree(store, spill_path)
+            shutil.rmtree(spill_path)
+            fsync_directory(path)
+            store.sync(f"{relative}/duckdb-spill")
+        _remove_owned_file(store, owner_path)
+        _validate_work_tree(store, path)
     shutil.rmtree(path)
     fsync_directory(path.parent)
     store.sync(relative)
@@ -500,7 +720,8 @@ def _input_marker(
     schema_sha256: str,
 ) -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
+        "state": "materializing",
         "binding_sha256": binding_sha256,
         "relation": relation,
         "table": table,
@@ -542,16 +763,36 @@ def _validate_input_tree(
         marker = decode(regular_bytes(owner, 1024))
     except Exception as exc:
         raise CatalogueError("historical input owner marker is invalid") from exc
+    base_fields = {
+        "version",
+        "state",
+        "binding_sha256",
+        "relation",
+        "table",
+        "schema_sha256",
+    }
+    sealed_fields = base_fields | {"input_sha256", "input_size", "row_count"}
     if (
         not isinstance(marker, dict)
-        or set(marker) != {"version", "binding_sha256", "relation", "table", "schema_sha256"}
+        or marker.get("state") not in {"materializing", "sealed"}
+        or set(marker) != (sealed_fields if marker.get("state") == "sealed" else base_fields)
         or type(marker.get("version")) is not int
-        or marker["version"] != 1
+        or marker["version"] != 2
         or not _hex(marker.get("binding_sha256"), 64)
         or marker.get("relation") != relation
         or not isinstance(marker.get("table"), str)
         or _RELATION.fullmatch(marker["table"]) is None
         or not _hex(marker.get("schema_sha256"), 64)
+        or marker.get("state") == "sealed"
+        and (
+            not _hex(marker.get("input_sha256"), 64)
+            or isinstance(marker.get("input_size"), bool)
+            or not isinstance(marker.get("input_size"), int)
+            or marker["input_size"] < 0
+            or isinstance(marker.get("row_count"), bool)
+            or not isinstance(marker.get("row_count"), int)
+            or marker["row_count"] < 0
+        )
     ):
         raise CatalogueError("historical input owner marker is invalid")
     if any(
@@ -583,13 +824,17 @@ def _interrupted_owner_write(store: Store, entries: dict[str, Path]) -> bool:
     return True
 
 
-def _discard_interrupted_marker_temps(store: Store, root: Path) -> None:
+def _discard_interrupted_marker_temps(
+    store: Store, root: Path, *, relations: set[str] | None = None
+) -> None:
     inputs = root / "inputs"
     if not inputs.exists():
         return
     _assert_directory(store, inputs)
     changed = False
     for path in list(inputs.iterdir()):
+        if relations is not None and path.name not in relations:
+            continue
         _validate_input_tree(store, path, path.name)
         entries = list(path.iterdir())
         if not entries:
@@ -626,16 +871,20 @@ def _discard_stale_inputs(
     root: Path,
     binding_sha256: str,
     tables: dict[str, str],
+    *,
+    relations: set[str] | None = None,
 ) -> None:
     if not _hex(binding_sha256, 64):
         raise CatalogueError("historical input binding is invalid")
-    _discard_interrupted_marker_temps(store, root)
+    _discard_interrupted_marker_temps(store, root, relations=relations)
     inputs = root / "inputs"
     if not inputs.exists():
         return
     _assert_directory(store, inputs)
     for path in list(inputs.iterdir()):
         relation = path.name
+        if relations is not None and relation not in relations:
+            continue
         marker = _validate_input_tree(store, path, relation)
         if marker is None:
             continue
@@ -645,14 +894,111 @@ def _discard_stale_inputs(
         if _RELATION.fullmatch(table) is None:
             raise CatalogueError("historical input table identity is invalid")
         schema_sha256 = _durable_schema_digest(store, root, relation)
-        _discard_input(
+        marker = _validate_input_tree(
             store,
-            root.relative_to(store.root).as_posix(),
+            path,
             relation,
             binding_sha256,
             table,
             schema_sha256,
         )
+        checkpoint = _read_checkpoint(store, root / "checkpoints" / f"{relation}.json")
+        complete = (
+            checkpoint is not None
+            and checkpoint.get("complete") is True
+            and checkpoint.get("binding_sha256") == binding_sha256
+            and checkpoint.get("table") == table
+            and checkpoint.get("schema_sha256") == schema_sha256
+        )
+        if marker["state"] == "materializing" or complete:
+            _discard_input(
+                store,
+                root.relative_to(store.root).as_posix(),
+                relation,
+                binding_sha256,
+                table,
+                schema_sha256,
+            )
+        else:
+            schema_path = store.path(
+                f"{root.relative_to(store.root).as_posix()}/schemas/{relation}.parquet"
+            )
+            _validate_sealed_input(store, path, marker, pq.read_schema(schema_path))
+
+
+def _validate_prepared_frontiers(
+    store: Store,
+    root: Path,
+    binding_sha256: str,
+    tables: dict[str, str],
+) -> None:
+    runs_root = root / "runs"
+    checkpoints_root = root / "checkpoints"
+    run_relations = {path.name for path in runs_root.iterdir()}
+    checkpoint_relations = {
+        path.stem for path in checkpoints_root.iterdir() if path.name != "publication.json"
+    }
+    if (run_relations | checkpoint_relations) - set(tables):
+        raise CatalogueError("historical frontier inventory has an unknown relation")
+    for relation, table in tables.items():
+        run_directory = runs_root / relation
+        checkpoint_path = checkpoints_root / f"{relation}.json"
+        if not run_directory.exists() and not checkpoint_path.exists():
+            continue
+        schema_path = store.path(
+            f"{root.relative_to(store.root).as_posix()}/schemas/{relation}.parquet"
+        )
+        schema_sha256 = _durable_schema_digest(store, root, relation)
+        schema = pq.read_schema(schema_path)
+        checkpoint = _read_checkpoint(store, checkpoint_path)
+        identity = {
+            "version": 2,
+            "binding_sha256": binding_sha256,
+            "table": table,
+            "keys": checkpoint.get("keys") if checkpoint is not None else [],
+            "schema_sha256": schema_sha256,
+        }
+        if checkpoint is None:
+            if not run_directory.exists():
+                raise CatalogueError("historical frontier checkpoint has no run directory")
+            owner_path = run_directory / "owner.json"
+            if owner_path.exists():
+                _ensure_frontier_owner(store, run_directory, relation, identity, create=False)
+            if any(path.name != "owner.json" for path in run_directory.iterdir()):
+                raise CatalogueError("uncommitted historical runs have no frontier checkpoint")
+            continue
+        if (
+            not isinstance(identity["keys"], list)
+            or not identity["keys"]
+            or any(
+                not isinstance(key, str) or _RELATION.fullmatch(key) is None
+                for key in identity["keys"]
+            )
+        ):
+            raise CatalogueError("historical frontier ordering binding is invalid")
+        _ordering_columns(schema, tuple(identity["keys"]))
+        if not run_directory.exists():
+            raise CatalogueError("historical frontier checkpoint has no run directory")
+        _ensure_frontier_owner(store, run_directory, relation, identity, create=False)
+        if not _checkpoint_matches(checkpoint, identity):
+            raise CatalogueError("historical frontier checkpoint binding changed")
+        _validate_frontier(store, run_directory, checkpoint, schema)
+        checkpoint = _recover_pending_write(
+            store,
+            checkpoint_path.relative_to(store.root).as_posix(),
+            run_directory,
+            checkpoint,
+            schema,
+        )
+        _finish_frontier_deletes(
+            store,
+            checkpoint_path.relative_to(store.root).as_posix(),
+            run_directory,
+            checkpoint,
+            schema,
+        )
+        checkpoint = _read_checkpoint(store, checkpoint_path) or checkpoint
+        _discard_unreferenced_frontier_runs(store, run_directory, checkpoint)
 
 
 def _discard_input(
@@ -869,24 +1215,142 @@ def _materialize_input(
     if not detached:
         raise CatalogueError("historical input database was not detached")
     store.check_deadline()
+    _seal_input(store, root=store.path(work_relative), directory=directory, schema=schema)
     return input_database
 
 
+def _seal_input(store: Store, *, root: Path, directory: Path, schema: pa.Schema) -> None:
+    database = directory / "input.duckdb"
+    wal = directory / "input.duckdb.wal"
+    if wal.exists():
+        raise CatalogueError("historical input database still has a write-ahead log")
+    _assert_owned_input_data_file(store, database)
+    checksum, size = file_digest(database, store.limits.max_root_bytes)
+    connection = duckdb.connect(str(database), read_only=True, config={"threads": "1"})
+    try:
+        input_schema = _reference_schema(
+            store,
+            connection,
+            root,
+            directory.name,
+            _INPUT_TABLE,
+            schema_name=f"{directory.name}_input",
+        )
+        if not input_schema.equals(schema, check_metadata=True):
+            raise CatalogueError("historical input changed the reference schema")
+        count, minimum, maximum = connection.execute(
+            f"select count(*), min(rowid), max(rowid) from main.{_INPUT_TABLE}"
+        ).fetchone()
+        if count == 0:
+            if minimum is not None or maximum is not None:
+                raise CatalogueError("historical input row positions are invalid")
+        elif minimum != 0 or maximum != count - 1:
+            raise CatalogueError("historical input row positions are not dense")
+    finally:
+        connection.close()
+    if wal.exists():
+        raise CatalogueError("historical input database produced a write-ahead log")
+    if file_digest(database, store.limits.max_root_bytes) != (checksum, size):
+        raise CatalogueError("historical input database changed while sealing")
+    owner = directory / "owner.json"
+    marker = decode(regular_bytes(owner, 1024))
+    marker.update(
+        {
+            "state": "sealed",
+            "input_sha256": checksum,
+            "input_size": size,
+            "row_count": count,
+        }
+    )
+    store.write(owner.relative_to(store.root).as_posix(), marker)
+    store.sync(directory.relative_to(store.root).as_posix())
+    sealed = _validate_input_tree(
+        store,
+        directory,
+        directory.name,
+        marker["binding_sha256"],
+        marker["table"],
+        marker["schema_sha256"],
+    )
+    if sealed is None:
+        raise CatalogueError("historical input seal disappeared")
+    _validate_sealed_input(store, directory, sealed, schema)
+
+
+def _validate_sealed_input(
+    store: Store,
+    directory: Path,
+    marker: dict[str, Any],
+    schema: pa.Schema,
+) -> None:
+    database = directory / "input.duckdb"
+    if (directory / "input.duckdb.wal").exists():
+        raise CatalogueError("sealed historical input still has a write-ahead log")
+    _assert_owned_input_data_file(store, database)
+    if file_digest(database, store.limits.max_root_bytes) != (
+        marker.get("input_sha256"),
+        marker.get("input_size"),
+    ):
+        raise CatalogueError("sealed historical input database changed")
+    connection = duckdb.connect(str(database), read_only=True, config={"threads": "1"})
+    try:
+        input_schema = _reference_schema(
+            store,
+            connection,
+            store.path(directory.parent.parent.relative_to(store.root).as_posix()),
+            directory.name,
+            _INPUT_TABLE,
+            schema_name=f"{directory.name}_input",
+        )
+        if not input_schema.equals(schema, check_metadata=True):
+            raise CatalogueError("sealed historical input schema changed")
+        count, minimum, maximum = connection.execute(
+            f"select count(*), min(rowid), max(rowid) from main.{_INPUT_TABLE}"
+        ).fetchone()
+        if count != marker.get("row_count") or (
+            (count == 0 and (minimum is not None or maximum is not None))
+            or (count > 0 and (minimum != 0 or maximum != count - 1))
+        ):
+            raise CatalogueError("sealed historical input row positions changed")
+    except duckdb.Error as exc:
+        raise CatalogueError("could not validate the sealed historical input") from exc
+    finally:
+        connection.close()
+    if (directory / "input.duckdb.wal").exists() or file_digest(
+        database, store.limits.max_root_bytes
+    ) != (marker.get("input_sha256"), marker.get("input_size")):
+        raise CatalogueError("sealed historical input changed during validation")
+
+
 def _prefetch_windows(
-    connection: duckdb.DuckDBPyConnection, table: str, schema: pa.Schema
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    schema: pa.Schema,
+    *,
+    start_rowid: int = 0,
+    total_row_count: int | None = None,
 ) -> Iterator[tuple[int, int, int]]:
     query = _input_row_size_query(table, schema)
-    count, minimum, maximum = connection.execute(
-        f"select count(*), min(rowid), max(rowid) from main.{table}"
-    ).fetchone()
-    if count == 0:
-        if minimum is not None or maximum is not None:
-            raise CatalogueError("historical input row positions are invalid")
-        return
-    if minimum != 0 or maximum != count - 1:
-        raise CatalogueError("historical input row positions are not dense")
+    if total_row_count is None:
+        count, minimum, maximum = connection.execute(
+            f"select count(*), min(rowid), max(rowid) from main.{table}"
+        ).fetchone()
+        if count == 0:
+            if minimum is not None or maximum is not None:
+                raise CatalogueError("historical input row positions are invalid")
+            return
+        if minimum != 0 or maximum != count - 1:
+            raise CatalogueError("historical input row positions are not dense")
+    else:
+        count = total_row_count
 
-    start = 0
+    if (
+        isinstance(start_rowid, bool)
+        or not isinstance(start_rowid, int)
+        or not 0 <= start_rowid <= count
+    ):
+        raise CatalogueError("historical input cursor is invalid")
+    start = start_rowid
     while start < count:
         block_end = min(count, start + _BATCH_ROWS)
         metadata = connection.execute(query, [start, block_end]).fetchall()
@@ -959,178 +1423,6 @@ def _read_input_window(
     ).to_arrow_reader(row_count)
 
 
-def _spool_runs(
-    store: Store,
-    connection: duckdb.DuckDBPyConnection,
-    run_directory: Path,
-    table: str,
-    schema: pa.Schema,
-    key_indices: tuple[int, ...],
-    input_relative: str,
-) -> dict[str, Any]:
-    generation = run_directory / "gen-00000000"
-    if generation.exists():
-        _remove_tree(store, generation)
-    generation.mkdir()
-    fsync_directory(run_directory)
-    manifest_partial = generation / "manifest.jsonl.partial"
-    manifest_path = generation / "manifest.jsonl"
-    manifest_hash = hashlib.sha256()
-    manifest_size = 0
-    run_count = 0
-    row_count = 0
-    run_bytes = 0
-    arrow_peak_bytes = 0
-    arrow_peak_rows = 0
-    max_singleton_bytes = 0
-    singleton_peak_bytes = 0
-    try:
-        with manifest_partial.open("wb") as manifest:
-            for window_start, window_rows, estimated_bytes in _prefetch_windows(
-                connection, table, schema
-            ):
-                store.check_deadline()
-                if window_rows == 1:
-                    max_singleton_bytes = max(max_singleton_bytes, estimated_bytes)
-                    metrics.peak("historical_input_singleton_bytes", estimated_bytes)
-                reader = _read_input_window(connection, table, window_start, window_rows)
-                fetched_rows = 0
-                try:
-                    for batch in reader:
-                        store.check_deadline()
-                        fetched_rows += batch.num_rows
-                        arrow_peak_bytes = max(arrow_peak_bytes, batch.nbytes)
-                        arrow_peak_rows = max(arrow_peak_rows, batch.num_rows)
-                        if batch.num_rows == 1:
-                            singleton_peak_bytes = max(singleton_peak_bytes, batch.nbytes)
-                            metrics.peak("historical_input_singleton_arrow_bytes", batch.nbytes)
-                        if batch.num_rows > window_rows or (
-                            batch.num_rows > 1 and batch.nbytes > _BATCH_BYTES
-                        ):
-                            raise CatalogueError("historical input exceeded its Arrow window")
-                        metrics.peak("historical_input_arrow_bytes", batch.nbytes)
-                        metrics.peak("historical_input_arrow_rows", batch.num_rows)
-                        converted = pa.Table.from_batches([batch]).cast(schema)
-                        for piece in _byte_bounded_batches(
-                            converted.to_batches(max_chunksize=_BATCH_ROWS)[0]
-                        ):
-                            table_piece = pa.Table.from_batches([piece])
-                            sort_columns = []
-                            sort_names = []
-                            for index in key_indices:
-                                field = schema.field(index)
-                                column = table_piece.column(index)
-                                data_type = _storage_type(field.type)
-                                if pa.types.is_string(data_type) or pa.types.is_large_string(
-                                    data_type
-                                ):
-                                    column = pc.cast(column, pa.binary())
-                                sort_columns.append(column)
-                                sort_names.append(field.name)
-                            sort_table = pa.Table.from_arrays(sort_columns, names=sort_names)
-                            indices = pc.sort_indices(
-                                sort_table,
-                                sort_keys=[(name, "ascending") for name in sort_names],
-                                null_placement="at_end",
-                            )
-                            sorted_piece = table_piece.take(indices)
-                            name = f"run-{run_count:08d}.parquet"
-                            path = generation / (name + ".partial")
-                            final_path = generation / name
-                            estimate = max(1024 * 1024, sorted_piece.nbytes * 2)
-                            store.reserve_storage(estimate)
-                            try:
-                                pq.write_table(
-                                    sorted_piece,
-                                    path,
-                                    compression="zstd",
-                                    compression_level=6,
-                                    row_group_size=_BATCH_ROWS,
-                                )
-                                fsync_file(path)
-                                os.replace(path, final_path)
-                                fsync_directory(generation)
-                                relative = final_path.relative_to(store.root).as_posix()
-                                store.sync_file(relative)
-                            finally:
-                                store.release_storage(estimate)
-                            checksum, size = file_digest(final_path, store.limits.max_root_bytes)
-                            count = pq.ParquetFile(final_path).metadata.num_rows
-                            entry = {
-                                "name": name,
-                                "sha256": checksum,
-                                "size": size,
-                                "rows": count,
-                            }
-                            encoded = json_bytes(entry)
-                            store.reserve_storage(len(encoded))
-                            try:
-                                manifest.write(encoded)
-                                manifest.flush()
-                                manifest_hash.update(encoded)
-                                manifest_size += len(encoded)
-                                store.sync_file(manifest_partial.relative_to(store.root).as_posix())
-                            finally:
-                                store.release_storage(len(encoded))
-                            run_count += 1
-                            row_count += count
-                            run_bytes += size
-                finally:
-                    reader.close()
-                if fetched_rows != window_rows:
-                    raise CatalogueError("historical input payload window has a gap")
-                store.sync(input_relative)
-                store.check_storage()
-        fsync_file(manifest_partial)
-        os.replace(manifest_partial, manifest_path)
-        fsync_directory(generation)
-        manifest_relative = manifest_path.relative_to(store.root).as_posix()
-        store.sync(manifest_partial.relative_to(store.root).as_posix())
-        store.sync_file(manifest_relative)
-    except BaseException:
-        raise
-    if row_count == 0:
-        # An empty relation still has one schema-bearing run for DuckDB COPY.
-        empty = pa.Table.from_batches([], schema=schema)
-        path = generation / "run-00000000.parquet"
-        store.reserve_storage(1024 * 1024)
-        try:
-            pq.write_table(empty, path, compression="zstd", compression_level=6)
-            fsync_file(path)
-            fsync_directory(generation)
-            store.sync_file(path.relative_to(store.root).as_posix())
-        finally:
-            store.release_storage(1024 * 1024)
-        checksum, size = file_digest(path, store.limits.max_root_bytes)
-        encoded = json_bytes({"name": path.name, "sha256": checksum, "size": size, "rows": 0})
-        store.reserve_storage(len(encoded))
-        try:
-            with manifest_path.open("ab") as manifest:
-                manifest.write(encoded)
-                manifest.flush()
-                os.fsync(manifest.fileno())
-            store.sync_file(manifest_relative)
-        finally:
-            store.release_storage(len(encoded))
-        fsync_directory(generation)
-        manifest_hash.update(encoded)
-        manifest_size += len(encoded)
-        run_count = 1
-        run_bytes = size
-    return {
-        "generation": 0,
-        "manifest_sha256": manifest_hash.hexdigest(),
-        "manifest_size": manifest_size,
-        "run_count": run_count,
-        "row_count": row_count,
-        "run_bytes": run_bytes,
-        "input_arrow_peak_bytes": arrow_peak_bytes,
-        "input_arrow_peak_rows": arrow_peak_rows,
-        "input_max_singleton_bytes": max_singleton_bytes,
-        "input_singleton_peak_bytes": singleton_peak_bytes,
-    }
-
-
 def _byte_bounded_batches(batch: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
     start = 0
     while start < batch.num_rows:
@@ -1141,116 +1433,877 @@ def _byte_bounded_batches(batch: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
         start = stop
 
 
-def _merge_generation(
+def _frontier_owner(identity: dict[str, Any], relation: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "binding_sha256": identity["binding_sha256"],
+        "relation": relation,
+        "table": identity["table"],
+        "schema_sha256": identity["schema_sha256"],
+    }
+
+
+def _ensure_frontier_owner(
     store: Store,
     run_directory: Path,
+    relation: str,
+    identity: dict[str, Any],
+    *,
+    create: bool = True,
+) -> None:
+    _assert_directory(store, run_directory)
+    path = run_directory / "owner.json"
+    expected = _frontier_owner(identity, relation)
+    if not path.exists():
+        if not create:
+            raise CatalogueError("historical frontier owner marker is missing")
+        if any(run_directory.iterdir()):
+            raise CatalogueError("historical frontier files have no owner marker")
+        store.write(path.relative_to(store.root).as_posix(), expected)
+        store.sync(run_directory.relative_to(store.root).as_posix())
+        return
+    _assert_regular(store, path)
+    try:
+        actual = decode(regular_bytes(path, 1024))
+    except Exception as exc:
+        raise CatalogueError("historical frontier owner marker is invalid") from exc
+    if actual != expected:
+        raise CatalogueError("historical frontier owner binding changed")
+
+
+def _empty_frontier(identity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **identity,
+        "complete": False,
+        "next_rowid": 0,
+        "source_row_count": None,
+        "input_sha256": None,
+        "input_size": None,
+        "next_run_id": 0,
+        "levels": [],
+        "pending_write": None,
+        "pending_delete": [],
+        "run_count": 0,
+        "row_count": 0,
+        "run_bytes": 0,
+        "input_arrow_peak_bytes": 0,
+        "input_arrow_peak_rows": 0,
+        "input_max_singleton_bytes": 0,
+        "input_singleton_peak_bytes": 0,
+    }
+
+
+def _frontier_name(run_id: int) -> str:
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or not 0 <= run_id < 10**12:
+        raise CatalogueError("historical frontier run identifier is invalid")
+    return f"run-{run_id:012d}.parquet"
+
+
+def _write_frontier_run(
+    store: Store,
+    run_directory: Path,
+    run_id: int,
+    level: int,
+    batch: pa.RecordBatch,
+    schema: pa.Schema,
+    key_indices: tuple[int, ...],
+) -> dict[str, Any]:
+    table = pa.Table.from_batches([batch]).cast(schema)
+    key_columns = []
+    key_names = []
+    for index in key_indices:
+        field = schema.field(index)
+        column = table.column(index)
+        data_type = _storage_type(field.type)
+        if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
+            column = pc.cast(column, pa.binary())
+        key_columns.append(column)
+        key_names.append(field.name)
+    indices = pc.sort_indices(
+        pa.Table.from_arrays(key_columns, names=key_names),
+        sort_keys=[(name, "ascending") for name in key_names],
+        null_placement="at_end",
+    )
+    sorted_batch = table.take(indices)
+    name = _frontier_name(run_id)
+    path = run_directory / name
+    partial = run_directory / (name + ".partial")
+    if path.exists() or partial.exists():
+        raise CatalogueError("historical frontier run identifier is already present")
+    estimated = max(1024 * 1024, sorted_batch.nbytes * 2)
+    store.reserve_storage(estimated)
+    sealed = False
+    try:
+        pq.write_table(
+            sorted_batch,
+            partial,
+            compression="zstd",
+            compression_level=6,
+            row_group_size=_BATCH_ROWS,
+        )
+        fsync_file(partial)
+        checksum, size = file_digest(partial, store.limits.max_root_bytes)
+        rows = pq.ParquetFile(partial).metadata.num_rows
+        if rows != sorted_batch.num_rows or not pq.ParquetFile(partial).schema_arrow.equals(
+            schema, check_metadata=True
+        ):
+            raise CatalogueError("historical frontier run changed its input batch")
+        os.replace(partial, path)
+        fsync_directory(run_directory)
+        store.sync_file(path.relative_to(store.root).as_posix())
+        sealed = True
+    finally:
+        if not sealed:
+            _remove_frontier_artifact(store, partial)
+            _remove_frontier_artifact(store, path)
+        store.release_storage(estimated)
+    return {"name": name, "level": level, "sha256": checksum, "size": size, "rows": rows}
+
+
+def _merge_frontier_group(
+    store: Store,
+    run_directory: Path,
+    descriptors: list[dict[str, Any]],
+    run_id: int,
+    level: int,
     schema: pa.Schema,
     key_indices: tuple[int, ...],
     key_types: tuple[pa.DataType, ...],
-    checkpoint: dict[str, Any],
-    next_generation: int,
 ) -> dict[str, Any]:
-    input_directory = run_directory / f"gen-{checkpoint['generation']:08d}"
-    output_directory = run_directory / f"gen-{next_generation:08d}"
-    # The current generation remains on disk until the next one is sealed.
-    # Preflight its full output allowance before starting the merge pass.
-    store.check_storage(max(1024 * 1024, checkpoint["run_bytes"] * 2))
-    if output_directory.exists():
-        _remove_tree(store, output_directory)
-    output_directory.mkdir()
-    fsync_directory(run_directory)
-    input_runs = _iter_runs(store, input_directory, checkpoint, schema)
-    output_manifest_partial = output_directory / "manifest.jsonl.partial"
-    output_manifest = output_directory / "manifest.jsonl"
-    manifest_hash = hashlib.sha256()
-    manifest_size = 0
-    run_count = 0
-    row_count = 0
-    run_bytes = 0
+    if len(descriptors) != _MERGE_FAN_IN:
+        raise CatalogueError("historical frontier carry must merge exactly eight runs")
+    paths = [run_directory / item["name"] for item in descriptors]
+    name = _frontier_name(run_id)
+    path = run_directory / name
+    partial = run_directory / (name + ".partial")
+    if path.exists() or partial.exists():
+        raise CatalogueError("historical frontier run identifier is already present")
+    projected = max(1024 * 1024, sum(item["size"] for item in descriptors) * 2)
+    store.reserve_storage(projected)
+    rows = 0
+    sealed = False
     try:
-        with output_manifest_partial.open("wb") as manifest:
-            while group := list(itertools.islice(input_runs, _MERGE_FAN_IN)):
-                store.check_deadline()
-                projected = max(1024 * 1024, sum(item[1]["size"] for item in group) * 2)
-                store.reserve_storage(projected)
-                name = f"run-{run_count:08d}.parquet"
-                path = output_directory / (name + ".partial")
-                final_path = output_directory / name
-                try:
-                    writer = pq.ParquetWriter(
-                        path,
-                        schema,
-                        compression="zstd",
-                        compression_level=6,
-                    )
-                    rows = 0
-                    try:
-                        for batch in _merge_batches(
-                            [item[0] for item in group],
-                            schema,
-                            key_indices,
-                            key_types,
-                            store=store,
-                        ):
-                            writer.write_table(
-                                pa.Table.from_batches([batch]), row_group_size=batch.num_rows
-                            )
-                            rows += batch.num_rows
-                    finally:
-                        writer.close()
-                    fsync_file(path)
-                    os.replace(path, final_path)
-                    fsync_directory(output_directory)
-                    store.sync_file(final_path.relative_to(store.root).as_posix())
-                    checksum, size = file_digest(final_path, store.limits.max_root_bytes)
-                finally:
-                    store.release_storage(projected)
-                entry = {"name": name, "sha256": checksum, "size": size, "rows": rows}
-                encoded = json_bytes(entry)
-                store.reserve_storage(len(encoded))
-                try:
-                    manifest.write(encoded)
-                    manifest.flush()
-                    manifest_hash.update(encoded)
-                    manifest_size += len(encoded)
-                    store.sync_file(output_manifest_partial.relative_to(store.root).as_posix())
-                finally:
-                    store.release_storage(len(encoded))
-                run_count += 1
-                row_count += rows
-                run_bytes += size
-        fsync_file(output_manifest_partial)
-        os.replace(output_manifest_partial, output_manifest)
-        fsync_directory(output_directory)
-        store.sync(output_manifest_partial.relative_to(store.root).as_posix())
-        store.sync_file(output_manifest.relative_to(store.root).as_posix())
-    except BaseException:
-        raise
-    if run_count == 0:
-        raise CatalogueError("historical merge pass produced no runs")
-    if row_count != checkpoint["row_count"]:
-        raise CatalogueError("historical merge pass changed the row count")
-    return {
-        **{
-            key: value
-            for key, value in checkpoint.items()
-            if key
-            not in {
-                "generation",
-                "manifest_sha256",
-                "manifest_size",
-                "run_count",
-                "run_bytes",
-                "row_count",
+        writer = pq.ParquetWriter(
+            partial,
+            schema,
+            compression="zstd",
+            compression_level=6,
+        )
+        try:
+            for batch in _merge_batches(
+                paths,
+                schema,
+                key_indices,
+                key_types,
+                store=store,
+            ):
+                writer.write_table(pa.Table.from_batches([batch]), row_group_size=batch.num_rows)
+                rows += batch.num_rows
+        finally:
+            writer.close()
+        fsync_file(partial)
+        checksum, size = file_digest(partial, store.limits.max_root_bytes)
+        parquet = pq.ParquetFile(partial)
+        expected_rows = sum(item["rows"] for item in descriptors)
+        if rows != expected_rows or parquet.metadata.num_rows != expected_rows:
+            raise CatalogueError("historical frontier carry changed its row count")
+        if not parquet.schema_arrow.equals(schema, check_metadata=True):
+            raise CatalogueError("historical frontier carry changed its schema")
+        os.replace(partial, path)
+        fsync_directory(run_directory)
+        store.sync_file(path.relative_to(store.root).as_posix())
+        sealed = True
+    finally:
+        if not sealed:
+            _remove_frontier_artifact(store, partial)
+            _remove_frontier_artifact(store, path)
+        store.release_storage(projected)
+    return {"name": name, "level": level, "sha256": checksum, "size": size, "rows": rows}
+
+
+def _frontier_totals(levels: list[list[dict[str, Any]]]) -> tuple[int, int, int]:
+    descriptors = [item for level in levels for item in level]
+    return (
+        len(descriptors),
+        sum(item["rows"] for item in descriptors),
+        sum(item["size"] for item in descriptors),
+    )
+
+
+def _normalized_levels(levels: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    while levels and not levels[-1]:
+        levels.pop()
+    return levels
+
+
+def _frontier_state_digest(checkpoint: dict[str, Any]) -> str:
+    return digest(
+        json_bytes(
+            {
+                key: checkpoint[key]
+                for key in (
+                    "binding_sha256",
+                    "schema_sha256",
+                    "input_sha256",
+                    "next_rowid",
+                    "next_run_id",
+                    "levels",
+                    "run_count",
+                    "row_count",
+                    "run_bytes",
+                )
             }
-        },
-        "generation": next_generation,
-        "manifest_sha256": manifest_hash.hexdigest(),
-        "manifest_size": manifest_size,
+        )
+    )
+
+
+def _frontier_leaf_plan(checkpoint: dict[str, Any]) -> list[dict[str, Any]]:
+    levels = [[item["name"] for item in level] for level in checkpoint["levels"]]
+    if not levels:
+        levels.append([])
+    run_id = checkpoint["next_run_id"]
+    planned = [{"name": _frontier_name(run_id), "level": 0, "parents": []}]
+    levels[0].append(planned[0]["name"])
+    run_id += 1
+    level = 0
+    while len(levels[level]) > _MERGE_FAN_IN - 1:
+        parents = levels[level][:_MERGE_FAN_IN]
+        del levels[level][:_MERGE_FAN_IN]
+        item = {
+            "name": _frontier_name(run_id),
+            "level": level + 1,
+            "parents": parents,
+        }
+        planned.append(item)
+        run_id += 1
+        while len(levels) <= level + 1:
+            levels.append([])
+        levels[level + 1].append(item["name"])
+        level += 1
+    return planned
+
+
+def _frontier_collapse_group(
+    levels: list[list[dict[str, Any]]],
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]], int]:
+    working = [list(level) for level in levels]
+    group: list[dict[str, Any]] = []
+    for level in working:
+        take = min(_MERGE_FAN_IN - len(group), len(level))
+        group.extend(level[:take])
+        del level[:take]
+        if len(group) == _MERGE_FAN_IN:
+            break
+    if len(group) != _MERGE_FAN_IN:
+        raise CatalogueError("historical final frontier could not collapse eight runs")
+    output_level = len(_normalized_levels(working))
+    return working, group, output_level
+
+
+def _frontier_collapse_plan(checkpoint: dict[str, Any]) -> list[dict[str, Any]]:
+    _, group, level = _frontier_collapse_group(checkpoint["levels"])
+    return [
+        {
+            "name": _frontier_name(checkpoint["next_run_id"]),
+            "level": level,
+            "parents": [item["name"] for item in group],
+        }
+    ]
+
+
+def _begin_frontier_write(
+    store: Store,
+    checkpoint_relative: str,
+    checkpoint: dict[str, Any],
+    *,
+    kind: str,
+    cursor_end: int,
+) -> dict[str, Any]:
+    if checkpoint.get("pending_write") is not None or checkpoint["pending_delete"]:
+        raise CatalogueError("historical frontier has unfinished file ownership work")
+    if kind == "leaf":
+        planned = _frontier_leaf_plan(checkpoint)
+        source_count = checkpoint.get("source_row_count")
+        if (
+            source_count is None
+            or isinstance(cursor_end, bool)
+            or not isinstance(cursor_end, int)
+            or cursor_end < checkpoint["next_rowid"]
+            or cursor_end > source_count
+            or cursor_end - checkpoint["next_rowid"] > _BATCH_ROWS
+            or cursor_end == checkpoint["next_rowid"]
+            and (source_count != 0 or checkpoint["run_count"] != 0)
+        ):
+            raise CatalogueError("historical frontier source batch cursor is invalid")
+    elif kind == "collapse":
+        if cursor_end != checkpoint["next_rowid"] or checkpoint["run_count"] <= _MERGE_FAN_IN:
+            raise CatalogueError("historical frontier collapse cursor is invalid")
+        planned = _frontier_collapse_plan(checkpoint)
+    else:
+        raise CatalogueError("historical frontier write intent kind is invalid")
+    intent = {
+        "kind": kind,
+        "binding_sha256": checkpoint["binding_sha256"],
+        "schema_sha256": checkpoint["schema_sha256"],
+        "input_sha256": checkpoint["input_sha256"],
+        "cursor_start": checkpoint["next_rowid"],
+        "cursor_end": cursor_end,
+        "frontier_sha256": _frontier_state_digest(checkpoint),
+        "planned": planned,
+        "completed": [],
+    }
+    updated = {**checkpoint, "pending_write": intent}
+    store.write(checkpoint_relative, updated)
+    return updated
+
+
+def _record_frontier_write(
+    store: Store,
+    checkpoint_relative: str,
+    checkpoint: dict[str, Any],
+    descriptor: dict[str, Any],
+) -> dict[str, Any]:
+    intent = checkpoint.get("pending_write")
+    if not isinstance(intent, dict):
+        raise CatalogueError("historical frontier write has no durable intent")
+    index = len(intent["completed"])
+    if index >= len(intent["planned"]):
+        raise CatalogueError("historical frontier write exceeded its durable intent")
+    planned = intent["planned"][index]
+    _validate_frontier_descriptor(descriptor, planned["level"])
+    if descriptor["name"] != planned["name"]:
+        raise CatalogueError("historical frontier output differs from its durable intent")
+    updated_intent = {**intent, "completed": [*intent["completed"], descriptor]}
+    updated = {**checkpoint, "pending_write": updated_intent}
+    store.write(checkpoint_relative, updated)
+    return updated
+
+
+def _validate_frontier_write_intent(
+    store: Store,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+    intent: Any,
+    schema: pa.Schema,
+) -> None:
+    fields = {
+        "kind",
+        "binding_sha256",
+        "schema_sha256",
+        "input_sha256",
+        "cursor_start",
+        "cursor_end",
+        "frontier_sha256",
+        "planned",
+        "completed",
+    }
+    if (
+        not isinstance(intent, dict)
+        or set(intent) != fields
+        or checkpoint["complete"]
+        or checkpoint["pending_delete"]
+        or intent.get("binding_sha256") != checkpoint["binding_sha256"]
+        or intent.get("schema_sha256") != checkpoint["schema_sha256"]
+        or intent.get("input_sha256") != checkpoint.get("input_sha256")
+        or intent.get("cursor_start") != checkpoint["next_rowid"]
+        or intent.get("frontier_sha256") != _frontier_state_digest(checkpoint)
+        or not isinstance(intent.get("planned"), list)
+        or not isinstance(intent.get("completed"), list)
+    ):
+        raise CatalogueError("historical frontier write intent is invalid")
+    cursor_end = intent.get("cursor_end")
+    source_count = checkpoint.get("source_row_count")
+    if (
+        source_count is None
+        or isinstance(cursor_end, bool)
+        or not isinstance(cursor_end, int)
+        or cursor_end < checkpoint["next_rowid"]
+        or cursor_end > source_count
+    ):
+        raise CatalogueError("historical frontier write intent cursor is invalid")
+    if intent["kind"] == "leaf":
+        if (
+            cursor_end - checkpoint["next_rowid"] > _BATCH_ROWS
+            or cursor_end == checkpoint["next_rowid"]
+            and (source_count != 0 or checkpoint["run_count"] != 0)
+        ):
+            raise CatalogueError("historical frontier leaf intent is invalid")
+        expected = _frontier_leaf_plan(checkpoint)
+    elif intent["kind"] == "collapse":
+        if cursor_end != checkpoint["next_rowid"] or checkpoint["run_count"] <= _MERGE_FAN_IN:
+            raise CatalogueError("historical frontier collapse intent is invalid")
+        expected = _frontier_collapse_plan(checkpoint)
+    else:
+        raise CatalogueError("historical frontier write intent kind is invalid")
+    if intent["planned"] != expected or not expected:
+        raise CatalogueError("historical frontier planned outputs changed")
+    if len(intent["completed"]) > len(expected):
+        raise CatalogueError("historical frontier completed too many planned outputs")
+    for index, descriptor in enumerate(intent["completed"]):
+        _validate_frontier_descriptor(descriptor, expected[index]["level"])
+        if descriptor["name"] != expected[index]["name"]:
+            raise CatalogueError("historical frontier completed output changed")
+    if intent["kind"] == "collapse" and len(intent["completed"]) > 1:
+        raise CatalogueError("historical collapse intent has extra outputs")
+    for index, planned in enumerate(expected):
+        final_path = run_directory / planned["name"]
+        partial_path = run_directory / (planned["name"] + ".partial")
+        if final_path.exists() and partial_path.exists():
+            raise CatalogueError("historical frontier intent has duplicate output paths")
+        if index < len(intent["completed"]):
+            if partial_path.exists():
+                raise CatalogueError("sealed frontier output has an unexpected partial file")
+            if final_path.exists():
+                _validate_frontier_run(store, run_directory, intent["completed"][index], schema)
+        else:
+            if final_path.exists():
+                _assert_frontier_artifact(store, final_path)
+            if partial_path.exists():
+                _assert_frontier_artifact(store, partial_path)
+
+
+def _recover_pending_write(
+    store: Store,
+    checkpoint_relative: str,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+    schema: pa.Schema,
+) -> dict[str, Any]:
+    intent = checkpoint.get("pending_write")
+    if intent is None:
+        return checkpoint
+    _validate_frontier_write_intent(store, run_directory, checkpoint, intent, schema)
+    for planned in intent["planned"]:
+        final_path = run_directory / planned["name"]
+        partial_path = run_directory / (planned["name"] + ".partial")
+        _remove_frontier_artifact(store, final_path)
+        _remove_frontier_artifact(store, partial_path)
+    updated = {**checkpoint, "pending_write": None}
+    store.write(checkpoint_relative, updated)
+    return updated
+
+
+def _commit_frontier(
+    store: Store,
+    checkpoint_relative: str,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+    levels: list[list[dict[str, Any]]],
+    next_rowid: int,
+    next_run_id: int,
+    created: list[dict[str, Any]],
+    schema: pa.Schema,
+) -> dict[str, Any]:
+    intent = checkpoint.get("pending_write")
+    if (
+        not isinstance(intent, dict)
+        or intent["completed"] != created
+        or len(created) != len(intent["planned"])
+        or next_run_id != checkpoint["next_run_id"] + len(created)
+        or next_rowid != intent["cursor_end"]
+    ):
+        raise CatalogueError("historical frontier commit does not match its write intent")
+    levels = _normalized_levels(levels)
+    if any(len(level) > _MERGE_FAN_IN - 1 for level in levels):
+        raise CatalogueError("historical frontier exceeded seven committed runs at a level")
+    run_count, row_count, run_bytes = _frontier_totals(levels)
+    if row_count != next_rowid:
+        raise CatalogueError("historical frontier cursor and row count differ")
+    committed_names = {item["name"] for level in levels for item in level}
+    old = [item for level in checkpoint["levels"] for item in level]
+    pending = [item for item in old + created if item["name"] not in committed_names]
+    updated = {
+        **checkpoint,
+        "complete": False,
+        "next_rowid": next_rowid,
+        "next_run_id": next_run_id,
+        "levels": levels,
+        "pending_write": None,
+        "pending_delete": pending,
         "run_count": run_count,
         "row_count": row_count,
         "run_bytes": run_bytes,
     }
+    for key in ("output_sha256", "output_size"):
+        updated.pop(key, None)
+    store.write(checkpoint_relative, updated)
+    _finish_frontier_deletes(store, checkpoint_relative, run_directory, updated, schema)
+    result = _read_checkpoint(store, store.path(checkpoint_relative))
+    if result is None:
+        raise CatalogueError("historical frontier checkpoint disappeared")
+    return result
+
+
+def _commit_frontier_leaf(
+    store: Store,
+    checkpoint_relative: str,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+    leaf: dict[str, Any],
+    next_rowid: int,
+    schema: pa.Schema,
+    key_indices: tuple[int, ...],
+    key_types: tuple[pa.DataType, ...],
+) -> dict[str, Any]:
+    intent = checkpoint.get("pending_write")
+    if not isinstance(intent, dict) or not intent["completed"] or intent["completed"][0] != leaf:
+        raise CatalogueError("historical frontier leaf was not sealed under its write intent")
+    levels = [list(level) for level in checkpoint["levels"]]
+    if not levels:
+        levels.append([])
+    levels[0].append(leaf)
+    created = list(intent["completed"])
+    next_run_id = checkpoint["next_run_id"] + 1
+    level = 0
+    while len(levels[level]) > _MERGE_FAN_IN - 1:
+        group = levels[level][:_MERGE_FAN_IN]
+        del levels[level][:_MERGE_FAN_IN]
+        planned = intent["planned"][len(created)]
+        if planned["parents"] != [item["name"] for item in group]:
+            raise CatalogueError("historical frontier carry parents changed from their intent")
+        output = _merge_frontier_group(
+            store,
+            run_directory,
+            group,
+            int(_FRONTIER_RUN.fullmatch(planned["name"]).group(1)),
+            planned["level"],
+            schema,
+            key_indices,
+            key_types,
+        )
+        checkpoint = _record_frontier_write(store, checkpoint_relative, checkpoint, output)
+        created.append(output)
+        next_run_id += 1
+        while len(levels) <= level + 1:
+            levels.append([])
+        levels[level + 1].append(output)
+        level += 1
+    if len(created) != len(intent["planned"]):
+        raise CatalogueError("historical frontier carry did not produce every planned output")
+    return _commit_frontier(
+        store,
+        checkpoint_relative,
+        run_directory,
+        checkpoint,
+        levels,
+        next_rowid,
+        next_run_id,
+        created,
+        schema,
+    )
+
+
+def _collapse_frontier(
+    store: Store,
+    checkpoint_relative: str,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+    schema: pa.Schema,
+    key_indices: tuple[int, ...],
+    key_types: tuple[pa.DataType, ...],
+) -> dict[str, Any]:
+    while checkpoint["run_count"] > _MERGE_FAN_IN:
+        levels, group, level = _frontier_collapse_group(checkpoint["levels"])
+        checkpoint = _begin_frontier_write(
+            store,
+            checkpoint_relative,
+            checkpoint,
+            kind="collapse",
+            cursor_end=checkpoint["next_rowid"],
+        )
+        planned = checkpoint["pending_write"]["planned"][0]
+        if planned["parents"] != [item["name"] for item in group]:
+            raise CatalogueError("historical collapse parents changed from their intent")
+        output = _merge_frontier_group(
+            store,
+            run_directory,
+            group,
+            int(_FRONTIER_RUN.fullmatch(planned["name"]).group(1)),
+            planned["level"],
+            schema,
+            key_indices,
+            key_types,
+        )
+        checkpoint = _record_frontier_write(store, checkpoint_relative, checkpoint, output)
+        while len(levels) <= level:
+            levels.append([])
+        levels[level].append(output)
+        checkpoint = _commit_frontier(
+            store,
+            checkpoint_relative,
+            run_directory,
+            checkpoint,
+            levels,
+            checkpoint["next_rowid"],
+            checkpoint["next_run_id"] + 1,
+            [output],
+            schema,
+        )
+    return checkpoint
+
+
+def _validate_frontier_run(
+    store: Store,
+    run_directory: Path,
+    descriptor: dict[str, Any],
+    schema: pa.Schema,
+) -> None:
+    path = run_directory / descriptor["name"]
+    _assert_regular(store, path)
+    checksum, size = file_digest(path, store.limits.max_root_bytes)
+    if checksum != descriptor["sha256"] or size != descriptor["size"]:
+        raise CatalogueError("historical frontier run changed")
+    parquet = pq.ParquetFile(path)
+    if parquet.metadata.num_rows != descriptor["rows"] or not parquet.schema_arrow.equals(
+        schema, check_metadata=True
+    ):
+        raise CatalogueError("historical frontier run metadata changed")
+
+
+def _assert_frontier_artifact(store: Store, path: Path) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise CatalogueError("historical frontier artifact is missing or unsafe") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_dev != store.root.stat().st_dev
+        or info.st_nlink != 1
+    ):
+        raise CatalogueError("historical frontier artifact is unsafe")
+
+
+def _remove_frontier_artifact(store: Store, path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    _assert_frontier_artifact(store, path)
+    path.unlink()
+    fsync_directory(path.parent)
+    store.sync(path.parent.relative_to(store.root).as_posix())
+
+
+def _validate_frontier(
+    store: Store,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+    schema: pa.Schema,
+) -> None:
+    allowed = {
+        "version",
+        "binding_sha256",
+        "table",
+        "keys",
+        "schema_sha256",
+        "complete",
+        "next_rowid",
+        "source_row_count",
+        "input_sha256",
+        "input_size",
+        "next_run_id",
+        "levels",
+        "pending_write",
+        "pending_delete",
+        "run_count",
+        "row_count",
+        "run_bytes",
+        "input_arrow_peak_bytes",
+        "input_arrow_peak_rows",
+        "input_max_singleton_bytes",
+        "input_singleton_peak_bytes",
+        "output_sha256",
+        "output_size",
+    }
+    if set(checkpoint) - allowed:
+        raise CatalogueError("historical frontier checkpoint has unexpected fields")
+    if (
+        "pending_write" not in checkpoint
+        or type(checkpoint.get("version")) is not int
+        or checkpoint["version"] != 2
+        or type(checkpoint.get("complete")) is not bool
+        or not _hex(checkpoint.get("binding_sha256"), 64)
+        or not _hex(checkpoint.get("schema_sha256"), 64)
+        or not isinstance(checkpoint.get("table"), str)
+        or not isinstance(checkpoint.get("keys"), list)
+        or not isinstance(checkpoint.get("levels"), list)
+        or not isinstance(checkpoint.get("pending_delete"), list)
+    ):
+        raise CatalogueError("historical frontier checkpoint is invalid")
+    for field in ("next_rowid", "next_run_id", "run_count", "row_count", "run_bytes"):
+        value = checkpoint.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CatalogueError("historical frontier checkpoint counters are invalid")
+    source_count = checkpoint.get("source_row_count")
+    if source_count is not None and (
+        isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or source_count < 0
+        or checkpoint["next_rowid"] > source_count
+    ):
+        raise CatalogueError("historical frontier source count is invalid")
+    if source_count is None and (
+        checkpoint["next_rowid"] != 0
+        or checkpoint["run_count"] != 0
+        or checkpoint.get("input_sha256") is not None
+        or checkpoint.get("input_size") is not None
+    ):
+        raise CatalogueError("historical frontier prefix has no sealed input binding")
+    if (checkpoint.get("input_sha256") is None) != (source_count is None):
+        raise CatalogueError("historical frontier input binding is incomplete")
+    if source_count is not None and (
+        not _hex(checkpoint.get("input_sha256"), 64)
+        or isinstance(checkpoint.get("input_size"), bool)
+        or not isinstance(checkpoint.get("input_size"), int)
+        or checkpoint["input_size"] < 0
+    ):
+        raise CatalogueError("historical frontier input binding is invalid")
+    for metric in (
+        "input_arrow_peak_bytes",
+        "input_arrow_peak_rows",
+        "input_max_singleton_bytes",
+        "input_singleton_peak_bytes",
+    ):
+        value = checkpoint.get(metric)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CatalogueError("historical frontier input metrics are invalid")
+    if checkpoint["complete"]:
+        if (
+            source_count is None
+            or checkpoint["next_rowid"] != source_count
+            or checkpoint["run_count"] < 1
+            or checkpoint["run_count"] > _MERGE_FAN_IN
+            or checkpoint["pending_write"] is not None
+            or checkpoint["pending_delete"]
+            or not _hex(checkpoint.get("output_sha256"), 64)
+        ):
+            raise CatalogueError("historical completed export digest is invalid")
+        size = checkpoint.get("output_size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise CatalogueError("historical completed export size is invalid")
+    elif "output_sha256" in checkpoint or "output_size" in checkpoint:
+        raise CatalogueError("incomplete historical frontier has output metadata")
+    if checkpoint["pending_write"] is not None and checkpoint["pending_delete"]:
+        raise CatalogueError("historical frontier has overlapping write and delete work")
+
+    run_names: set[str] = set()
+    run_ids: set[int] = set()
+    total_rows = total_bytes = total_runs = 0
+    for level_index, level in enumerate(checkpoint["levels"]):
+        if not isinstance(level, list) or len(level) > _MERGE_FAN_IN - 1:
+            raise CatalogueError("historical frontier level exceeds seven runs")
+        for descriptor in level:
+            _validate_frontier_descriptor(descriptor, level_index)
+            match = _FRONTIER_RUN.fullmatch(descriptor["name"])
+            assert match is not None
+            run_id = int(match.group(1))
+            if run_id >= checkpoint["next_run_id"] or run_id in run_ids:
+                raise CatalogueError("historical frontier run identifier is invalid")
+            if descriptor["name"] in run_names:
+                raise CatalogueError("historical frontier repeats a run")
+            run_ids.add(run_id)
+            run_names.add(descriptor["name"])
+            _validate_frontier_run(store, run_directory, descriptor, schema)
+            total_rows += descriptor["rows"]
+            total_bytes += descriptor["size"]
+            total_runs += 1
+    if (
+        total_runs != checkpoint["run_count"]
+        or total_rows != checkpoint["row_count"]
+        or total_bytes != checkpoint["run_bytes"]
+        or total_rows != checkpoint["next_rowid"]
+    ):
+        raise CatalogueError("historical frontier inventory does not match its checkpoint")
+
+    if checkpoint["pending_write"] is not None:
+        _validate_frontier_write_intent(
+            store,
+            run_directory,
+            checkpoint,
+            checkpoint["pending_write"],
+            schema,
+        )
+
+    pending_names = set()
+    pending_ids = set()
+    for descriptor in checkpoint["pending_delete"]:
+        _validate_frontier_descriptor(descriptor, descriptor.get("level"))
+        name = descriptor["name"]
+        if name in run_names or name in pending_names:
+            raise CatalogueError("historical frontier pending-delete inventory overlaps")
+        pending_id = int(_FRONTIER_RUN.fullmatch(name).group(1))
+        if (
+            pending_id >= checkpoint["next_run_id"]
+            or pending_id in run_ids
+            or pending_id in pending_ids
+        ):
+            raise CatalogueError("historical frontier pending-delete identifier is invalid")
+        pending_ids.add(pending_id)
+        pending_names.add(name)
+        path = run_directory / name
+        if path.exists():
+            _validate_frontier_run(store, run_directory, descriptor, schema)
+
+
+def _validate_frontier_descriptor(descriptor: Any, level: Any) -> None:
+    if (
+        not isinstance(descriptor, dict)
+        or set(descriptor) != {"name", "level", "sha256", "size", "rows"}
+        or descriptor.get("level") != level
+        or isinstance(descriptor.get("level"), bool)
+        or not isinstance(descriptor.get("level"), int)
+        or descriptor["level"] < 0
+        or not isinstance(descriptor.get("name"), str)
+        or _FRONTIER_RUN.fullmatch(descriptor["name"]) is None
+        or not _hex(descriptor.get("sha256"), 64)
+        or isinstance(descriptor.get("size"), bool)
+        or not isinstance(descriptor.get("size"), int)
+        or descriptor["size"] < 0
+        or isinstance(descriptor.get("rows"), bool)
+        or not isinstance(descriptor.get("rows"), int)
+        or descriptor["rows"] < 0
+    ):
+        raise CatalogueError("historical frontier run descriptor is invalid")
+
+
+def _finish_frontier_deletes(
+    store: Store,
+    checkpoint_relative: str,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+    schema: pa.Schema,
+) -> None:
+    pending = checkpoint.get("pending_delete", [])
+    if not pending:
+        return
+    for descriptor in pending:
+        path = run_directory / descriptor["name"]
+        if path.exists():
+            _validate_frontier_run(store, run_directory, descriptor, schema)
+            _remove_owned_file(store, path)
+    updated = {**checkpoint, "pending_delete": []}
+    store.write(checkpoint_relative, updated)
+
+
+def _discard_unreferenced_frontier_runs(
+    store: Store,
+    run_directory: Path,
+    checkpoint: dict[str, Any],
+) -> None:
+    if checkpoint.get("pending_write") is not None:
+        raise CatalogueError("historical frontier write intent was not recovered")
+    referenced = {item["name"] for level in checkpoint["levels"] for item in level} | {
+        item["name"] for item in checkpoint["pending_delete"]
+    }
+    for path in list(run_directory.iterdir()):
+        if path.name == "owner.json" or path.name in referenced:
+            continue
+        match = _FRONTIER_RUN.fullmatch(path.name) or _FRONTIER_PARTIAL.fullmatch(path.name)
+        if match is None:
+            if _GENERATION.fullmatch(path.name):
+                raise CatalogueError("legacy run generation found in frontier work directory")
+            raise CatalogueError("historical frontier contains a foreign file")
+        raise CatalogueError("historical frontier contains an unowned run identifier")
 
 
 def _copy_merged(
@@ -1264,8 +2317,9 @@ def _copy_merged(
     output_path: Path,
     output_relative: str,
 ) -> None:
-    generation = run_directory / f"gen-{checkpoint['generation']:08d}"
-    runs = [path for path, _ in _iter_runs(store, generation, checkpoint, schema)]
+    runs = [
+        run_directory / descriptor["name"] for level in checkpoint["levels"] for descriptor in level
+    ]
     projected = max(1024 * 1024, checkpoint["run_bytes"] * 2)
     partial = store.path(output_relative + ".partial")
     _remove_owned_file(store, partial)
@@ -1484,136 +2538,6 @@ def _take_rows(
     return batch
 
 
-def _iter_runs(
-    store: Store,
-    generation: Path,
-    checkpoint: dict[str, Any],
-    schema: pa.Schema,
-) -> Iterator[tuple[Path, dict[str, Any]]]:
-    manifest = generation / "manifest.jsonl"
-    _assert_regular(store, manifest)
-    checksum, size = file_digest(manifest, store.limits.max_root_bytes)
-    if (
-        checksum != checkpoint.get("manifest_sha256")
-        or size != checkpoint.get("manifest_size")
-        or isinstance(checkpoint.get("manifest_size"), bool)
-        or not isinstance(checkpoint.get("manifest_size"), int)
-        or isinstance(checkpoint.get("row_count"), bool)
-        or not isinstance(checkpoint.get("row_count"), int)
-        or checkpoint["row_count"] < 0
-        or isinstance(checkpoint.get("run_bytes"), bool)
-        or not isinstance(checkpoint.get("run_bytes"), int)
-        or checkpoint["run_bytes"] < 0
-    ):
-        raise CatalogueError("historical run manifest changed")
-    expected = checkpoint.get("run_count")
-    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
-        raise CatalogueError("invalid historical run count")
-    seen = 0
-    total_rows = 0
-    total_bytes = 0
-    with manifest.open("rb") as source:
-        for line in source:
-            store.check_deadline()
-            try:
-                record = json.loads(line)
-            except (ValueError, UnicodeError) as exc:
-                raise CatalogueError("invalid historical run manifest") from exc
-            if (
-                not isinstance(record, dict)
-                or record.get("name") != f"run-{seen:08d}.parquet"
-                or not _hex(record.get("sha256"), 64)
-                or isinstance(record.get("size"), bool)
-                or not isinstance(record.get("size"), int)
-                or record["size"] < 0
-                or isinstance(record.get("rows"), bool)
-                or not isinstance(record.get("rows"), int)
-                or record["rows"] < 0
-            ):
-                raise CatalogueError("invalid historical run inventory")
-            path = store.path(generation.relative_to(store.root).as_posix() + "/" + record["name"])
-            _assert_regular(store, path)
-            actual_hash, actual_size = file_digest(path, store.limits.max_root_bytes)
-            if actual_hash != record["sha256"] or actual_size != record["size"]:
-                raise CatalogueError("historical sorted run changed")
-            parquet = pq.ParquetFile(path)
-            if parquet.metadata.num_rows != record["rows"] or not parquet.schema_arrow.equals(
-                schema, check_metadata=True
-            ):
-                raise CatalogueError("historical sorted run metadata changed")
-            seen += 1
-            total_rows += record["rows"]
-            total_bytes += record["size"]
-            yield path, record
-    if (
-        seen != expected
-        or total_rows != checkpoint.get("row_count")
-        or total_bytes != checkpoint.get("run_bytes")
-    ):
-        raise CatalogueError("historical sorted run inventory is incomplete")
-
-
-def _valid_generation(
-    store: Store,
-    run_directory: Path,
-    generation: int,
-    checkpoint: dict[str, Any],
-    schema: pa.Schema,
-) -> bool:
-    path = run_directory / f"gen-{generation:08d}"
-    try:
-        _assert_directory(store, path)
-        entries = list(path.iterdir())
-        if any(
-            entry.name != "manifest.jsonl" for entry in entries if entry.name.startswith("manifest")
-        ):
-            return False
-        if (
-            isinstance(checkpoint.get("run_count"), bool)
-            or not isinstance(checkpoint.get("run_count"), int)
-            or checkpoint["run_count"] < 1
-            or not _hex(checkpoint.get("manifest_sha256"), 64)
-            or isinstance(checkpoint.get("generation"), bool)
-            or checkpoint.get("generation") != generation
-        ):
-            return False
-        if len(entries) != checkpoint.get("run_count", -1) + 1:
-            return False
-        for entry in entries:
-            if entry.name != "manifest.jsonl" and _RUN.fullmatch(entry.name) is None:
-                return False
-            _assert_regular(store, entry)
-        sum(1 for _ in _iter_runs(store, path, checkpoint, schema))
-        return True
-    except (CatalogueError, OSError, ValueError):
-        return False
-
-
-def _remove_unreferenced_generations(store: Store, relative: str, keep: int) -> None:
-    directory = store.path(relative)
-    _assert_directory(store, directory)
-    for path in directory.iterdir():
-        if _GENERATION.fullmatch(path.name) is None:
-            raise CatalogueError("unexpected historical run directory")
-        generation = int(path.name[-8:])
-        if generation != keep:
-            _remove_tree(store, path)
-
-
-def _remove_relation_runs(store: Store, work_relative: str, name: str) -> None:
-    relative = f"{work_relative}/runs/{name}"
-    path = store.path(relative)
-    if path.exists():
-        _remove_tree(store, path)
-
-
-def _remove_tree(store: Store, path: Path) -> None:
-    _validate_owned_tree(store, path)
-    shutil.rmtree(path)
-    fsync_directory(path.parent)
-    store.sync(path.relative_to(store.root).as_posix())
-
-
 def _remove_owned_file(store: Store, path: Path) -> None:
     if not path.exists():
         return
@@ -1647,28 +2571,16 @@ def _assert_regular(store: Store, path: Path) -> None:
         raise CatalogueError("historical export file is unsafe or oversized")
 
 
-def _validate_owned_tree(store: Store, path: Path) -> None:
-    _assert_directory(store, path)
-    for child in path.iterdir():
-        info = child.lstat()
-        if stat.S_ISDIR(info.st_mode):
-            if _GENERATION.fullmatch(child.name) is None:
-                raise CatalogueError("historical export work tree contains an unexpected directory")
-            _validate_owned_tree(store, child)
-        elif (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_nlink != 1
-            or child.name not in {"manifest.jsonl", "manifest.jsonl.partial"}
-            and _RUN.fullmatch(child.name) is None
-            and re.fullmatch(r"run-[0-9]{8}\.parquet\.partial", child.name) is None
-        ):
-            raise CatalogueError("historical export work tree contains an unsafe entry")
-
-
 def _validate_work_tree(store: Store, root: Path) -> None:
     _assert_directory(store, root)
     allowed = {"output", "runs", "checkpoints", "schemas", "inputs", "duckdb-spill"}
+    spill_owner = False
+    spill_directory = False
     for child in root.iterdir():
+        if child.name == _SPILL_OWNER:
+            _validate_spill_owner_marker(store, root)
+            spill_owner = True
+            continue
         if child.name not in allowed or child.is_symlink() or not child.is_dir():
             raise CatalogueError("historical export work tree contains an unexpected entry")
         if child.name == "output":
@@ -1691,36 +2603,91 @@ def _validate_work_tree(store: Store, root: Path) -> None:
                 if _RELATION.fullmatch(relation.name) is None or relation.is_symlink():
                     raise CatalogueError("historical export run inventory is unsafe")
                 _assert_directory(store, relation)
-                for generation in relation.iterdir():
-                    if _GENERATION.fullmatch(generation.name) is None:
-                        raise CatalogueError("historical export generation inventory is unsafe")
-                    _assert_directory(store, generation)
-                    for entry in generation.iterdir():
-                        if entry.name not in {"manifest.jsonl", "manifest.jsonl.partial"} and not (
-                            _RUN.fullmatch(entry.name)
-                            or re.fullmatch(r"run-[0-9]{8}\.parquet\.partial", entry.name)
-                        ):
-                            raise CatalogueError(
-                                "historical export run contains an unexpected file"
-                            )
+                for entry in relation.iterdir():
+                    if entry.name == "owner.json":
                         _assert_regular(store, entry)
+                    elif _FRONTIER_RUN.fullmatch(entry.name) or _FRONTIER_PARTIAL.fullmatch(
+                        entry.name
+                    ):
+                        _assert_frontier_artifact(store, entry)
+                    elif _GENERATION.fullmatch(entry.name):
+                        _assert_directory(store, entry)
+                        for generation_entry in entry.iterdir():
+                            if generation_entry.name not in {
+                                "manifest.jsonl",
+                                "manifest.jsonl.partial",
+                            } and not (
+                                _RUN.fullmatch(generation_entry.name)
+                                or re.fullmatch(
+                                    r"run-[0-9]{8}\.parquet\.partial",
+                                    generation_entry.name,
+                                )
+                            ):
+                                raise CatalogueError("historical run contains an unexpected file")
+                            _assert_regular(store, generation_entry)
+                    else:
+                        raise CatalogueError("historical run inventory is unsafe")
         elif child.name == "inputs":
             for relation in child.iterdir():
                 if _RELATION.fullmatch(relation.name) is None or relation.is_symlink():
                     raise CatalogueError("historical input inventory is unsafe")
                 _validate_input_tree(store, relation, relation.name)
         else:
+            spill_directory = True
             _validate_safe_tree(store, child)
+    if spill_directory and not spill_owner:
+        raise CatalogueError("historical DuckDB spill directory has no durable owner")
+
+
+def _validate_spill_owner_marker(store: Store, root: Path) -> dict[str, Any]:
+    path = root / _SPILL_OWNER
+    _assert_regular(store, path)
+    try:
+        owner = decode(regular_bytes(path, 4096))
+    except Exception as exc:
+        raise CatalogueError("historical DuckDB spill owner marker is invalid") from exc
+    expected_fields = {
+        "version",
+        "root",
+        "temporary",
+        "source_database",
+        "spill",
+        "historical_export",
+        "export_binding_sha256",
+    }
+    relative = root.relative_to(store.root).as_posix()
+    source_database = owner.get("source_database") if isinstance(owner, dict) else None
+    if (
+        not isinstance(owner, dict)
+        or set(owner) != expected_fields
+        or type(owner.get("version")) is not int
+        or owner["version"] != 1
+        or owner.get("root") != str(store.root.resolve())
+        or owner.get("temporary") != relative
+        or owner.get("spill") != f"{relative}/duckdb-spill"
+        or type(owner.get("historical_export")) is not bool
+        or not _hex(owner.get("export_binding_sha256"), 64)
+        or not isinstance(source_database, str)
+        or not source_database
+        or Path(source_database).is_absolute()
+        or ".." in Path(source_database).parts
+        or Path(source_database).as_posix() != source_database
+    ):
+        raise CatalogueError("historical DuckDB spill owner binding is invalid")
+    return owner
 
 
 def _validate_safe_tree(store: Store, path: Path) -> None:
     _assert_directory(store, path)
     for child in path.iterdir():
-        info = child.lstat()
-        if stat.S_ISDIR(info.st_mode):
-            _validate_safe_tree(store, child)
-        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise CatalogueError("historical export work tree contains an unsafe entry")
+        if _DUCKDB_SPILL_FILE.fullmatch(child.name) is None:
+            raise CatalogueError("historical DuckDB spill inventory contains a foreign entry")
+        try:
+            _assert_regular(store, child)
+        except CatalogueError as exc:
+            raise CatalogueError(
+                "historical DuckDB spill inventory contains an unsafe entry"
+            ) from exc
 
 
 def _hex(value: Any, length: int) -> bool:

@@ -253,10 +253,10 @@ def test_external_merge_uses_multiple_bounded_passes_and_reuses_sealed_export(
         output = store.path(f"{work_relative}/output/source_rows.parquet")
         assert pq.read_table(output, columns=["ordinal"])["ordinal"].to_pylist() == list(range(19))
 
-        def unexpected_respool(*args, **kwargs):
+        def unexpected_materialize(*args, **kwargs):
             raise AssertionError("sealed relation should be reused")
 
-        monkeypatch.setattr(historical_export, "_spool_runs", unexpected_respool)
+        monkeypatch.setattr(historical_export, "_materialize_input", unexpected_materialize)
         second = historical_export.export_relation(
             store,
             connection,

@@ -398,7 +398,7 @@ Preserve the producer's timezone when reconciling older sessions: their saved
 boot stamp includes local display text. UTC process-identity queries must scope
 their timezone override to that query.
 
-Run reconciliation from the canonical verified checkout, using the tested
+Run legacy reconciliation from the canonical verified checkout, using the tested
 interpreter. Its managed-runtime lookup is relative to the script's source
 checkout; invoking a copied script inside a frozen runtime does not relocate
 that lookup through the project-data environment setting. The exact memory
@@ -407,3 +407,77 @@ bound to the saved UTC launch identity and report hashes. Original storage-stop
 evidence requirements remain unchanged. Distinct verified memory-stop and typed temporary-storage-stop attempts
 may append reconciliation records for the same session; exact events are
 idempotent and conflicting records for the same attempt are rejected.
+
+### Private historical continuation state
+
+Readiness, adoption, export frontiers and operational grants are private recovery
+artifacts. They do not change public relation schemas, exact decimal values,
+payload text, provenance, UTF-8/null-last ordering or unique-key requirements.
+The public historical export policy remains compatible with certified releases;
+an incompatible private run layout receives a distinct checkpoint binding.
+
+A validation cursor is bound to the candidate database, selected receipt
+evidence, normalization code and schema. Prefix verification precedes skipping
+compared rows. Only complete landing, membership, eligibility and coverage checks
+authorize a readiness seal. The immutable adoption record establishes ownership;
+later mutable phase seals establish which closed candidate state can reuse those
+checks. An unsealed change cannot authorize reuse or a loader fallback.
+
+Original DB/WAL retirement requires independently verified adoption and durable
+cleanup intent before deletion, with directory synchronization afterward.
+Recovery preserves an adopted candidate and resolves interrupted cleanup before
+advancing. Installed build evidence retains its adoption lineage.
+
+Historical readiness and adoption seals retain their original receipts. Later
+candidate changes or approved source cleanup must not rewrite those outcomes.
+A model continuation validates current candidate state under its own grant;
+late source retirement records separate verification and cleanup evidence.
+
+An export frontier commits its source cursor and referenced run inventory
+together. Compaction seals outputs before replacing the frontier and removes
+superseded inputs only afterward. At most eight readers participate in any merge,
+including the final ordered COPY. Sealed scratch input is reusable only after
+its checksum, schema, ownership, dense row positions and absent WAL verify.
+
+Grants and their latches are explicit and attempt-specific. Historical readiness
+cannot acquire new observations, reset prior accounting or authorize publication.
+Publication, independent verification and activation have distinct durable
+outcomes; failure after replacement leaves activation uncertain until readback.
+The saved session retains its original `full`, `resume` or `historical` capture
+mode. Exact historical grant and capture bindings authorize the private work;
+continuation does not rewrite that original mode.
+
+An interrupted private grant retains its consumed launch and exact controller,
+worker, storage and runtime bindings. Same-boot reconciliation requires proof
+that both recorded processes and groups are absent under the canonical locks.
+A changed boot instead requires the explicit historical reboot/accounting
+recovery route, the saved volume/root identities and complete accounting. That
+route does not query or signal process identities from the previous boot. Both
+routes preserve prior failures and grants, start no worker and grant no time.
+Private pause receipts name the applicable conditional commands using the bound
+frozen source and the literal virtual-environment interpreter path.
+If a verified reboot changes the volume's numeric device identifier, the
+completed recovery history binds the current mount to the original frozen
+volume and root. Fresh grants record the current device; prior freeze, grant
+and validation records retain their original identities. An unexplained
+same-boot device change or a split across current mounts still fails closed.
+
+Every private processing forecast retains the 96/144 GiB database/temporary
+admission thresholds. A source-starting grant may preserve a measured
+pre-cleanup temporary baseline up to 192 GiB, independently of its processing
+forecast. Only initial inventory checks and the supervised source maintenance
+step may carry that baseline; after maintenance, snapshot and all later work
+require current inventory within the approved processing projection.
+
+The 65,536-entry inventory bound applies to declared mutable workspaces and
+external run artifacts. Retained raw receipts and capture metadata remain in
+full byte accounting; their file count does not consume the mutable inventory
+quota. Direct namespace roots count once as conservative inventory overhead.
+Admission still inspects the whole root for unsafe entries and device
+changes, and the live sampler retains its namespace and workspace bounds.
+New-release live supervision retains its separate per-release bound; admission
+forecasts must include coexistence. These monitors are not filesystem quotas.
+Fresh admission binds owned inventory and counters exactly. Whole-volume free
+space may change between measurement and launch; it must still cover the fixed
+floor plus all projected future consumption. Later live checks retain the floor
+without charging completed work again.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import shutil
 from datetime import datetime, timedelta
@@ -122,13 +123,40 @@ def capture_at(store, snapshot, timestamp=DELTA_TIME, *, client_factory=None, **
     # This helper builds the pre-historical exchange catalogue used by the
     # incremental compatibility tests. New historical-profile behavior is
     # exercised directly in test_historical_capture.py.
-    kwargs.setdefault("catalogue_profile", "exchange")
+    if "catalogue_profile" in inspect.signature(acquisition.capture).parameters:
+        kwargs.setdefault("catalogue_profile", "exchange")
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(fixtures, "now", lambda: timestamp)
         patch.setattr(acquisition, "now", lambda: timestamp)
         return acquisition.capture(
             store, client_factory=client_factory or snapshot.factory, **kwargs
         )
+
+
+def test_capture_at_adapts_catalogue_profile_to_capture_signature(monkeypatch):
+    store = object()
+    snapshot = Snapshot()
+
+    def legacy_capture(received_store, *, client_factory=None):
+        return received_store, client_factory
+
+    monkeypatch.setattr(acquisition, "capture", legacy_capture)
+    assert capture_at(store, snapshot) == (store, snapshot.factory)
+
+    def current_capture(received_store, *, client_factory=None, catalogue_profile="historical"):
+        return received_store, client_factory, catalogue_profile
+
+    monkeypatch.setattr(acquisition, "capture", current_capture)
+    assert capture_at(store, snapshot) == (store, snapshot.factory, "exchange")
+    assert capture_at(store, snapshot, catalogue_profile="historical") == (
+        store,
+        snapshot.factory,
+        "historical",
+    )
+
+    monkeypatch.setattr(acquisition, "capture", legacy_capture)
+    with pytest.raises(TypeError, match="catalogue_profile"):
+        capture_at(store, snapshot, catalogue_profile="historical")
 
 
 def controlled_receipt_client(snapshot, target_endpoint, page_id, received_at):

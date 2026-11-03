@@ -90,6 +90,15 @@ On 2026-10-27, the focused migration-interruption checks passed (20 tests, 22.52
 
 On 2026-10-28, a separate frozen runtime at revision `5ee6abd` was installed offline from the lockfile with DuckDB 2.0.0, dlt 1.31.0, dbt-duckdb 1.11.1, dbt-core 1.12.5 and PyArrow 26.0.0. Independent verification matched all 132 tracked source files and all 91 installed distributions to the frozen source and lockfile. The prior runtime was retained. Ingestion was held at that installation checkpoint by explicit operator choice; installation does not establish a completed catalogue, warehouse migration or production activation. Any later restart still requires compatible readers, fresh recovery eligibility and accounting checks, and explicit authorization within the applicable session limits.
 
+The checker keeps current-only private resource-setting and checker-reaping tests
+in the candidate and canonical suites. The archived reference predates those
+internal interfaces. Both versions still exercise duplicate/replay, exact-value
+series builds and capture recovery; explicit cross-version phases consume the
+old dictionary and warehouse baselines and compare frozen public schemas and
+ordered values. The focused delta phase verifies baseline consumption,
+immutability and sentinel values; it does not establish full incremental-output
+equivalence. The broader sample comparisons below are separate evidence.
+
 ### Bounded cross-version measurements, 28 October 2026
 
 The MacBook comparison used separate locked environments and frozen sources: `f76a3f3` with DuckDB 1.5.6/dbt-duckdb 1.11.0, and `5ee6abd` with DuckDB 2.0.0/dbt-duckdb 1.11.1. Other locked stack versions were held constant. The same offline `combo-heavy` fixture contained 10,000 live and 10,000 historical markets, 20,003 baseline observations and 197,306 combo legs. There was no live API traffic. Each reported timing profile used one warm-up per engine and three paired runs, ordered reference/candidate, candidate/reference, reference/candidate, with supervised children capped at 180 seconds. The table uses `pipeline_elapsed_seconds`; interpreter startup, baseline setup/cloning, query-only profiles and separately timed standalone verification are excluded and recorded separately.
@@ -761,3 +770,92 @@ were made, and there is no accepted release or production activation. The
 continuation still requires independent verification and explicit activation;
 none of the earlier failed capacity measurements are superseded by the new code
 or authorization.
+
+## Historical completion engineering gate (2026-11-03)
+
+The retained pre-compaction one-million-observation export qualification completed
+all six relations in 771.93 seconds. It recorded 5,553,635,328 bytes of process
+RSS high-water and 1,100,196,126 bytes of scratch/run/output coexistence. This was
+a diagnostic fixture, not full-scale admission, publication or activation.
+
+The subsequent forecast remained **NO_ADMIT**. Its representative-density
+scenario projected about 411 million combo-leg rows, rather than measuring the
+full capture's combo count. At one initial run per 4,096 rows this required at
+least 100,342 run files, exceeding the 65,536-entry live inventory ceiling.
+Estimated export time including additional merge passes was 25.62 hours, or
+30.74 hours with a 20% sensitivity, excluding unmeasured stage validation and
+build work. The saved production stop occurred earlier, during dbt spill growth;
+fixing export inventory alone cannot establish build capacity.
+
+The replacement engineering approach retains bounded external sorting and adds
+incremental compaction and durable progress. Its effectiveness requires fresh
+1M and 3M current-plan qualification, then exact saved-stage validation and
+phase-specific capacity evidence. Existing fixture results do not establish its
+throughput. Readiness work is real processing and consumes its own explicit
+grant; completed validated work is retained for later grants.
+
+Before choosing processing grants, record actual derived relation counts,
+scratch/database/WAL/spill and retained-output coexistence, physical inventory
+peaks, RSS, Arrow allocation, oversized rows and throughput. Include repeated
+checksum/certification scans, checkpoint and activation costs in the forecast,
+with a 30% time allowance. Source/candidate coexistence must fit before adoption;
+retiring a verified source later does not reduce that initial copy peak. The
+existing resource ceilings and protective stops remain unchanged, and monitored
+limits remain cooperative rather than filesystem quotas.
+
+### Incremental-compaction qualifications (2026-11-03)
+
+Fresh diagnostic exports completed all six relations from 1,000,723 and
+3,000,523 genuine saved observations. The 3M fixture was independently selected;
+it was not a repeated 1M fixture. Both runs used the locked DuckDB 2.0.0 runtime,
+4 GB memory, four threads, bounded input windows, incremental eight-way
+compaction and one-thread final `COPY`.
+
+| Measurement | 1M | 3M |
+|---|---:|---:|
+| Export/check elapsed | 755.82 s | 2,469.72 s |
+| Arrow pool peak | 384,323,136 B | 1,039,552,448 B |
+| Process RSS high-water | 5,951,782,912 B | 6,677,839,872 B |
+| Allocated diagnostic-tree peak | 2,162,794,496 B | 6,093,086,720 B |
+| Retained/in-flight run peak | 52 files / 1,085,442,245 B | 55 files / 3,329,021,650 B |
+| Final exports | 710,561,342 B | 2,161,442,770 B |
+| Largest private input DB | 338,702,336 B | 1,031,811,072 B |
+| Largest observed private-input WAL | 22,424,319 B | 25,749,046 B |
+
+The database footprint includes a diagnostic source copy; it must not be reported
+as private scratch alone. Input hooks observed WAL growth missed by the outer
+one-second sampler. Spill-labelled samples can include ownership markers, so
+they do not establish a native-spill byte count. These are observed peaks, not
+hard resource bounds. Other unrelated host work was recorded during measurement.
+
+| Relation | 1M rows | 3M rows |
+|---|---:|---:|
+| Series | 15,394 | 15,394 |
+| Events | 11,284 | 34,084 |
+| Markets | 974,045 | 2,951,045 |
+| Relationships | 985,329 | 2,985,129 |
+| Combo legs | 5,156,497 | 15,783,241 |
+| Observation history | 1,000,723 | 3,000,523 |
+
+Both runs checked exact schemas, ordering, uniqueness, row preservation and
+representative payload/decimal/provenance values. Repeated-rule and combo tails
+were included. The largest estimated row was 37,419 bytes; no oversized
+singleton occurred in these fixtures. Separate regression tests cover oversized
+rows and eight oversized merge heads. Input windows remained at most 4,096 rows
+and 8 MiB. An independent read-only check rehashed all twelve final Parquet files
+and matched their metadata row counts and serialized Arrow schema hashes.
+
+Native measurements bind the exact pre-remount-correction package archived in
+ignored `data/verification/historical-completion-20261103/`. Only readiness and
+ownership code in `warehouse.py` and `historical_resume.py` changed afterward.
+The measured warehouse entry points, exporter, publish module, SQL/models,
+normalization and dependency lock remained unchanged; the recorded source delta
+makes this scope explicit. These measurements support the unchanged export
+components, not a claim that the final package or full production capture was
+qualified. Final source gates and real saved-stage validation remain required.
+
+The 79,762,323-observation production stage has not been validated, published or
+activated by these diagnostics. Its actual derived cardinalities and dbt spill
+costs remain unknown. No full-scale grant schedule or admission follows from
+fixture size alone. Earlier failed harness attempts, their clocks and retained
+progress remain in the evidence history.
