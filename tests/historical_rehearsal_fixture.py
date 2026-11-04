@@ -13,6 +13,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 def _sha256(raw: bytes) -> str:
@@ -200,6 +201,7 @@ def _write_stage_and_spills(operator: Path, capture_id: str) -> tuple[str, Path,
     unrelated_spill.parent.mkdir(parents=True)
     # The cleanup proof itself is counted as temporary storage.
     owned_spill.write_bytes(b"s" * 1024**2)
+    owned_spill.with_name("second-owned-page.bin").write_bytes(b"t" * 16 * 1024)
     unrelated_spill.write_bytes(b"unrelated dbt spill must remain")
     for runtime_name, spill, database_path in (
         (owned_runtime_name, owned_spill.parent, database),
@@ -247,7 +249,27 @@ def _write_stage_and_spills(operator: Path, capture_id: str) -> tuple[str, Path,
             f"select * from population p\nwhere p.capture_id = '{capture_id}'\n",
             encoding="utf-8",
         )
-    return stage_name, owned_spill, unrelated_spill
+
+    # Seed a real durable cleanup inventory and interrupt its deletion loop.
+    remove = store.remove
+    removed = []
+
+    def interrupt_cleanup(relative):
+        if removed:
+            raise InterruptedError("fixture spill cleanup interrupted")
+        remove(relative)
+        removed.append(relative)
+
+    with store.writer_guard(), patch.object(store, "remove", interrupt_cleanup):
+        try:
+            warehouse._cleanup_resumed_historical_dbt_spills(store, capture_id, f"tmp/{stage_name}")
+        except InterruptedError as exc:
+            if str(exc) != "fixture spill cleanup interrupted":
+                raise
+        else:
+            raise RuntimeError("fixture spill cleanup did not leave a partial inventory")
+    (surviving_spill,) = owned_spill.parent.iterdir()
+    return stage_name, surviving_spill, unrelated_spill
 
 
 def _write_stopped_report(

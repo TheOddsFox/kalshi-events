@@ -342,6 +342,11 @@ def test_real_sealed_historical_recovery(monkeypatch):
     old_report = report_path.read_bytes()
     unrelated = fixture["unrelated_spill"]
     unrelated_hash = hashlib.sha256(unrelated.read_bytes()).digest()
+    survivor = fixture["owned_spill"]
+    cleanup_inventory = survivor.parent.parent / "historical-spill-cleanup.json"
+    original_cleanup = cleanup_inventory.read_bytes()
+    original_files = json.loads(original_cleanup)["result"]["files"]
+    assert len(original_files) == 2 and survivor.is_file()
     stage_db = directory / "operator/tmp" / fixture["stage_name"] / "warehouse.duckdb"
     source = {
         path: hashlib.sha256(path.read_bytes()).digest()
@@ -354,12 +359,15 @@ def test_real_sealed_historical_recovery(monkeypatch):
     assert code != 0 and "bound to a different capture" in output, output
     assert not (control / "grants" / bad_grant / "launch.json").exists()
     assert report_path.read_bytes() == old_report
-    assert fixture["owned_spill"].is_file()
+    assert survivor.is_file()
     assert not (directory / "production.duckdb").exists()
 
     _, code, output, _ = run(["source", "readiness", "adoption"])
     assert code == 0, output
-    assert not fixture["owned_spill"].exists()
+    assert not survivor.exists()
+    assert cleanup_inventory.read_bytes() == original_cleanup
+    maintenance = grants.read_json(control / "source/startup-maintenance.json")
+    assert maintenance["removed_files"] == sorted(original_files, key=lambda item: item["path"])
     assert hashlib.sha256(unrelated.read_bytes()).digest() == unrelated_hash
     assert all(
         hashlib.sha256(path.read_bytes()).digest() == digest for path, digest in source.items()

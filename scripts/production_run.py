@@ -9142,56 +9142,92 @@ def _historical_validate_storage_handoff(
     expected_parent = report_path.parent / "logs"
     try:
         relative = progress_path.relative_to(expected_parent)
-        parent_info = progress_path.parent.lstat()
-        logs_info = expected_parent.lstat()
-        before = progress_path.lstat()
-        descriptor = os.open(progress_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        device = directory.stat().st_dev
+        parents = (expected_parent, progress_path.parent)
+        parent_info = tuple(path.lstat() for path in parents)
     except (OSError, ValueError) as exc:
         raise RunnerError("historical storage observer progress is unavailable") from exc
-    try:
-        opened = os.fstat(descriptor)
+    if (
+        len(relative.parts) != 2
+        or re.fullmatch(r"invocation-[0-9a-f]{32}", relative.parts[0]) is None
+        or re.fullmatch(r"[a-z0-9-]+\.storage\.json", relative.parts[1]) is None
+        or any(not stat.S_ISDIR(info.st_mode) or info.st_dev != device for info in parent_info)
+    ):
+        raise RunnerError("historical storage observer progress path is unsafe")
+
+    def identity(info: os.stat_result) -> tuple[int, int, int]:
+        return info.st_dev, info.st_ino, info.st_mode
+
+    def payload_metadata(info: os.stat_result) -> tuple[int, int, int, int]:
+        return info.st_size, info.st_mtime_ns, info.st_uid, info.st_gid
+
+    def safe_file(info: os.stat_result) -> bool:
+        return stat.S_ISREG(info.st_mode) and info.st_dev == device and info.st_size <= MIB
+
+    parent_identity = tuple(identity(info) for info in parent_info)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    # The supervisor replaces the sample atomically. Discard raced generations.
+    for _ in range(3):
+        try:
+            before = progress_path.lstat()
+            if not safe_file(before) or before.st_nlink != 1:
+                raise RunnerError("historical storage observer progress path is unsafe")
+            descriptor = os.open(progress_path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if not safe_file(opened) or opened.st_nlink not in {0, 1}:
+                    raise RunnerError("historical storage observer progress path is unsafe")
+                raw_parts = []
+                total = 0
+                if identity(before) == identity(opened) and opened.st_nlink == 1:
+                    while chunk := os.read(descriptor, min(64 * 1024, MIB + 1 - total)):
+                        raw_parts.append(chunk)
+                        total += len(chunk)
+                        if total > MIB:
+                            raise RunnerError("historical storage observer progress is oversized")
+                after = os.fstat(descriptor)
+                final = progress_path.lstat()
+                if final.st_ino != opened.st_ino and after.st_nlink == 1:
+                    after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if (
+                not safe_file(final)
+                or final.st_nlink != 1
+                or after.st_nlink not in {0, 1}
+                or tuple(identity(path.lstat()) for path in parents) != parent_identity
+            ):
+                raise RunnerError("historical storage observer progress path is unsafe")
+        except OSError as exc:
+            raise RunnerError("historical storage observer progress is unavailable") from exc
+
         if (
-            len(relative.parts) != 2
-            or re.fullmatch(r"invocation-[0-9a-f]{32}", relative.parts[0]) is None
-            or re.fullmatch(r"[a-z0-9-]+\.storage\.json", relative.parts[1]) is None
-            or not stat.S_ISDIR(parent_info.st_mode)
-            or stat.S_ISLNK(parent_info.st_mode)
-            or not stat.S_ISDIR(logs_info.st_mode)
-            or stat.S_ISLNK(logs_info.st_mode)
-            or parent_info.st_dev != directory.stat().st_dev
-            or logs_info.st_dev != directory.stat().st_dev
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or opened.st_dev != directory.stat().st_dev
-            or opened.st_size > MIB
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            identity(opened) != identity(after)
+            or payload_metadata(opened) != payload_metadata(after)
+            or (after.st_nlink == opened.st_nlink == 1 and after.st_ctime_ns != opened.st_ctime_ns)
         ):
-            raise RunnerError("historical storage observer progress path is unsafe")
-        raw_parts = []
-        total = 0
-        while chunk := os.read(descriptor, min(64 * 1024, MIB + 1 - total)):
-            raw_parts.append(chunk)
-            total += len(chunk)
-            if total > MIB:
-                raise RunnerError("historical storage observer progress is oversized")
-        after = os.fstat(descriptor)
-        final = progress_path.lstat()
-
-        def signature(info: os.stat_result) -> tuple[int, ...]:
-            return (
-                info.st_dev,
-                info.st_ino,
-                info.st_mode,
-                info.st_nlink,
-                info.st_size,
-                info.st_mtime_ns,
-                info.st_ctime_ns,
-            )
-
-        if signature(opened) != signature(after) or signature(opened) != signature(final):
             raise RunnerError("historical storage observer progress changed during read")
-    finally:
-        os.close(descriptor)
+        if before.st_ino != opened.st_ino and opened.st_nlink == 1:
+            continue
+        if identity(before) == identity(opened) and payload_metadata(before) == payload_metadata(
+            opened
+        ):
+            if final.st_ino != opened.st_ino and after.st_nlink == 0:
+                continue
+            if (
+                identity(final) == identity(opened)
+                and payload_metadata(final) == payload_metadata(opened)
+                and before.st_ctime_ns
+                == opened.st_ctime_ns
+                == after.st_ctime_ns
+                == final.st_ctime_ns
+                and opened.st_nlink == after.st_nlink == 1
+                and total == opened.st_size
+            ):
+                break
+        raise RunnerError("historical storage observer progress changed during read")
+    else:
+        raise RunnerError("historical storage observer progress kept changing during read")
 
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}

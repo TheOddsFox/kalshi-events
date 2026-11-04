@@ -4607,6 +4607,233 @@ def _storage_supervision_workspace(artifacts):
     return directory, operator, report_path, log_dir, report
 
 
+def _storage_handoff_state(token, sample_count):
+    return {
+        "version": 1,
+        "invocation_token": token,
+        "sample_count": sample_count,
+        "target_interval_seconds": int(production._effective_limits()["storage_sample_seconds"]),
+    }
+
+
+def _write_storage_handoff_state(report_path, token, sample_count):
+    progress = (
+        report_path.parent
+        / "logs"
+        / f"invocation-{'d' * 32}"
+        / "historical-test-source-snapshot.storage.json"
+    )
+    state = _storage_handoff_state(token, sample_count)
+    production._atomic_report(progress, state)
+    return progress, state
+
+
+@pytest.mark.parametrize("replace_after_open", [False, True])
+def test_storage_handoff_retries_real_atomic_replacement_around_open(
+    artifacts, monkeypatch, replace_after_open
+):
+    directory, _operator, report_path, _log_dir, _report = _storage_supervision_workspace(artifacts)
+    token = "e" * 32
+    progress, _initial = _write_storage_handoff_state(report_path, token, 1)
+    original_inode = progress.stat().st_ino
+    real_open = os.open
+    replaced = False
+
+    def replace_around_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if os.fspath(path) == os.fspath(progress) and not replaced:
+            replaced = True
+            if replace_after_open:
+                descriptor = real_open(path, flags, *args, **kwargs)
+                production._atomic_report(progress, _storage_handoff_state(token, 2))
+                assert os.fstat(descriptor).st_nlink == 0
+                return descriptor
+            production._atomic_report(progress, _storage_handoff_state(token, 2))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(production.os, "open", replace_around_open)
+    state = production._historical_validate_storage_handoff(
+        directory, report_path, progress, invocation_token=token
+    )
+
+    assert replaced
+    assert progress.stat().st_ino != original_inode
+    assert state == _storage_handoff_state(token, 2)
+
+
+@pytest.mark.parametrize("replace_at_final_stat", [False, True])
+def test_storage_handoff_retries_real_atomic_replacement_after_open(
+    artifacts, monkeypatch, replace_at_final_stat
+):
+    directory, _operator, report_path, _log_dir, _report = _storage_supervision_workspace(artifacts)
+    token = "f" * 32
+    progress, _initial = _write_storage_handoff_state(report_path, token, 3)
+    original_inode = progress.stat().st_ino
+    real_read = os.read
+    real_lstat = Path.lstat
+    read_started = False
+    replaced = False
+
+    def replace():
+        nonlocal replaced
+        replaced = True
+        production._atomic_report(progress, _storage_handoff_state(token, 4))
+
+    def replace_after_first_read(descriptor, size):
+        nonlocal read_started
+        chunk = real_read(descriptor, size)
+        opened = os.fstat(descriptor)
+        if chunk and opened.st_ino == original_inode and not replaced:
+            read_started = True
+            if not replace_at_final_stat:
+                replace()
+        return chunk
+
+    def replace_before_final_stat(path):
+        if path == progress and read_started and not replaced:
+            replace()
+        return real_lstat(path)
+
+    monkeypatch.setattr(production.os, "read", replace_after_first_read)
+    if replace_at_final_stat:
+        monkeypatch.setattr(Path, "lstat", replace_before_final_stat)
+    state = production._historical_validate_storage_handoff(
+        directory, report_path, progress, invocation_token=token
+    )
+
+    assert replaced
+    assert progress.stat().st_ino != original_inode
+    assert state == _storage_handoff_state(token, 4)
+
+
+def test_storage_handoff_bounds_retries_when_atomic_replacements_continue(artifacts, monkeypatch):
+    directory, _operator, report_path, _log_dir, _report = _storage_supervision_workspace(artifacts)
+    token = "1" * 32
+    progress, _initial = _write_storage_handoff_state(report_path, token, 1)
+    real_open = os.open
+    replacement_budget = 32
+    replacements = 0
+
+    class RetryBudgetExceeded(Exception):
+        pass
+
+    def continuously_replace_before_open(path, flags, *args, **kwargs):
+        nonlocal replacements
+        if os.fspath(path) == os.fspath(progress):
+            if replacements == replacement_budget:
+                raise RetryBudgetExceeded("handoff retry loop exceeded test budget")
+            replacements += 1
+            production._atomic_report(progress, _storage_handoff_state(token, replacements + 1))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(production.os, "open", continuously_replace_before_open)
+    with pytest.raises(production.RunnerError):
+        production._historical_validate_storage_handoff(
+            directory, report_path, progress, invocation_token=token
+        )
+    assert 1 < replacements < replacement_budget
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "hardlink"])
+def test_storage_handoff_rejects_unsafe_replacement_after_lstat(
+    artifacts, monkeypatch, replacement_kind
+):
+    directory, _operator, report_path, _log_dir, _report = _storage_supervision_workspace(artifacts)
+    token = "2" * 32
+    progress, _initial = _write_storage_handoff_state(report_path, token, 1)
+    replacement = progress.with_name("replacement.storage.json")
+    production._atomic_report(replacement, _storage_handoff_state(token, 2))
+    real_open = os.open
+    replaced = False
+
+    def install_unsafe_replacement(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if os.fspath(path) == os.fspath(progress) and not replaced:
+            replaced = True
+            progress.unlink()
+            if replacement_kind == "symlink":
+                progress.symlink_to(replacement)
+            else:
+                os.link(replacement, progress)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(production.os, "open", install_unsafe_replacement)
+    with pytest.raises(production.RunnerError):
+        production._historical_validate_storage_handoff(
+            directory, report_path, progress, invocation_token=token
+        )
+    assert replaced
+    if replacement_kind == "symlink":
+        assert progress.is_symlink()
+    else:
+        assert progress.stat().st_nlink == 2
+
+
+def test_storage_handoff_fails_closed_on_same_inode_in_place_mutation(artifacts, monkeypatch):
+    directory, _operator, report_path, _log_dir, _report = _storage_supervision_workspace(artifacts)
+    token = "3" * 32
+    progress, _initial = _write_storage_handoff_state(report_path, token, 5)
+    original_inode = progress.stat().st_ino
+    replacement = (
+        json.dumps(_storage_handoff_state(token, 6), sort_keys=True, indent=2).encode() + b"\n"
+    )
+    real_read = os.read
+    mutated = False
+
+    def mutate_after_first_read(descriptor, size):
+        nonlocal mutated
+        chunk = real_read(descriptor, size)
+        opened = os.fstat(descriptor)
+        if chunk and opened.st_ino == original_inode and not mutated:
+            mutated = True
+            with progress.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(replacement)
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+        return chunk
+
+    monkeypatch.setattr(production.os, "read", mutate_after_first_read)
+    with pytest.raises(production.RunnerError, match="changed during read"):
+        production._historical_validate_storage_handoff(
+            directory, report_path, progress, invocation_token=token
+        )
+    assert mutated
+    assert progress.stat().st_ino == original_inode
+
+
+def test_storage_handoff_preserves_freshness_and_token_checks_for_stale_state(artifacts):
+    directory, _operator, report_path, _log_dir, _report = _storage_supervision_workspace(artifacts)
+    token = "4" * 32
+    progress, expected = _write_storage_handoff_state(report_path, token, 7)
+    stale_time = time.time() - max(60, expected["target_interval_seconds"] * 10)
+    os.utime(progress, (stale_time, stale_time))
+
+    with pytest.raises(production.RunnerError, match="heartbeat is stale"):
+        production._historical_validate_storage_handoff(
+            directory, report_path, progress, invocation_token=token
+        )
+    assert (
+        production._historical_validate_storage_handoff(
+            directory,
+            report_path,
+            progress,
+            invocation_token=token,
+            allow_stale=True,
+        )
+        == expected
+    )
+    with pytest.raises(production.RunnerError, match="not bound"):
+        production._historical_validate_storage_handoff(
+            directory,
+            report_path,
+            progress,
+            invocation_token="5" * 32,
+            allow_stale=True,
+        )
+
+
 def _normal_memory_sample(_pid=None, *, timeout=5.0):
     del timeout
     return {
