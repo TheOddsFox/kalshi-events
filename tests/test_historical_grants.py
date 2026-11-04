@@ -3109,7 +3109,7 @@ def test_private_changed_boot_recovery_uses_existing_flags_and_ignores_old_pids(
         "accounting_complete": True,
         "unfinished_reservations": [],
         "attempts": 12,
-        "downloaded_bytes": 4096,
+        "downloaded_or_reserved_bytes": 4096,
     }
 
     def read_accounting(*_args):
@@ -3117,16 +3117,6 @@ def test_private_changed_boot_recovery_uses_existing_flags_and_ignores_old_pids(
         return snapshot
 
     monkeypatch.setattr(production, "_read_accounting_worker", read_accounting)
-    monkeypatch.setattr(
-        production,
-        "_reconciliation_accounting",
-        lambda *_a: {
-            "accounting_complete": True,
-            "attempts": 12,
-            "downloaded_bytes": 4096,
-        },
-    )
-    monkeypatch.setattr(production, "_check_accounting_match", lambda *_a: None)
 
     report, code = production.run_production(
         attempt["directory"],
@@ -3196,19 +3186,9 @@ def test_reboot_remount_keeps_frozen_origin_and_allows_fresh_grant_preflight(
         "accounting_complete": True,
         "unfinished_reservations": [],
         "attempts": 12,
-        "downloaded_bytes": 4096,
+        "downloaded_or_reserved_bytes": 4096,
     }
     monkeypatch.setattr(production, "_read_accounting_worker", lambda *_a: snapshot)
-    monkeypatch.setattr(
-        production,
-        "_reconciliation_accounting",
-        lambda *_a: {
-            "accounting_complete": True,
-            "attempts": 12,
-            "downloaded_bytes": 4096,
-        },
-    )
-    monkeypatch.setattr(production, "_check_accounting_match", lambda *_a: None)
     report, code = production.run_production(
         attempt["directory"],
         historical=True,
@@ -4692,3 +4672,183 @@ def test_startup_cleanup_is_only_overstop_observer_allowance(artifacts, monkeypa
         assert reason == "startup cleanup exceeded its fixed temporary metadata allowance"
     finally:
         production._ACTIVE_LIMITS.reset(token)
+
+
+def test_authorized_census_revalidates_protocol5_capture_and_writes_proof(artifacts, monkeypatch):
+    import collections
+    import hashlib
+    import json
+
+    from conftest import FakeClient
+
+    from kalshi_events import capture, historical, publish
+    from kalshi_events.common import (
+        CatalogueError,
+        Store,
+        atomic_json,
+        json_bytes,
+        series_root_marker,
+        series_scope,
+    )
+    from kalshi_events.incremental import root_id
+
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    import historical_admission
+
+    store = Store(artifacts / "operator")
+    with store.writer_guard():
+        logical_root_id = root_id(store, create=True)
+    captured = capture.capture(
+        store,
+        client_factory=lambda active_store, budget, **options: FakeClient(
+            active_store, budget, {}, **options
+        ),
+    )
+    state = capture.read_capture(store, captured["capture_id"])
+    assert state["acquisition_protocol"] == 5
+    state_sha = state.verified_snapshot_sha256
+    selection = historical.historical_selection(state, allow_legacy_incomplete=True)
+    task_indices = historical.historical_task_indices(state, allow_legacy_incomplete=True)
+    task_scopes = {int(index): scope for index, scope in state["task_scopes"].items()}
+    excluded = [
+        {"task_index": index, "scope": scope, "endpoint": state["tasks"][index]["endpoint"]}
+        for index, scope in sorted(task_scopes.items())
+        if scope in publish.HISTORICAL_OMITTED_SCOPES
+    ]
+
+    selected_pages = []
+    for order, row in enumerate(state.page_rows):
+        if row["index"] not in task_indices:
+            continue
+        receipt_dir = store.path(row["relative"]).parent
+        manifest = json.loads((receipt_dir / "manifest.json").read_bytes())
+        selected_pages.append(
+            {
+                **row,
+                "order": order,
+                "endpoint": manifest["endpoint"],
+                "generation": manifest.get(
+                    "task_generation", manifest.get("request_generation", 0)
+                ),
+                "encoded_bytes": (receipt_dir / "body.bin").stat().st_size,
+                "decoded_bytes": manifest.get("decoded_size", manifest["size"]),
+                "status": manifest["status"],
+                "manifest_bytes": (receipt_dir / "manifest.json").stat().st_size,
+            }
+        )
+    data_pages = [
+        page
+        for page in selected_pages
+        if page["status"] == 200 and page["endpoint"] != "/historical/cutoff"
+    ]
+    groups = collections.defaultdict(list)
+    observations = collections.Counter()
+    nested_event_markets = 0
+    endpoint_collections = {
+        "/series": "series",
+        "/events": "events",
+        "/historical/markets": "markets",
+    }
+    for page in data_pages:
+        groups[(page["endpoint"], page["generation"])].append(page)
+        receipt_dir = store.path(page["relative"]).parent
+        payload = json.loads((receipt_dir / "body.bin").read_bytes())
+        rows = payload[endpoint_collections[page["endpoint"]]]
+        observations[page["endpoint"]] += len(rows)
+        if page["endpoint"] == "/events":
+            nested_event_markets += sum(len(event.get("markets", [])) for event in rows)
+    observations_by_endpoint = dict(sorted(observations.items()))
+    exact_observations = sum(observations_by_endpoint.values())
+    data_strata = []
+    for (endpoint, generation), pages in sorted(groups.items()):
+        decoded = sorted(page["decoded_bytes"] for page in pages)
+        data_strata.append(
+            {
+                "endpoint": endpoint,
+                "generation": generation,
+                "candidate_pages": len(pages),
+                "encoded_bytes": sum(page["encoded_bytes"] for page in pages),
+                "decoded_bytes": sum(decoded),
+                "median_decoded_page_bytes": decoded[(len(decoded) + 1) // 2 - 1],
+                "max_decoded_page_bytes": max(decoded),
+            }
+        )
+    index = {
+        "capture_id": state["capture_id"],
+        "capture_state_sha256": state_sha,
+        "historical_selection": selection,
+        "selected_task_indices": sorted(task_indices),
+        "retired_scopes_excluded": excluded,
+        "data_candidate_pages": len(data_pages),
+        "manifest_metadata_bytes": sum(page["manifest_bytes"] for page in selected_pages),
+        "pages": [
+            {key: page[key] for key in historical_admission.INDEX_PAGE_FIELDS}
+            for page in data_pages
+        ],
+    }
+    index_raw = json_bytes(index)
+    population = {
+        "status": "complete",
+        "capture_id": state["capture_id"],
+        "capture_state_sha256": state_sha,
+        "metadata_index_sha256": hashlib.sha256(index_raw).hexdigest(),
+        "candidate_pages": len(data_pages),
+        "pages_processed": len(data_pages),
+        "next_index": len(data_pages),
+        "observation_counts": observations_by_endpoint
+        | {"nested_event_markets": nested_event_markets},
+        "candidate_population": {"data_strata": data_strata, "control_receipts": []},
+        "encoded_bytes_verified": sum(page["encoded_bytes"] for page in data_pages),
+        "decoded_bytes_verified": sum(page["decoded_bytes"] for page in data_pages),
+        "page_counts": dict(
+            sorted(collections.Counter(page["endpoint"] for page in data_pages).items())
+        ),
+    }
+    population_raw = json_bytes(population)
+    index_path = artifacts / "receipt-index.json"
+    population_path = artifacts / "population.json"
+    index_path.write_bytes(index_raw)
+    population_path.write_bytes(population_raw)
+    monkeypatch.setattr(historical_admission, "AUTHORIZED_CAPTURE_ID", state["capture_id"])
+    monkeypatch.setattr(historical_admission, "AUTHORIZED_ROOT_ID", logical_root_id)
+    monkeypatch.setattr(historical_admission, "AUTHORIZED_STATE_SHA256", state_sha)
+    monkeypatch.setattr(
+        historical_admission, "AUTHORIZED_INDEX_SHA256", hashlib.sha256(index_raw).hexdigest()
+    )
+    authorized_population = {
+        "candidate_pages": len(data_pages),
+        "observations_by_endpoint": observations_by_endpoint,
+        "nested_event_markets": nested_event_markets,
+        "exact_observations": exact_observations,
+    }
+    monkeypatch.setattr(historical_admission, "AUTHORIZED_POPULATION", authorized_population)
+    census_control = {
+        **authorized_population,
+        "population_report_path": str(population_path),
+        "population_report_sha256": hashlib.sha256(population_raw).hexdigest(),
+        "receipt_index_path": str(index_path),
+        "receipt_index_sha256": hashlib.sha256(index_raw).hexdigest(),
+        "capture_id": state["capture_id"],
+        "root_id": logical_root_id,
+        "capture_state_sha256": state_sha,
+    }
+    control_root = artifacts / "controls"
+    (control_root / "source").mkdir(parents=True, mode=0o700)
+    authority = {
+        "directory": artifacts,
+        "operator": store.root,
+        "control_root": control_root,
+        "identity": {"capture_id": state["capture_id"], "session_id": "b" * 32},
+        "source_snapshot": {"sha256": "c" * 64},
+        "control": {"authorized_census": census_control},
+        "grant": {"workflow_deadline_monotonic": time.monotonic() + 60},
+    }
+
+    census = production._historical_census_proof(authority, full_revalidation_if_missing=True)
+    assert census["candidate_pages"] == len(data_pages)
+    proof = grants.read_json(control_root / "source" / "authorized-census.json")
+    assert proof["census"] == census
+
+    atomic_json(store.path("root.json"), series_root_marker(series_scope("SERIES")))
+    with pytest.raises(CatalogueError, match="capture scope does not match the operator root"):
+        production._historical_authorized_census(authority, full_revalidation=True)

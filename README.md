@@ -577,6 +577,10 @@ An interrupted private worker must be reconciled before another grant. Its pause
 receipt records separate same-boot and verified-reboot commands from the frozen
 runtime. Same-boot recovery proves the recorded processes absent; reboot recovery
 checks the saved volume, root and accounting without probing old process IDs.
+For a verified historical temporary-storage stop from before private grants,
+offline reboot recovery can retain a freshly verified reservation upper bound
+when receipts remain unfinished. The accounting stays incomplete, and recovery
+records the specific storage stop before clearing the stale worker marker.
 Neither reconciliation starts processing or extends a grant. Use the literal
 virtual-environment interpreter path recorded in the command.
 

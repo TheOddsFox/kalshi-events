@@ -454,6 +454,12 @@ A changed boot instead requires the explicit historical reboot/accounting
 recovery route, the saved volume/root identities and complete accounting. That
 route does not query or signal process identities from the previous boot. Both
 routes preserve prior failures and grants, start no worker and grant no time.
+For a verified legacy historical temporary-storage stop, offline reboot
+reconciliation may use the freshly validated reservation upper bound when exact
+receipt totals are unavailable. The report retains incomplete accounting and the
+unfinished reservation identities. Reconciliation durably records the typed
+temporary-stop event before clearing the old worker marker. Other reboot
+recovery paths still require exact accounting.
 Private pause receipts name the applicable conditional commands using the bound
 frozen source and the literal virtual-environment interpreter path.
 If a verified reboot changes the volume's numeric device identifier, the

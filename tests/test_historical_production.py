@@ -372,18 +372,18 @@ def test_mixed_window_history_applies_each_version_duration_cap(
         "deadline_epoch": now_epoch - 10 + 86_400,
         "deadline_monotonic": now_monotonic - 10 + 86_400,
     }
-    legacy_end_epoch = current["started_epoch"] - 1
-    legacy_end_monotonic = current["started_monotonic"] - 1
+    legacy_started_epoch = current["started_epoch"] - 1 - legacy_duration
+    legacy_started_monotonic = current["started_monotonic"] - 1 - legacy_duration
     legacy = {
         "version": 1,
         "capture_id": CAPTURE_ID,
         "root_id": "c" * 32,
         "revision": "f" * 40,
         "started_at": production._utc(),
-        "started_epoch": legacy_end_epoch - legacy_duration,
-        "started_monotonic": legacy_end_monotonic - legacy_duration,
-        "deadline_epoch": legacy_end_epoch,
-        "deadline_monotonic": legacy_end_monotonic,
+        "started_epoch": legacy_started_epoch,
+        "started_monotonic": legacy_started_monotonic,
+        "deadline_epoch": legacy_started_epoch + legacy_duration,
+        "deadline_monotonic": legacy_started_monotonic + legacy_duration,
     }
     report = {
         "root_id": "c" * 32,

@@ -388,10 +388,15 @@ def _validate_current_processing_launch(
     capture_id: str,
     pid: int,
     pgid: int,
+    *,
+    expected_report_boot_stamp: str | None = None,
 ) -> tuple[Path, bytes, str]:
     from kalshi_events.common import regular_bytes
 
     current_revision = _revision()
+    expected_boot_stamp = (
+        _boot_stamp() if expected_report_boot_stamp is None else expected_report_boot_stamp
+    )
     processing_revision = launch.get("processing_revision")
     reconciliation_source = launch.get("reconciliation_code_source")
     if (
@@ -402,7 +407,9 @@ def _validate_current_processing_launch(
         or not REVISION.fullmatch(launch["revision"])
         or not isinstance(reconciliation_source, dict)
         or reconciliation_source.get("revision") != launch.get("revision")
-        or report.get("boot_stamp") != _boot_stamp()
+        or not isinstance(expected_boot_stamp, str)
+        or not expected_boot_stamp
+        or report.get("boot_stamp") != expected_boot_stamp
         or launch.get("session") != str(report_path)
         or launch.get("capture_id") != capture_id
         or launch.get("root_id") != report.get("root_id")
@@ -1339,7 +1346,133 @@ def _historical_reboot_mount_proof(
         "time_budget_started_epoch": _time_budget_started(report, "epoch"),
         "deadline_epoch": _time_budget_deadline(report, "epoch"),
     }
-    for index, event in enumerate(history):
+    if not isinstance(history[-1], dict):
+        raise RunnerError("historical reboot mount history contains a malformed event")
+    recovery_indices = [
+        index
+        for index, event in enumerate(history)
+        if isinstance(event, dict) and event.get("recovery_kind") == "prior_boot_temporary_stop"
+    ]
+    if len(recovery_indices) > 1:
+        raise RunnerError("historical reboot history contains multiple legacy stop recoveries")
+    prior_boot_temporary_stop = bool(recovery_indices)
+    prior_device = origin_device
+    prior_boot: str | None = None
+    recovery_index = recovery_indices[0] if recovery_indices else None
+    if recovery_index is not None:
+        recovery = history[recovery_index]
+        prefix = history[:recovery_index]
+        original_system = report.get("original_system")
+        if (
+            not isinstance(original_system, dict)
+            or type(original_system.get("filesystem_device")) is not int
+            or original_system.get("filesystem_device") < 0
+            or original_system.get("filesystem_volume_uuid") not in {None, expected_volume}
+        ):
+            raise RunnerError("legacy reboot origin is not bound to its original session")
+        prior_device = original_system["filesystem_device"]
+        legacy_fields = {
+            "recovered_at",
+            "previous_boot_stamp",
+            "boot_stamp",
+            "previous_filesystem_device",
+            "filesystem_device",
+            "volume_uuid",
+            "prior_volume_uuid_available",
+            "previous_monotonic",
+            "wall_deadlines_preserved",
+            "accounting_reconciliation_required",
+        }
+        for event in prefix:
+            if not isinstance(event, dict):
+                raise RunnerError("pre-freeze reboot history is not a valid legacy prefix")
+            previous_monotonic = event.get("previous_monotonic")
+            if (
+                set(event) != legacy_fields
+                or not isinstance(event.get("recovered_at"), str)
+                or not isinstance(event.get("previous_boot_stamp"), str)
+                or not event["previous_boot_stamp"]
+                or not isinstance(event.get("boot_stamp"), str)
+                or not event["boot_stamp"]
+                or event["previous_boot_stamp"] == event["boot_stamp"]
+                or type(event.get("previous_filesystem_device")) is not int
+                or event["previous_filesystem_device"] != prior_device
+                or type(event.get("filesystem_device")) is not int
+                or event["filesystem_device"] < 0
+                or event.get("volume_uuid") != expected_volume
+                or type(event.get("prior_volume_uuid_available")) is not bool
+                or not isinstance(previous_monotonic, dict)
+                or set(previous_monotonic)
+                != {"started_monotonic", "time_budget_started_monotonic", "deadline_monotonic"}
+                or any(
+                    type(value) not in {int, float} or not math.isfinite(value)
+                    for value in previous_monotonic.values()
+                )
+                or event.get("wall_deadlines_preserved") != deadlines
+                or event.get("accounting_reconciliation_required") is not True
+                or prior_boot is not None
+                and event["previous_boot_stamp"] != prior_boot
+            ):
+                raise RunnerError("pre-freeze reboot history is not a valid legacy prefix")
+            prior_device = event["filesystem_device"]
+            prior_boot = event["boot_stamp"]
+        if prefix:
+            if prior_device != origin_device or prior_boot != recovery.get("previous_boot_stamp"):
+                raise RunnerError("legacy reboot history does not reach its frozen session origin")
+        elif prior_device != origin_device:
+            raise RunnerError("frozen session origin has no history binding")
+        if (
+            recovery.get("previous_filesystem_device") != origin_device
+            or prior_boot is not None
+            and recovery.get("previous_boot_stamp") != prior_boot
+            or not isinstance(recovery.get("pre_recovery_history_sha256"), str)
+            or recovery["pre_recovery_history_sha256"]
+            != hashlib.sha256(
+                json.dumps(prefix, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+            ).hexdigest()
+        ):
+            raise RunnerError("first post-freeze reboot event is not bound to its legacy prefix")
+        if (
+            not isinstance(identity.get("prior_session_sha256"), str)
+            or recovery.get("session_before_sha256") != identity["prior_session_sha256"]
+        ):
+            raise RunnerError(
+                "temporary-stop reboot proof is not bound to the frozen prior session"
+            )
+        if recovery_index == len(history) - 1:
+            stop_audit = report.get("stopped_worker_reconciliation")
+            stop_evidence = (
+                stop_audit.get("storage_stop_evidence") if isinstance(stop_audit, dict) else None
+            )
+            if (
+                not isinstance(stop_audit, dict)
+                or stop_audit.get("recovery_kind") != "prior_boot_temporary_stop"
+                or recovery.get("previous_boot_stamp") != stop_audit.get("boot_stamp")
+                or recovery.get("previous_active_process_group")
+                != stop_audit.get("stale_process_group")
+                or recovery.get("stopped_worker_event_id") != stop_audit.get("event_id")
+                or recovery.get("stopped_worker_audit_sha256")
+                != stop_audit.get("recovery_audit_sha256")
+                or recovery.get("stopped_worker_session_before_sha256")
+                != stop_audit.get("session_before_sha256")
+                or recovery.get("stopped_worker_reconciled_boot_stamp") != final_boot_stamp
+                or stop_audit.get("recovered_boot_stamp") != final_boot_stamp
+                or stop_audit.get("reconciliation_kind") != "temporary_storage_stop"
+                or not isinstance(stop_evidence, dict)
+                or stop_evidence.get("category") != "temporary"
+                or reconciliation.get("recovery_kind") != "prior_boot_temporary_stop"
+                or reconciliation.get("stopped_worker_event_id") != stop_audit.get("event_id")
+                or reconciliation.get("stopped_worker_audit_sha256")
+                != stop_audit.get("recovery_audit_sha256")
+                or reconciliation.get("stopped_worker_session_before_sha256")
+                != stop_audit.get("session_before_sha256")
+            ):
+                raise RunnerError("prior-boot temporary-stop recovery is not bound to its audit")
+        events_to_validate = history[recovery_index:]
+    else:
+        events_to_validate = history
+
+    for index, event in enumerate(events_to_validate):
         if not isinstance(event, dict):
             raise RunnerError("historical reboot mount history contains a malformed event")
         previous_boot = event.get("previous_boot_stamp")
@@ -1359,7 +1492,17 @@ def _historical_reboot_mount_proof(
             or filesystem_device < 0
             or event.get("volume_uuid") != expected_volume
             or event.get("accounting_basis") != "exact"
-            or event.get("accounting_complete") is not True
+            and not (
+                prior_boot_temporary_stop
+                and index == 0
+                and event.get("accounting_basis") == "reserved-upper-bound"
+                and event.get("accounting_complete") is False
+                and event.get("accounting_bound_verified") is True
+                and isinstance(event.get("reservation_inventory_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", event["reservation_inventory_sha256"]) is not None
+            )
+            or event.get("accounting_basis") == "exact"
+            and event.get("accounting_complete") is not True
             or event.get("processing_worker_started") is not False
             or event.get("grant_started") is not False
             or type(previous_group) not in {int, type(None)}
@@ -1379,6 +1522,47 @@ def _historical_reboot_mount_proof(
         prior_boot = boot_stamp
         prior_device = filesystem_device
     latest = history[-1]
+    bounded = latest.get("accounting_basis") == "reserved-upper-bound"
+    accounting_proof_invalid = (
+        reconciliation.get("accounting_basis") != latest.get("accounting_basis")
+        or reconciliation.get("processing_worker_started") is not False
+        or reconciliation.get("grant_started") is not False
+    )
+    if bounded:
+        accounting_proof_invalid = accounting_proof_invalid or (
+            latest.get("accounting_complete") is not False
+            or latest.get("accounting_bound_verified") is not True
+            or reconciliation.get("accounting_complete") is not False
+            or reconciliation.get("accounting_bound_verified") is not True
+            or report.get("accounting_complete") is not False
+            or report.get("accounting_basis") != "reserved-upper-bound"
+            or report.get("accounting_bound_verified") is not True
+            or report.get("unfinished_reservation_ids") != latest.get("unfinished_reservation_ids")
+            or report.get("consumption_state") != "reserved-upper-bound"
+            or report.get("downloaded_bytes") is not None
+            or report.get("downloaded_bytes_upper_bound")
+            != latest.get("downloaded_bytes_upper_bound")
+            or report.get("requests") != latest.get("attempts")
+            or not latest.get("unfinished_reservation_ids")
+        )
+    else:
+        accounting_proof_invalid = accounting_proof_invalid or (
+            latest.get("accounting_basis") != "exact"
+            or latest.get("accounting_complete") is not True
+            or report.get("accounting_complete") is not True
+            or report.get("unfinished_reservation_ids") != []
+            or report.get("consumption_state") != "verified"
+            or prior_boot_temporary_stop
+            and recovery_index == len(history) - 1
+            and (
+                reconciliation.get("accounting_complete") is not True
+                or reconciliation.get("accounting_bound_verified") is not False
+                or report.get("accounting_basis") != "exact"
+                or report.get("accounting_bound_verified") is not False
+                or report.get("requests") != latest.get("attempts")
+                or report.get("downloaded_bytes") != latest.get("downloaded_bytes")
+            )
+        )
     if (
         latest.get("boot_stamp") != final_boot_stamp
         or latest.get("filesystem_device") != final_device
@@ -1389,12 +1573,7 @@ def _historical_reboot_mount_proof(
         or reconciliation.get("capture_id") != identity.get("capture_id")
         or reconciliation.get("root_id") != identity.get("root_id")
         or reconciliation.get("boot_stamp") != final_boot_stamp
-        or reconciliation.get("accounting_basis") != "exact"
-        or reconciliation.get("processing_worker_started") is not False
-        or reconciliation.get("grant_started") is not False
-        or report.get("accounting_complete") is not True
-        or report.get("unfinished_reservation_ids") != []
-        or report.get("consumption_state") != "verified"
+        or accounting_proof_invalid
         or reconciliation.get("private_worker_reconciliation_sha256")
         != latest.get("private_worker_reconciliation_sha256")
         or report.get("root_id") != identity.get("root_id")
@@ -1402,9 +1581,13 @@ def _historical_reboot_mount_proof(
     ):
         raise RunnerError("historical reboot reconciliation does not bind the current mount")
     original_system = report.get("original_system")
-    if isinstance(original_system, dict) and (
-        original_system.get("filesystem_device") != origin_device
-        or original_system.get("filesystem_volume_uuid") not in {None, expected_volume}
+    if (
+        not prior_boot_temporary_stop
+        and isinstance(original_system, dict)
+        and (
+            original_system.get("filesystem_device") != origin_device
+            or original_system.get("filesystem_volume_uuid") not in {None, expected_volume}
+        )
     ):
         raise RunnerError("historical reboot origin differs from its frozen root")
     return latest
@@ -3210,17 +3393,37 @@ def _validate_initial_historical_accounting_session(
     return report
 
 
+def _accounting_store(root: Path) -> Any:
+    from kalshi_events.common import Limits, Store
+
+    return Store(
+        root,
+        Limits(
+            max_rate=float(_effective_limits()["rate"]),
+            max_requests=int(_effective_limits()["attempts"]),
+            max_download_bytes=int(_effective_limits()["downloaded_bytes"]),
+            max_response_bytes=int(_effective_limits()["response_bytes"]),
+            max_decoded_response_bytes=int(_effective_limits()["decoded_response_bytes"]),
+            max_duration_seconds=float(_effective_limits()["session_seconds"]),
+            max_root_bytes=int(_effective_limits()["root_bytes"]),
+            max_temp_bytes=int(_effective_limits()["temporary_bytes"]),
+            max_database_bytes=int(_effective_limits()["database_bytes"]),
+        ),
+    )
+
+
 def _read_accounting_worker(
     root: Path,
     expected_capture_id: str | None = None,
     *,
+    locked_store: Any | None = None,
     cleanup_historical_stages: bool = False,
     expected_directory: Path | None = None,
     report_path: Path | None = None,
     expected_root_id: str | None = None,
     expected_revision: str | None = None,
 ) -> dict[str, Any]:
-    from kalshi_events.common import Limits, Store, decode, regular_bytes
+    from kalshi_events.common import Store, decode, regular_bytes
 
     if cleanup_historical_stages:
         if (
@@ -3237,20 +3440,14 @@ def _read_accounting_worker(
     ):
         raise RunnerError("historical cleanup identity was supplied without its closed flag")
 
-    store = Store(
-        root,
-        Limits(
-            max_rate=float(_effective_limits()["rate"]),
-            max_requests=int(_effective_limits()["attempts"]),
-            max_download_bytes=int(_effective_limits()["downloaded_bytes"]),
-            max_response_bytes=int(_effective_limits()["response_bytes"]),
-            max_decoded_response_bytes=int(_effective_limits()["decoded_response_bytes"]),
-            max_duration_seconds=float(_effective_limits()["session_seconds"]),
-            max_root_bytes=int(_effective_limits()["root_bytes"]),
-            max_temp_bytes=int(_effective_limits()["temporary_bytes"]),
-            max_database_bytes=int(_effective_limits()["database_bytes"]),
-        ),
-    )
+    if locked_store is not None and (
+        cleanup_historical_stages
+        or not isinstance(locked_store, Store)
+        or locked_store.root != Path(root).resolve()
+        or not locked_store.writer_locked_by_current_thread
+    ):
+        raise RunnerError("accounting scan requires the validated locked operator store")
+    store = locked_store if locked_store is not None else _accounting_store(root)
     if cleanup_historical_stages and expected_directory is not None:
         from production_activation import (
             _activation_temporary_names,
@@ -3285,7 +3482,7 @@ def _read_accounting_worker(
                 max_temp_bytes=store.limits.max_temp_bytes,
                 max_duration_seconds=store.remaining,
             )
-    with store.lock():
+    with store.lock() if locked_store is None else contextlib.nullcontext():
         capture_state = None
         if expected_capture_id is not None:
             from kalshi_events.capture import read_capture
@@ -4300,7 +4497,12 @@ def _operator_writer_lock(operator: Path):
 
 
 def _stopped_worker_evidence(
-    directory: Path, report_path: Path, report: dict[str, Any], capture_id: str
+    directory: Path,
+    report_path: Path,
+    report: dict[str, Any],
+    capture_id: str,
+    *,
+    expected_saved_boot_stamp: str | None = None,
 ) -> tuple[dict[str, Any], Path, bytes, Path, bytes, Path | None, bytes | None]:
     from kalshi_events.common import regular_bytes, safe_path
 
@@ -4380,6 +4582,7 @@ def _stopped_worker_evidence(
             capture_id,
             launch_pid,
             launch_pgid,
+            expected_report_boot_stamp=expected_saved_boot_stamp,
         )
         revision_source = "processing_revision"
     try:
@@ -7624,6 +7827,10 @@ def _finish_historical_reboot_reconciliation(
         or report.get("production_state") == "verified"
         or report.get("capture_id") != capture_id
         or report.get("boot_stamp") == pending.get("boot_stamp")
+        or pending.get("boot_stamp") != _boot_stamp()
+        or not isinstance(report.get("system"), dict)
+        or pending.get("previous_boot_stamp") != report.get("boot_stamp")
+        or pending.get("previous_filesystem_device") != report["system"].get("filesystem_device")
         or report.get("active_process_group") != pending.get("previous_active_process_group")
         or private_uncertain
         and (
@@ -7652,17 +7859,217 @@ def _finish_historical_reboot_reconciliation(
             expected_current_volume_uuid=pending["volume_uuid"],
         )
 
-    snapshot = _read_accounting_worker(directory / "operator", capture_id)
+    history = report.get("reboot_recovery_history", [])
     if (
-        snapshot.get("root_id") != report.get("root_id")
-        or snapshot.get("accounting_complete") is not True
-        or snapshot.get("unfinished_reservations") != []
+        not isinstance(history, list)
+        or len(history) >= 64
+        or any(not isinstance(item, dict) for item in history)
     ):
-        raise RunnerError("reboot recovery requires complete exact receipt accounting")
-    accounting = _reconciliation_accounting(snapshot, capture_id)
-    if accounting.get("accounting_complete") is not True:
-        raise RunnerError("reboot recovery cannot proceed with bounded or incomplete accounting")
-    _check_accounting_match(snapshot, accounting)
+        raise RunnerError("reboot recovery history is invalid or full")
+    previous_system = report.get("system")
+    if not isinstance(previous_system, dict):
+        raise RunnerError("reboot recovery has no saved filesystem identity")
+    pre_recovery_history_sha256 = hashlib.sha256(
+        json.dumps(history, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+    operator = directory / "operator"
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    audit_binding: dict[str, Any] | None = None
+
+    def read_accounting(locked_store: Any | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+        current_snapshot = (
+            _read_accounting_worker(operator, capture_id)
+            if locked_store is None
+            else _read_accounting_worker(operator, capture_id, locked_store=locked_store)
+        )
+        if current_snapshot.get("root_id") != report.get("root_id"):
+            raise RunnerError("reboot recovery accounting belongs to another operator root")
+        if current_snapshot.get("accounting_complete") is not True and (
+            private_uncertain
+            or not isinstance(report.get("storage_safety_stop"), dict)
+            or report.get("phase") != "stopped"
+        ):
+            raise RunnerError("reboot recovery requires complete exact receipt accounting")
+        current_accounting = _reconciliation_accounting(current_snapshot, capture_id)
+        if current_accounting.get("accounting_complete") is True:
+            current_accounting.setdefault("downloaded_bytes_upper_bound", None)
+            current_accounting.setdefault("accounting_basis", "exact")
+            current_accounting.setdefault("accounting_bound_verified", False)
+            current_accounting.setdefault("unfinished_reservation_ids", [])
+        previous_attempts = report.get("requests")
+        if previous_attempts is not None and (
+            isinstance(previous_attempts, bool)
+            or not isinstance(previous_attempts, int)
+            or current_accounting.get("attempts", -1) < previous_attempts
+        ):
+            raise RunnerError("reboot receipt accounting regressed its saved request count")
+        previous_downloaded = report.get("downloaded_bytes")
+        current_downloaded = current_accounting.get("downloaded_bytes")
+        if (
+            report.get("accounting_complete") is True
+            and current_accounting.get("accounting_complete") is True
+            and previous_downloaded is not None
+            and (
+                isinstance(previous_downloaded, bool)
+                or not isinstance(previous_downloaded, int)
+                or not isinstance(current_downloaded, int)
+                or current_downloaded < previous_downloaded
+            )
+        ):
+            raise RunnerError("reboot exact receipt accounting regressed its saved byte count")
+        _check_accounting_match(current_snapshot, current_accounting)
+        return current_snapshot, current_accounting
+
+    # Keep the scan and audit under the same writer lock. Exclude storage totals
+    # from the audit digest so a retry after the append keeps the same event ID.
+    if (
+        not private_uncertain
+        and isinstance(report.get("storage_safety_stop"), dict)
+        and report.get("phase") == "stopped"
+        and report.get("error") is not None
+        and type(report.get("active_process_group")) is int
+        and report["active_process_group"] > 1
+    ):
+        store = _accounting_store(operator)
+        with store.writer_guard():
+            if not store.writer_locked_by_current_thread:
+                raise RunnerError("reboot recovery failed to acquire the canonical writer guard")
+            snapshot, accounting = read_accounting(locked_store=store)
+            accounting_sha256 = _accounting_snapshot_sha256(snapshot)
+            if regular_bytes(report_path, 16 * MIB) != raw or _strict_json(report_path) != report:
+                raise RunnerError("session report changed before reboot audit append")
+            stop = _stopped_worker_evidence(
+                directory,
+                report_path,
+                report,
+                capture_id,
+                expected_saved_boot_stamp=pending["previous_boot_stamp"],
+            )
+            (
+                evidence,
+                evidence_path,
+                evidence_raw,
+                launch_path,
+                launch_raw,
+                checks_path,
+                checks_raw,
+            ) = stop
+            if evidence.get("category") == "temporary":
+                if (
+                    evidence.get("original_process_group")
+                    != pending.get("previous_active_process_group")
+                    or evidence.get("mode") != "historical"
+                    or report.get("boot_stamp") != pending.get("previous_boot_stamp")
+                ):
+                    raise RunnerError("prior-boot temporary stop evidence changed")
+                event_identity = {
+                    "capture_id": capture_id,
+                    "session_id": report.get("session_id"),
+                    "root_id": report.get("root_id"),
+                    "stale_process_group": evidence["original_process_group"],
+                    "supervisor_pid": evidence["supervisor_pid"],
+                    "supervisor_pgid": evidence["supervisor_pgid"],
+                    "boot_stamp": report["boot_stamp"],
+                    "revision": report.get("revision"),
+                    "launch_revision_source": evidence["launch_revision_source"],
+                    "processing_revision": evidence.get("processing_revision"),
+                    "reconciliation_runtime_revision": evidence.get(
+                        "reconciliation_runtime_revision"
+                    ),
+                    "report_sha256": raw_sha256,
+                    "evidence_path": str(evidence_path),
+                    "evidence_sha256": hashlib.sha256(evidence_raw).hexdigest(),
+                    "launch_path": str(launch_path),
+                    "launch_sha256": hashlib.sha256(launch_raw).hexdigest(),
+                    "launch_checks_path": str(checks_path) if checks_path is not None else None,
+                    "launch_checks_sha256": (
+                        hashlib.sha256(checks_raw).hexdigest() if checks_raw is not None else None
+                    ),
+                    "primary_stop_reason": report.get("error"),
+                    "reconciliation_kind": "temporary_storage_stop",
+                    "storage_stop_evidence": {
+                        key: evidence[key]
+                        for key in (
+                            "mode",
+                            "category",
+                            "revision_source",
+                            "threshold_bytes",
+                            "threshold_inclusive",
+                            "observed_bytes",
+                            "original_process_group",
+                        )
+                    },
+                    "recovery_kind": "prior_boot_temporary_stop",
+                    "recovered_boot_stamp": pending["boot_stamp"],
+                    "accounting_sha256": accounting_sha256,
+                    "pre_recovery_history_sha256": pre_recovery_history_sha256,
+                    "accounting_basis": accounting["accounting_basis"],
+                    "accounting_complete": accounting["accounting_complete"],
+                    "accounting_bound_verified": accounting["accounting_bound_verified"],
+                    "attempts": accounting["attempts"],
+                    "downloaded_bytes": accounting.get("downloaded_bytes"),
+                    "downloaded_bytes_upper_bound": accounting.get("downloaded_bytes_upper_bound"),
+                    "unfinished_reservation_ids": accounting["unfinished_reservation_ids"],
+                    "reservation_inventory_sha256": accounting.get("reservation_inventory_sha256"),
+                    "previous_filesystem_device": pending["previous_filesystem_device"],
+                    "filesystem_device": pending["filesystem_device"],
+                    "volume_uuid": pending["volume_uuid"],
+                    "prior_process_group_ignored_after_boot_change": True,
+                }
+                event_id = hashlib.sha256(
+                    json.dumps(event_identity, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                audit = _append_stopped_worker_audit(
+                    operator,
+                    {
+                        "version": 1,
+                        "event_id": event_id,
+                        "reconciled_at": _utc(),
+                        **event_identity,
+                    },
+                    allow_distinct_attempts=True,
+                )
+                import historical_grants as grants
+
+                record_sha256 = grants.sha256_json(audit)
+                audit_binding = {
+                    "event_id": event_id,
+                    "record_sha256": record_sha256,
+                    "audit_file": "stopped-worker-reconciliation.jsonl",
+                    "boot_stamp": report["boot_stamp"],
+                    "primary_stop_reason": report.get("error"),
+                    "supervisor_pid": evidence["supervisor_pid"],
+                    "supervisor_pgid": evidence["supervisor_pgid"],
+                    "reconciliation_kind": "temporary_storage_stop",
+                    "recovery_kind": "prior_boot_temporary_stop",
+                    "storage_stop_evidence": event_identity["storage_stop_evidence"],
+                    "stale_process_group": evidence["original_process_group"],
+                    "termination_evidence_sha256": event_identity["evidence_sha256"],
+                    "session_before_sha256": raw_sha256,
+                    "pre_recovery_history_sha256": pre_recovery_history_sha256,
+                    "recovered_boot_stamp": pending["boot_stamp"],
+                    "launch_revision_source": event_identity["launch_revision_source"],
+                    "processing_revision": event_identity["processing_revision"],
+                    "reconciliation_runtime_revision": event_identity[
+                        "reconciliation_runtime_revision"
+                    ],
+                    "launch_sha256": event_identity["launch_sha256"],
+                    "launch_checks_sha256": event_identity["launch_checks_sha256"],
+                    "recovery_audit_sha256": record_sha256,
+                }
+            elif accounting.get("accounting_complete") is not True:
+                raise RunnerError("reboot recovery requires a typed temporary storage stop")
+            if regular_bytes(report_path, 16 * MIB) != raw:
+                raise RunnerError("session report changed during reboot audit append")
+    else:
+        snapshot, accounting = read_accounting()
+
+    accounting_sha256 = (
+        _accounting_snapshot_sha256(snapshot)
+        if audit_binding is not None
+        else _full_accounting_snapshot_sha256(snapshot)
+    )
 
     private_reconciliation_sha256 = None
     if private_uncertain:
@@ -7673,9 +8080,7 @@ def _finish_historical_reboot_reconciliation(
             or private_worker.get("worker_pgid") != pending.get("previous_active_process_group")
         ):
             raise RunnerError("private reboot reconciliation binding changed")
-        accounting_sha256 = hashlib.sha256(
-            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        ).hexdigest()
+        accounting_sha256 = _full_accounting_snapshot_sha256(snapshot)
         private_record, private_reconciliation_sha256 = _historical_write_private_reconciliation(
             Path(private_worker["control_root"]),
             private_worker["grant_id"],
@@ -7705,17 +8110,6 @@ def _finish_historical_reboot_reconciliation(
         if private_record.get("sha256") != private_reconciliation_sha256:
             raise RunnerError("private reboot reconciliation record failed readback")
 
-    history = report.get("reboot_recovery_history", [])
-    if (
-        not isinstance(history, list)
-        or len(history) >= 64
-        or any(not isinstance(item, dict) for item in history)
-    ):
-        raise RunnerError("reboot recovery history is invalid or full")
-    previous_system = report.get("system")
-    if not isinstance(previous_system, dict):
-        raise RunnerError("reboot recovery has no saved filesystem identity")
-
     wall_now = time.time()
     mono_now = time.monotonic()
     offset = mono_now - wall_now
@@ -7729,39 +8123,57 @@ def _finish_historical_reboot_reconciliation(
     report["active_process_group"] = None
     report.update(
         requests=accounting["attempts"],
-        downloaded_bytes=accounting["downloaded_bytes"],
-        downloaded_bytes_upper_bound=None,
-        accounting_complete=True,
-        accounting_basis="exact",
-        accounting_bound_verified=False,
-        unfinished_reservation_ids=[],
-        consumption_state="verified",
+        downloaded_bytes=accounting.get("downloaded_bytes"),
+        downloaded_bytes_upper_bound=accounting.get("downloaded_bytes_upper_bound"),
+        accounting_complete=accounting["accounting_complete"],
+        accounting_basis=accounting["accounting_basis"],
+        accounting_bound_verified=accounting["accounting_bound_verified"],
+        unfinished_reservation_ids=accounting["unfinished_reservation_ids"],
+        consumption_state=(
+            accounting["accounting_basis"]
+            if accounting["accounting_complete"] is False
+            else "verified"
+        ),
         network_activity_this_invocation={
             "requests": 0,
             "downloaded_bytes": 0,
             "accounting_complete": True,
         },
-        operator_accounting={
-            "state": "verified",
-            "requests": accounting["attempts"],
-            "downloaded_bytes": accounting["downloaded_bytes"],
-        },
     )
+    _record_operator_accounting(report, snapshot)
+    if audit_binding is not None:
+        report["active_process_group"] = None
+        report["stopped_worker_reconciliation"] = audit_binding
     reboot_event = {
         "recovered_at": _utc(),
         **pending,
         "session_before_sha256": hashlib.sha256(raw).hexdigest(),
-        "accounting_sha256": hashlib.sha256(
-            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        ).hexdigest(),
-        "accounting_basis": "exact",
-        "accounting_complete": True,
+        "accounting_sha256": accounting_sha256,
+        "pre_recovery_history_sha256": pre_recovery_history_sha256,
+        "accounting_basis": accounting["accounting_basis"],
+        "accounting_complete": accounting["accounting_complete"],
+        "accounting_bound_verified": accounting["accounting_bound_verified"],
+        "attempts": accounting["attempts"],
+        "downloaded_bytes": accounting.get("downloaded_bytes"),
+        "downloaded_bytes_upper_bound": accounting.get("downloaded_bytes_upper_bound"),
+        "unfinished_reservation_ids": accounting["unfinished_reservation_ids"],
+        "reservation_inventory_sha256": accounting.get("reservation_inventory_sha256"),
         "prior_process_group_ignored_after_boot_change": pending["previous_active_process_group"]
         is not None,
         "processing_worker_started": False,
         "grant_started": False,
         "wall_deadlines_preserved": pending["wall_deadlines_preserved"],
     }
+    if audit_binding is not None:
+        reboot_event.update(
+            recovery_kind="prior_boot_temporary_stop",
+            recovered_boot_stamp=pending["boot_stamp"],
+            stopped_worker_event_id=audit_binding["event_id"],
+            stopped_worker_audit_sha256=audit_binding["recovery_audit_sha256"],
+            stopped_worker_session_before_sha256=audit_binding["session_before_sha256"],
+            stopped_worker_reconciled_boot_stamp=audit_binding["recovered_boot_stamp"],
+            pre_recovery_history_sha256=pre_recovery_history_sha256,
+        )
     if private_uncertain:
         reboot_event["private_worker_reconciliation_sha256"] = private_reconciliation_sha256
         report["private_historical_grant"]["state"] = "reconciled-after-boot-change"
@@ -7772,11 +8184,20 @@ def _finish_historical_reboot_reconciliation(
         "capture_id": capture_id,
         "root_id": report["root_id"],
         "boot_stamp": pending["boot_stamp"],
-        "accounting_basis": "exact",
+        "accounting_basis": accounting["accounting_basis"],
+        "accounting_complete": accounting["accounting_complete"],
+        "accounting_bound_verified": accounting["accounting_bound_verified"],
         "processing_worker_started": False,
         "grant_started": False,
         "private_worker_reconciliation_sha256": private_reconciliation_sha256,
     }
+    if audit_binding is not None:
+        report["historical_reboot_reconciliation"].update(
+            recovery_kind="prior_boot_temporary_stop",
+            stopped_worker_event_id=audit_binding["event_id"],
+            stopped_worker_audit_sha256=audit_binding["recovery_audit_sha256"],
+            stopped_worker_session_before_sha256=audit_binding["session_before_sha256"],
+        )
     report["phase"] = "stopped"
     report["error"] = None
     report["recovery"] = (
@@ -7902,6 +8323,36 @@ def _reconciliation_accounting(snapshot: dict[str, Any], capture_id: str) -> dic
         "unfinished_reservations": 0,
         "unfinished_reservation_ids": [],
     }
+
+
+def _accounting_snapshot_sha256(snapshot: dict[str, Any]) -> str:
+    """Hash receipt-derived facts without storage usage that the audit append changes."""
+    facts = {
+        key: snapshot.get(key)
+        for key in (
+            "root_id",
+            "attempts",
+            "downloaded_or_reserved_bytes",
+            "accounting_complete",
+            "unfinished_reservations",
+        )
+    }
+    unfinished = facts["unfinished_reservations"]
+    if isinstance(unfinished, list):
+        facts["unfinished_reservations"] = sorted(
+            unfinished,
+            key=lambda item: item.get("request_id", "") if isinstance(item, dict) else "",
+        )
+    return hashlib.sha256(
+        json.dumps(facts, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _full_accounting_snapshot_sha256(snapshot: dict[str, Any]) -> str:
+    """Keep the established digest for exact and private reboot reconciliation records."""
+    return hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
 
 
 def _record_operator_accounting(report: dict[str, Any], snapshot: dict[str, Any]) -> None:
@@ -8273,7 +8724,7 @@ def _historical_authorized_census(
     import historical_admission
 
     from kalshi_events import capture, historical, publish
-    from kalshi_events.common import CatalogueError
+    from kalshi_events.common import CatalogueError, _root_scope
 
     control = authority["control"].get("authorized_census")
     if not isinstance(control, dict):
@@ -8415,6 +8866,7 @@ def _historical_authorized_census(
             self.root = root.resolve(strict=True)
             self.deadline = deadline
             self.limits = type("ReadOnlyLimits", (), {"max_root_bytes": 350 * GIB})()
+            self.scope = _root_scope(strict_json(read_regular(self.path("root.json"), MIB)))
 
         def path(self, relative: str) -> Path:
             candidate = Path(relative)
@@ -9626,6 +10078,22 @@ def _historical_authority(
         identity,
         bundle["freeze"],
     )
+    stopped_reconciliation = report.get("stopped_worker_reconciliation")
+    if (
+        prelaunch
+        and bundle["approval"].get("phase") == "source"
+        and isinstance(stopped_reconciliation, dict)
+        and stopped_reconciliation.get("recovery_kind") == "prior_boot_temporary_stop"
+    ):
+        _historical_reconciliation_audit(
+            {
+                "report": report,
+                "identity": identity,
+                "operator": operator,
+                "freeze": bundle["freeze"],
+                "current_mount": current_mount,
+            }
+        )
     root_device = current_mount["device"]
     root_volume = current_mount["volume_uuid"]
     boot_stamp = report.get("boot_stamp")
@@ -11175,6 +11643,7 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
     supervisor_pid = reconciliation.get("supervisor_pid")
     supervisor_pgid = reconciliation.get("supervisor_pgid")
     stop_boot = reconciliation.get("boot_stamp")
+    typed_stop_transition = None
     if (
         not isinstance(event_id, str)
         or re.fullmatch(r"[0-9a-f]{64}", event_id) is None
@@ -11203,8 +11672,29 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
         recovery = report.get("historical_reboot_reconciliation")
         history = report.get("reboot_recovery_history")
         reboot = history[-1] if isinstance(history, list) and history else None
+        typed_stop = (
+            isinstance(reconciliation, dict)
+            and reconciliation.get("recovery_kind") == "prior_boot_temporary_stop"
+        )
+        typed_stop_index = None
+        if typed_stop:
+            typed_indices = (
+                [
+                    index
+                    for index, item in enumerate(history)
+                    if isinstance(item, dict)
+                    and item.get("recovery_kind") == "prior_boot_temporary_stop"
+                ]
+                if isinstance(history, list)
+                else []
+            )
+            if len(typed_indices) != 1:
+                raise RunnerError("prior-boot stop recovery transition is missing or duplicated")
+            typed_stop_index = typed_indices[0]
+            typed_stop_transition = history[typed_stop_index]
         freeze = authority.get("freeze")
         current_mount = authority.get("current_mount")
+        system = report.get("system")
         current_device = (
             current_mount.get("device")
             if isinstance(current_mount, dict)
@@ -11222,23 +11712,125 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
             or recovery.get("capture_id") != identity["capture_id"]
             or recovery.get("root_id") != identity["root_id"]
             or recovery.get("boot_stamp") != current_boot
-            or recovery.get("accounting_basis") != "exact"
             or recovery.get("processing_worker_started") is not False
             or recovery.get("grant_started") is not False
             or not isinstance(reboot, dict)
-            or reboot.get("previous_boot_stamp") != stop_boot
+            or not typed_stop
+            and reboot.get("previous_boot_stamp") != stop_boot
             or reboot.get("boot_stamp") != current_boot
             or reboot.get("volume_uuid") != current_volume
             or reboot.get("filesystem_device") != current_device
-            or reboot.get("accounting_basis") != "exact"
-            or reboot.get("accounting_complete") is not True
             or reboot.get("processing_worker_started") is not False
             or reboot.get("grant_started") is not False
             or reboot.get("prior_process_group_ignored_after_boot_change")
             is not (reboot.get("previous_active_process_group") is not None)
             or reboot.get("previous_active_process_group") not in (None, stale_group)
-            or report.get("system", {}).get("filesystem_device") != current_device
-            or report.get("system", {}).get("filesystem_volume_uuid") != current_volume
+            or not isinstance(system, dict)
+            or system.get("filesystem_device") != current_device
+            or system.get("filesystem_volume_uuid") != current_volume
+        ):
+            raise RunnerError(
+                "old-boot stopped-worker identity lacks exact reboot accounting proof"
+            )
+        if typed_stop:
+            transition = typed_stop_transition
+            assert isinstance(transition, dict) and isinstance(typed_stop_index, int)
+            prefix = history[:typed_stop_index]
+            prefix_sha256 = hashlib.sha256(
+                json.dumps(prefix, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+            ).hexdigest()
+            latest_is_typed_stop = typed_stop_index == len(history) - 1
+            bounded = transition.get("accounting_basis") == "reserved-upper-bound"
+            if (
+                transition.get("previous_boot_stamp") != stop_boot
+                or transition.get("previous_active_process_group") != stale_group
+                or transition.get("boot_stamp") != reconciliation.get("recovered_boot_stamp")
+                or transition.get("recovered_boot_stamp") != transition.get("boot_stamp")
+                or transition.get("stopped_worker_event_id") != event_id
+                or transition.get("stopped_worker_audit_sha256")
+                != reconciliation.get("recovery_audit_sha256")
+                or transition.get("stopped_worker_session_before_sha256")
+                != reconciliation.get("session_before_sha256")
+                or transition.get("pre_recovery_history_sha256") != prefix_sha256
+                or transition.get("session_before_sha256")
+                != reconciliation.get("session_before_sha256")
+                or transition.get("session_before_sha256") != identity.get("prior_session_sha256")
+                or reconciliation.get("recovered_boot_stamp") != transition.get("boot_stamp")
+                or latest_is_typed_stop
+                and (
+                    recovery.get("recovery_kind") != "prior_boot_temporary_stop"
+                    or recovery.get("stopped_worker_event_id") != event_id
+                    or recovery.get("stopped_worker_audit_sha256")
+                    != reconciliation.get("recovery_audit_sha256")
+                    or recovery.get("stopped_worker_session_before_sha256")
+                    != reconciliation.get("session_before_sha256")
+                    or transition.get("boot_stamp") != current_boot
+                )
+                or not latest_is_typed_stop
+                and (
+                    reboot.get("accounting_basis") != "exact"
+                    or reboot.get("accounting_complete") is not True
+                    or recovery.get("accounting_basis") != "exact"
+                )
+            ):
+                raise RunnerError("prior-boot stop recovery is missing its typed audit binding")
+            if latest_is_typed_stop and bounded:
+                if (
+                    report.get("accounting_complete") is not False
+                    or report.get("accounting_basis") != "reserved-upper-bound"
+                    or report.get("accounting_bound_verified") is not True
+                    or recovery.get("accounting_complete") is not False
+                    or recovery.get("accounting_basis") != "reserved-upper-bound"
+                    or recovery.get("accounting_bound_verified") is not True
+                    or report.get("consumption_state") != "reserved-upper-bound"
+                    or report.get("downloaded_bytes") is not None
+                    or report.get("requests") != transition.get("attempts")
+                    or report.get("downloaded_bytes_upper_bound")
+                    != transition.get("downloaded_bytes_upper_bound")
+                    or report.get("unfinished_reservation_ids")
+                    != transition.get("unfinished_reservation_ids")
+                    or transition.get("accounting_complete") is not False
+                    or transition.get("accounting_bound_verified") is not True
+                    or not transition.get("unfinished_reservation_ids")
+                    or not isinstance(transition.get("reservation_inventory_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", transition["reservation_inventory_sha256"])
+                    is None
+                    or not isinstance(transition.get("accounting_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", transition["accounting_sha256"]) is None
+                ):
+                    raise RunnerError("bounded reboot proof is missing its saved receipt binding")
+            else:
+                if (
+                    latest_is_typed_stop
+                    and bounded
+                    or recovery.get("accounting_basis") != "exact"
+                    or recovery.get("accounting_complete") is not True
+                    or recovery.get("accounting_bound_verified") is not False
+                    or report.get("accounting_complete") is not True
+                    or report.get("accounting_basis") != "exact"
+                    or report.get("accounting_bound_verified") is not False
+                    or report.get("unfinished_reservation_ids") != []
+                    or report.get("consumption_state") != "verified"
+                    or report.get("requests") != reboot.get("attempts")
+                    or report.get("downloaded_bytes") != reboot.get("downloaded_bytes")
+                    or reboot.get("accounting_basis") != "exact"
+                    or reboot.get("accounting_complete") is not True
+                    or not isinstance(reboot.get("accounting_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", reboot["accounting_sha256"]) is None
+                    or latest_is_typed_stop
+                    and (
+                        transition.get("accounting_complete") is not True
+                        or transition.get("accounting_bound_verified") is not False
+                        or transition.get("accounting_basis") != "exact"
+                        or transition.get("attempts") != reboot.get("attempts")
+                        or transition.get("downloaded_bytes") != reboot.get("downloaded_bytes")
+                    )
+                ):
+                    raise RunnerError("exact reboot proof is missing its saved receipt binding")
+        elif (
+            recovery.get("accounting_basis") != "exact"
+            or reboot.get("accounting_basis") != "exact"
+            or reboot.get("accounting_complete") is not True
         ):
             raise RunnerError(
                 "old-boot stopped-worker identity lacks exact reboot accounting proof"
@@ -11285,7 +11877,7 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
         or record.get("storage_stop_evidence") != stop
     ):
         raise RunnerError("stopped-worker audit readback does not match the selected session")
-    return {
+    result = {
         "event_id": event_id,
         "record_sha256": grants.sha256_json(record),
         "audit_file": reconciliation["audit_file"],
@@ -11294,6 +11886,49 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
         "supervisor_pid": supervisor_pid,
         "supervisor_pgid": supervisor_pgid,
     }
+    if reconciliation.get("recovery_kind") == "prior_boot_temporary_stop":
+        transition = typed_stop_transition
+        if (
+            stop_boot == current_boot
+            or not isinstance(transition, dict)
+            or record.get("recovery_kind") != "prior_boot_temporary_stop"
+            or record.get("recovered_boot_stamp") != transition.get("boot_stamp")
+            or record.get("report_sha256") != reconciliation.get("session_before_sha256")
+            or record.get("pre_recovery_history_sha256")
+            != transition.get("pre_recovery_history_sha256")
+            or record.get("accounting_sha256") != transition.get("accounting_sha256")
+            or record.get("accounting_basis") != transition.get("accounting_basis")
+            or record.get("accounting_complete") != transition.get("accounting_complete")
+            or record.get("accounting_bound_verified")
+            != transition.get("accounting_bound_verified")
+            or record.get("attempts") != transition.get("attempts")
+            or record.get("downloaded_bytes") != transition.get("downloaded_bytes")
+            or record.get("downloaded_bytes_upper_bound")
+            != transition.get("downloaded_bytes_upper_bound")
+            or record.get("unfinished_reservation_ids")
+            != transition.get("unfinished_reservation_ids")
+            or record.get("reservation_inventory_sha256")
+            != transition.get("reservation_inventory_sha256")
+            or record.get("previous_filesystem_device")
+            != transition.get("previous_filesystem_device")
+            or record.get("filesystem_device") != transition.get("filesystem_device")
+            or record.get("volume_uuid") != transition.get("volume_uuid")
+            or record.get("prior_process_group_ignored_after_boot_change") is not True
+            or reconciliation.get("recovery_audit_sha256") != result["record_sha256"]
+            or not isinstance(transition.get("session_before_sha256"), str)
+            or transition.get("session_before_sha256") != identity.get("prior_session_sha256")
+        ):
+            raise RunnerError("prior-boot temporary-stop audit is not bound to its recovery")
+        result.update(
+            recovery_kind="prior_boot_temporary_stop",
+            # Startup cleanup seals this proof, so it must survive later reboots.
+            accounting_basis=transition["accounting_basis"],
+            accounting_sha256=transition["accounting_sha256"],
+            session_before_sha256=transition["session_before_sha256"],
+            pre_recovery_history_sha256=transition["pre_recovery_history_sha256"],
+            recovered_boot_stamp=transition["boot_stamp"],
+        )
+    return result
 
 
 def _historical_startup_maintenance_path(authority: dict[str, Any]) -> Path:
