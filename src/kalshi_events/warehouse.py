@@ -2383,18 +2383,36 @@ def _historical_dbt_runtime_matches(
             ):
                 return None
             nodes = manifest.get("nodes", {})
-            capture_bound_nodes = [
-                nodes.get(f"model.kalshi_events._historical_current_{name}")
-                for name in ("events", "series")
-            ]
-            if any(
-                not isinstance(node, dict)
-                or node.get("config", {}).get("enabled") is not True
-                or capture_id not in node.get("compiled_code", "")
-                for node in capture_bound_nodes
-            ):
-                return None
-        except (AttributeError, TypeError, ValueError, CatalogueError):
+            for name in ("events", "series"):
+                model = f"_historical_current_{name}"
+                node = nodes.get(f"model.kalshi_events.{model}")
+                if not isinstance(node, dict) or node.get("config", {}).get("enabled") is not True:
+                    return None
+                compiled = node.get("compiled_code")
+                if compiled is not None:
+                    if not isinstance(compiled, str) or capture_id not in compiled:
+                        return None
+                    continue
+                # An interrupted dbt build can leave a parse-time manifest.
+                if node.get("original_file_path") != f"models/{model}.sql":
+                    return None
+                artifact = (
+                    runtime / "target" / "compiled" / "kalshi_events" / "models" / f"{model}.sql"
+                )
+                details = artifact.lstat()
+                if (
+                    not stat.S_ISREG(details.st_mode)
+                    or details.st_nlink != 1
+                    or details.st_dev != store.root.stat().st_dev
+                ):
+                    return None
+                predicate = f"where p.capture_id = '{capture_id}'".encode()
+                if not any(
+                    line.strip() == predicate
+                    for line in regular_bytes(artifact, 1024**2).splitlines()
+                ):
+                    return None
+        except (AttributeError, OSError, TypeError, ValueError, CatalogueError):
             return None
     return spill, digest(regular_bytes(profiles, 1024**2)), output["path"]
 

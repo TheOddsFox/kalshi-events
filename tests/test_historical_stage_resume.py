@@ -224,6 +224,89 @@ def test_cleanup_preserves_explicit_stage_and_only_removes_its_bound_dbt_spill(
     assert cleanup_proof["binding"]["database"] == str(database)
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "matching",
+        "missing",
+        "wrong-capture",
+        "disabled",
+        "inline-conflict",
+        "symlink",
+        "symlink-parent",
+        "hardlink",
+        "large",
+    ],
+)
+def test_interrupted_dbt_manifest_uses_bounded_compiled_artifacts(store: Store, case: str):
+    capture_id = "a" * 32
+    stage = "tmp/build-historical-" + "d" * 32
+    database = store.path(f"{stage}/warehouse.duckdb")
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"saved database")
+    runtime = store.path("tmp/dbt-" + "f" * 32)
+    spill = runtime / "spill"
+    spill.mkdir(parents=True)
+    (spill / "spill.bin").write_bytes(b"temporary pages")
+    store.write(
+        f"tmp/{runtime.name}/profiles.yml",
+        {
+            "kalshi_events": {
+                "outputs": {
+                    "local": {
+                        "path": str(database),
+                        "config_options": {"temp_directory": str(spill)},
+                    }
+                }
+            }
+        },
+    )
+    nodes = {}
+    compiled = runtime / "target/compiled/kalshi_events/models"
+    compiled.mkdir(parents=True)
+    for name in ("events", "series"):
+        model = f"_historical_current_{name}"
+        nodes[f"model.kalshi_events.{model}"] = {
+            "config": {"enabled": True},
+            "original_file_path": f"models/{model}.sql",
+        }
+        (compiled / f"{model}.sql").write_text(
+            f"select * from population p\nwhere p.capture_id = '{capture_id}'\n"
+        )
+    events = compiled / "_historical_current_events.sql"
+    if case == "missing":
+        events.unlink()
+    elif case == "wrong-capture":
+        events.write_text("where p.capture_id = '" + "b" * 32 + "'\n")
+    elif case == "disabled":
+        nodes["model.kalshi_events._historical_current_events"]["config"]["enabled"] = False
+    elif case == "inline-conflict":
+        nodes["model.kalshi_events._historical_current_events"]["compiled_code"] = "select 1"
+    elif case == "symlink-parent":
+        original = compiled.with_name("original")
+        compiled.rename(original)
+        compiled.symlink_to(original, target_is_directory=True)
+    elif case in {"symlink", "hardlink"}:
+        original = events.with_suffix(".original")
+        events.rename(original)
+        if case == "symlink":
+            events.symlink_to(original)
+        else:
+            events.hardlink_to(original)
+    elif case == "large":
+        with events.open("ab") as stream:
+            stream.truncate(1024**2 + 1)
+    store.write(
+        f"tmp/{runtime.name}/target/manifest.json",
+        {"metadata": {"project_name": "kalshi_events"}, "nodes": nodes},
+    )
+
+    with store.writer_guard():
+        warehouse._cleanup_resumed_historical_dbt_spills(store, capture_id, stage)
+    assert (spill / "spill.bin").exists() is (case != "matching")
+    assert database.read_bytes() == b"saved database"
+
+
 def test_partial_spill_cleanup_retry_keeps_the_original_inventory(store: Store, monkeypatch):
     state = acquisition.capture(store, client_factory=_factory({}))
     stage_name = "build-historical-" + "e" * 32

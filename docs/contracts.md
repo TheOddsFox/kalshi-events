@@ -460,6 +460,10 @@ receipt totals are unavailable. The report retains incomplete accounting and the
 unfinished reservation identities. Reconciliation durably records the typed
 temporary-stop event before clearing the old worker marker. Other reboot
 recovery paths still require exact accounting.
+Historical spill cleanup checks the dbt profile against the exact saved stage.
+If an interrupted build leaves a parse-time manifest without inline compiled
+SQL, cleanup requires the capture predicate in both fixed compiled historical
+model files. Missing, conflicting or unsafe ownership evidence blocks cleanup.
 Private pause receipts name the applicable conditional commands using the bound
 frozen source and the literal virtual-environment interpreter path.
 If a verified reboot changes the volume's numeric device identifier, the
