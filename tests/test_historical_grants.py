@@ -2107,6 +2107,24 @@ def test_frozen_control_rejects_unsafe_root_before_reading(artifacts, identity, 
         grants.read_frozen_control(alias, expected_identity=identity)
 
 
+def test_activated_warehouse_record_requires_the_bound_hard_link(artifacts):
+    source = artifacts / "warehouse.duckdb"
+    source.write_bytes(b"certified fixture bytes")
+    alias = artifacts / "production.duckdb"
+    os.link(source, alias)
+    with pytest.raises(production.RunnerError, match="unsafe or oversized"):
+        production._historical_file_record(alias)
+    record = production._historical_file_record(alias, linked_source=source)
+    assert record["sha256"] == grants.sha256_bytes(source.read_bytes())
+    other = artifacts / "unrelated.duckdb"
+    other.write_bytes(source.read_bytes())
+    with pytest.raises(production.RunnerError, match="not a hard link"):
+        production._historical_file_record(alias, linked_source=other)
+    os.link(source, artifacts / "untracked.duckdb")
+    with pytest.raises(production.RunnerError, match="unsafe or oversized"):
+        production._historical_file_record(alias, linked_source=source)
+
+
 def test_phase_seal_survives_crash_before_attempt_result_and_next_grant_starts_next_phase(
     artifacts, identity
 ):

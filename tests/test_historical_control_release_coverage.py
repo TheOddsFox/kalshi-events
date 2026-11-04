@@ -205,9 +205,11 @@ def verified_candidate(incomplete_historical_release, monkeypatch):
         "launch": {"launch_id": uuid.uuid4().hex},
         "store": store,
     }
+    report_before_verification = report_path.read_bytes()
     verification = production._historical_release_verification(
         authority, grant_id_for_receipt=verification_grant_id
     )
+    assert report_path.read_bytes() == report_before_verification
     assert verification["standalone"] == verification["manifest"]
     assert "scope_complete" not in verification["standalone"]
     assert verification["receipt"]["source_capture_complete"] is False
@@ -499,6 +501,6 @@ def test_fresh_grant_reuses_audit_after_post_replace_failure_with_fresh_readback
     assert activated["scope_complete"] is True
     assert activated["relation_rows"] == verified_candidate["expected_rows"]
     assert activated["activation_audit"]["sha256"] == original_audit_sha256
-    assert json.loads(authority["report_path"].read_text())["production_state"] == "verified"
+    assert json.loads(authority["report_path"].read_text())["production_state"] == "attempting"
     assert os.path.samefile(alias, source_warehouse)
     assert not list(directory.glob(".production.duckdb.*.tmp"))

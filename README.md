@@ -431,6 +431,24 @@ Native endpoint, cursor and immutable evidence patterns were adapted from `oddsf
 
 After `scripts/verify` builds distributions, run `uv run --locked python scripts/check-distributions.py` and `uv run --locked python scripts/check-installed.py`. GitHub Actions CI is disabled; run these verification commands manually. The installed check creates a separate locked environment, installs the checksummed wheel, verifies its site-packages import origin and parses its packaged dbt project from a temporary working directory.
 
+Before admitting a saved-stage production grant, run the opt-in historical
+rehearsal on the macOS production host with at least 152 GiB free. Use the wheel
+built from the candidate revision and the audited `runtime_manifest.py` helper
+from the existing verified runtime.
+
+```sh
+UV_OFFLINE=1 KALSHI_HISTORICAL_REHEARSAL=1 \
+  KALSHI_HISTORICAL_REHEARSAL_WHEEL=/absolute/path/to/candidate.whl \
+  KALSHI_HISTORICAL_REHEARSAL_RUNTIME_HELPER=/absolute/path/to/runtime_manifest.py \
+  uv run --locked pytest -q -s tests/test_historical_production_rehearsal.py
+```
+
+The rehearsal allocates a new fixture and runtime under ignored `data/`, prints
+their paths, and retains the command, phase, and activation evidence there.
+It exercises the frozen source controller with fixture census pins and a
+disposable alias. Use the separate installed-wheel check for the unmodified
+wheel, and size production grants from measured production evidence.
+
 The consumer repository owns the full installed handoff harness. Given two separate installed wheel environments, run:
 
 ```sh

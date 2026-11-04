@@ -3263,6 +3263,7 @@ def _release_verify(
     *,
     storage_supervision: bool = False,
     wall_deadline_epoch_override: float | None = None,
+    preserve_session: bool = False,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -3276,6 +3277,30 @@ def _release_verify(
     ]
     stdout = paths["logs"] / "release-verify.stdout.json"
     stderr = paths["logs"] / "release-verify.stderr.log"
+    if preserve_session:
+        # The enclosing private worker owns the active group and its report.
+        # Keep the verifier in that group so it shares the same live supervision.
+        if storage_supervision:
+            raise RunnerError("private verification cannot create a second storage supervisor")
+        timeout = _child_time_remaining(deadline, wall_deadline_epoch_override) - float(
+            _effective_limits()["terminate_seconds"]
+        )
+        if timeout <= 0:
+            raise BudgetStop("insufficient time remains for private release verification")
+        env = {**os.environ, "PYTHONPATH": str(SOURCE_ROOT / "src")}
+        try:
+            with stdout.open("xb") as out, stderr.open("xb") as err:
+                result = subprocess.run(
+                    command, env=env, stdout=out, stderr=err, timeout=timeout, check=False
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise BudgetStop("private release verification exceeded its deadline") from exc
+        if _child_time_remaining(deadline, wall_deadline_epoch_override) <= 0:
+            raise BudgetStop("private release verification exceeded its deadline")
+        value = _strict_json(stdout)
+        if result.returncode != 0 or value is None:
+            raise RunnerError("standalone release verification failed or has unknown status")
+        return value
     storage_progress = _stage_storage_progress_path(paths, "release-verify")
     storage_token = uuid.uuid4().hex if storage_supervision else None
     started = time.monotonic()
@@ -3749,6 +3774,7 @@ _LIVE_TMP_NAMES = (
     re.compile(r"load-[0-9a-f]{32}\Z"),
     re.compile(r"baseline-verify-[0-9a-f]{32}\Z"),
     re.compile(r"activation-readback-[0-9a-f]{32}\Z"),
+    re.compile(r"ordering-policy-[0-9a-f]{32}\Z"),
     re.compile(r"database-copy-[0-9a-f]{32}\Z"),
     re.compile(r"build-[0-9a-f]{32}\Z"),
     re.compile(r"build-v2-[0-9a-f]{32}\Z"),
@@ -8529,7 +8555,9 @@ def _historical_assert_pinned_python(control_root: Path) -> None:
         )
 
 
-def _historical_file_record(path: Path, *, max_bytes: int = 256 * 1024 * 1024) -> dict[str, Any]:
+def _historical_file_record(
+    path: Path, *, max_bytes: int = 256 * 1024 * 1024, linked_source: Path | None = None
+) -> dict[str, Any]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         before = path.lstat()
@@ -8540,7 +8568,7 @@ def _historical_file_record(path: Path, *, max_bytes: int = 256 * 1024 * 1024) -
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
+            or opened.st_nlink != (1 if linked_source is None else 2)
             or opened.st_size > max_bytes
             or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
         ):
@@ -8568,6 +8596,8 @@ def _historical_file_record(path: Path, *, max_bytes: int = 256 * 1024 * 1024) -
 
         if signature(opened) != signature(after) or signature(opened) != signature(final):
             raise RunnerError(f"frozen runtime input changed while being hashed: {path}")
+        if linked_source is not None and signature(opened) != signature(linked_source.lstat()):
+            raise RunnerError("activated database is not a hard link to the certified warehouse")
         return {
             "sha256": checksum.hexdigest(),
             "size": size,
@@ -9515,6 +9545,7 @@ class _HistoricalStorageHeartbeat:
                     grace = float(state["target_interval_seconds"] * 4)
             except Exception as exc:
                 self._failure = f"historical live storage supervisor failed: {exc}"
+                print(self._failure, file=sys.stderr, flush=True)
                 if os.getpid() > 1 and os.getpgrp() == os.getpid():
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(os.getpgrp(), signal.SIGTERM)
@@ -10388,6 +10419,7 @@ def _historical_release_verification(
         float(authority["grant"]["deadline_monotonic"]),
         storage_supervision=False,
         wall_deadline_epoch_override=float(authority["grant"]["deadline_epoch"]),
+        preserve_session=True,
     )
     source_capture_complete = standalone.get("source_capture_complete")
     scope_complete = (
@@ -11384,9 +11416,16 @@ def _historical_phase_outputs(authority: dict[str, Any], phase: str) -> dict[str
             authority["control_root"] / "activations" / f"{authority['grant']['grant_id']}.json"
         )
         result, _ = _historical_read_artifact(result_path, 4 * MIB)
-        current, _manifest = _historical_published_release(authority)
+        current, manifest = _historical_published_release(authority)
         database_path = authority["directory"] / "production.duckdb"
-        database_record = _historical_file_record(database_path, max_bytes=128 * GIB)
+        certified_source = build_dir / "warehouse.duckdb"
+        database_record = _historical_file_record(
+            database_path, max_bytes=128 * GIB, linked_source=certified_source
+        )
+        for database in (database_path, certified_source):
+            wal = database.with_name(database.name + ".wal")
+            if wal.exists() or wal.is_symlink():
+                raise RunnerError("activated database or certified warehouse has a WAL")
         relation_rows = result.get("relation_rows")
         readback = result.get("production_readback")
         audit_binding = authority["report"].get("activation_audit")
@@ -11406,6 +11445,7 @@ def _historical_phase_outputs(authority: dict[str, Any], phase: str) -> dict[str
             or result.get("capture_id") != capture_id
             or result.get("source_release_id") != current["source_release_id"]
             or result.get("warehouse_sha256") != database_record["sha256"]
+            or manifest.get("warehouse_sha256") != database_record["sha256"]
             or audit_sha != authority["approval"].get("activation_audit_sha256")
             or audit.get("capture_id") != census_control.get("capture_id")
             or audit.get("root_id") != census_control.get("root_id")
@@ -11957,7 +11997,7 @@ def _historical_read_startup_maintenance(authority: dict[str, Any]) -> dict[str,
     from kalshi_events import historical_resume, warehouse
 
     path = _historical_startup_maintenance_path(authority)
-    proof, _raw_sha = _historical_read_artifact(path, 16 * MIB)
+    proof = grants.read_json(path, max_bytes=16 * MIB)
     body = {key: value for key, value in proof.items() if key != "sha256"}
     expected_fields = {
         "version",
@@ -12274,8 +12314,8 @@ def _historical_startup_maintenance(authority: dict[str, Any]) -> dict[str, Any]
                     ]
             except OSError as exc:
                 raise RunnerError("warehouse spill cleanup audit could not be inventoried") from exc
-            for proof_path in proof_entries:
-                cleanup, cleanup_sha = _historical_read_artifact(proof_path, MIB)
+            for cleanup_path in proof_entries:
+                cleanup, cleanup_sha = _historical_read_artifact(cleanup_path, MIB)
                 result = historical_resume.validate_proof(
                     cleanup, "abandoned-dbt-spill-cleanup", ownership
                 )
@@ -12303,7 +12343,7 @@ def _historical_startup_maintenance(authority: dict[str, Any]) -> dict[str, Any]
                     )
                 cleanup_records.append(
                     {
-                        "path": proof_path.relative_to(store.root).as_posix(),
+                        "path": cleanup_path.relative_to(store.root).as_posix(),
                         "sha256": cleanup_sha,
                         "runtime": ownership["runtime"],
                         "spill": spill.relative_to(store.root).as_posix(),
@@ -12734,8 +12774,6 @@ def _historical_worker_action(
             raise RunnerError("historical activation did not complete a verified readback")
         result_path = control_root / "activations" / f"{grant_id}.json"
         grants.write_once_json(result_path, activation)
-        authority["report"]["production_state"] = "verified"
-        _atomic_report(report_path, authority["report"])
         return {
             "activation_audit_sha256": audit_binding["sha256"],
             "production_database_sha256": activation.get("warehouse_sha256"),
@@ -13503,6 +13541,10 @@ def _historical_control_main(directory: Path, control_root: Path, grant_id: str)
                 bindings=identity,
                 grant_launch=launch,
             )
+            if phase in {"verified-publication", "activation"}:
+                state_field = "production_state" if phase == "activation" else "publication_state"
+                report[state_field] = "verified"
+                _atomic_report(report_path, report)
             completed.append(phase)
         _historical_stop_record(
             directory,

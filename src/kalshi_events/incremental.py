@@ -1519,8 +1519,6 @@ def _prune_locked(
     ):
         raise CatalogueError("cannot prune before the requested release is current")
     _finish_retirement_plan(store)
-    trash = store.path("prune-trash")
-    durable_mkdir(trash)
 
     pointer_manifests: list[dict[str, Any]] = []
     for version, pointer_name in publication_pointers(store):
@@ -1733,6 +1731,7 @@ def _prune_locked(
         # identity remains discoverable if the process stops before cleanup.
         remove_capture_cache(store, state["capture_id"])
         return removed_captures
+    durable_mkdir(store.path("prune-trash"))
     # No cached proof is used after retention has selected the complete removal set.
     context.captures.clear()
     _write_retirement_plan(store, {"version": 1, "kind": "prune", "entries": entries})

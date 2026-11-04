@@ -123,12 +123,13 @@ def test_live_storage_stops_on_temporary_burst_above_category_threshold(producti
     assert reason == "live temporary storage reached the 56 GiB stop threshold"
 
 
-def test_activation_readback_spill_is_a_registered_accounted_workspace(production, tmp_path):
+@pytest.mark.parametrize("prefix", ["activation-readback", "ordering-policy"])
+def test_verification_spill_is_a_registered_accounted_workspace(production, tmp_path, prefix):
     directory, operator, _run_root, _logs, _report_path, report, external, progress = _workspace(
         tmp_path, production
     )
     state = production._begin_storage_supervision(directory, operator, report, progress, external)
-    spill = operator / "tmp" / f"activation-readback-{'c' * 32}" / "spill.tmp"
+    spill = operator / "tmp" / f"{prefix}-{'c' * 32}" / "spill.tmp"
     spill.parent.mkdir(parents=True)
     spill.write_bytes(b"x" * 4096)
     assert (

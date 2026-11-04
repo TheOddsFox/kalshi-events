@@ -892,10 +892,11 @@ def _private_regular_file(path: Path, *, max_bytes: int = 1024 * 1024) -> bytes:
         os.close(descriptor)
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_json(path: Path, *, max_bytes: int = 1024 * 1024) -> dict[str, Any]:
     try:
         value = json.loads(
-            _private_regular_file(path).decode("utf-8"), parse_constant=_reject_constant
+            _private_regular_file(path, max_bytes=max_bytes).decode("utf-8"),
+            parse_constant=_reject_constant,
         )
     except ControlError:
         raise
