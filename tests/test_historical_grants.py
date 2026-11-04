@@ -2099,6 +2099,14 @@ def test_grant_launch_artifact_cannot_be_reused(artifacts, identity):
         grants.write_once_json(path, launch)
 
 
+def test_frozen_control_rejects_unsafe_root_before_reading(artifacts, identity, monkeypatch):
+    alias = artifacts / "alias"
+    alias.symlink_to(artifacts, target_is_directory=True)
+    monkeypatch.setattr(grants, "read_json", lambda *_: pytest.fail("opened an unsafe root"))
+    with pytest.raises(grants.ControlError, match="control root must be owner-only"):
+        grants.read_frozen_control(alias, expected_identity=identity)
+
+
 def test_phase_seal_survives_crash_before_attempt_result_and_next_grant_starts_next_phase(
     artifacts, identity
 ):
@@ -2184,6 +2192,18 @@ def test_phase_seal_survives_crash_before_attempt_result_and_next_grant_starts_n
         "frozen_at_epoch": time.time(),
     }
     grants.write_once_json(artifacts / "freeze.json", freeze)
+
+    template_readback = grants.read_frozen_control(artifacts, expected_identity=template_identity)
+    assert (
+        grants.read_frozen_control(artifacts, expected_identity=frozen_identity)
+        == template_readback
+    )
+    with pytest.raises(grants.ControlError, match="do not match this session"):
+        grants.read_control_template(artifacts, expected_identity=frozen_identity)
+    for key in ("capture_id", "state_sha256", "source_sha256", "runtime_sha256"):
+        wrong = dict(frozen_identity, **{key: "f" * len(frozen_identity[key])})
+        with pytest.raises(grants.ControlError, match="frozen historical control identity changed"):
+            grants.read_frozen_control(artifacts, expected_identity=wrong)
 
     source_approval, source_latch, source_launch, _epoch, _mono = _grant(
         frozen_identity, phase="source", phases=["source"]

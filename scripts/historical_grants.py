@@ -287,6 +287,9 @@ def validate_frozen_control(
     for key in _BINDING_FIELDS[:6]:
         if bound[key] != expected[key]:
             raise ControlError("frozen historical control identity changed")
+    for key in _BINDING_FIELDS[6:]:
+        if expected[key] is not None and bound[key] != expected[key]:
+            raise ControlError("frozen historical control identity changed")
     if bound["state_sha256"] != freeze.get("state_sha256"):
         raise ControlError("frozen state digest differs from its identity binding")
     if bound["source_sha256"] != freeze.get("source_sha256"):
@@ -1034,7 +1037,11 @@ def read_frozen_control(
     *,
     expected_identity: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
-    control, control_hash = read_control_template(root, expected_identity=expected_identity)
+    # The template may have empty pin slots even after the grant binds them.
+    _control_root(root)
+    control, control_hash = read_control_template(
+        root, expected_identity=read_json(root / "control.json").get("identity")
+    )
     freeze_path = root / "freeze.json"
     try:
         body = _private_regular_file(freeze_path)
@@ -1046,10 +1053,13 @@ def read_frozen_control(
         freeze = json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
     except (UnicodeDecodeError, ValueError) as exc:
         raise ControlError("frozen historical control artifact is malformed") from exc
-    identity = validate_frozen_control(
+    validate_frozen_control(
         freeze,
         control_sha256=control_hash,
         expected_identity=control["identity"],
+    )
+    identity = validate_frozen_control(
+        freeze, control_sha256=control_hash, expected_identity=expected_identity
     )
     return {"control": control, "freeze": freeze, "identity": identity}, sha256_bytes(body)
 
