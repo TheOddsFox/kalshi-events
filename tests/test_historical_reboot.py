@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import sys
 import time
@@ -462,6 +463,30 @@ def test_legacy_temporary_stop_accepts_bound_reservations_and_preserves_old_hist
     source_proof = production._historical_reconciliation_audit(authority)
     assert source_proof["recovery_kind"] == "prior_boot_temporary_stop"
     assert source_proof["accounting_basis"] == "reserved-upper-bound"
+
+    # Source maintenance and later proof readbacks run with a current child.
+    for phase in (
+        "historical-source-maintenance",
+        "historical-source-snapshot",
+        "historical-readiness-prepare",
+    ):
+        active = dict(reconciled, phase=phase, active_process_group=os.getpid())
+        active_authority = dict(authority, report=active)
+        with pytest.raises(production.RunnerError, match="exact reconciled temporary-stop audit"):
+            production._historical_reconciliation_audit(active_authority)
+        active_authority["supervised_report_phase"] = phase
+        assert production._historical_reconciliation_audit(active_authority) == source_proof
+        for field, changed in (
+            ("boot_stamp", "wrong-boot"),
+            ("phase", "stopped"),
+            ("active_process_group", os.getpid() + 1),
+        ):
+            with pytest.raises(
+                production.RunnerError, match="exact reconciled temporary-stop audit"
+            ):
+                production._historical_reconciliation_audit(
+                    dict(active_authority, report=dict(active, **{field: changed}))
+                )
 
     tampered = copy.deepcopy(reconciled)
     tampered["reboot_recovery_history"][0]["filesystem_device"] += 1

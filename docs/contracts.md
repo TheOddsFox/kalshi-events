@@ -478,6 +478,10 @@ pre-cleanup temporary baseline up to 192 GiB, independently of its processing
 forecast. Only initial inventory checks and the supervised source maintenance
 step may carry that baseline; after maintenance, snapshot and all later work
 require current inventory within the approved processing projection.
+Maintenance and later checkpoint readback revalidate the earlier temporary-stop
+audit. Inside a worker, the runner first authenticates the current grant's
+supervised handoff and checks its session phase and process identity. The audit
+continues to identify the earlier worker, supervisor and boot.
 
 The 65,536-entry inventory bound applies to declared mutable workspaces and
 external run artifacts. Retained raw receipts and capture metadata remain in

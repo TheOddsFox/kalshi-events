@@ -3266,6 +3266,63 @@ def test_reboot_remount_keeps_frozen_origin_and_allows_fresh_grant_preflight(
     assert authority["approval"]["grant_id"] == grant_id
     assert session_binding["root_device"] == current_device
     assert approval["measurements"]["session_report_sha256"] == session_binding["report_sha256"]
+    assert authority["supervised_report_phase"] is None
+
+    report = authority["report"]
+    worker_pid = os.getpid()
+    supervisor_pid = os.getppid()
+    storage_token = "b" * 32
+    progress = attempt["report_path"].with_name("test-storage.json")
+    running = report["private_historical_grant"]
+    running.update(
+        state="supervised-child-pending",
+        substep="maintenance",
+        worker_pid=worker_pid,
+        worker_pgid=worker_pid,
+        controller_pid=supervisor_pid,
+        storage_invocation_token=storage_token,
+        storage_progress_path=str(progress),
+    )
+    report.update(
+        phase="historical-source-maintenance",
+        active_process_group=worker_pid,
+        storage_supervision_invocation=storage_token,
+        storage_supervision_file=str(progress),
+    )
+    monkeypatch.setattr(production, "_historical_validate_storage_handoff", lambda *_a, **_k: {})
+
+    def worker_authority():
+        production._atomic_report(attempt["report_path"], report)
+        return production._historical_authority(
+            attempt["directory"],
+            attempt["control_root"],
+            grant_id,
+            launch_sha256=launch_sha256,
+            require_worker=True,
+            expected_phase="source",
+            expected_substep="maintenance",
+            storage_invocation_token=storage_token,
+            storage_progress_path=progress,
+            supervisor_pid=supervisor_pid,
+        )
+
+    assert worker_authority()["supervised_report_phase"] == "historical-source-maintenance"
+    for record, field, replacement in (
+        (report, "phase", "historical-source-snapshot"),
+        (report, "active_process_group", worker_pid + 1),
+        (running, "state", "stopped"),
+        (running, "grant_id", "f" * 32),
+        (running, "launch_id", "f" * 32),
+        (running, "launch_sha256", "f" * 64),
+        (running, "control_root", "/wrong-root"),
+        (running, "worker_pid", worker_pid + 1),
+        (running, "worker_pgid", worker_pid + 1),
+        (running, "controller_pid", supervisor_pid + 1),
+    ):
+        original, record[field] = record[field], replacement
+        with pytest.raises(production.RunnerError, match="not the supervised child"):
+            worker_authority()
+        record[field] = original
 
 
 def _reboot_mount_report(attempt, current_device):

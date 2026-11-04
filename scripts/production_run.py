@@ -10186,14 +10186,21 @@ def _historical_authority(
         running = report.get("private_historical_grant")
         if (
             report.get("active_process_group") != os.getpid()
+            or report.get("phase") != f"historical-{expected_phase}-{expected_substep}"
             or not isinstance(running, dict)
+            or running.get("state") != "supervised-child-pending"
             or running.get("grant_id") != grant_id
             or running.get("launch_sha256") != launch_sha256
+            or running.get("launch_id") != launch["launch_id"]
+            or running.get("control_root") != str(control_root)
             or running.get("phase") != expected_phase
             or running.get("substep") != expected_substep
+            or running.get("worker_pid") != os.getpid()
+            or running.get("worker_pgid") != os.getpid()
             or not isinstance(storage_invocation_token, str)
             or re.fullmatch(r"[0-9a-f]{32}", storage_invocation_token) is None
             or running.get("storage_invocation_token") != storage_invocation_token
+            or type(supervisor_pid) is not int
             or running.get("controller_pid") != supervisor_pid
             or report.get("storage_supervision_invocation") != storage_invocation_token
             or not isinstance(storage_progress_path, Path)
@@ -10292,6 +10299,7 @@ def _historical_authority(
         "session_binding": session_binding,
         "report_path": report_path,
         "report": report,
+        "supervised_report_phase": report["phase"] if require_worker else None,
         "profile": profile,
         "store": store,
         "current_mount": current_mount,
@@ -11604,10 +11612,17 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
         f"{admission['storage_temporary_stop_bytes'] // GIB} GiB stop threshold"
     )
     current_boot = _boot_stamp()
+    stopped = report.get("phase") == "stopped" and report.get("active_process_group") is None
+    # Only the authority built after the private handoff can attest the live report.
+    supervised_phase = authority.get("supervised_report_phase")
+    supervised = (
+        supervised_phase is not None
+        and report.get("phase") == supervised_phase
+        and report.get("active_process_group") == os.getpid()
+    )
     if (
         report.get("boot_stamp") != current_boot
-        or report.get("active_process_group") is not None
-        or report.get("phase") != "stopped"
+        or not (stopped or supervised)
         or not isinstance(reconciliation, dict)
         or not {
             "event_id",
@@ -11636,7 +11651,8 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
         or stop.get("original_process_group") != reconciliation.get("stale_process_group")
     ):
         raise RunnerError(
-            "startup cleanup requires the exact reconciled same-boot temporary-stop audit"
+            "startup cleanup requires the exact reconciled temporary-stop audit "
+            "and a stopped session or authenticated supervised worker"
         )
     event_id = reconciliation.get("event_id")
     stale_group = reconciliation.get("stale_process_group")
