@@ -383,8 +383,16 @@ def test_real_sealed_historical_recovery(monkeypatch):
     assert not production._process_group_exists(worker)
     attempt = grants.read_json(control / "grants" / interrupted / "attempt-result.json")
     assert attempt["outcome"] == "stopped" and attempt["reconciliation_required"] is False
+    assert (attempt["phase"], attempt["substep"]) == ("export", "publish")
     assert grants.read_phase_chain(control / "phases", identity) == checkpoint
-    assert json.loads(report_path.read_bytes())["active_process_group"] is None
+    stopped_report = json.loads(report_path.read_bytes())
+    assert stopped_report["phase"] == "stopped"
+    assert stopped_report["active_process_group"] is None
+    progress = Path(stopped_report["storage_supervision_file"])
+    assert progress.is_relative_to(report_path.parent)
+    storage = grants.read_json(progress)
+    assert storage["invocation_token"] == stopped_report["storage_supervision_invocation"]
+    assert storage["sample_count"] > 0 and storage["last_sample_monotonic"] is not None
 
     _, code, output, _ = run(["export", "verified-publication", "independent-verification"])
     assert code == 0, output

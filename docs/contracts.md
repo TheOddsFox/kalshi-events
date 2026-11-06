@@ -451,15 +451,18 @@ An interrupted private grant retains its consumed launch and exact controller,
 worker, storage and runtime bindings. Same-boot reconciliation requires proof
 that both recorded processes and groups are absent under the canonical locks.
 A changed boot instead requires the explicit historical reboot/accounting
-recovery route, the saved volume/root identities and complete accounting. That
+recovery route, the saved volume/root identities and validated accounting. That
 route does not query or signal process identities from the previous boot. Both
 routes preserve prior failures and grants, start no worker and grant no time.
 For a verified legacy historical temporary-storage stop, offline reboot
 reconciliation may use the freshly validated reservation upper bound when exact
 receipt totals are unavailable. The report retains incomplete accounting and the
 unfinished reservation identities. Reconciliation durably records the typed
-temporary-stop event before clearing the old worker marker. Other reboot
-recovery paths still require exact accounting.
+temporary-stop event before clearing the old worker marker. A subsequent
+private-worker reboot may carry that same bound forward when a fresh scan under
+the writer guard matches the typed audit exactly. The private reconciliation
+record binds the consumed grant and accounting digest and remains required on
+later mount readbacks. Other reboot paths require exact accounting.
 Historical spill cleanup checks the dbt profile against the exact saved stage.
 If an interrupted build leaves a parse-time manifest without inline compiled
 SQL, cleanup requires the capture predicate in both fixed compiled historical

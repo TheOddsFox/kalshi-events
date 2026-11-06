@@ -353,8 +353,9 @@ def test_wrong_volume_uuid_fails_before_session_write(stopped_session, monkeypat
     assert report_path.read_bytes() == before
 
 
+@pytest.mark.parametrize("private_reboot", [None, "unchanged", "changed-receipts"])
 def test_legacy_temporary_stop_accepts_bound_reservations_and_preserves_old_history(
-    stopped_session, monkeypatch
+    stopped_session, monkeypatch, private_reboot
 ):
     directory, report_path, report = stopped_session
     frozen_device = _legacy_temporary_stop(directory, report_path, report)
@@ -504,6 +505,145 @@ def test_legacy_temporary_stop_accepts_bound_reservations_and_preserves_old_hist
     tampered_accounting["downloaded_bytes_upper_bound"] += 1
     with pytest.raises(production.RunnerError, match="bounded reboot proof"):
         production._historical_reconciliation_audit({**authority, "report": tampered_accounting})
+
+    if private_reboot is not None:
+        private_marker = {
+            "state": "supervised-child-pending",
+            "phase": "models",
+            "substep": "build",
+            "grant_id": "7" * 32,
+            "launch_sha256": "8" * 64,
+            "worker_pgid": 4321,
+        }
+        reconciled.update(
+            phase="historical-models-build",
+            active_process_group=4321,
+            private_historical_grant=private_marker,
+        )
+        production._atomic_report(report_path, reconciled)
+        before_private = report_path.read_bytes()
+        private_proof = {
+            **private_marker,
+            "identity": identity,
+            "control_root": str(directory),
+            "freeze": authority["freeze"],
+            "session_root_device": directory.stat().st_dev,
+            "launch_id": "6" * 32,
+            "controller_pid": 4320,
+            "controller_pgid": 4320,
+            "worker_pid": 4321,
+            "worker_pgid": 4321,
+            "storage_sha256": "5" * 64,
+            "report_sha256": hashlib.sha256(before_private).hexdigest(),
+        }
+        private_pending = copy.deepcopy(reconciled)
+        private_pending["_pending_historical_reboot_reconciliation"] = {
+            "previous_boot_stamp": "new-boot",
+            "boot_stamp": "third-boot",
+            "previous_filesystem_device": directory.stat().st_dev,
+            "filesystem_device": directory.stat().st_dev,
+            "volume_uuid": VOLUME_UUID,
+            "previous_active_process_group": 4321,
+            "private_worker_reconciliation": private_proof,
+            "wall_deadlines_preserved": audit["wall_deadlines_preserved"],
+        }
+        monkeypatch.setattr(production, "_boot_stamp", lambda: "third-boot")
+        real_current_mount = production._historical_current_mount
+        monkeypatch.setattr(production, "_historical_current_mount", lambda *_a, **_kw: None)
+
+        grants_root = directory / "grants"
+        grants_root.mkdir(mode=0o700)
+        grant_path = grants_root / private_marker["grant_id"]
+        grant_path.mkdir(mode=0o700)
+        real_write_private = production._historical_write_private_reconciliation
+
+        def write_private(root, grant_id, body):
+            assert store.writer_locked_by_current_thread
+            assert grant_id == private_marker["grant_id"]
+            assert body["accounting_sha256"] == audit["accounting_sha256"]
+            return real_write_private(root, grant_id, body)
+
+        monkeypatch.setattr(production, "_historical_write_private_reconciliation", write_private)
+        if private_reboot == "changed-receipts":
+            accounting_snapshot[0] = snapshot | {
+                "downloaded_or_reserved_bytes": snapshot["downloaded_or_reserved_bytes"] + 1,
+            }
+            with pytest.raises(production.RunnerError, match="differs from its audited bound"):
+                production._finish_historical_reboot_reconciliation(
+                    directory, report_path, private_pending, CAPTURE_ID
+                )
+            assert report_path.read_bytes() == before_private
+            assert not (grant_path / "private-reconciliation.json").exists()
+            return
+
+        recovered = production._finish_historical_reboot_reconciliation(
+            directory, report_path, private_pending, CAPTURE_ID
+        )
+        assert recovered["active_process_group"] is None
+        assert recovered["downloaded_bytes"] is None
+        assert recovered["unfinished_reservation_ids"] == audit["unfinished_reservation_ids"]
+        assert recovered["deadline_epoch"] == reconciled["deadline_epoch"]
+        assert (
+            production._historical_reconciliation_audit(dict(authority, report=recovered))
+            == source_proof
+        )
+        assert (
+            production._historical_reboot_mount_proof(
+                recovered,
+                identity,
+                authority["freeze"],
+                final_device=directory.stat().st_dev,
+                final_volume_uuid=VOLUME_UUID,
+                final_boot_stamp="third-boot",
+            )
+            is recovered["reboot_recovery_history"][-1]
+        )
+        private_event = recovered["reboot_recovery_history"][-1]
+        production._historical_read_bounded_private_reboot(directory, identity, private_event)
+        moved_grant = directory / "moved-grant"
+        grant_path.rename(moved_grant)
+        grant_path.symlink_to(moved_grant, target_is_directory=True)
+        with pytest.raises(production.RunnerError, match="record is missing or unsafe"):
+            production._historical_read_bounded_private_reboot(directory, identity, private_event)
+        grant_path.unlink()
+        moved_grant.rename(grant_path)
+        with pytest.raises(production.RunnerError, match="record differs"):
+            production._historical_read_bounded_private_reboot(
+                directory,
+                identity,
+                dict(private_event, private_worker_reconciliation_sha256="3" * 64),
+            )
+        tampered = copy.deepcopy(recovered)
+        tampered["reboot_recovery_history"][-1]["accounting_sha256"] = "3" * 64
+        with pytest.raises(production.RunnerError, match="transition proof"):
+            production._historical_reboot_mount_proof(
+                tampered,
+                identity,
+                authority["freeze"],
+                final_device=directory.stat().st_dev,
+                final_volume_uuid=VOLUME_UUID,
+                final_boot_stamp="third-boot",
+            )
+        accounting_snapshot[0] = _exact_snapshot() | {"attempts": 8}
+        monkeypatch.setattr(production, "_boot_stamp", lambda: "fourth-boot")
+        _, next_pending, _ = _load(directory)
+        exact_recovery = production._finish_historical_reboot_reconciliation(
+            directory, report_path, next_pending, CAPTURE_ID
+        )
+        monkeypatch.setattr(production, "_historical_control_root", lambda path: path)
+        mount_args = (
+            directory,
+            directory / "operator",
+            directory,
+            exact_recovery,
+            identity,
+            authority["freeze"],
+        )
+        real_current_mount(*mount_args)
+        (grant_path / "private-reconciliation.json").unlink()
+        with pytest.raises(production.RunnerError, match="record is missing or unsafe"):
+            real_current_mount(*mount_args)
+        return
 
     accounting_snapshot[0] = _exact_snapshot()
     monkeypatch.setattr(production, "_boot_stamp", lambda: "third-boot")

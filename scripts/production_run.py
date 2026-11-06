@@ -1308,6 +1308,40 @@ def _historical_path_device(path: Path) -> int:
     return info.st_dev
 
 
+_RESERVATION_BOUND_FIELDS = (
+    "accounting_basis",
+    "accounting_complete",
+    "accounting_bound_verified",
+    "attempts",
+    "downloaded_bytes",
+    "downloaded_bytes_upper_bound",
+    "unfinished_reservation_ids",
+    "reservation_inventory_sha256",
+)
+
+
+def _same_audited_reservation_bound(current: dict[str, Any], audited: dict[str, Any]) -> bool:
+    return (
+        audited.get("accounting_basis") == "reserved-upper-bound"
+        and audited.get("accounting_complete") is False
+        and audited.get("accounting_bound_verified") is True
+        and audited.get("downloaded_bytes") is None
+        and bool(audited.get("unfinished_reservation_ids"))
+        and re.fullmatch(r"[0-9a-f]{64}", str(audited.get("reservation_inventory_sha256")))
+        is not None
+        and all(current.get(key) == audited.get(key) for key in _RESERVATION_BOUND_FIELDS)
+    )
+
+
+def _private_reboot_preserves_bound(event: dict[str, Any], audited: dict[str, Any]) -> bool:
+    return (
+        re.fullmatch(r"[0-9a-f]{64}", str(event.get("private_worker_reconciliation_sha256")))
+        is not None
+        and event.get("accounting_sha256") == audited.get("accounting_sha256")
+        and _same_audited_reservation_bound(event, audited)
+    )
+
+
 def _historical_reboot_mount_proof(
     report: dict[str, Any],
     identity: dict[str, Any],
@@ -1494,12 +1528,12 @@ def _historical_reboot_mount_proof(
             or event.get("accounting_basis") != "exact"
             and not (
                 prior_boot_temporary_stop
-                and index == 0
-                and event.get("accounting_basis") == "reserved-upper-bound"
-                and event.get("accounting_complete") is False
-                and event.get("accounting_bound_verified") is True
-                and isinstance(event.get("reservation_inventory_sha256"), str)
-                and re.fullmatch(r"[0-9a-f]{64}", event["reservation_inventory_sha256"]) is not None
+                and (
+                    index == 0
+                    and _same_audited_reservation_bound(event, recovery)
+                    or index > 0
+                    and _private_reboot_preserves_bound(event, recovery)
+                )
             )
             or event.get("accounting_basis") == "exact"
             and event.get("accounting_complete") is not True
@@ -1593,6 +1627,43 @@ def _historical_reboot_mount_proof(
     return latest
 
 
+def _historical_read_bounded_private_reboot(
+    control_root: Path, identity: dict[str, Any], event: dict[str, Any]
+) -> None:
+    import historical_grants as grants
+
+    worker = event.get("private_worker_reconciliation")
+    grant_id = worker.get("grant_id") if isinstance(worker, dict) else None
+    if not isinstance(grant_id, str) or re.fullmatch(r"[0-9a-f]{32}", grant_id) is None:
+        raise RunnerError("bounded private reboot has no exact grant binding")
+    grants_root = control_root / "grants"
+    grant_root = grants_root / grant_id
+    try:
+        grants._private_directory(grants_root, "historical grants directory")
+        grants._private_directory(grant_root, "historical grant directory")
+        record = grants.read_json(grant_root / "private-reconciliation.json")
+    except grants.ControlError as exc:
+        raise RunnerError("bounded private reboot record is missing or unsafe") from exc
+    body = {key: value for key, value in record.items() if key != "sha256"}
+    if (
+        record.get("sha256") != grants.sha256_json(body)
+        or record.get("sha256") != event.get("private_worker_reconciliation_sha256")
+        or record.get("kind") != "changed_boot_worker_ignored"
+        or record.get("identity") != identity
+        or record.get("grant_id") != grant_id
+        or record.get("launch_sha256") != worker.get("launch_sha256")
+        or record.get("session_before_sha256") != event.get("session_before_sha256")
+        or record.get("from_boot_stamp") != event.get("previous_boot_stamp")
+        or record.get("to_boot_stamp") != event.get("boot_stamp")
+        or record.get("previous_active_process_group") != event.get("previous_active_process_group")
+        or record.get("accounting_sha256") != event.get("accounting_sha256")
+        or record.get("process_group_interaction") != "not_queried_after_boot_change"
+        or record.get("reconciliation_worker_started") is not False
+        or record.get("new_grant_started") is not False
+    ):
+        raise RunnerError("bounded private reboot record differs from its transition")
+
+
 def _historical_current_mount(
     directory: Path,
     operator: Path,
@@ -1677,12 +1748,15 @@ def _historical_current_mount(
             final_boot_stamp=current_boot,
         )
     device_lineage = [freeze["root_device"]]
-    history = report.get("reboot_recovery_history")
-    if isinstance(history, list):
-        for event in history:
-            device = event.get("filesystem_device") if isinstance(event, dict) else None
-            if type(device) is int and device not in device_lineage:
-                device_lineage.append(device)
+    for event in report.get("reboot_recovery_history") or []:
+        if (
+            event.get("accounting_basis") == "reserved-upper-bound"
+            and event.get("private_worker_reconciliation_sha256") is not None
+        ):
+            _historical_read_bounded_private_reboot(control_root, identity, event)
+        device = event.get("filesystem_device")
+        if type(device) is int and device not in device_lineage:
+            device_lineage.append(device)
     if not allow_unreconciled_boot_change and root_device not in device_lineage:
         raise RunnerError("current historical device is outside its completed reboot lineage")
     return {
@@ -7822,10 +7896,25 @@ def _finish_historical_reboot_reconciliation(
     report_path: Path,
     report: dict[str, Any],
     capture_id: str,
+    *,
+    locked_store: Any | None = None,
 ) -> dict[str, Any]:
     """Read exact stopped-session accounting before recording the confirmed new boot."""
 
     from kalshi_events.common import regular_bytes
+
+    pending_proof = report.get("_pending_historical_reboot_reconciliation")
+    if (
+        locked_store is None
+        and isinstance(pending_proof, dict)
+        and isinstance(pending_proof.get("private_worker_reconciliation"), dict)
+        and report.get("accounting_basis") == "reserved-upper-bound"
+    ):
+        store = _accounting_store(directory / "operator")
+        with store.writer_guard():
+            return _finish_historical_reboot_reconciliation(
+                directory, report_path, report, capture_id, locked_store=store
+            )
 
     pending = report.pop("_pending_historical_reboot_reconciliation", None)
     if not isinstance(pending, dict):
@@ -7912,9 +8001,11 @@ def _finish_historical_reboot_reconciliation(
         if current_snapshot.get("root_id") != report.get("root_id"):
             raise RunnerError("reboot recovery accounting belongs to another operator root")
         if current_snapshot.get("accounting_complete") is not True and (
-            private_uncertain
-            or not isinstance(report.get("storage_safety_stop"), dict)
-            or report.get("phase") != "stopped"
+            not private_uncertain
+            and (
+                not isinstance(report.get("storage_safety_stop"), dict)
+                or report.get("phase") != "stopped"
+            )
         ):
             raise RunnerError("reboot recovery requires complete exact receipt accounting")
         current_accounting = _reconciliation_accounting(current_snapshot, capture_id)
@@ -8089,7 +8180,7 @@ def _finish_historical_reboot_reconciliation(
             if regular_bytes(report_path, 16 * MIB) != raw:
                 raise RunnerError("session report changed during reboot audit append")
     else:
-        snapshot, accounting = read_accounting()
+        snapshot, accounting = read_accounting(locked_store=locked_store)
 
     accounting_sha256 = (
         _accounting_snapshot_sha256(snapshot)
@@ -8102,11 +8193,36 @@ def _finish_historical_reboot_reconciliation(
         if (
             private_worker.get("identity", {}).get("capture_id") != capture_id
             or private_worker.get("identity", {}).get("root_id") != report.get("root_id")
+            or private_worker.get("report_sha256") != raw_sha256
             or private_worker.get("worker_pid") != private_worker.get("worker_pgid")
             or private_worker.get("worker_pgid") != pending.get("previous_active_process_group")
         ):
             raise RunnerError("private reboot reconciliation binding changed")
-        accounting_sha256 = _full_accounting_snapshot_sha256(snapshot)
+        if accounting["accounting_complete"] is False:
+            import historical_grants as grants
+
+            audit = report.get("stopped_worker_reconciliation")
+            if (
+                not isinstance(audit, dict)
+                or audit.get("recovery_kind") != "prior_boot_temporary_stop"
+            ):
+                raise RunnerError("private reboot requires an audited reservation bound")
+            record = _read_stopped_worker_audit(operator, audit.get("event_id"))
+            if (
+                locked_store is None
+                or grants.sha256_json(record) != audit.get("recovery_audit_sha256")
+                or record.get("recovery_kind") != "prior_boot_temporary_stop"
+                or record.get("capture_id") != capture_id
+                or record.get("session_id") != report.get("session_id")
+                or record.get("root_id") != report.get("root_id")
+                or record.get("report_sha256") != private_worker["identity"]["prior_session_sha256"]
+                or record.get("accounting_sha256") != _accounting_snapshot_sha256(snapshot)
+                or not _same_audited_reservation_bound(accounting, record)
+            ):
+                raise RunnerError(
+                    "private reboot receipt accounting differs from its audited bound"
+                )
+            accounting_sha256 = record["accounting_sha256"]
         private_record, private_reconciliation_sha256 = _historical_write_private_reconciliation(
             Path(private_worker["control_root"]),
             private_worker["grant_id"],
@@ -11672,10 +11788,41 @@ def _historical_activation_claimed(
     return True
 
 
-def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any]:
+def _read_stopped_worker_audit(operator: Path, event_id: str) -> dict[str, Any]:
     import historical_grants as grants
 
     from kalshi_events.common import regular_bytes
+
+    audit_path = operator / "stopped-worker-reconciliation.jsonl"
+    try:
+        audit_info = audit_path.lstat()
+        if (
+            not stat.S_ISREG(audit_info.st_mode)
+            or stat.S_ISLNK(audit_info.st_mode)
+            or audit_info.st_nlink != 1
+            or audit_info.st_dev != operator.stat().st_dev
+        ):
+            raise RunnerError("stopped-worker audit readback is unsafe")
+        raw = regular_bytes(audit_path, MIB)
+    except OSError as exc:
+        raise RunnerError("stopped-worker audit readback is unavailable") from exc
+    matching = []
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line.decode("utf-8"), parse_constant=grants._reject_constant)
+        except (UnicodeError, ValueError) as exc:
+            raise RunnerError("stopped-worker audit readback is malformed") from exc
+        if not isinstance(row, dict) or row.get("version") != 1:
+            raise RunnerError("stopped-worker audit readback is malformed")
+        if row.get("event_id") == event_id:
+            matching.append(row)
+    if len(matching) != 1:
+        raise RunnerError("stopped-worker audit event is missing or duplicated")
+    return matching[0]
+
+
+def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any]:
+    import historical_grants as grants
 
     report = authority["report"]
     identity = authority["identity"]
@@ -11817,6 +11964,11 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
             or reboot.get("prior_process_group_ignored_after_boot_change")
             is not (reboot.get("previous_active_process_group") is not None)
             or reboot.get("previous_active_process_group") not in (None, stale_group)
+            and not (
+                typed_stop
+                and isinstance(typed_stop_transition, dict)
+                and _private_reboot_preserves_bound(reboot, typed_stop_transition)
+            )
             or not isinstance(system, dict)
             or system.get("filesystem_device") != current_device
             or system.get("filesystem_volume_uuid") != current_volume
@@ -11859,6 +12011,7 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
                     or transition.get("boot_stamp") != current_boot
                 )
                 or not latest_is_typed_stop
+                and not _private_reboot_preserves_bound(reboot, transition)
                 and (
                     reboot.get("accounting_basis") != "exact"
                     or reboot.get("accounting_complete") is not True
@@ -11866,7 +12019,9 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
                 )
             ):
                 raise RunnerError("prior-boot stop recovery is missing its typed audit binding")
-            if latest_is_typed_stop and bounded:
+            if bounded and (
+                latest_is_typed_stop or _private_reboot_preserves_bound(reboot, transition)
+            ):
                 if (
                     report.get("accounting_complete") is not False
                     or report.get("accounting_basis") != "reserved-upper-bound"
@@ -11927,32 +12082,7 @@ def _historical_reconciliation_audit(authority: dict[str, Any]) -> dict[str, Any
             raise RunnerError(
                 "old-boot stopped-worker identity lacks exact reboot accounting proof"
             )
-    audit_path = operator / reconciliation["audit_file"]
-    try:
-        audit_info = audit_path.lstat()
-        if (
-            not stat.S_ISREG(audit_info.st_mode)
-            or stat.S_ISLNK(audit_info.st_mode)
-            or audit_info.st_nlink != 1
-            or audit_info.st_dev != operator.stat().st_dev
-        ):
-            raise RunnerError("stopped-worker audit readback is unsafe")
-        raw = regular_bytes(audit_path, MIB)
-    except OSError as exc:
-        raise RunnerError("stopped-worker audit readback is unavailable") from exc
-    matching = []
-    for line in raw.splitlines():
-        try:
-            row = json.loads(line.decode("utf-8"), parse_constant=grants._reject_constant)
-        except (UnicodeError, ValueError) as exc:
-            raise RunnerError("stopped-worker audit readback is malformed") from exc
-        if not isinstance(row, dict) or row.get("version") != 1:
-            raise RunnerError("stopped-worker audit readback is malformed")
-        if row.get("event_id") == event_id:
-            matching.append(row)
-    if len(matching) != 1:
-        raise RunnerError("stopped-worker audit event is missing or duplicated")
-    record = matching[0]
+    record = _read_stopped_worker_audit(operator, event_id)
     if (
         record.get("capture_id") != identity["capture_id"]
         or record.get("session_id") != identity["session_id"]
@@ -13449,6 +13579,13 @@ def _historical_control_main(directory: Path, control_root: Path, grant_id: str)
                     child_source_root=source_root,
                 )
                 code, reason, reaped = status
+                if (
+                    code is None
+                    and reason
+                    and reaped
+                    and report.get("active_process_group") is None
+                ):
+                    raise RunnerError(reason)
                 storage_state = _historical_validate_storage_handoff(
                     directory,
                     report_path,
@@ -13600,8 +13737,8 @@ def _historical_control_main(directory: Path, control_root: Path, grant_id: str)
     except Exception as exc:
         if launch_sha256 is not None and report_path is not None:
             current = _strict_json(report_path) or report or {}
-            if current.get("active_process_group") is None:
-                current["phase"] = "stopped"
+            outcome = "stopped" if current.get("active_process_group") is None else "uncertain"
+            current["phase"] = outcome
             # The current controller already validated and holds this identity.
             # Do not re-read the freeze through an incomplete call signature in
             # the failure path; the consumed launch is bound to this snapshot.
@@ -13644,9 +13781,7 @@ def _historical_control_main(directory: Path, control_root: Path, grant_id: str)
                 control_root,
                 grant_id,
                 launch_sha256,
-                outcome=(
-                    "uncertain" if current.get("active_process_group") is not None else "stopped"
-                ),
+                outcome=outcome,
                 phase=current_phase,
                 substep=current_substep,
                 completed_phases=completed,

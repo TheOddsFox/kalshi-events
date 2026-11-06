@@ -2829,8 +2829,9 @@ def test_post_launch_baseline_mismatch_consumes_launch_without_worker(
     )
 
 
+@pytest.mark.parametrize("failure", ["unreaped", "observer", "preflight"])
 def test_controller_persists_full_private_recovery_handoff_on_unreaped_child(
-    artifacts, identity, monkeypatch, capsys
+    artifacts, identity, monkeypatch, capsys, failure
 ):
     from types import SimpleNamespace
 
@@ -2953,6 +2954,8 @@ def test_controller_persists_full_private_recovery_handoff_on_unreaped_child(
     )
 
     def unconfirmed_child(_command, **kwargs):
+        if failure == "preflight":
+            return None, "memory pressure was not normal before supervised work", True
         worker_pid = 987_654
         child_report = kwargs["report"]
         token = kwargs["storage_invocation_token"]
@@ -2974,6 +2977,8 @@ def test_controller_persists_full_private_recovery_handoff_on_unreaped_child(
             },
         )
         production._atomic_report(report_path, child_report)
+        if failure == "observer":
+            raise production.RunnerError("storage observer readback failed")
         return None, "child outcome unclear", False
 
     monkeypatch.setattr(production, "_invoke", unconfirmed_child)
@@ -2981,6 +2986,12 @@ def test_controller_persists_full_private_recovery_handoff_on_unreaped_child(
     assert result == 1
     saved = production._strict_json(report_path)
     marker = saved["private_historical_grant"]
+    if failure == "preflight":
+        assert saved["phase"] == stop_record["outcome"] == "stopped"
+        assert saved["active_process_group"] is None
+        assert marker["reason"] == "memory pressure was not normal before supervised work"
+        assert stop_record["reason"] == marker["reason"]
+        return
     assert saved["phase"] == "uncertain"
     assert saved["active_process_group"] == 987_654
     assert marker["state"] == "stopped"
@@ -2992,7 +3003,9 @@ def test_controller_persists_full_private_recovery_handoff_on_unreaped_child(
     assert marker["storage_invocation_token"] == saved["storage_supervision_invocation"]
     assert marker["storage_progress_path"] == saved["storage_supervision_file"]
     assert stop_record["root_volume_uuid"] == root_volume
-    assert "child outcome unclear" in capsys.readouterr().out
+    assert stop_record["outcome"] == "uncertain"
+    assert stop_record["reason"] == marker["reason"]
+    assert marker["reason"] in capsys.readouterr().out
 
 
 def _mock_private_recovery_runtime(monkeypatch, attempt, *, current_boot=None):

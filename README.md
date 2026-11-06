@@ -599,6 +599,10 @@ For a verified historical temporary-storage stop from before private grants,
 offline reboot recovery can retain a freshly verified reservation upper bound
 when receipts remain unfinished. The accounting stays incomplete, and recovery
 records the specific storage stop before clearing the stale worker marker.
+A later private-worker reboot can retain that same bound when a fresh locked
+receipt scan exactly matches the typed audit. The original downloaded byte
+total remains unknown, and the private grant's reconciliation record is retained
+for mount readback.
 Neither reconciliation starts processing or extends a grant. Use the literal
 virtual-environment interpreter path recorded in the command.
 
