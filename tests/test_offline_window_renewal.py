@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_historical_production import (
@@ -49,6 +50,75 @@ def _load_renewal(production, directory):
         offline_duration_seconds=600,
         renew_offline_window=True,
     )
+
+
+def _prepare_reboot_boundary(
+    directory,
+    production,
+    monkeypatch,
+    *,
+    now_epoch=2200.0,
+    now_monotonic=50.0,
+    old_started_epoch=1000.0,
+    old_deadline_epoch=1600.0,
+    reconciled_epoch=2100.0,
+):
+    _report_path, report, _operator = _renewable_session(directory, production)
+    old = dict(report["offline_historical_window"])
+    old.update(
+        started_epoch=old_started_epoch,
+        deadline_epoch=old_deadline_epoch,
+        started_monotonic=10_000.0,
+        deadline_monotonic=10_000.0 + old_deadline_epoch - old_started_epoch,
+    )
+    report["offline_historical_window"] = old
+    report["boot_stamp"] = "new boot"
+    event = {
+        "previous_boot_stamp": "old boot",
+        "boot_stamp": "new boot",
+        "offline_window_capture_id": report["capture_id"],
+        "offline_window_root_id": report["root_id"],
+        "offline_window_before_sha256": production._offline_window_digest(old),
+        "offline_window_history_index": 0,
+        "offline_window_reconciled_epoch": reconciled_epoch,
+        "processing_worker_started": False,
+        "grant_started": False,
+    }
+    report["reboot_recovery_history"] = [event]
+    report["historical_reboot_reconciliation"] = {
+        "state": "complete",
+        "boot_stamp": report["boot_stamp"],
+        "capture_id": report["capture_id"],
+        "root_id": report["root_id"],
+        "processing_worker_started": False,
+        "grant_started": False,
+    }
+    report["offline_historical_window_boot_transition"] = {
+        "index": 0,
+        "reboot_sha256": production._offline_window_digest(event),
+        "successor_sha256": None,
+    }
+    monkeypatch.setattr(production, "_revision", lambda: "e" * 40)
+    monkeypatch.setattr(
+        production,
+        "time",
+        SimpleNamespace(time=lambda: now_epoch, monotonic=lambda: now_monotonic),
+    )
+    return report, old
+
+
+def _successor_window(production, previous, *, started_epoch, started_monotonic):
+    duration = 600.0
+    return {
+        **previous,
+        "version": 2,
+        "revision": "e" * 40,
+        "started_at": production._utc(),
+        "started_epoch": started_epoch,
+        "started_monotonic": started_monotonic,
+        "deadline_epoch": started_epoch + duration,
+        "deadline_monotonic": started_monotonic + duration,
+    }
 
 
 def test_explicit_renewal_rejects_a_canonical_writer_lock_held_by_another_writer(
@@ -264,3 +334,126 @@ def test_explicit_renewal_rejects_canonical_lock_replaced_after_acquisition(
         f"observed failure: {failure!r}"
     )
     assert original_strict_json(report_path) == before
+
+
+def test_reboot_boundary_allows_only_the_proven_monotonic_reset(production, tmp_path, monkeypatch):
+    report, old = _prepare_reboot_boundary(tmp_path / "production", production, monkeypatch)
+
+    successor = production._configure_offline_historical_window(report, CAPTURE_ID, 600, renew=True)
+
+    assert old["deadline_monotonic"] > successor["started_monotonic"]
+    assert report["offline_historical_window_history"] == [old]
+    transition = report["offline_historical_window_boot_transition"]
+    assert transition["successor_sha256"] == production._offline_window_digest(successor)
+    assert production._validate_offline_historical_window(report, CAPTURE_ID) is successor
+
+
+def test_same_boot_monotonic_reset_without_reboot_record_is_rejected(
+    production, tmp_path, monkeypatch
+):
+    report, old = _prepare_reboot_boundary(tmp_path / "production", production, monkeypatch)
+    report["boot_stamp"] = "same boot"
+    report.pop("reboot_recovery_history")
+    report.pop("offline_historical_window_boot_transition")
+    successor = _successor_window(production, old, started_epoch=2200, started_monotonic=50)
+    report["offline_historical_window_history"] = [old]
+    report["offline_historical_window"] = successor
+
+    with pytest.raises(production.RunnerError, match="history is out of order"):
+        production._validate_offline_historical_window(report, CAPTURE_ID)
+
+
+def test_reboot_boundary_does_not_authorize_a_second_monotonic_reset(
+    production, tmp_path, monkeypatch
+):
+    report, _old = _prepare_reboot_boundary(tmp_path / "production", production, monkeypatch)
+    first_successor = production._configure_offline_historical_window(
+        report, CAPTURE_ID, 600, renew=True
+    )
+    second_successor = _successor_window(
+        production,
+        first_successor,
+        started_epoch=first_successor["deadline_epoch"],
+        started_monotonic=25,
+    )
+    report["offline_historical_window_history"].append(first_successor)
+    report["offline_historical_window"] = second_successor
+
+    with pytest.raises(production.RunnerError, match="history is out of order"):
+        production._validate_offline_historical_window(report, CAPTURE_ID)
+
+
+@pytest.mark.parametrize("digest_to_tamper", ["old", "successor"])
+def test_reboot_boundary_rejects_tampered_old_or_successor_digest(
+    production, tmp_path, monkeypatch, digest_to_tamper
+):
+    report, _old = _prepare_reboot_boundary(tmp_path / "production", production, monkeypatch)
+    production._configure_offline_historical_window(report, CAPTURE_ID, 600, renew=True)
+    transition = report["offline_historical_window_boot_transition"]
+    if digest_to_tamper == "old":
+        event = report["reboot_recovery_history"][0]
+        event["offline_window_before_sha256"] = "0" * 64
+        transition["reboot_sha256"] = production._offline_window_digest(event)
+    else:
+        transition["successor_sha256"] = "0" * 64
+
+    with pytest.raises(production.RunnerError, match="changed its window or reconciliation"):
+        production._validate_offline_historical_window(report, CAPTURE_ID)
+
+
+def test_reboot_does_not_renew_before_the_preserved_wall_expiry(production, tmp_path, monkeypatch):
+    report, old = _prepare_reboot_boundary(
+        tmp_path / "production",
+        production,
+        monkeypatch,
+        now_epoch=2600,
+        old_started_epoch=2000,
+        old_deadline_epoch=3000,
+        reconciled_epoch=2500,
+    )
+
+    with pytest.raises(production.RunnerError, match="offline historical window expired"):
+        production._validate_offline_historical_window(
+            report, CAPTURE_ID, allow_revision_change=True
+        )
+    with pytest.raises(production.RunnerError, match="both clocks to expire"):
+        production._configure_offline_historical_window(report, CAPTURE_ID, 600, renew=True)
+
+    assert report["offline_historical_window"] == old
+    assert "offline_historical_window_history" not in report
+
+
+def test_reboot_overlap_requires_and_records_explicit_supersession(
+    production, tmp_path, monkeypatch
+):
+    report, old = _prepare_reboot_boundary(
+        tmp_path / "production",
+        production,
+        monkeypatch,
+        now_epoch=2600,
+        old_started_epoch=2000,
+        old_deadline_epoch=3000,
+        reconciled_epoch=2500,
+    )
+
+    successor = production._configure_offline_historical_window(
+        report, CAPTURE_ID, 600, renew=True, supersede=True
+    )
+
+    assert successor["started_epoch"] < old["deadline_epoch"]
+    assert successor["started_monotonic"] < old["deadline_monotonic"]
+    assert report["offline_historical_window_supersessions"] == [
+        {
+            "history_index": 0,
+            "window_started_epoch": old["started_epoch"],
+            "window_started_monotonic": old["started_monotonic"],
+            "window_deadline_epoch": old["deadline_epoch"],
+            "window_deadline_monotonic": old["deadline_monotonic"],
+            "successor_started_epoch": successor["started_epoch"],
+            "successor_started_monotonic": successor["started_monotonic"],
+        }
+    ]
+
+    report["offline_historical_window_supersessions"] = []
+    with pytest.raises(production.RunnerError, match="history overlaps or is out of order"):
+        production._validate_offline_historical_window(report, CAPTURE_ID)

@@ -903,10 +903,14 @@ def test_offline_renewal_rejects_malformed_or_overlapping_window_history(
         )
 
 
-@pytest.mark.parametrize("offline_window", [False, True, "renew", "supersede", "renew-atomic-fail"])
+@pytest.mark.parametrize(
+    "offline_window", [False, True, "renew", "supersede", "renew-atomic-fail", "held"]
+)
 def test_offline_historical_work_accepts_scoped_completion_without_faking_capture_completion(
     production, tmp_path, monkeypatch, offline_window
 ):
+    hold = offline_window == "held"
+    duration = 10800 if hold else 3600
     renewal = offline_window in {"renew", "supersede", "renew-atomic-fail"}
     supersede = offline_window == "supersede"
     atomic_failure = offline_window == "renew-atomic-fail"
@@ -1066,7 +1070,12 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
             assert command[-3] == CAPTURE_ID
             if has_offline_window:
                 limits = json.loads(command[-2])
-                assert 0 < limits["max-duration-seconds"] <= 3600
+                assert 0 < limits["max-duration-seconds"] <= duration
+            if hold:
+                assert (
+                    production._strict_json(report_path)["historical_publication_hold"]["state"]
+                    == "pending"
+                )
             value = {
                 "complete": True,
                 "capture_id": CAPTURE_ID,
@@ -1105,11 +1114,30 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
         if has_offline_window:
             deadline = kwargs.get("deadline", args[-1])
             assert deadline <= production._ACTIVE_OFFLINE_HISTORICAL_WINDOW["deadline_monotonic"]
-        return {
+        verification = {
             "source_release_id": RELEASE_ID,
             "coverage_scope": "historical",
             "source_capture_complete": False,
         }
+        if hold:
+            verification.update(
+                contract="oddsfox.kalshi.historical.v1",
+                root_id=report["root_id"],
+                capture_id=CAPTURE_ID,
+            )
+            manifest = operator / "releases" / RELEASE_ID / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            raw = json.dumps(verification).encode()
+            manifest.write_bytes(raw)
+            (operator / "current-historical.json").write_text(
+                json.dumps(
+                    {
+                        "source_release_id": RELEASE_ID,
+                        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
+            )
+        return verification
 
     monkeypatch.setattr(production, "_release_verify", verify_release)
 
@@ -1132,12 +1160,55 @@ def test_offline_historical_work_accepts_scoped_completion_without_faking_captur
         directory,
         capture_id=CAPTURE_ID,
         historical=True,
-        offline_duration_seconds=3600 if offline_window else None,
+        offline_duration_seconds=duration if offline_window else None,
+        publish_only=hold,
         renew_offline_window=renewal and not supersede,
         supersede_offline_window=supersede,
     )
 
     assert code == 0, result.get("error")
+    if hold:
+        assert [label for label, _command in events] == ["refresh"]
+        assert result["phase"] == "stopped"
+        assert result["historical_publication_hold"]["state"] == "verified"
+        assert result["production_state"] == "not_attempted"
+        with pytest.raises((OSError, RuntimeError)):
+            production.run_production(
+                directory,
+                capture_id=CAPTURE_ID,
+                historical=True,
+                activate_held_historical="f" * 64,
+            )
+        assert [label for label, _command in events] == ["refresh"]
+        assert "activation_audit" not in production._strict_json(report_path)
+        audit = {
+            "version": 1,
+            "session_id": result["session_id"],
+            "capture_id": CAPTURE_ID,
+            "root_id": result["root_id"],
+            "capture_state_sha256": "a" * 64,
+            "receipt_index_sha256": "b" * 64,
+            "population_report_sha256": "c" * 64,
+            "observations_by_endpoint": {"/series": 1},
+            "exact_observations": 1,
+            "sample_strategy": "verified-parquet-keyed-v1",
+        }
+        audit_raw = json.dumps(audit).encode()
+        audit_sha = hashlib.sha256(audit_raw).hexdigest()
+        audit_path = report_path.with_name(f"activation-audit-{audit_sha}.json")
+        audit_path.write_bytes(audit_raw)
+        audit_path.chmod(0o400)
+        activated, code = production.run_production(
+            directory,
+            capture_id=CAPTURE_ID,
+            historical=True,
+            activate_held_historical=audit_sha,
+        )
+        assert code == 0, activated.get("error")
+        assert activated["production_state"] == "verified"
+        assert activated["offline_historical_window"] == result["offline_historical_window"]
+        assert [label for label, _command in events] == ["refresh", "activation"]
+        return
     assert [label for label, _command in events] == ["refresh", "activation"]
     assert result["capture_complete"] is False
     assert result["source_capture_complete"] is False

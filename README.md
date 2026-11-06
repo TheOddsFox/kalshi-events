@@ -237,6 +237,14 @@ python scripts/run-production.py \
 python scripts/run-production.py \
   --directory "./data/kalshi-production" \
   --historical --capture-id CAPTURE_ID
+# Hold a verified historical publication for independent audit:
+python scripts/run-production.py \
+  --directory "./data/kalshi-production" \
+  --historical --capture-id CAPTURE_ID --publish-only
+# Activate the exact held release using the audit stored in its session:
+python scripts/run-production.py \
+  --directory "./data/kalshi-production" \
+  --historical --capture-id CAPTURE_ID --activate-held-historical AUDIT_SHA256
 # Only after a supervisor reports unknown child accounting from abrupt termination:
 python scripts/run-production.py \
   --directory "./data/kalshi-production" \
@@ -256,6 +264,13 @@ python scripts/run-production.py \
 ```
 
 `--reconcile-accounting` is an explicit recovery path for a stopped session whose child died before returning its counters. Under the canonical writer lock, it validates every receipt and binds each unfinished request to the exact capture task. If all durable attempts are finalized, it restores their validated exact totals. Otherwise it charges the full sealed response ceiling plus one 64 KiB HTTP read chunk per unfinished request against the original aggregate limit. The pinned HTTP core reads at most 64 KiB per chunk. Before recovery proceeds, the supervisor enforces the approved legacy-to-current or current-to-current lock/package transition, HTTP transport-source fingerprint and 64 KiB read bound described in the [recovery contract](docs/contracts.md#production-database-entry-point). Only the documented historical legacy reports may omit selected saved package fields. The prior system snapshot is retained as `original_system`, while `system` records the recovery environment. In the latter case exact downloaded bytes remain unknown and the report records the conservative bound; unfinished receipts are never edited. Recovery accepts only the stopped session's exact capture, pinned HTTP runtime, boot identity (unless explicitly recovered below), effective deadlines and resource ceilings, and only after supported child-counter stops (including a resumed child missing invocation counters), compressed-memory, process RSS, low-disk-space, or persistent process-group RSS sampling timeouts. The exact legacy system-wide `ps` timeout report is accepted for existing sessions. Current free-space and all other resource checks still run before networking; ledger mismatches, receipt or integrity failures, mount changes, malformed resource output, and unreaped process groups remain ineligible. It records the recovery revision while preserving the original revision and source. The current supervisor uses macOS pressure state rather than the former 20 GiB logical-compressor cutoff; legacy stops remain identifiable in the report history. A retry after any new abrupt stop needs another explicit reconciliation.
+
+The publication hold requires an authorized offline window. It is recorded
+before work starts and becomes eligible for activation after standalone
+verification. The ordinary activation paths reject a held capture. Use the same
+session for audited activation. That invocation uses the saved resource profile
+and skips build and export. If the window expired, renew it explicitly for
+activation only.
 
 Memory supervision samples every 15 seconds. Before processing starts, telemetry must be available and macOS pressure must be NORMAL. During work, CRITICAL pressure stops at the first observed sample; WARN pressure stops after 60 continuous seconds, resetting on NORMAL or a sample gap above 22.5 seconds. The existing process-group RSS limit remains greater than 24 GiB for 60 seconds. The complete telemetry sample is bounded to five seconds and the invocation deadline. The pressure reader uses a capability-checked private macOS sysctl, with userspace values 1=NORMAL, 2=WARN and 4=CRITICAL; unsupported output fails closed.
 

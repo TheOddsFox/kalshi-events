@@ -463,6 +463,18 @@ private-worker reboot may carry that same bound forward when a fresh scan under
 the writer guard matches the typed audit exactly. The private reconciliation
 record binds the consumed grant and accounting digest and remains required on
 later mount readbacks. Other reboot paths require exact accounting.
+The standard supervisor can renew one offline window across a completed
+historical reboot reconciliation. The report binds the preserved predecessor
+and exact successor windows to the reboot event. Wall time orders the windows
+across the boot boundary. Monotonic ordering still applies within a boot.
+
+For a standard publish-only invocation, an owner-only capture marker records
+the hold before processing. The session attaches standalone verification only
+after it succeeds. Ordinary activation checks the held capture even if its
+session report is missing. Audited activation uses the same
+session, deadline, profile, and exact held release and manifest. The activation
+worker validates the audit before replacing the consumer link.
+
 Historical spill cleanup checks the dbt profile against the exact saved stage.
 If an interrupted build leaves a parse-time manifest without inline compiled
 SQL, cleanup requires the capture predicate in both fixed compiled historical

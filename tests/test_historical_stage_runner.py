@@ -113,6 +113,86 @@ def test_run_production_api_rejects_stage_outside_historical_capture(production,
         )
 
 
+def test_production_profile_is_local_to_the_invocation(production, tmp_path, monkeypatch):
+    def reject_preflight(*_args, **_kwargs):
+        assert production._ACTIVE_LIMITS.get() == production._limits_for_profile("expanded")
+        raise production.RunnerError("stop before preflight")
+
+    monkeypatch.setattr(production, "validate_mode", reject_preflight)
+    caller_profile = production._ACTIVE_LIMITS.get()
+    with pytest.raises(production.RunnerError, match="stop before preflight"):
+        production.run_production(tmp_path, resource_profile="expanded")
+    assert production._ACTIVE_LIMITS.get() is caller_profile
+
+
+def test_historical_publication_hold_blocks_generic_activation_and_pointer_changes(
+    production, tmp_path
+):
+    release_id = "f" * 64
+    run = tmp_path / "runs" / ("a" * 32)
+    run.mkdir(parents=True)
+    report_path = run / "session.json"
+    operator = tmp_path / "operator"
+    release = operator / "releases" / release_id
+    release.mkdir(parents=True)
+    manifest = {
+        "source_release_id": release_id,
+        "capture_id": CAPTURE_ID,
+        "root_id": ROOT_ID,
+        "contract": "oddsfox.kalshi.historical.v1",
+        "coverage_scope": "historical",
+    }
+    body = json.dumps(manifest).encode()
+    (release / "manifest.json").write_bytes(body)
+    pointer_path = operator / "current-historical.json"
+    pointer = {
+        "source_release_id": release_id,
+        "manifest_sha256": hashlib.sha256(body).hexdigest(),
+    }
+    pointer_path.write_text(json.dumps(pointer))
+    identity = {"session_id": run.name, "capture_id": CAPTURE_ID, "root_id": ROOT_ID}
+    hold = {"state": "pending", **identity}
+    report = {
+        **identity,
+        "phase": "stopped",
+        "publication_state": "verified",
+        "historical_publication_hold": hold,
+    }
+    production._historical_hold_intent(tmp_path, report)
+    with pytest.raises(production.RunnerError, match="held for explicit audited activation"):
+        production._guard_historical_activation_hold(tmp_path, CAPTURE_ID)
+    with pytest.raises(production.RunnerError, match="lost its audited activation session"):
+        production._guard_historical_activation_hold(tmp_path, CAPTURE_ID, report_path)
+    production._atomic_report(report_path, report)
+    with pytest.raises(production.RunnerError, match="held for explicit audited activation"):
+        production._guard_historical_activation_hold(tmp_path, CAPTURE_ID)
+    with pytest.raises(production.RunnerError, match="verified historical publication hold"):
+        production._held_release_id(operator, report)
+
+    hold.update(
+        state="verified",
+        release_id=release_id,
+        manifest_sha256=pointer["manifest_sha256"],
+        standalone_verification=manifest,
+    )
+    assert production._held_release_id(operator, report) == release_id
+    report["phase"] = "activation"
+    report["activation_audit"] = {"sha256": "d" * 64}
+    production._atomic_report(report_path, report)
+    production._guard_historical_activation_hold(tmp_path, CAPTURE_ID, report_path)
+    with pytest.raises(production.RunnerError, match="held for explicit audited activation"):
+        production._guard_historical_activation_hold(tmp_path, CAPTURE_ID)
+
+    pointer_path.write_text(json.dumps({**pointer, "source_release_id": "e" * 64}))
+    with pytest.raises(production.RunnerError, match="pointer differs"):
+        production._held_release_id(operator, report)
+    pointer_path.write_text(json.dumps(pointer))
+    manifest["warehouse_sha256"] = "c" * 64
+    hold["standalone_verification"] = manifest
+    with pytest.raises(production.RunnerError, match="manifest differs"):
+        production._held_release_id(operator, report)
+
+
 @pytest.mark.parametrize("stale_activation", [False, True])
 def test_initial_accounting_preserves_only_the_selected_stage(
     production, tmp_path, monkeypatch, stale_activation

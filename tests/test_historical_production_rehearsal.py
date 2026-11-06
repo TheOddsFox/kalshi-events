@@ -41,6 +41,7 @@ def _issue_fixture_grant(
     *,
     audit_sha=None,
     wrong_binding=False,
+    retire_source=False,
 ):
     grant_id = uuid.uuid4().hex
     frozen, _ = grants.read_frozen_control(control, expected_identity=identity)
@@ -113,8 +114,8 @@ def _issue_fixture_grant(
         "measurements": {"report_sha256": measurement_sha, **measured},
         "resource_admission": admission,
         "freeze": {"engineering": True, "runtime": True, "controls": True},
-        "retire_source": False,
-        "retirement_policy": None,
+        "retire_source": retire_source,
+        "retirement_policy": ("coexistence-capacity-relief-approved-v1" if retire_source else None),
         "activation_audit_sha256": audit_sha,
     }
     grants.write_once_json(destination / "approval.json", approval)
@@ -282,7 +283,92 @@ def _check_fixture_release(release, database, fixture):
     return counts
 
 
-def test_real_sealed_historical_recovery(monkeypatch):
+def _standard_historical_handoff(directory, control, fixture, grants):
+    report_path = fixture["report_path"]
+    capture_id = fixture["capture_id"]
+    prefix = [
+        str(control / ".venv/bin/python"),
+        "-B",
+        str(control / "source/scripts/production_run.py"),
+        "--directory",
+        str(directory),
+        "--historical",
+    ]
+
+    def invoke(*args):
+        return subprocess.run(
+            [*prefix, *args],
+            cwd=ROOT,
+            env={**os.environ, "KALSHI_EVENTS_PROJECT_ROOT": str(ROOT)},
+            capture_output=True,
+            text=True,
+            timeout=960,
+            check=False,
+        )
+
+    result = invoke(
+        "--capture-id",
+        capture_id,
+        "--resume-historical-stage",
+        fixture["stage_name"],
+        "--publish-only",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(report_path.read_bytes())
+    hold = report["historical_publication_hold"]
+    assert hold["state"] == "verified"
+    alias = directory / "production.duckdb"
+    assert not alias.exists()
+    release = directory / "operator/releases" / hold["release_id"]
+    certified = directory / "operator/builds-historical" / capture_id / "warehouse.duckdb"
+    counts = _check_fixture_release(release, certified, fixture)
+    assert not (directory / "operator/tmp" / fixture["stage_name"]).exists()
+
+    refused = invoke("--activate-current")
+    assert refused.returncode != 0 and "held for explicit audited activation" in (
+        refused.stdout + refused.stderr
+    )
+    refused = invoke("--capture-id", capture_id, "--activate-held-historical", "f" * 64)
+    assert refused.returncode != 0
+    assert not alias.exists()
+    census = fixture["census"]
+    audit = {
+        "version": 1,
+        "session_id": report["session_id"],
+        "sample_strategy": "verified-parquet-keyed-v1",
+        **{
+            key: census[key]
+            for key in (
+                "capture_id",
+                "root_id",
+                "capture_state_sha256",
+                "receipt_index_sha256",
+                "population_report_sha256",
+                "observations_by_endpoint",
+                "exact_observations",
+            )
+        },
+    }
+    raw = grants.canonical_bytes(audit)
+    audit_sha = grants.sha256_bytes(raw)
+    audit_path = report_path.with_name(f"activation-audit-{audit_sha}.json")
+    with audit_path.open("xb") as handle:
+        handle.write(raw)
+        os.fsync(handle.fileno())
+    audit_path.chmod(0o400)
+    result = invoke("--capture-id", capture_id, "--activate-held-historical", audit_sha)
+    assert result.returncode == 0, result.stdout + result.stderr
+    final = json.loads(report_path.read_bytes())
+    assert final["publication_state"] == final["production_state"] == "verified"
+    assert final["active_process_group"] is None
+    assert final["activation"]["relation_rows"] == counts
+    assert final["activation"]["production_readback"]["read_only"] is True
+    assert alias.samefile(certified)
+    assert hashlib.sha256(alias.read_bytes()).hexdigest() == final["activation"]["warehouse_sha256"]
+
+
+@pytest.mark.parametrize("standard_supervisor", [False, True], ids=["private", "standard"])
+def test_real_sealed_historical_recovery(monkeypatch, standard_supervisor):
     if sys.platform != "darwin":
         pytest.fail("the opt-in historical rehearsal requires macOS")
     from historical_rehearsal_fixture import prepare_fixture
@@ -333,6 +419,7 @@ def test_real_sealed_historical_recovery(monkeypatch):
             phases,
             audit_sha=options.pop("audit_sha", None),
             wrong_binding=options.pop("wrong_binding", False),
+            retire_source=options.pop("retire_source", False),
         )
         code, output, worker = _run_fixture_grant(
             grants, directory, control, report_path, grant_id, **options
@@ -361,6 +448,16 @@ def test_real_sealed_historical_recovery(monkeypatch):
     assert report_path.read_bytes() == old_report
     assert survivor.is_file()
     assert not (directory / "production.duckdb").exists()
+
+    if standard_supervisor:
+        _, code, output, _ = run(["source", "readiness"])
+        assert code == 0, output
+        _, code, output, _ = run(["adoption"], retire_source=True)
+        assert code == 0, output
+        assert all(not path.exists() for path in source)
+        assert grants.read_phase_chain(control / "phases", identity)[0] == "adoption"
+        _standard_historical_handoff(directory, control, fixture, grants)
+        return
 
     _, code, output, _ = run(["source", "readiness", "adoption"])
     assert code == 0, output

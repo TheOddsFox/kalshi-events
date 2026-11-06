@@ -5720,6 +5720,8 @@ def _monitor_deadline(report: dict[str, Any], *, workflow: bool) -> float:
         window = _ACTIVE_OFFLINE_HISTORICAL_WINDOW
         wall_remaining = float(window["deadline_epoch"]) - time.time()
         reserve = _offline_workflow_reserve(window) if workflow else 0.0
+        if workflow and "historical_publication_hold" in report:
+            reserve = max(reserve, 2 * 3600)
         return min(
             float(window["deadline_monotonic"]) - reserve,
             float(window["started_monotonic"]) + ceiling,
@@ -5749,6 +5751,8 @@ def _child_wall_deadline_epoch(
             else _effective_limits()["active_cutoff_seconds"]
         )
         reserve = _offline_workflow_reserve(window) if workflow_deadline else 0.0
+        if workflow_deadline and "historical_publication_hold" in report:
+            reserve = max(reserve, 2 * 3600)
         wall_now = time.time()
         return min(
             float(window["deadline_epoch"]) - reserve,
@@ -5870,6 +5874,84 @@ def _offline_historical_window_bounds(
     return started_epoch, deadline_epoch, started_monotonic, deadline_monotonic
 
 
+def _offline_window_digest(value: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _offline_window_boot_boundary(
+    report: dict[str, Any], windows: list[dict[str, Any]]
+) -> tuple[int, bool] | None:
+    transition = report.get("offline_historical_window_boot_transition")
+    if transition is None:
+        return None
+    if not isinstance(transition, dict) or set(transition) != {
+        "index",
+        "reboot_sha256",
+        "successor_sha256",
+    }:
+        raise RunnerError("invalid offline historical boot transition")
+    index = transition["index"]
+    history = report.get("reboot_recovery_history")
+    if type(index) is not int or not 0 <= index < len(windows) or not isinstance(history, list):
+        raise RunnerError("invalid offline historical boot transition index")
+    matches = [
+        event
+        for event in history
+        if isinstance(event, dict) and _offline_window_digest(event) == transition["reboot_sha256"]
+    ]
+    if len(matches) != 1:
+        raise RunnerError("offline historical boot transition lacks its reconciliation")
+    event = matches[0]
+    pending = transition["successor_sha256"] is None
+    reconciled_epoch = event.get("offline_window_reconciled_epoch")
+    reconciliation = report.get("historical_reboot_reconciliation")
+    if (
+        type(reconciled_epoch) not in (int, float)
+        or not math.isfinite(reconciled_epoch)
+        or reconciled_epoch < windows[index]["started_epoch"]
+        or event.get("offline_window_before_sha256") != _offline_window_digest(windows[index])
+        or event.get("offline_window_capture_id") != report.get("capture_id")
+        or event.get("offline_window_root_id") != report.get("root_id")
+        or event.get("offline_window_history_index") != index
+        or not isinstance(event.get("previous_boot_stamp"), str)
+        or not isinstance(event.get("boot_stamp"), str)
+        or event["previous_boot_stamp"] == event["boot_stamp"]
+        or event.get("processing_worker_started") is not False
+        or event.get("grant_started") is not False
+        or (
+            pending
+            and (
+                index != len(windows) - 1
+                or not isinstance(reconciliation, dict)
+                or reconciliation.get("state") != "complete"
+                or reconciliation.get("boot_stamp") != event["boot_stamp"]
+                or event["boot_stamp"] != report.get("boot_stamp")
+                or reconciliation.get("capture_id") != report.get("capture_id")
+                or reconciliation.get("root_id") != report.get("root_id")
+                or reconciliation.get("processing_worker_started") is not False
+                or reconciliation.get("grant_started") is not False
+            )
+        )
+        or (
+            not pending
+            and (
+                index + 1 >= len(windows)
+                or transition["successor_sha256"] != _offline_window_digest(windows[index + 1])
+                or windows[index + 1]["started_epoch"] < reconciled_epoch
+            )
+        )
+    ):
+        raise RunnerError("offline historical boot transition changed its window or reconciliation")
+    return index, pending
+
+
+def _offline_window_pending_boot(report: dict[str, Any]) -> bool:
+    transition = report.get("offline_historical_window_boot_transition")
+    return isinstance(transition, dict) and transition.get("successor_sha256") is None
+
+
 def _validate_offline_historical_window_history(
     report: dict[str, Any], capture_id: str, *, allow_old_current_revision: bool = False
 ) -> list[dict[str, Any]]:
@@ -5887,6 +5969,7 @@ def _validate_offline_historical_window_history(
         )
         for item in windows
     ]
+    boot_boundary = _offline_window_boot_boundary(report, windows)
     supersessions = report.get("offline_historical_window_supersessions", [])
     if not isinstance(supersessions, list):
         raise RunnerError("offline historical window supersession history is invalid")
@@ -5932,9 +6015,10 @@ def _validate_offline_historical_window_history(
         superseded_indices.add(index)
 
     for index, (previous, successor) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
-        if successor[0] < previous[0] or successor[2] < previous[2]:
+        same_boot = boot_boundary != (index, False)
+        if successor[0] < previous[0] or (same_boot and successor[2] < previous[2]):
             raise RunnerError("offline historical window history is out of order")
-        overlaps = successor[0] < previous[1] or successor[2] < previous[3]
+        overlaps = successor[0] < previous[1] or (same_boot and successor[2] < previous[3])
         if overlaps != (index in superseded_indices):
             raise RunnerError("offline historical window history overlaps or is out of order")
     return history
@@ -5963,7 +6047,7 @@ def _validate_offline_historical_window(
         bounds[1] - time.time(),
         bounds[3] - time.monotonic(),
     )
-    if remaining <= 0 and not allow_expired:
+    if not allow_expired and (remaining <= 0 or _offline_window_pending_boot(report)):
         raise RunnerError("offline historical window expired")
     return window
 
@@ -5991,8 +6075,9 @@ def _configure_offline_historical_window(
             allow_expired=True,
             allow_revision_change=True,
         )
-        expired = time.time() >= float(existing["deadline_epoch"]) and time.monotonic() >= float(
-            existing["deadline_monotonic"]
+        expired = time.time() >= float(existing["deadline_epoch"]) and (
+            _offline_window_pending_boot(report)
+            or time.monotonic() >= float(existing["deadline_monotonic"])
         )
         if not expired and not supersede:
             raise RunnerError("offline historical window renewal requires both clocks to expire")
@@ -6026,6 +6111,10 @@ def _configure_offline_historical_window(
         "deadline_epoch": started_epoch + duration,
         "deadline_monotonic": started_monotonic + duration,
     }
+    if renew and _offline_window_pending_boot(report):
+        report["offline_historical_window_boot_transition"]["successor_sha256"] = (
+            _offline_window_digest(report["offline_historical_window"])
+        )
     if early_supersede:
         history_index = len(report["offline_historical_window_history"]) - 1
         supersessions = list(report.get("offline_historical_window_supersessions", []))
@@ -6149,6 +6238,132 @@ def _kill_awake_guard(process: subprocess.Popen[Any]) -> None:
             process.wait(timeout=3)
 
 
+def _historical_hold_release(
+    operator: Path, report: dict[str, Any], release_id: str, verification: dict[str, Any]
+) -> str:
+    """Resolve the exact current release and check its manifest binding."""
+    from kalshi_events.common import regular_bytes, safe_path
+
+    if not isinstance(release_id, str) or not re.fullmatch(r"[0-9a-f]{64}", release_id):
+        raise RunnerError("held historical release ID is invalid")
+    pointer = _strict_json(safe_path(operator / "current-historical.json"))
+    if not pointer or pointer.get("source_release_id") != release_id:
+        raise RunnerError("current historical pointer differs from the held release")
+    manifest_path = safe_path(operator / "releases" / release_id / "manifest.json")
+    raw = regular_bytes(manifest_path, MIB)
+    manifest = json.loads(raw)
+    manifest_sha = hashlib.sha256(raw).hexdigest()
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("source_release_id") != release_id
+        or manifest.get("capture_id") != report.get("capture_id")
+        or manifest.get("root_id") != report.get("root_id")
+        or manifest.get("contract") != "oddsfox.kalshi.historical.v1"
+        or pointer.get("manifest_sha256") != manifest_sha
+        or manifest != verification
+    ):
+        raise RunnerError("historical release manifest differs from the held capture")
+    return manifest_sha
+
+
+def _held_release_id(operator: Path, report: dict[str, Any]) -> str:
+    hold = report.get("historical_publication_hold")
+    if (
+        not isinstance(hold, dict)
+        or hold.get("state") != "verified"
+        or report.get("publication_state") != "verified"
+        or any(hold.get(key) != report.get(key) for key in ("session_id", "capture_id", "root_id"))
+    ):
+        raise RunnerError("activation requires this session's verified historical publication hold")
+    release_id = hold.get("release_id")
+    verification = hold.get("standalone_verification")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("source_release_id") != release_id
+        or verification.get("coverage_scope") != "historical"
+    ):
+        raise RunnerError("held historical release lacks standalone verification evidence")
+    if _historical_hold_release(operator, report, release_id, verification) != hold.get(
+        "manifest_sha256"
+    ):
+        raise RunnerError("historical manifest changed after the publication hold")
+    return release_id
+
+
+def _historical_hold_intent(directory: Path, report: dict[str, Any]) -> None:
+    import historical_grants as grants
+
+    from kalshi_events.common import fsync_directory, safe_path
+
+    registry = safe_path(directory / "runs" / ".historical-holds")
+    try:
+        registry.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    else:
+        fsync_directory(registry.parent)
+    grants._private_directory(registry, "historical hold directory")
+    capture_id = report["capture_id"]
+    intent = {key: report[key] for key in ("session_id", "capture_id", "root_id")}
+    marker = registry / f"{capture_id}.json"
+    if marker.exists() or marker.is_symlink():
+        if grants.read_json(marker) != intent:
+            raise RunnerError("historical hold is already bound to a different session")
+    else:
+        grants.write_once_json(marker, intent)
+
+
+def _guard_historical_activation_hold(
+    directory: Path,
+    capture_id: str,
+    report_path: Path | None = None,
+) -> None:
+    import historical_grants as grants
+
+    from kalshi_events.common import safe_path
+
+    registry = safe_path(directory / "runs" / ".historical-holds")
+    marker = registry / f"{capture_id}.json"
+    if marker.exists() or marker.is_symlink():
+        grants._private_directory(registry, "historical hold directory")
+        intent = grants.read_json(marker)
+        session_id = intent.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not CAPTURE_ID.fullmatch(session_id)
+            or report_path != directory / "runs" / session_id / REPORT_NAME
+        ):
+            raise RunnerError("historical release is held for explicit audited activation")
+        report = _strict_json(safe_path(report_path))
+        if (
+            report is None
+            or any(
+                intent.get(key) != report.get(key)
+                for key in ("capture_id", "root_id", "session_id")
+            )
+            or report.get("phase") != "activation"
+            or not isinstance(report.get("historical_publication_hold"), dict)
+            or not isinstance(report.get("activation_audit"), dict)
+        ):
+            raise RunnerError("historical hold lost its audited activation session")
+        return
+
+    for path in safe_path(directory / "runs").glob(f"*/{REPORT_NAME}"):
+        report = _strict_json(safe_path(path))
+        if report is None:
+            raise RunnerError("historical activation session report is unavailable")
+        if (
+            report.get("capture_id") == capture_id
+            and "historical_publication_hold" in report
+            and (
+                path != report_path
+                or report.get("phase") != "activation"
+                or not isinstance(report.get("activation_audit"), dict)
+            )
+        ):
+            raise RunnerError("historical release is held for explicit audited activation")
+
+
 @_resource_profile_scope
 def run_production(
     directory: Path,
@@ -6167,6 +6382,8 @@ def run_production(
     reconcile_stopped_worker: bool = False,
     resource_profile: str | None = None,
     resume_historical_stage: str | None = None,
+    publish_only: bool = False,
+    activate_held_historical: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Run one bounded catalogue refresh/resume or verify-and-activate a publication."""
     preflight_started = time.monotonic()
@@ -6180,6 +6397,21 @@ def run_production(
         supersede_offline_window=supersede_offline_window,
         resource_profile=resource_profile,
     )
+    if publish_only or activate_held_historical is not None:
+        if (
+            mode != "historical"
+            or reconcile_stopped_worker
+            or reconcile_accounting
+            or recover_reboot
+        ):
+            raise RunnerError("historical hold options require an offline historical capture run")
+        if activate_held_historical is not None and (
+            publish_only
+            or resume_historical_stage is not None
+            or not isinstance(activate_held_historical, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", activate_held_historical)
+        ):
+            raise RunnerError("held activation requires only the exact capture and audit digest")
     if resume_historical_stage is not None:
         _validate_historical_stage(resume_historical_stage)
         if mode != "historical":
@@ -6262,6 +6494,34 @@ def run_production(
                     ), 0
                 finally:
                     _ACTIVE_LIMITS.reset(token)
+            hold = report.get("historical_publication_hold")
+            if activate_held_historical is not None:
+                if report.get("phase") != "stopped":
+                    raise RunnerError("held activation requires a stopped historical session")
+                held_release = _held_release_id(operator, report)
+                previous_activation_audit = report.get("activation_audit")
+                report["activation_audit"] = {
+                    "relative_path": f"activation-audit-{activate_held_historical}.json",
+                    "sha256": activate_held_historical,
+                }
+            elif "historical_publication_hold" in report and (
+                not publish_only or not isinstance(hold, dict) or hold.get("state") != "pending"
+            ):
+                raise RunnerError(
+                    "historical publication hold requires explicit audited activation"
+                )
+            elif publish_only and hold is None:
+                if (
+                    offline_duration_seconds is None
+                    and report.get("offline_historical_window") is None
+                ):
+                    raise RunnerError("publication hold requires a bounded offline window")
+                report["historical_publication_hold"] = {
+                    "state": "pending",
+                    **{key: report[key] for key in ("session_id", "capture_id", "root_id")},
+                }
+            if publish_only:
+                _historical_hold_intent(directory, report)
             profile = report.get("resource_profile", "default")
             _ACTIVE_LIMITS.set(_limits_from_report(report, profile))
             if reconcile_accounting:
@@ -6361,6 +6621,20 @@ def run_production(
             report["phase"] = "stopped"
             _atomic_report(report_path, report)
             return result, 3
+        if activate_held_historical is not None:
+            from production_activation import _activation_audit_payload
+
+            try:
+                _activation_audit_payload(
+                    directory, report["activation_audit"], expected_session_id=report["session_id"]
+                )
+            except Exception:
+                if previous_activation_audit is None:
+                    report.pop("activation_audit")
+                else:
+                    report["activation_audit"] = previous_activation_audit
+                _atomic_report(report_path, report)
+                raise
         offline_window = None
         if mode == "historical":
             if renew_offline_window or supersede_offline_window:
@@ -6403,6 +6677,8 @@ def run_production(
                     _atomic_report(report_path, report)
         if offline_window is not None:
             reserve = _offline_workflow_reserve(offline_window)
+            if publish_only:
+                reserve = max(reserve, 2 * 3600)
             report["offline_workflow_reserve_seconds"] = reserve
             report["offline_workflow_deadline_epoch"] = (
                 float(offline_window["deadline_epoch"]) - reserve
@@ -6411,6 +6687,8 @@ def run_production(
                 float(offline_window["deadline_monotonic"]) - reserve
             )
             _atomic_report(report_path, report)
+        if (publish_only or activate_held_historical is not None) and offline_window is None:
+            raise RunnerError("historical hold options require a bounded offline window")
         awake = subprocess.Popen(
             ["caffeinate", "-is", "-w", str(os.getpid())],
             stdin=subprocess.DEVNULL,
@@ -6421,13 +6699,34 @@ def run_production(
         global _ACTIVE_OFFLINE_HISTORICAL_WINDOW
         _ACTIVE_OFFLINE_HISTORICAL_WINDOW = offline_window
         try:
-            if mode not in {"activate-current", "activate-historical"} and _monitor_deadline(
-                report, workflow=True
-            ) <= time.monotonic() + float(_effective_limits()["terminate_seconds"]):
+            if (
+                activate_held_historical is None
+                and mode not in {"activate-current", "activate-historical"}
+                and _monitor_deadline(report, workflow=True)
+                <= time.monotonic() + float(_effective_limits()["terminate_seconds"])
+            ):
                 raise BudgetStop("workflow deadline reached before supervised work could start")
             session_deadline = _monitor_deadline(report, workflow=False)
             standalone_result: dict[str, Any] | None = None
-            if mode not in {"activate-current", "activate-historical"}:
+            if activate_held_historical is not None:
+                activation_accounting = _resource_guard(
+                    directory,
+                    operator,
+                    report=report,
+                    deadline=session_deadline,
+                    paths=paths,
+                    require_complete_accounting=False,
+                    capture_id=capture_id,
+                )
+                if activation_accounting.get("root_id") != report.get("root_id"):
+                    raise RunnerError("held activation accounting belongs to another root")
+                _check_accounting_match(activation_accounting, report)
+                _record_operator_accounting(report, activation_accounting)
+                standalone_result = {
+                    "source_release_id": held_release,
+                    "coverage_scope": "historical",
+                }
+            elif mode not in {"activate-current", "activate-historical"}:
                 snapshot = None
                 if mode == "historical":
                     snapshot = _resource_guard(
@@ -6880,6 +7179,23 @@ def run_production(
                     raise RunnerError("standalone verification returned a different release")
                 if historical_profile and standalone_result.get("coverage_scope") != "historical":
                     raise RunnerError("standalone verification did not confirm historical coverage")
+                if publish_only:
+                    manifest_sha = _historical_hold_release(
+                        operator, report, release_id, standalone_result
+                    )
+                    report["historical_publication_hold"].update(
+                        state="verified",
+                        release_id=release_id,
+                        manifest_sha256=manifest_sha,
+                        standalone_verification=standalone_result,
+                    )
+                    report["phase"] = "stopped"
+                    report["error"] = None
+                    report["recovery"] = (
+                        "Complete the independent audit, then activate this held release."
+                    )
+                    _atomic_report(report_path, report)
+                    return result, 0
             else:
                 activation_accounting = _resource_guard(
                     directory,
@@ -6912,6 +7228,7 @@ def run_production(
                         raise RunnerError(
                             "current historical release has no exact capture identity"
                         )
+                    _guard_historical_activation_hold(directory, current_capture)
                     report["capture_id"] = current_capture
                     report["root_id"] = summary.get("root_id")
                 release = Path(str(current["output"]))
@@ -6979,7 +7296,9 @@ def run_production(
                     stop_reason or "production activation did not finish with verified readback"
                 )
                 report["recovery"] = (
-                    "Run --activate-current --historical to reverify the historical publication and hard-link state."
+                    "Reverify the held release and use --activate-held-historical with its audit."
+                    if activate_held_historical is not None
+                    else "Run --activate-current --historical to reverify the historical publication and hard-link state."
                     if catalogue_version == 3
                     else "Run --activate-current to reverify the actual publication and hard-link state."
                 )
@@ -7115,6 +7434,13 @@ def _activation_worker(
                     "historical activation pointer does not bind a valid release manifest"
                 )
             current_capture = manifest["capture_id"]
+            _guard_historical_activation_hold(directory, current_capture, report_path)
+            if (
+                session_report is not None
+                and "historical_publication_hold" in session_report
+                and _held_release_id(operator, session_report) != release_id
+            ):
+                raise RunnerError("activation release differs from the audited publication hold")
             if session_report is not None and "activation_audit" in session_report:
                 if report_path is None:
                     raise RunnerError("activation audit requires its session report path")
@@ -7263,6 +7589,14 @@ def main(argv: list[str] | None = None) -> int:
         "--recovery-volume-uuid",
         help="explicit APFS volume UUID to verify when recovering after reboot",
     )
+    parser.add_argument(
+        "--publish-only", action="store_true", help="hold verified historical publication for audit"
+    )
+    parser.add_argument(
+        "--activate-held-historical",
+        metavar="AUDIT_SHA256",
+        help="activate only the exact held historical release after independent audit",
+    )
     args = parser.parse_args(argv)
     try:
         validate_mode(
@@ -7336,6 +7670,8 @@ def main(argv: list[str] | None = None) -> int:
                 reconcile_stopped_worker=args.reconcile_stopped_worker,
                 resource_profile=args.historical_resource_profile,
                 resume_historical_stage=args.resume_historical_stage,
+                publish_only=args.publish_only,
+                activate_held_historical=args.activate_held_historical,
             )
     except (BudgetStop, RunnerInterrupted) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
@@ -7693,8 +8029,9 @@ def _load_resume(
             or report_path.parent.parent != run_root
         ):
             raise RunnerError("offline historical renewal report is outside its capture path")
-        expired = time.time() >= float(window["deadline_epoch"]) and time.monotonic() >= float(
-            window["deadline_monotonic"]
+        expired = time.time() >= float(window["deadline_epoch"]) and (
+            _offline_window_pending_boot(report)
+            or time.monotonic() >= float(window["deadline_monotonic"])
         )
         if not expired and not supersede_offline_window:
             raise RunnerError("offline historical window renewal requires both clocks to expire")
@@ -7923,6 +8260,12 @@ def _finish_historical_reboot_reconciliation(
     saved = _strict_json(report_path)
     if saved is None or saved != report:
         raise RunnerError("session report changed before reboot accounting reconciliation")
+    if (
+        report.get("offline_historical_window") is not None
+        and report.get("offline_historical_window_boot_transition") is not None
+        and not _offline_window_pending_boot(report)
+    ):
+        raise RunnerError("a second offline historical boot transition requires separate recovery")
     private_worker = pending.get("private_worker_reconciliation")
     private_uncertain = isinstance(private_worker, dict)
     private_phase = report.get("private_historical_grant", {})
@@ -8320,6 +8663,24 @@ def _finish_historical_reboot_reconciliation(
         reboot_event["private_worker_reconciliation_sha256"] = private_reconciliation_sha256
         report["private_historical_grant"]["state"] = "reconciled-after-boot-change"
         report["private_historical_grant"]["reconciliation_sha256"] = private_reconciliation_sha256
+    offline_window = report.get("offline_historical_window")
+    if isinstance(offline_window, dict) and (
+        report.get("offline_historical_window_boot_transition") is None
+        or _offline_window_pending_boot(report)
+    ):
+        index = len(report.get("offline_historical_window_history", []))
+        reboot_event.update(
+            offline_window_before_sha256=_offline_window_digest(offline_window),
+            offline_window_capture_id=capture_id,
+            offline_window_root_id=report["root_id"],
+            offline_window_history_index=index,
+            offline_window_reconciled_epoch=wall_now,
+        )
+        report["offline_historical_window_boot_transition"] = {
+            "index": index,
+            "reboot_sha256": _offline_window_digest(reboot_event),
+            "successor_sha256": None,
+        }
     report["reboot_recovery_history"] = [*history, reboot_event]
     report["historical_reboot_reconciliation"] = {
         "state": "complete",
@@ -8343,9 +8704,8 @@ def _finish_historical_reboot_reconciliation(
     report["phase"] = "stopped"
     report["error"] = None
     report["recovery"] = (
-        "No historical worker or grant was started. After runtime/control freeze and a fresh "
-        "phase approval, resume only with the private --_historical-control command for the "
-        f"next sealed phase and capture {capture_id}."
+        "No historical worker or grant was started. After explicit authorization, use the "
+        "approved offline historical continuation for this capture and its saved checkpoint."
     )
     report["last_observed_at"] = _utc()
     report["last_observed_epoch"] = wall_now
